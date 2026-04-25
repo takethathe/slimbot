@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -15,10 +16,14 @@ impl ConfigScheme {
 
     /// Generate a complete default Config with all fields populated.
     pub fn default_config(&self) -> Config {
+        let default_provider_name = "default".to_string();
+        let mut providers = HashMap::new();
+        providers.insert(default_provider_name.clone(), self.default_provider_config());
+
         Config {
             data_dir: Self::default_data_dir(),
-            provider: self.default_provider_config(),
-            agent: self.default_agent_config(),
+            agent: self.default_agent_config(&default_provider_name),
+            providers,
             tools: vec![],
             channels: vec![],
         }
@@ -32,27 +37,33 @@ impl ConfigScheme {
             config.data_dir = Self::default_data_dir();
         }
 
-        // provider
-        if config.provider.api_url.is_empty() {
-            config.provider.api_url = Self::DEFAULT_API_URL.to_string();
-        }
-        if config.provider.model.is_empty() {
-            config.provider.model = Self::DEFAULT_MODEL.to_string();
-        }
-        if config.provider.temperature <= 0.0 || config.provider.temperature > 2.0 {
-            config.provider.temperature = Self::DEFAULT_TEMPERATURE;
-        }
-        if config.provider.max_tokens == 0 {
-            config.provider.max_tokens = Self::DEFAULT_MAX_TOKENS;
-        }
-        // api_key is NOT normalized — it must be set by the user
-
         // agent
+        if config.agent.provider.is_empty() {
+            config.agent.provider = "default".to_string();
+        }
         if config.agent.max_iterations == 0 {
             config.agent.max_iterations = Self::DEFAULT_MAX_ITERATIONS;
         }
         if config.agent.timeout_seconds == 0 {
             config.agent.timeout_seconds = Self::DEFAULT_TIMEOUT;
+        }
+
+        // providers
+        for provider in config.providers.values_mut() {
+            if provider.r#type.is_empty() {
+                provider.r#type = Self::DEFAULT_PROVIDER_TYPE.to_string();
+            }
+            self.normalize_provider_url(provider);
+            if provider.model.is_empty() {
+                provider.model = Self::DEFAULT_MODEL.to_string();
+            }
+            if provider.temperature <= 0.0 || provider.temperature > 2.0 {
+                provider.temperature = Self::DEFAULT_TEMPERATURE;
+            }
+            if provider.max_tokens == 0 {
+                provider.max_tokens = Self::DEFAULT_MAX_TOKENS;
+            }
+            // api_key is NOT normalized — it must be set by the user
         }
 
         // tools & channels: remove entries with empty name/type
@@ -77,14 +88,29 @@ impl ConfigScheme {
         Path::new(path).exists()
     }
 
+    /// Derive the full API URL from api_url or base_url.
+    /// Priority: api_url > base_url + suffix > default.
+    fn normalize_provider_url(&self, provider: &mut crate::config::ProviderConfig) {
+        if !provider.api_url.is_empty() {
+            return; // api_url takes priority
+        }
+        if !provider.base_url.is_empty() {
+            let base = provider.base_url.trim_end_matches('/');
+            provider.api_url = format!("{}/v1/chat/completions", base);
+        } else {
+            provider.api_url = Self::DEFAULT_API_URL.to_string();
+        }
+    }
+
     // ── Default value constants ──
 
-    const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
-    const DEFAULT_MODEL: &str = "gpt-4o";
-    const DEFAULT_TEMPERATURE: f32 = 0.7;
-    const DEFAULT_MAX_TOKENS: u32 = 4096;
-    const DEFAULT_MAX_ITERATIONS: u32 = 40;
-    const DEFAULT_TIMEOUT: u64 = 120;
+    pub const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+    pub const DEFAULT_PROVIDER_TYPE: &str = "openai";
+    pub const DEFAULT_MODEL: &str = "gpt-4o";
+    pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+    pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+    pub const DEFAULT_MAX_ITERATIONS: u32 = 40;
+    pub const DEFAULT_TIMEOUT: u64 = 120;
 
     fn default_data_dir() -> String {
         let home = dirs::home_dir()
@@ -95,7 +121,9 @@ impl ConfigScheme {
 
     fn default_provider_config(&self) -> ProviderConfig {
         ProviderConfig {
+            r#type: Self::DEFAULT_PROVIDER_TYPE.to_string(),
             api_url: Self::DEFAULT_API_URL.to_string(),
+            base_url: String::new(),
             api_key: String::new(), // must be set by user
             model: Self::DEFAULT_MODEL.to_string(),
             temperature: Self::DEFAULT_TEMPERATURE,
@@ -103,8 +131,9 @@ impl ConfigScheme {
         }
     }
 
-    fn default_agent_config(&self) -> AgentConfig {
+    fn default_agent_config(&self, provider_ref: &str) -> AgentConfig {
         AgentConfig {
+            provider: provider_ref.to_string(),
             max_iterations: Self::DEFAULT_MAX_ITERATIONS,
             timeout_seconds: Self::DEFAULT_TIMEOUT,
         }
@@ -121,15 +150,26 @@ mod tests {
         ConfigScheme::new()
     }
 
+    fn default_provider(config: &Config) -> &ProviderConfig {
+        config.providers.get("default").expect("default provider should exist")
+    }
+
+    fn default_provider_mut(config: &mut Config) -> &mut ProviderConfig {
+        config.providers.get_mut("default").expect("default provider should exist")
+    }
+
     #[test]
     fn test_default_config_has_all_fields() {
         let config = scheme().default_config();
         assert!(!config.data_dir.is_empty());
-        assert!(!config.provider.api_url.is_empty());
-        assert!(config.provider.api_key.is_empty()); // intentional
-        assert!(!config.provider.model.is_empty());
-        assert!((config.provider.temperature - 0.7).abs() < f32::EPSILON);
-        assert_eq!(config.provider.max_tokens, 4096);
+        assert_eq!(config.agent.provider, "default");
+        let provider = default_provider(&config);
+        assert_eq!(provider.r#type, "openai");
+        assert!(!provider.api_url.is_empty());
+        assert!(provider.api_key.is_empty()); // intentional
+        assert!(!provider.model.is_empty());
+        assert!((provider.temperature - 0.7).abs() < f32::EPSILON);
+        assert_eq!(provider.max_tokens, 4096);
         assert_eq!(config.agent.max_iterations, 40);
         assert_eq!(config.agent.timeout_seconds, 120);
         assert!(config.tools.is_empty());
@@ -139,37 +179,73 @@ mod tests {
     #[test]
     fn test_normalize_fills_missing_provider() {
         let mut config = scheme().default_config();
-        config.provider.api_url.clear();
-        config.provider.model.clear();
-        config.provider.temperature = 0.0;
-        config.provider.max_tokens = 0;
+        default_provider_mut(&mut config).api_url.clear();
+        default_provider_mut(&mut config).model.clear();
+        default_provider_mut(&mut config).temperature = 0.0;
+        default_provider_mut(&mut config).max_tokens = 0;
 
         scheme().normalize(&mut config);
 
-        assert_eq!(config.provider.api_url, ConfigScheme::DEFAULT_API_URL);
-        assert_eq!(config.provider.model, ConfigScheme::DEFAULT_MODEL);
-        assert_eq!(config.provider.temperature, 0.7);
-        assert_eq!(config.provider.max_tokens, 4096);
+        let provider = default_provider(&config);
+        assert_eq!(provider.api_url, ConfigScheme::DEFAULT_API_URL);
+        assert_eq!(provider.model, ConfigScheme::DEFAULT_MODEL);
+        assert_eq!(provider.temperature, 0.7);
+        assert_eq!(provider.max_tokens, 4096);
+    }
+
+    #[test]
+    fn test_normalize_derives_url_from_base_url() {
+        let mut config = scheme().default_config();
+        default_provider_mut(&mut config).api_url.clear();
+        default_provider_mut(&mut config).base_url = "https://api.example.com".to_string();
+
+        scheme().normalize(&mut config);
+
+        assert_eq!(default_provider(&config).api_url, "https://api.example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_normalize_api_url_takes_priority_over_base_url() {
+        let mut config = scheme().default_config();
+        default_provider_mut(&mut config).api_url = "https://existing.com/v1/chat/completions".to_string();
+        default_provider_mut(&mut config).base_url = "https://ignored.com".to_string();
+
+        scheme().normalize(&mut config);
+
+        assert_eq!(default_provider(&config).api_url, "https://existing.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_normalize_custom_provider_base_url() {
+        let mut config = scheme().default_config();
+        default_provider_mut(&mut config).r#type = "custom".to_string();
+        default_provider_mut(&mut config).api_url.clear();
+        default_provider_mut(&mut config).base_url = "https://my-provider.example.com/api".to_string();
+
+        scheme().normalize(&mut config);
+
+        assert_eq!(default_provider(&config).r#type, "custom");
+        assert_eq!(default_provider(&config).api_url, "https://my-provider.example.com/api/v1/chat/completions");
     }
 
     #[test]
     fn test_normalize_preserves_valid_api_key() {
         let mut config = scheme().default_config();
-        config.provider.api_key = "sk-test-key".to_string();
+        default_provider_mut(&mut config).api_key = "sk-test-key".to_string();
 
         scheme().normalize(&mut config);
 
-        assert_eq!(config.provider.api_key, "sk-test-key");
+        assert_eq!(default_provider(&config).api_key, "sk-test-key");
     }
 
     #[test]
     fn test_normalize_fixes_invalid_temperature() {
         let mut config = scheme().default_config();
-        config.provider.temperature = 5.0; // out of range
+        default_provider_mut(&mut config).temperature = 5.0; // out of range
 
         scheme().normalize(&mut config);
 
-        assert_eq!(config.provider.temperature, 0.7);
+        assert_eq!(default_provider(&config).temperature, 0.7);
     }
 
     #[test]
@@ -201,7 +277,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: Config = serde_json::from_str(&content).unwrap();
         assert!(!parsed.data_dir.is_empty());
-        assert_eq!(parsed.provider.model, "gpt-4o");
+        assert_eq!(default_provider(&parsed).model, "gpt-4o");
     }
 
     #[test]
@@ -209,5 +285,26 @@ mod tests {
         // default_config should always produce a non-empty data_dir
         let config = scheme().default_config();
         assert!(config.data_dir.ends_with(".slimbot"));
+    }
+
+    #[test]
+    fn test_multiple_providers() {
+        let mut config = scheme().default_config();
+        config.providers.insert("siliconflow".to_string(), ProviderConfig {
+            r#type: "custom".to_string(),
+            api_url: String::new(),
+            base_url: "https://api.siliconflow.cn".to_string(),
+            api_key: "sk-sf-key".to_string(),
+            model: "Qwen/Qwen2.5-72B-Instruct".to_string(),
+            temperature: 0.7,
+            max_tokens: 4096,
+        });
+        config.agent.provider = "siliconflow".to_string();
+
+        scheme().normalize(&mut config);
+
+        let sf = config.providers.get("siliconflow").unwrap();
+        assert_eq!(sf.api_url, "https://api.siliconflow.cn/v1/chat/completions");
+        assert_eq!(sf.api_key, "sk-sf-key");
     }
 }

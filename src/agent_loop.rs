@@ -22,7 +22,9 @@ impl AgentLoop {
     pub async fn from_config(config_path: &str) -> Result<Self> {
         let config = Config::load(config_path)?;
 
-        let provider = Arc::new(OpenAIProvider::new(&config.provider));
+        let provider_config = config.providers.get(&config.agent.provider)
+            .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", config.agent.provider))?;
+        let provider = Arc::new(OpenAIProvider::new(provider_config));
 
         let mut tool_manager = ToolManager::new();
         tool_manager.init_from_config(&config.tools);

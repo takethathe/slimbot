@@ -11,14 +11,29 @@ use super::{ChatResponse, FinishReason};
 pub struct OpenAIProvider {
     client: reqwest::Client,
     config: ProviderConfig,
+    /// Resolved API URL — derived from api_url, base_url, or default at construction.
+    api_url: String,
 }
 
 impl OpenAIProvider {
     pub fn new(config: &ProviderConfig) -> Self {
+        let api_url = Self::resolve_api_url(config);
         Self {
             client: reqwest::Client::new(),
             config: config.clone(),
+            api_url,
         }
+    }
+
+    fn resolve_api_url(config: &ProviderConfig) -> String {
+        if !config.api_url.is_empty() {
+            return config.api_url.clone();
+        }
+        if !config.base_url.is_empty() {
+            let base = config.base_url.trim_end_matches('/');
+            return format!("{}/v1/chat/completions", base);
+        }
+        "https://api.openai.com/v1/chat/completions".to_string()
     }
 }
 
@@ -121,7 +136,7 @@ impl crate::provider::Provider for OpenAIProvider {
             body["tools"] = serde_json::json!(tool_defs);
         }
 
-        let resp = self.client.post(&self.config.api_url)
+        let resp = self.client.post(&self.api_url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .header("Content-Type", "application/json")
             .json(&body)

@@ -3,6 +3,18 @@ use anyhow::Result;
 use crate::config::{Config, ProviderConfig, AgentConfig};
 use crate::config_scheme::ConfigScheme;
 
+fn default_fallback_provider() -> ProviderConfig {
+    ProviderConfig {
+        r#type: "custom".to_string(),
+        api_url: String::new(),
+        base_url: String::new(),
+        api_key: String::new(),
+        model: String::new(),
+        temperature: ConfigScheme::DEFAULT_TEMPERATURE,
+        max_tokens: ConfigScheme::DEFAULT_MAX_TOKENS,
+    }
+}
+
 /// Load an existing config file, using serde defaults for missing fields.
 /// If deserialization fails entirely, falls back to the scheme's default config.
 fn load_config_with_defaults(path: &str, scheme: &ConfigScheme) -> Result<Config> {
@@ -23,11 +35,28 @@ fn load_config_with_defaults(path: &str, scheme: &ConfigScheme) -> Result<Config
     if let Some(v) = value.get("data_dir").and_then(|v| v.as_str()) {
         config.data_dir = v.to_string();
     }
-    if let Some(obj) = value.get("provider").and_then(|v| v.as_object()) {
-        merge_provider(&mut config.provider, obj);
-    }
     if let Some(obj) = value.get("agent").and_then(|v| v.as_object()) {
         merge_agent(&mut config.agent, obj);
+    }
+    if let Some(providers) = value.get("providers").and_then(|v| v.as_object()) {
+        for (key, val) in providers {
+            if let Some(obj) = val.as_object() {
+                if let Some(existing) = config.providers.get_mut(key) {
+                    merge_provider(existing, obj);
+                } else {
+                    let mut provider = config.providers.values().next().cloned()
+                        .unwrap_or_else(default_fallback_provider);
+                    merge_provider(&mut provider, obj);
+                    config.providers.insert(key.clone(), provider);
+                }
+            }
+        }
+    }
+    // Backward compat: merge legacy "provider" object into the default provider
+    if let Some(obj) = value.get("provider").and_then(|v| v.as_object()) {
+        if let Some(default_provider) = config.providers.get_mut("default") {
+            merge_provider(default_provider, obj);
+        }
     }
     if let Some(arr) = value.get("tools").and_then(|v| v.as_array()) {
         config.tools = arr.iter()
@@ -44,8 +73,14 @@ fn load_config_with_defaults(path: &str, scheme: &ConfigScheme) -> Result<Config
 }
 
 fn merge_provider(target: &mut ProviderConfig, src: &serde_json::Map<String, serde_json::Value>) {
+    if let Some(v) = src.get("type").and_then(|v| v.as_str()) {
+        target.r#type = v.to_string();
+    }
     if let Some(v) = src.get("api_url").and_then(|v| v.as_str()) {
         target.api_url = v.to_string();
+    }
+    if let Some(v) = src.get("base_url").and_then(|v| v.as_str()) {
+        target.base_url = v.to_string();
     }
     if let Some(v) = src.get("api_key").and_then(|v| v.as_str()) {
         target.api_key = v.to_string();
@@ -62,6 +97,9 @@ fn merge_provider(target: &mut ProviderConfig, src: &serde_json::Map<String, ser
 }
 
 fn merge_agent(target: &mut AgentConfig, src: &serde_json::Map<String, serde_json::Value>) {
+    if let Some(v) = src.get("provider").and_then(|v| v.as_str()) {
+        target.provider = v.to_string();
+    }
     if let Some(v) = src.get("max_iterations").and_then(|v| v.as_u64()) {
         target.max_iterations = v as u32;
     }
@@ -109,13 +147,14 @@ pub fn run_setup(config_path: Option<&str>) -> Result<()> {
     let config = load_config_with_defaults(path, &scheme)?;
     eprintln!("\nConfig summary:");
     eprintln!("  data_dir: {}", config.data_dir);
-    eprintln!("  provider.api_url: {}", config.provider.api_url);
-    eprintln!("  provider.model: {}", config.provider.model);
-    eprintln!("  provider.temperature: {}", config.provider.temperature);
-    eprintln!("  provider.max_tokens: {}", config.provider.max_tokens);
-    eprintln!("  provider.api_key: {}", mask_api_key(&config.provider.api_key));
+    eprintln!("  agent.provider: {}", config.agent.provider);
     eprintln!("  agent.max_iterations: {}", config.agent.max_iterations);
     eprintln!("  agent.timeout_seconds: {}", config.agent.timeout_seconds);
+    eprintln!("  providers:");
+    for (name, provider) in &config.providers {
+        eprintln!("    {}: type={} model={} api_key={}",
+            name, provider.r#type, provider.model, mask_api_key(&provider.api_key));
+    }
     eprintln!("  tools: {} entries", config.tools.len());
     eprintln!("  channels: {} entries", config.channels.len());
     eprintln!("\nEdit {} to configure your API key and channels.", path);

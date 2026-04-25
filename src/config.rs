@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -29,9 +30,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_provider_type() -> String {
+    "openai".to_string()
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProviderConfig {
+    #[serde(default = "default_provider_type")]
+    pub r#type: String,
+    /// Full API endpoint URL (e.g. "https://api.openai.com/v1/chat/completions").
+    /// If empty, derived from `base_url` + "/v1/chat/completions".
+    #[serde(default)]
     pub api_url: String,
+    /// Base URL for the provider (e.g. "https://api.openai.com").
+    /// Used when `api_url` is not set — the full URL is derived from this.
+    #[serde(default)]
+    pub base_url: String,
     pub api_key: String,
     pub model: String,
     #[serde(default = "default_temperature")]
@@ -42,6 +56,8 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AgentConfig {
+    /// References a key in `Config.providers`.
+    pub provider: String,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
     #[serde(default = "default_timeout")]
@@ -68,8 +84,8 @@ pub struct ChannelEntry {
 pub struct Config {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    pub provider: ProviderConfig,
     pub agent: AgentConfig,
+    pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub tools: Vec<ToolEntry>,
     #[serde(default)]
@@ -104,14 +120,16 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.provider.api_key.is_empty() {
-            anyhow::bail!("provider.api_key must not be empty");
+        if self.agent.provider.is_empty() {
+            anyhow::bail!("agent.provider must not be empty");
         }
-        if self.provider.model.is_empty() {
-            anyhow::bail!("provider.model must not be empty");
+        let provider = self.providers.get(&self.agent.provider)
+            .ok_or_else(|| anyhow::anyhow!("Provider '{}' referenced by agent not found in providers", self.agent.provider))?;
+        if provider.api_key.is_empty() {
+            anyhow::bail!("provider '{}'.api_key must not be empty", self.agent.provider);
         }
-        if self.agent.max_iterations == 0 {
-            anyhow::bail!("agent.max_iterations must be greater than 0");
+        if provider.model.is_empty() {
+            anyhow::bail!("provider '{}'.model must not be empty", self.agent.provider);
         }
         Ok(())
     }
