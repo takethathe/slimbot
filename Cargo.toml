@@ -1,0 +1,18 @@
+[package]
+name = "slimbot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+async-trait = "0.1"
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
