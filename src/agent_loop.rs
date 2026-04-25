@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -8,7 +7,7 @@ use crate::config::Config;
 use crate::context::ContextBuilder;
 use crate::provider::{OpenAIProvider, Provider};
 use crate::runner::AgentRunner;
-use crate::session::{SessionManager, SharedSessionManager, SessionTask};
+use crate::session::{SessionManager, SessionTask, SharedSessionManager};
 use crate::tool::{Tool, ToolManager};
 
 pub struct AgentLoop {
@@ -22,18 +21,16 @@ impl AgentLoop {
     pub async fn from_config(config_path: &str) -> Result<Self> {
         let config = Config::load(config_path)?;
 
-        let provider_config = config.providers.get(&config.agent.provider)
+        let provider_config = config
+            .providers
+            .get(&config.agent.provider)
             .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", config.agent.provider))?;
         let provider = Arc::new(OpenAIProvider::new(provider_config));
 
-        let mut tool_manager = ToolManager::new(
-            Path::new(&config.data_dir).join("workspace"),
-        );
+        let mut tool_manager = ToolManager::new(config.workspace_dir());
         tool_manager.init_from_config(&config.tools);
 
-        let session_manager = Arc::new(Mutex::new(
-            SessionManager::new(config.session_dir())?
-        ));
+        let session_manager = Arc::new(Mutex::new(SessionManager::new(config.session_dir())?));
 
         Ok(Self {
             config,
@@ -65,7 +62,7 @@ impl AgentLoop {
             ContextBuilder::new(
                 self.session_manager.clone(),
                 self.tool_manager.clone(),
-                Path::new(&self.config.data_dir).join("workspace"),
+                self.config.workspace_dir(),
             ),
             self.tool_manager.clone(),
             self.provider.clone(),

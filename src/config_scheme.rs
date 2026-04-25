@@ -18,10 +18,14 @@ impl ConfigScheme {
     pub fn default_config(&self) -> Config {
         let default_provider_name = "default".to_string();
         let mut providers = HashMap::new();
-        providers.insert(default_provider_name.clone(), self.default_provider_config());
+        providers.insert(
+            default_provider_name.clone(),
+            self.default_provider_config(),
+        );
 
         Config {
             data_dir: Self::default_data_dir(),
+            workspace_dir: String::new(), // resolved by Config::load
             agent: self.default_agent_config(&default_provider_name),
             providers,
             tools: vec![],
@@ -35,6 +39,10 @@ impl ConfigScheme {
         // data_dir
         if config.data_dir.is_empty() {
             config.data_dir = Self::default_data_dir();
+        }
+        // workspace_dir
+        if config.workspace_dir.is_empty() {
+            config.workspace_dir = format!("{}/workspace", config.data_dir);
         }
 
         // agent
@@ -151,17 +159,25 @@ mod tests {
     }
 
     fn default_provider(config: &Config) -> &ProviderConfig {
-        config.providers.get("default").expect("default provider should exist")
+        config
+            .providers
+            .get("default")
+            .expect("default provider should exist")
     }
 
     fn default_provider_mut(config: &mut Config) -> &mut ProviderConfig {
-        config.providers.get_mut("default").expect("default provider should exist")
+        config
+            .providers
+            .get_mut("default")
+            .expect("default provider should exist")
     }
 
     #[test]
     fn test_default_config_has_all_fields() {
-        let config = scheme().default_config();
+        let mut config = scheme().default_config();
+        scheme().normalize(&mut config);
         assert!(!config.data_dir.is_empty());
+        assert!(!config.workspace_dir.is_empty());
         assert_eq!(config.agent.provider, "default");
         let provider = default_provider(&config);
         assert_eq!(provider.r#type, "openai");
@@ -201,18 +217,25 @@ mod tests {
 
         scheme().normalize(&mut config);
 
-        assert_eq!(default_provider(&config).api_url, "https://api.example.com/v1/chat/completions");
+        assert_eq!(
+            default_provider(&config).api_url,
+            "https://api.example.com/v1/chat/completions"
+        );
     }
 
     #[test]
     fn test_normalize_api_url_takes_priority_over_base_url() {
         let mut config = scheme().default_config();
-        default_provider_mut(&mut config).api_url = "https://existing.com/v1/chat/completions".to_string();
+        default_provider_mut(&mut config).api_url =
+            "https://existing.com/v1/chat/completions".to_string();
         default_provider_mut(&mut config).base_url = "https://ignored.com".to_string();
 
         scheme().normalize(&mut config);
 
-        assert_eq!(default_provider(&config).api_url, "https://existing.com/v1/chat/completions");
+        assert_eq!(
+            default_provider(&config).api_url,
+            "https://existing.com/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -220,12 +243,16 @@ mod tests {
         let mut config = scheme().default_config();
         default_provider_mut(&mut config).r#type = "custom".to_string();
         default_provider_mut(&mut config).api_url.clear();
-        default_provider_mut(&mut config).base_url = "https://my-provider.example.com/api".to_string();
+        default_provider_mut(&mut config).base_url =
+            "https://my-provider.example.com/api".to_string();
 
         scheme().normalize(&mut config);
 
         assert_eq!(default_provider(&config).r#type, "custom");
-        assert_eq!(default_provider(&config).api_url, "https://my-provider.example.com/api/v1/chat/completions");
+        assert_eq!(
+            default_provider(&config).api_url,
+            "https://my-provider.example.com/api/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -275,8 +302,10 @@ mod tests {
         assert!(scheme().config_exists(&path));
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: Config = serde_json::from_str(&content).unwrap();
+        let mut parsed: Config = serde_json::from_str(&content).unwrap();
+        scheme().normalize(&mut parsed);
         assert!(!parsed.data_dir.is_empty());
+        assert!(!parsed.workspace_dir.is_empty());
         assert_eq!(default_provider(&parsed).model, "gpt-4o");
     }
 
@@ -288,17 +317,40 @@ mod tests {
     }
 
     #[test]
+    fn test_workspace_dir_derived_from_data_dir() {
+        let mut config = scheme().default_config();
+        // Config::load resolves workspace_dir, but default_config leaves it empty
+        // ConfigScheme::normalize should also fill it
+        scheme().normalize(&mut config);
+        assert_eq!(
+            config.workspace_dir,
+            format!("{}/workspace", config.data_dir)
+        );
+    }
+
+    #[test]
+    fn test_workspace_dir_override() {
+        let mut config = scheme().default_config();
+        config.workspace_dir = "/custom/workspace".to_string();
+        scheme().normalize(&mut config);
+        assert_eq!(config.workspace_dir, "/custom/workspace");
+    }
+
+    #[test]
     fn test_multiple_providers() {
         let mut config = scheme().default_config();
-        config.providers.insert("siliconflow".to_string(), ProviderConfig {
-            r#type: "custom".to_string(),
-            api_url: String::new(),
-            base_url: "https://api.siliconflow.cn".to_string(),
-            api_key: "sk-sf-key".to_string(),
-            model: "Qwen/Qwen2.5-72B-Instruct".to_string(),
-            temperature: 0.7,
-            max_tokens: 4096,
-        });
+        config.providers.insert(
+            "siliconflow".to_string(),
+            ProviderConfig {
+                r#type: "custom".to_string(),
+                api_url: String::new(),
+                base_url: "https://api.siliconflow.cn".to_string(),
+                api_key: "sk-sf-key".to_string(),
+                model: "Qwen/Qwen2.5-72B-Instruct".to_string(),
+                temperature: 0.7,
+                max_tokens: 4096,
+            },
+        );
         config.agent.provider = "siliconflow".to_string();
 
         scheme().normalize(&mut config);

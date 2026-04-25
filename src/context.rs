@@ -55,7 +55,8 @@ impl ContextBuilder {
                     if path.extension().map_or(false, |e| e == "md") {
                         if let Ok(content) = std::fs::read_to_string(&path) {
                             if !content.is_empty() {
-                                let name = path.file_stem()
+                                let name = path
+                                    .file_stem()
                                     .map(|s| s.to_string_lossy().to_string())
                                     .unwrap_or_default();
                                 system_parts.push(format!("[Skill: {}] {}", name, content));
@@ -81,7 +82,9 @@ impl ContextBuilder {
 
         // Assemble system prompt
         let system_prompt = system_parts.join("\n\n---\n\n");
-        let mut all_messages = vec![Message::System { content: system_prompt }];
+        let mut all_messages = vec![Message::System {
+            content: system_prompt,
+        }];
         all_messages.extend(messages);
 
         let tools = Some(self.tool_manager.to_openai_functions());
@@ -93,6 +96,7 @@ impl ContextBuilder {
     }
 
     fn fixed_intro() -> String {
-        "You are SlimBot, an AI assistant. You can call tools to help the user complete tasks.".to_string()
+        "You are SlimBot, an AI assistant. You can call tools to help the user complete tasks."
+            .to_string()
     }
 }

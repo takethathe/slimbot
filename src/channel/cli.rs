@@ -14,7 +14,8 @@ pub struct CliChannel {
 
 impl CliChannel {
     pub fn from_config(config: &serde_json::Value) -> Result<Self> {
-        let prompt = config.get("prompt")
+        let prompt = config
+            .get("prompt")
             .and_then(|v| v.as_str())
             .unwrap_or("> ")
             .to_string();
@@ -30,7 +31,9 @@ impl CliChannel {
 pub struct CliChannelFactory;
 
 impl ChannelFactory for CliChannelFactory {
-    fn channel_type(&self) -> &str { "cli" }
+    fn channel_type(&self) -> &str {
+        "cli"
+    }
 
     fn create(&self, config: &serde_json::Value) -> Result<Box<dyn Channel>> {
         Ok(Box::new(CliChannel::from_config(config)?))
@@ -39,9 +42,15 @@ impl ChannelFactory for CliChannelFactory {
 
 #[async_trait]
 impl Channel for CliChannel {
-    fn id(&self) -> &str { &self.channel_id }
-    fn chat_id(&self) -> &str { &self.chat_id }
-    fn name(&self) -> &str { "CLI" }
+    fn id(&self) -> &str {
+        &self.channel_id
+    }
+    fn chat_id(&self) -> &str {
+        &self.chat_id
+    }
+    fn name(&self) -> &str {
+        "CLI"
+    }
 
     async fn read_input(&mut self) -> Result<String> {
         print!("{}", self.prompt);

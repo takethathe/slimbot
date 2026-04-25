@@ -45,9 +45,11 @@ impl Tool for FileWriterTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<String> {
-        let path_str = args["path"].as_str()
+        let path_str = args["path"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: path"))?;
-        let content = args["content"].as_str()
+        let content = args["content"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: content"))?;
 
         let target = resolve_workspace_path(path_str, &self.workspace_dir)?;
@@ -57,10 +59,15 @@ impl Tool for FileWriterTool {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        tokio::fs::write(&target, content).await
+        tokio::fs::write(&target, content)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", path_str, e))?;
 
-        Ok(format!("Successfully wrote {} bytes to {}", content.len(), path_str))
+        Ok(format!(
+            "Successfully wrote {} bytes to {}",
+            content.len(),
+            path_str
+        ))
     }
 }
 
@@ -72,13 +79,18 @@ mod tests {
     async fn test_write_and_read_back() {
         let tmp = tempfile::tempdir().unwrap();
         let writer = FileWriterTool::new(tmp.path().to_path_buf());
-        let result = writer.execute(serde_json::json!({
-            "path": "test.txt",
-            "content": "hello world"
-        })).await.unwrap();
+        let result = writer
+            .execute(serde_json::json!({
+                "path": "test.txt",
+                "content": "hello world"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("11 bytes"));
 
-        let content = tokio::fs::read_to_string(tmp.path().join("test.txt")).await.unwrap();
+        let content = tokio::fs::read_to_string(tmp.path().join("test.txt"))
+            .await
+            .unwrap();
         assert_eq!(content, "hello world");
     }
 }

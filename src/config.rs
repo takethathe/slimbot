@@ -5,9 +5,14 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 fn default_data_dir() -> String {
-    let home = dirs::home_dir().map(|p| p.to_string_lossy().to_string())
+    let home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string());
     format!("{}/.slimbot", home)
+}
+
+fn default_workspace_dir_for_serde() -> String {
+    String::new()
 }
 
 fn default_temperature() -> f32 {
@@ -84,6 +89,10 @@ pub struct ChannelEntry {
 pub struct Config {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// Directory for workspace files (agent.md, skills, sessions, etc.).
+    /// Defaults to `{data_dir}/workspace` if not set.
+    #[serde(default = "default_workspace_dir_for_serde")]
+    pub workspace_dir: String,
     pub agent: AgentConfig,
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -94,14 +103,17 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .context("Failed to read config.json")?;
-        let config: Config = serde_json::from_str(&content)
-            .context("Invalid config.json format")?;
+        let content = std::fs::read_to_string(path).context("Failed to read config.json")?;
+        let mut config: Config =
+            serde_json::from_str(&content).context("Invalid config.json format")?;
         config.validate()?;
 
-        let data_dir = Path::new(&config.data_dir);
-        std::fs::create_dir_all(data_dir.join("workspace/sessions"))?;
+        // Derive workspace_dir from data_dir if not explicitly set
+        if config.workspace_dir.is_empty() {
+            config.workspace_dir = format!("{}/workspace", config.data_dir);
+        }
+
+        std::fs::create_dir_all(config.session_dir())?;
 
         Ok(config)
     }
@@ -115,18 +127,31 @@ impl Config {
         Ok(())
     }
 
+    /// Returns the workspace directory path.
+    pub fn workspace_dir(&self) -> PathBuf {
+        Path::new(&self.workspace_dir).to_path_buf()
+    }
+
+    /// Returns the sessions directory path.
     pub fn session_dir(&self) -> PathBuf {
-        Path::new(&self.data_dir).join("workspace/sessions")
+        Path::new(&self.workspace_dir).join("sessions")
     }
 
     fn validate(&self) -> Result<()> {
         if self.agent.provider.is_empty() {
             anyhow::bail!("agent.provider must not be empty");
         }
-        let provider = self.providers.get(&self.agent.provider)
-            .ok_or_else(|| anyhow::anyhow!("Provider '{}' referenced by agent not found in providers", self.agent.provider))?;
+        let provider = self.providers.get(&self.agent.provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Provider '{}' referenced by agent not found in providers",
+                self.agent.provider
+            )
+        })?;
         if provider.api_key.is_empty() {
-            anyhow::bail!("provider '{}'.api_key must not be empty", self.agent.provider);
+            anyhow::bail!(
+                "provider '{}'.api_key must not be empty",
+                self.agent.provider
+            );
         }
         if provider.model.is_empty() {
             anyhow::bail!("provider '{}'.model must not be empty", self.agent.provider);

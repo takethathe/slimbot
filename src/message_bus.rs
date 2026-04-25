@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_loop::AgentLoop;
-use crate::session::{ensure_session, SessionManager, SessionTask, TaskHook, TaskState};
+use crate::session::{SessionManager, SessionTask, TaskHook, TaskState, ensure_session};
 
 pub struct MessageBus {
     agent_loop: Arc<AgentLoop>,
@@ -54,14 +54,14 @@ impl MessageBus {
             let sm = self.agent_loop.session_manager();
             let mut guard: tokio::sync::MutexGuard<'_, SessionManager> = sm.lock().await;
             guard.dequeue_task(&request.session_id).await
-        }.ok_or_else(|| anyhow!("Queue is empty"))?;
+        }
+        .ok_or_else(|| anyhow!("Queue is empty"))?;
 
         // 5. Execute
-        let result = self.agent_loop.run_task(
-            &request.session_id,
-            &mut task,
-            request.channel_inject,
-        ).await?;
+        let result = self
+            .agent_loop
+            .run_task(&request.session_id, &mut task, request.channel_inject)
+            .await?;
 
         Ok(BusResult {
             session_id: request.session_id,

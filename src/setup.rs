@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::config::{Config, ProviderConfig, AgentConfig};
+use crate::config::{AgentConfig, Config, ProviderConfig};
 use crate::config_scheme::ConfigScheme;
 
 fn default_fallback_provider() -> ProviderConfig {
@@ -35,6 +35,9 @@ fn load_config_with_defaults(path: &str, scheme: &ConfigScheme) -> Result<Config
     if let Some(v) = value.get("data_dir").and_then(|v| v.as_str()) {
         config.data_dir = v.to_string();
     }
+    if let Some(v) = value.get("workspace_dir").and_then(|v| v.as_str()) {
+        config.workspace_dir = v.to_string();
+    }
     if let Some(obj) = value.get("agent").and_then(|v| v.as_object()) {
         merge_agent(&mut config.agent, obj);
     }
@@ -44,7 +47,11 @@ fn load_config_with_defaults(path: &str, scheme: &ConfigScheme) -> Result<Config
                 if let Some(existing) = config.providers.get_mut(key) {
                     merge_provider(existing, obj);
                 } else {
-                    let mut provider = config.providers.values().next().cloned()
+                    let mut provider = config
+                        .providers
+                        .values()
+                        .next()
+                        .cloned()
                         .unwrap_or_else(default_fallback_provider);
                     merge_provider(&mut provider, obj);
                     config.providers.insert(key.clone(), provider);
@@ -59,12 +66,14 @@ fn load_config_with_defaults(path: &str, scheme: &ConfigScheme) -> Result<Config
         }
     }
     if let Some(arr) = value.get("tools").and_then(|v| v.as_array()) {
-        config.tools = arr.iter()
+        config.tools = arr
+            .iter()
             .filter_map(|v| serde_json::from_value(v.clone()).ok())
             .collect();
     }
     if let Some(arr) = value.get("channels").and_then(|v| v.as_array()) {
-        config.channels = arr.iter()
+        config.channels = arr
+            .iter()
             .filter_map(|v| serde_json::from_value(v.clone()).ok())
             .collect();
     }
@@ -147,13 +156,19 @@ pub fn run_setup(config_path: Option<&str>) -> Result<()> {
     let config = load_config_with_defaults(path, &scheme)?;
     eprintln!("\nConfig summary:");
     eprintln!("  data_dir: {}", config.data_dir);
+    eprintln!("  workspace_dir: {}", config.workspace_dir);
     eprintln!("  agent.provider: {}", config.agent.provider);
     eprintln!("  agent.max_iterations: {}", config.agent.max_iterations);
     eprintln!("  agent.timeout_seconds: {}", config.agent.timeout_seconds);
     eprintln!("  providers:");
     for (name, provider) in &config.providers {
-        eprintln!("    {}: type={} model={} api_key={}",
-            name, provider.r#type, provider.model, mask_api_key(&provider.api_key));
+        eprintln!(
+            "    {}: type={} model={} api_key={}",
+            name,
+            provider.r#type,
+            provider.model,
+            mask_api_key(&provider.api_key)
+        );
     }
     eprintln!("  tools: {} entries", config.tools.len());
     eprintln!("  channels: {} entries", config.channels.len());

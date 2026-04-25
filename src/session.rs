@@ -15,8 +15,12 @@ pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
-    System { content: String },
-    User { content: String },
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
     Assistant {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,10 +63,7 @@ impl TaskHook {
         }
     }
 
-    pub fn with_status_channel(
-        self,
-        tx: tokio::sync::mpsc::Sender<(String, TaskState)>,
-    ) -> Self {
+    pub fn with_status_channel(self, tx: tokio::sync::mpsc::Sender<(String, TaskState)>) -> Self {
         Self {
             status_tx: Some(tx),
             session_id: self.session_id,
@@ -126,17 +127,22 @@ impl SessionManager {
             return Ok(self.sessions.get(session_id).unwrap());
         }
         let messages = Self::load_messages_from_jsonl(&self.session_dir, session_id)?;
-        self.sessions.insert(session_id.to_string(), Session {
-            id: session_id.to_string(),
-            task_queue: VecDeque::new(),
-            tasks: HashMap::new(),
-            messages,
-        });
+        self.sessions.insert(
+            session_id.to_string(),
+            Session {
+                id: session_id.to_string(),
+                task_queue: VecDeque::new(),
+                tasks: HashMap::new(),
+                messages,
+            },
+        );
         Ok(self.sessions.get(session_id).unwrap())
     }
 
     pub async fn add_message(&mut self, session_id: &str, msg: Message) -> Result<()> {
-        let session = self.sessions.get_mut(session_id)
+        let session = self
+            .sessions
+            .get_mut(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
         session.messages.push(msg);
         Ok(())
@@ -150,7 +156,8 @@ impl SessionManager {
     }
 
     pub async fn dequeue_task(&mut self, session_id: &str) -> Option<SessionTask> {
-        self.sessions.get_mut(session_id)
+        self.sessions
+            .get_mut(session_id)
             .and_then(|s| s.task_queue.pop_front())
     }
 
@@ -161,13 +168,16 @@ impl SessionManager {
     }
 
     pub async fn get_messages(&self, session_id: &str) -> Vec<Message> {
-        self.sessions.get(session_id)
+        self.sessions
+            .get(session_id)
             .map(|s| s.messages.clone())
             .unwrap_or_default()
     }
 
     pub async fn persist(&self, session_id: &str) -> Result<()> {
-        let session = self.sessions.get(session_id)
+        let session = self
+            .sessions
+            .get(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
         let file_path = self.session_dir.join(format!("{}.jsonl", session_id));
         let mut file = std::fs::File::create(&file_path)?;
@@ -188,9 +198,11 @@ impl SessionManager {
         let mut messages = Vec::new();
         for line in reader.lines() {
             let line = line?;
-            if line.trim().is_empty() { continue; }
-            let msg: Message = serde_json::from_str(&line)
-                .context(format!("Invalid JSONL format: {}", line))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let msg: Message =
+                serde_json::from_str(&line).context(format!("Invalid JSONL format: {}", line))?;
             messages.push(msg);
         }
         Ok(messages)

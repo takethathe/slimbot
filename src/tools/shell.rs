@@ -44,7 +44,8 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<String> {
-        let command = args["command"].as_str()
+        let command = args["command"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: command"))?;
 
         let timeout = tokio::time::Duration::from_secs(self.timeout_secs);
@@ -54,7 +55,8 @@ impl Tool for ShellTool {
                 .arg(command)
                 .output()
                 .await
-        }).await;
+        })
+        .await;
 
         match output {
             Ok(Ok(output)) => {
@@ -65,19 +67,27 @@ impl Tool for ShellTool {
                     result.push_str(&format!("stdout:\n{}", stdout.trim_end()));
                 }
                 if !stderr.is_empty() {
-                    if !result.is_empty() { result.push_str("\n---\n"); }
+                    if !result.is_empty() {
+                        result.push_str("\n---\n");
+                    }
                     result.push_str(&format!("stderr:\n{}", stderr.trim_end()));
                 }
                 if result.is_empty() {
                     result = "(no output)".to_string();
                 }
                 if !output.status.success() {
-                    result.push_str(&format!("\n\nExit code: {}", output.status.code().unwrap_or(-1)));
+                    result.push_str(&format!(
+                        "\n\nExit code: {}",
+                        output.status.code().unwrap_or(-1)
+                    ));
                 }
                 Ok(result)
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("Failed to execute command: {}", e)),
-            Err(_) => Err(anyhow::anyhow!("Command timed out after {} seconds", self.timeout_secs)),
+            Err(_) => Err(anyhow::anyhow!(
+                "Command timed out after {} seconds",
+                self.timeout_secs
+            )),
         }
     }
 }
@@ -89,7 +99,10 @@ mod tests {
     #[tokio::test]
     async fn test_shell_echo() {
         let tool = ShellTool::default();
-        let result = tool.execute(serde_json::json!({"command": "echo hello"})).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({"command": "echo hello"}))
+            .await
+            .unwrap();
         assert!(result.contains("hello"));
     }
 
@@ -103,7 +116,9 @@ mod tests {
     #[tokio::test]
     async fn test_shell_timeout() {
         let tool = ShellTool::new(1);
-        let result = tool.execute(serde_json::json!({"command": "sleep 10"})).await;
+        let result = tool
+            .execute(serde_json::json!({"command": "sleep 10"}))
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }

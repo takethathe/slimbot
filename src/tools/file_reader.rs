@@ -14,7 +14,10 @@ pub struct FileReaderTool {
 
 impl FileReaderTool {
     pub fn new(workspace_dir: PathBuf) -> Self {
-        Self { workspace_dir, max_bytes: 50_000 }
+        Self {
+            workspace_dir,
+            max_bytes: 50_000,
+        }
     }
 }
 
@@ -42,7 +45,8 @@ impl Tool for FileReaderTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<String> {
-        let path_str = args["path"].as_str()
+        let path_str = args["path"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: path"))?;
 
         let resolved = resolve_workspace_path(path_str, &self.workspace_dir)?;
@@ -51,7 +55,8 @@ impl Tool for FileReaderTool {
             return Err(anyhow::anyhow!("Not a file: {}", path_str));
         }
 
-        let content = tokio::fs::read_to_string(&resolved).await
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", path_str, e))?;
 
         // Truncate to avoid context explosion
@@ -75,7 +80,9 @@ mod tests {
     async fn test_read_nonexistent_file() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = FileReaderTool::new(tmp.path().to_path_buf());
-        let result = tool.execute(serde_json::json!({"path": "nonexistent.txt"})).await;
+        let result = tool
+            .execute(serde_json::json!({"path": "nonexistent.txt"}))
+            .await;
         assert!(result.is_err());
     }
 }

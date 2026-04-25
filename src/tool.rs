@@ -50,14 +50,36 @@ impl ToolManager {
     pub fn init_from_config(&mut self, entries: &[ToolEntry]) {
         // If no tools configured in config, enable all built-in tools by default
         let default_entries = vec![
-            ToolEntry { name: "shell".into(), enabled: true },
-            ToolEntry { name: "file_reader".into(), enabled: true },
-            ToolEntry { name: "file_writer".into(), enabled: true },
-            ToolEntry { name: "file_editor".into(), enabled: true },
-            ToolEntry { name: "list_dir".into(), enabled: true },
-            ToolEntry { name: "make_dir".into(), enabled: true },
+            ToolEntry {
+                name: "shell".into(),
+                enabled: true,
+            },
+            ToolEntry {
+                name: "file_reader".into(),
+                enabled: true,
+            },
+            ToolEntry {
+                name: "file_writer".into(),
+                enabled: true,
+            },
+            ToolEntry {
+                name: "file_editor".into(),
+                enabled: true,
+            },
+            ToolEntry {
+                name: "list_dir".into(),
+                enabled: true,
+            },
+            ToolEntry {
+                name: "make_dir".into(),
+                enabled: true,
+            },
         ];
-        let effective = if entries.is_empty() { &default_entries } else { entries };
+        let effective = if entries.is_empty() {
+            &default_entries
+        } else {
+            entries
+        };
 
         for entry in effective {
             if entry.enabled {
@@ -71,17 +93,20 @@ impl ToolManager {
     }
 
     pub fn to_openai_functions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|tool| {
-            ToolDefinition {
+        self.tools
+            .values()
+            .map(|tool| ToolDefinition {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 parameters: tool.parameters(),
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     pub async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
-        let tool = self.tools.get(name)
+        let tool = self
+            .tools
+            .get(name)
             .ok_or_else(|| anyhow::anyhow!("Tool not found: {}", name))?;
         tool.execute(args).await
     }

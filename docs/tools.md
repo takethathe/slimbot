@@ -128,9 +128,9 @@ Create a directory, including all parent directories.
 
 ## Security
 
-All file operations are restricted to the `data_dir` configured in `config.json`.
+All file operations are restricted to the `workspace_dir` configured in `config.json`.
 
-- **Path validation**: Every file path is resolved against `data_dir` and validated using canonical absolute paths. Paths that escape the data directory (via `../`, symlinks, etc.) are rejected.
+- **Path validation**: Every file path is resolved against `workspace_dir` and validated using canonical absolute paths. Paths that escape the workspace directory (via `../`, symlinks, etc.) are rejected.
 - **Shell isolation**: The `shell` tool has no directory restriction but is subject to a 30-second timeout.
 - **Read size limit**: `file_reader` output is capped at 50,000 characters.
 

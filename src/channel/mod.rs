@@ -65,11 +65,16 @@ impl ChannelManager {
             if !entry.enabled {
                 continue;
             }
-            let factory = factories.iter()
+            let factory = factories
+                .iter()
                 .find(|f| f.channel_type() == entry.r#type)
                 .ok_or_else(|| anyhow::anyhow!("Unregistered channel type: {}", entry.r#type))?;
             let channel = factory.create(&entry.config)?;
-            eprintln!("Registered channel: {} ({})", channel.name(), channel.session_id());
+            eprintln!(
+                "Registered channel: {} ({})",
+                channel.name(),
+                channel.session_id()
+            );
             self.channels.push(channel);
         }
         Ok(())
@@ -102,7 +107,10 @@ impl ChannelManager {
                 while let Some((_session_id, state)) = status_rx.recv().await {
                     match &state {
                         TaskState::Running { current_iteration } => {
-                            eprintln!("[{}] [{}] Running - iteration {}", channel_name, sid, current_iteration);
+                            eprintln!(
+                                "[{}] [{}] Running - iteration {}",
+                                channel_name, sid, current_iteration
+                            );
                         }
                         TaskState::Completed { .. } => {
                             eprintln!("[{}] [{}] Completed", channel_name, sid);
@@ -145,9 +153,7 @@ impl ChannelManager {
                     };
 
                     let bus = message_bus.clone();
-                    let result = match tokio::spawn(async move {
-                        bus.send(request).await
-                    }).await {
+                    let result = match tokio::spawn(async move { bus.send(request).await }).await {
                         Ok(Ok(r)) => r,
                         Ok(Err(e)) => {
                             eprintln!("[{}] Bus error: {}", channel.name(), e);

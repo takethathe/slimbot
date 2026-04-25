@@ -1,15 +1,15 @@
+mod agent_loop;
+mod channel;
 mod config;
+mod config_scheme;
+mod context;
+mod message_bus;
+mod provider;
+mod runner;
+mod session;
+mod setup;
 mod tool;
 mod tools;
-mod provider;
-mod session;
-mod context;
-mod runner;
-mod agent_loop;
-mod message_bus;
-mod channel;
-mod config_scheme;
-mod setup;
 
 use std::sync::Arc;
 
@@ -25,7 +25,11 @@ async fn main() -> Result<()> {
 
     // Handle setup subcommand
     if args.len() > 1 && args[1] == "setup" {
-        let config_path = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+        let config_path = if args.len() > 2 {
+            Some(args[2].as_str())
+        } else {
+            None
+        };
         return setup::run_setup(config_path);
     }
 
@@ -33,7 +37,8 @@ async fn main() -> Result<()> {
         args[1].clone()
     } else {
         // Default: ~/.slimbot/config.json
-        let home = dirs::home_dir().map(|p| p.to_string_lossy().to_string())
+        let home = dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".to_string());
         format!("{}/.slimbot/config.json", home)
     };
@@ -53,10 +58,7 @@ async fn main() -> Result<()> {
     // Load channels from config
     // Need to reload config to get channel entries
     let config = crate::config::Config::load(&config_path)?;
-    channel_manager.init_from_config(
-        &config.channels,
-        &[Box::new(CliChannelFactory)],
-    )?;
+    channel_manager.init_from_config(&config.channels, &[Box::new(CliChannelFactory)])?;
 
     // Start channel loop
     channel_manager.run().await?;

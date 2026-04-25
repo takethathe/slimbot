@@ -75,15 +75,19 @@ impl crate::provider::Provider for OpenAIProvider {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<ChatResponse> {
-        let api_messages: Vec<serde_json::Value> = messages.iter().map(|m| {
-            match m {
+        let api_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| match m {
                 Message::System { content } => {
                     serde_json::json!({"role": "system", "content": content})
                 }
                 Message::User { content } => {
                     serde_json::json!({"role": "user", "content": content})
                 }
-                Message::Assistant { content, tool_calls } => {
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                } => {
                     let mut obj = serde_json::json!({"role": "assistant"});
                     if let Some(c) = content {
                         obj["content"] = serde_json::json!(c);
@@ -91,29 +95,35 @@ impl crate::provider::Provider for OpenAIProvider {
                         obj["content"] = serde_json::Value::Null;
                     }
                     if let Some(calls) = tool_calls {
-                        let tc: Vec<_> = calls.iter().map(|call| {
-                            serde_json::json!({
-                                "id": call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": call.name,
-                                    "arguments": call.args.to_string(),
-                                }
+                        let tc: Vec<_> = calls
+                            .iter()
+                            .map(|call| {
+                                serde_json::json!({
+                                    "id": call.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": call.name,
+                                        "arguments": call.args.to_string(),
+                                    }
+                                })
                             })
-                        }).collect();
+                            .collect();
                         obj["tool_calls"] = serde_json::json!(tc);
                     }
                     obj
                 }
-                Message::Tool { content, tool_call_id } => {
+                Message::Tool {
+                    content,
+                    tool_call_id,
+                } => {
                     serde_json::json!({
                         "role": "tool",
                         "content": content,
                         "tool_call_id": tool_call_id,
                     })
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         let mut body = serde_json::json!({
             "model": self.config.model,
@@ -123,20 +133,25 @@ impl crate::provider::Provider for OpenAIProvider {
         });
 
         if let Some(tools) = tools {
-            let tool_defs: Vec<serde_json::Value> = tools.iter().map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
+            let tool_defs: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = serde_json::json!(tool_defs);
         }
 
-        let resp = self.client.post(&self.api_url)
+        let resp = self
+            .client
+            .post(&self.api_url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -149,10 +164,11 @@ impl crate::provider::Provider for OpenAIProvider {
             anyhow::bail!("API request failed: {} - {}", status, body);
         }
 
-        let api_resp: ApiResponse = resp.json().await
-            .context("Failed to parse API response")?;
+        let api_resp: ApiResponse = resp.json().await.context("Failed to parse API response")?;
 
-        let choice = api_resp.choices.first()
+        let choice = api_resp
+            .choices
+            .first()
             .context("API response has no result")?;
 
         let finish_reason = match choice.finish_reason.as_deref() {
@@ -164,14 +180,15 @@ impl crate::provider::Provider for OpenAIProvider {
         };
 
         let tool_calls = choice.message.tool_calls.as_ref().map(|calls| {
-            calls.iter().map(|call| {
-                crate::tool::ToolCall {
+            calls
+                .iter()
+                .map(|call| crate::tool::ToolCall {
                     id: call.id.clone(),
                     name: call.function.name.clone(),
                     args: serde_json::from_str(&call.function.arguments)
                         .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-                }
-            }).collect()
+                })
+                .collect()
         });
 
         Ok(ChatResponse {

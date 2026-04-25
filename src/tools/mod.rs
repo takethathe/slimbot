@@ -1,9 +1,9 @@
-pub mod shell;
+pub mod file_editor;
 pub mod file_reader;
 pub mod file_writer;
-pub mod file_editor;
 pub mod list_dir;
 pub mod make_dir;
+pub mod shell;
 
 use std::path::{Path, PathBuf};
 
@@ -38,9 +38,9 @@ pub fn resolve_workspace_path(user_path: &str, workspace_dir: &Path) -> anyhow::
         }
     }
 
-    let ancestor_abs = ancestor.canonicalize().map_err(|e| {
-        anyhow::anyhow!("Cannot resolve base directory for '{}': {}", user_path, e)
-    })?;
+    let ancestor_abs = ancestor
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("Cannot resolve base directory for '{}': {}", user_path, e))?;
 
     if !ancestor_abs.starts_with(&workspace_dir_abs) {
         anyhow::bail!("Path escapes workspace directory: {}", user_path);
@@ -61,11 +61,21 @@ pub fn resolve_workspace_path(user_path: &str, workspace_dir: &Path) -> anyhow::
 pub fn create_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
     match name {
         "shell" => Some(Box::new(shell::ShellTool::default())),
-        "file_reader" => Some(Box::new(file_reader::FileReaderTool::new(workspace_dir.to_path_buf()))),
-        "file_writer" => Some(Box::new(file_writer::FileWriterTool::new(workspace_dir.to_path_buf()))),
-        "file_editor" => Some(Box::new(file_editor::FileEditorTool::new(workspace_dir.to_path_buf()))),
-        "list_dir" => Some(Box::new(list_dir::ListDirTool::new(workspace_dir.to_path_buf()))),
-        "make_dir" => Some(Box::new(make_dir::MakeDirTool::new(workspace_dir.to_path_buf()))),
+        "file_reader" => Some(Box::new(file_reader::FileReaderTool::new(
+            workspace_dir.to_path_buf(),
+        ))),
+        "file_writer" => Some(Box::new(file_writer::FileWriterTool::new(
+            workspace_dir.to_path_buf(),
+        ))),
+        "file_editor" => Some(Box::new(file_editor::FileEditorTool::new(
+            workspace_dir.to_path_buf(),
+        ))),
+        "list_dir" => Some(Box::new(list_dir::ListDirTool::new(
+            workspace_dir.to_path_buf(),
+        ))),
+        "make_dir" => Some(Box::new(make_dir::MakeDirTool::new(
+            workspace_dir.to_path_buf(),
+        ))),
         _ => None,
     }
 }

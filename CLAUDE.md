@@ -69,9 +69,8 @@ ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 →
 ## 数据目录
 
 ```
-~/.slimbot/
-├── config.json                     # 配置文件
-└── workspace/
+~/.slimbot/                         # data_dir (默认，运行时数据)
+└── workspace/                      # workspace_dir (默认，工作区)
     ├── agent.md                    # Agent 行为定义
     ├── user.md                     # 用户画像
     ├── soul.md                     # Agent 人格
@@ -80,6 +79,8 @@ ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 →
     └── sessions/
         └── {session_id}.jsonl      # 会话消息持久化
 ```
+
+`data_dir` 和 `workspace_dir` 是两个独立配置项。`workspace_dir` 默认值为 `{data_dir}/workspace`。
 
 ## 关键设计决策
 

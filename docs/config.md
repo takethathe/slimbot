@@ -23,12 +23,11 @@ If the config file already exists, `setup` will load it, fill in any missing def
 
 ## Data Directory
 
-All runtime data is stored under `data_dir` (default: `~/.slimbot/`). The directory structure:
+Session data and workspace files are stored in separate directories. The directory structure:
 
 ```
-~/.slimbot/
-├── config.json                     # Configuration file
-└── workspace/
+~/.slimbot/                         # data_dir (runtime/session data)
+└── workspace/                      # workspace_dir (agent files, skills, sessions)
     ├── agent.md                    # Agent behavior definition
     ├── user.md                     # User profile
     ├── soul.md                     # Agent personality
@@ -38,13 +37,14 @@ All runtime data is stored under `data_dir` (default: `~/.slimbot/`). The direct
         └── {session_id}.jsonl      # Session message persistence
 ```
 
-The `sessions/` directory is created automatically on startup.
+`data_dir` and `workspace_dir` are independently configurable. By default, `workspace_dir` is `{data_dir}/workspace`.
 
 ## Configuration Structure
 
 ```json
 {
   "data_dir": "~/.slimbot",
+  "workspace_dir": "~/.slimbot/workspace",
   "agent": { ... },
   "providers": { ... },
   "tools": [ ... ],
@@ -56,7 +56,8 @@ The `sessions/` directory is created automatically on startup.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `data_dir` | string | No | `~/.slimbot` | Base directory for all runtime data |
+| `data_dir` | string | No | `~/.slimbot` | Base directory for runtime session data |
+| `workspace_dir` | string | No | `{data_dir}/workspace` | Directory for agent files, skills, and sessions |
 | `agent` | object | **Yes** | — | Single agent configuration |
 | `providers` | object | **Yes** | — | Named provider definitions (keyed map) |
 | `tools` | array | No | `[]` | Registered tool definitions |
@@ -198,6 +199,7 @@ If validation fails, the application will exit with an error message.
 When running `cargo run -- setup` on an existing config, the following normalization rules apply:
 
 - Empty `data_dir` → `~/.slimbot`
+- Empty `workspace_dir` → `{data_dir}/workspace`
 - Empty `agent.provider` → `"default"`
 - Empty `agent.max_iterations` → `40`
 - Empty `agent.timeout_seconds` → `120`
@@ -216,6 +218,7 @@ When running `cargo run -- setup` on an existing config, the following normaliza
 ```json
 {
   "data_dir": "/Users/takethat/.slimbot",
+  "workspace_dir": "/Users/takethat/.slimbot/workspace",
   "agent": {
     "provider": "siliconflow",
     "max_iterations": 40,

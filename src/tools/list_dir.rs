@@ -41,7 +41,8 @@ impl Tool for ListDirTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<String> {
-        let path_str = args["path"].as_str()
+        let path_str = args["path"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: path"))?;
 
         let resolved = resolve_workspace_path(path_str, &self.workspace_dir)?;
@@ -83,11 +84,18 @@ mod tests {
     async fn test_list_dir() {
         let tmp = tempfile::tempdir().unwrap();
         // Create some files
-        tokio::fs::write(tmp.path().join("a.txt"), "").await.unwrap();
-        tokio::fs::write(tmp.path().join("b.txt"), "").await.unwrap();
+        tokio::fs::write(tmp.path().join("a.txt"), "")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("b.txt"), "")
+            .await
+            .unwrap();
 
         let tool = ListDirTool::new(tmp.path().to_path_buf());
-        let result = tool.execute(serde_json::json!({"path": "."})).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({"path": "."}))
+            .await
+            .unwrap();
         assert!(result.contains("a.txt"));
         assert!(result.contains("b.txt"));
     }
@@ -96,14 +104,19 @@ mod tests {
     async fn test_list_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = ListDirTool::new(tmp.path().to_path_buf());
-        let result = tool.execute(serde_json::json!({"path": "."})).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({"path": "."}))
+            .await
+            .unwrap();
         assert_eq!(result, "(empty directory)");
     }
 
     #[tokio::test]
     async fn test_list_not_a_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("file.txt"), "hello").await.unwrap();
+        tokio::fs::write(tmp.path().join("file.txt"), "hello")
+            .await
+            .unwrap();
 
         let tool = ListDirTool::new(tmp.path().to_path_buf());
         let result = tool.execute(serde_json::json!({"path": "file.txt"})).await;

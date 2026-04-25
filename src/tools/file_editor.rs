@@ -50,11 +50,14 @@ impl Tool for FileEditorTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<String> {
-        let path_str = args["path"].as_str()
+        let path_str = args["path"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: path"))?;
-        let old_string = args["old_string"].as_str()
+        let old_string = args["old_string"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: old_string"))?;
-        let new_string = args["new_string"].as_str()
+        let new_string = args["new_string"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: new_string"))?;
 
         let resolved = resolve_workspace_path(path_str, &self.workspace_dir)?;
@@ -63,26 +66,35 @@ impl Tool for FileEditorTool {
             return Err(anyhow::anyhow!("Not a file: {}", path_str));
         }
 
-        let content = tokio::fs::read_to_string(&resolved).await
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", path_str, e))?;
 
         let count = content.matches(old_string).count();
         if count == 0 {
-            return Err(anyhow::anyhow!("'old_string' not found in file '{}'", path_str));
+            return Err(anyhow::anyhow!(
+                "'old_string' not found in file '{}'",
+                path_str
+            ));
         }
         if count > 1 {
             return Err(anyhow::anyhow!(
                 "'old_string' found {} times in '{}'. Provide a more specific string for unique match.",
-                count, path_str
+                count,
+                path_str
             ));
         }
 
         let new_content = content.replacen(old_string, new_string, 1);
 
-        tokio::fs::write(&resolved, &new_content).await
+        tokio::fs::write(&resolved, &new_content)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", path_str, e))?;
 
-        Ok(format!("Successfully edited {}: 1 replacement made", path_str))
+        Ok(format!(
+            "Successfully edited {}: 1 replacement made",
+            path_str
+        ))
     }
 }
 
@@ -97,11 +109,14 @@ mod tests {
         tokio::fs::write(&file_path, "hello world").await.unwrap();
 
         let tool = FileEditorTool::new(tmp.path().to_path_buf());
-        let result = tool.execute(serde_json::json!({
-            "path": "edit.txt",
-            "old_string": "world",
-            "new_string": "rust"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "edit.txt",
+                "old_string": "world",
+                "new_string": "rust"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("1 replacement"));
 
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
@@ -115,11 +130,13 @@ mod tests {
         tokio::fs::write(&file_path, "hello world").await.unwrap();
 
         let tool = FileEditorTool::new(tmp.path().to_path_buf());
-        let result = tool.execute(serde_json::json!({
-            "path": "edit.txt",
-            "old_string": "missing",
-            "new_string": "rust"
-        })).await;
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "edit.txt",
+                "old_string": "missing",
+                "new_string": "rust"
+            }))
+            .await;
         assert!(result.is_err());
     }
 
@@ -130,11 +147,13 @@ mod tests {
         tokio::fs::write(&file_path, "foo foo").await.unwrap();
 
         let tool = FileEditorTool::new(tmp.path().to_path_buf());
-        let result = tool.execute(serde_json::json!({
-            "path": "edit.txt",
-            "old_string": "foo",
-            "new_string": "bar"
-        })).await;
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "edit.txt",
+                "old_string": "foo",
+                "new_string": "bar"
+            }))
+            .await;
         assert!(result.is_err());
     }
 }
