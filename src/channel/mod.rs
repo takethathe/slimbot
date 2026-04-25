@@ -83,16 +83,17 @@ impl ChannelManager {
 
     /// Start I/O loops for all channels
     pub async fn run(&mut self) -> Result<()> {
-        for idx in 0..self.channels.len() {
-            let channel = &mut self.channels[idx];
+        // Take ownership of channels to move them into spawned tasks
+        let channels = std::mem::take(&mut self.channels);
+
+        for mut channel in channels {
             let session_id = channel.session_id();
 
             // Create status event channel for each channel
             let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<(String, TaskState)>(32);
 
             // Send state changes to Channel via TaskHook
-            let hook = TaskHook::new(&session_id)
-                .with_status_channel(status_tx);
+            let hook = TaskHook::new(&session_id).with_status_channel(status_tx);
 
             // Background task: listen for status events from TaskHook, display via Channel
             let sid = session_id.clone();
@@ -114,34 +115,60 @@ impl ChannelManager {
                 }
             });
 
-            loop {
-                let input = match channel.read_input().await {
-                    Ok(s) if s.is_empty() => continue,
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[{}] Read failed: {}", channel.name(), e);
-                        continue;
+            // Spawn a concurrent task for each channel's I/O loop
+            let message_bus = self.message_bus.clone();
+            tokio::spawn(async move {
+                loop {
+                    let input = match channel.read_input().await {
+                        Ok(s) if s.is_empty() => continue,
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[{}] Read failed: {}", channel.name(), e);
+                            continue;
+                        }
+                    };
+
+                    // ChannelManager prepares inject content ahead of time
+                    let channel_inject = match channel.prepare_inject().await {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            eprintln!("[{}] Prepare inject failed: {}", channel.name(), e);
+                            None
+                        }
+                    };
+
+                    let request = BusRequest {
+                        session_id: channel.session_id(),
+                        content: input,
+                        channel_inject,
+                        hook: hook.clone(),
+                    };
+
+                    let bus = message_bus.clone();
+                    let result = match tokio::spawn(async move {
+                        bus.send(request).await
+                    }).await {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            eprintln!("[{}] Bus error: {}", channel.name(), e);
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("[{}] Spawn join error: {}", channel.name(), e);
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = channel.write_output(&result).await {
+                        eprintln!("[{}] Write output failed: {}", channel.name(), e);
                     }
-                };
-
-                // ChannelManager prepares inject content ahead of time
-                let channel_inject = channel.prepare_inject().await.ok();
-
-                let request = BusRequest {
-                    session_id: channel.session_id(),
-                    content: input,
-                    channel_inject,
-                    hook: hook.clone(),
-                };
-
-                let bus = self.message_bus.clone();
-                let result = tokio::spawn(async move {
-                    bus.send(request).await
-                }).await??;
-
-                channel.write_output(&result).await?;
-            }
+                }
+            });
         }
-        Ok(())
+
+        // Wait forever — each channel runs in its own spawned task
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
     }
 }

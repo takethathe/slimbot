@@ -27,7 +27,7 @@ impl AgentLoop {
         let provider = Arc::new(OpenAIProvider::new(provider_config));
 
         let mut tool_manager = ToolManager::new(
-            Path::new(&config.data_dir).to_path_buf(),
+            Path::new(&config.data_dir).join("workspace"),
         );
         tool_manager.init_from_config(&config.tools);
 

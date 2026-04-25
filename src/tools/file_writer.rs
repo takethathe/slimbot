@@ -4,16 +4,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::tool::Tool;
-use crate::tools::resolve_data_path;
+use crate::tools::resolve_workspace_path;
 
 /// Tool that writes content to a file (creates or overwrites).
 pub struct FileWriterTool {
-    data_dir: PathBuf,
+    workspace_dir: PathBuf,
 }
 
 impl FileWriterTool {
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+    pub fn new(workspace_dir: PathBuf) -> Self {
+        Self { workspace_dir }
     }
 }
 
@@ -24,7 +24,7 @@ impl Tool for FileWriterTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file, creating it if it does not exist. Path must be within the data directory."
+        "Write content to a file, creating it if it does not exist. Path must be within the workspace directory."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -33,7 +33,7 @@ impl Tool for FileWriterTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write (within data directory)"
+                    "description": "Path to the file to write (within workspace directory)"
                 },
                 "content": {
                     "type": "string",
@@ -50,7 +50,7 @@ impl Tool for FileWriterTool {
         let content = args["content"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: content"))?;
 
-        let target = resolve_data_path(path_str, &self.data_dir)?;
+        let target = resolve_workspace_path(path_str, &self.workspace_dir)?;
 
         // Ensure parent directory exists
         if let Some(parent) = target.parent() {

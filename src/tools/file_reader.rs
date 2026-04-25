@@ -4,17 +4,17 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::tool::Tool;
-use crate::tools::resolve_data_path;
+use crate::tools::resolve_workspace_path;
 
-/// Tool that reads file contents from the data directory.
+/// Tool that reads file contents from the workspace directory.
 pub struct FileReaderTool {
-    data_dir: PathBuf,
+    workspace_dir: PathBuf,
     max_bytes: usize,
 }
 
 impl FileReaderTool {
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, max_bytes: 50_000 }
+    pub fn new(workspace_dir: PathBuf) -> Self {
+        Self { workspace_dir, max_bytes: 50_000 }
     }
 }
 
@@ -25,7 +25,7 @@ impl Tool for FileReaderTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file. Path must be within the data directory."
+        "Read the contents of a file. Path must be within the workspace directory."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -34,7 +34,7 @@ impl Tool for FileReaderTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read (within data directory)"
+                    "description": "Path to the file to read (within workspace directory)"
                 }
             },
             "required": ["path"]
@@ -45,7 +45,7 @@ impl Tool for FileReaderTool {
         let path_str = args["path"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: path"))?;
 
-        let resolved = resolve_data_path(path_str, &self.data_dir)?;
+        let resolved = resolve_workspace_path(path_str, &self.workspace_dir)?;
 
         if !resolved.is_file() {
             return Err(anyhow::anyhow!("Not a file: {}", path_str));

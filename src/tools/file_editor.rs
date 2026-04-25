@@ -4,17 +4,17 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::tool::Tool;
-use crate::tools::resolve_data_path;
+use crate::tools::resolve_workspace_path;
 
 /// Tool that performs search-and-replace in a file.
 /// Requires old_string to appear exactly once in the file.
 pub struct FileEditorTool {
-    data_dir: PathBuf,
+    workspace_dir: PathBuf,
 }
 
 impl FileEditorTool {
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+    pub fn new(workspace_dir: PathBuf) -> Self {
+        Self { workspace_dir }
     }
 }
 
@@ -25,7 +25,7 @@ impl Tool for FileEditorTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing an exact occurrence of old_string with new_string. old_string must appear exactly once in the file. Path must be within the data directory."
+        "Edit a file by replacing an exact occurrence of old_string with new_string. old_string must appear exactly once in the file. Path must be within the workspace directory."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -34,7 +34,7 @@ impl Tool for FileEditorTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to edit (within data directory)"
+                    "description": "Path to the file to edit (within workspace directory)"
                 },
                 "old_string": {
                     "type": "string",
@@ -57,7 +57,7 @@ impl Tool for FileEditorTool {
         let new_string = args["new_string"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: new_string"))?;
 
-        let resolved = resolve_data_path(path_str, &self.data_dir)?;
+        let resolved = resolve_workspace_path(path_str, &self.workspace_dir)?;
 
         if !resolved.is_file() {
             return Err(anyhow::anyhow!("Not a file: {}", path_str));

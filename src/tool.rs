@@ -30,14 +30,14 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolManager {
     tools: HashMap<String, Box<dyn Tool>>,
-    data_dir: PathBuf,
+    workspace_dir: PathBuf,
 }
 
 impl ToolManager {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(workspace_dir: PathBuf) -> Self {
         Self {
             tools: HashMap::new(),
-            data_dir,
+            workspace_dir,
         }
     }
 
@@ -61,7 +61,7 @@ impl ToolManager {
 
         for entry in effective {
             if entry.enabled {
-                if let Some(tool) = create_builtin_tool(&entry.name, &self.data_dir) {
+                if let Some(tool) = create_builtin_tool(&entry.name, &self.workspace_dir) {
                     self.register(tool);
                 } else {
                     eprintln!("Unknown tool: {}", entry.name);
@@ -87,6 +87,6 @@ impl ToolManager {
     }
 }
 
-fn create_builtin_tool(name: &str, data_dir: &Path) -> Option<Box<dyn Tool>> {
-    crate::tools::create_tool(name, data_dir)
+fn create_builtin_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
+    crate::tools::create_tool(name, workspace_dir)
 }

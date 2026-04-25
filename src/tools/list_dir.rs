@@ -4,16 +4,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::tool::Tool;
-use crate::tools::resolve_data_path;
+use crate::tools::resolve_workspace_path;
 
 /// Tool that lists directory contents.
 pub struct ListDirTool {
-    data_dir: PathBuf,
+    workspace_dir: PathBuf,
 }
 
 impl ListDirTool {
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+    pub fn new(workspace_dir: PathBuf) -> Self {
+        Self { workspace_dir }
     }
 }
 
@@ -24,7 +24,7 @@ impl Tool for ListDirTool {
     }
 
     fn description(&self) -> &str {
-        "List the contents of a directory. Returns entries prefixed with [D] for directories, [F] for files, [L] for links. Path must be within the data directory."
+        "List the contents of a directory. Returns entries prefixed with [D] for directories, [F] for files, [L] for links. Path must be within the workspace directory."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -33,7 +33,7 @@ impl Tool for ListDirTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the directory to list (within data directory)"
+                    "description": "Path to the directory to list (within workspace directory)"
                 }
             },
             "required": ["path"]
@@ -44,7 +44,7 @@ impl Tool for ListDirTool {
         let path_str = args["path"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: path"))?;
 
-        let resolved = resolve_data_path(path_str, &self.data_dir)?;
+        let resolved = resolve_workspace_path(path_str, &self.workspace_dir)?;
 
         if !resolved.is_dir() {
             return Err(anyhow::anyhow!("Not a directory: {}", path_str));
