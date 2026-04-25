@@ -26,7 +26,9 @@ impl AgentLoop {
             .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", config.agent.provider))?;
         let provider = Arc::new(OpenAIProvider::new(provider_config));
 
-        let mut tool_manager = ToolManager::new();
+        let mut tool_manager = ToolManager::new(
+            Path::new(&config.data_dir).to_path_buf(),
+        );
         tool_manager.init_from_config(&config.tools);
 
         let session_manager = Arc::new(Mutex::new(

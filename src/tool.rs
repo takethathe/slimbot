@@ -1,11 +1,11 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ToolEntry;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -30,12 +30,14 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolManager {
     tools: HashMap<String, Box<dyn Tool>>,
+    data_dir: PathBuf,
 }
 
 impl ToolManager {
-    pub fn new() -> Self {
+    pub fn new(data_dir: PathBuf) -> Self {
         Self {
             tools: HashMap::new(),
+            data_dir,
         }
     }
 
@@ -46,9 +48,20 @@ impl ToolManager {
     }
 
     pub fn init_from_config(&mut self, entries: &[ToolEntry]) {
-        for entry in entries {
+        // If no tools configured in config, enable all built-in tools by default
+        let default_entries = vec![
+            ToolEntry { name: "shell".into(), enabled: true },
+            ToolEntry { name: "file_reader".into(), enabled: true },
+            ToolEntry { name: "file_writer".into(), enabled: true },
+            ToolEntry { name: "file_editor".into(), enabled: true },
+            ToolEntry { name: "list_dir".into(), enabled: true },
+            ToolEntry { name: "make_dir".into(), enabled: true },
+        ];
+        let effective = if entries.is_empty() { &default_entries } else { entries };
+
+        for entry in effective {
             if entry.enabled {
-                if let Some(tool) = create_builtin_tool(&entry.name) {
+                if let Some(tool) = create_builtin_tool(&entry.name, &self.data_dir) {
                     self.register(tool);
                 } else {
                     eprintln!("Unknown tool: {}", entry.name);
@@ -74,12 +87,6 @@ impl ToolManager {
     }
 }
 
-fn create_builtin_tool(name: &str) -> Option<Box<dyn Tool>> {
-    // Reserved: built-in tool extension point
-    match name {
-        _ => {
-            eprintln!("Unrecognized tool name: {}", name);
-            None
-        }
-    }
+fn create_builtin_tool(name: &str, data_dir: &Path) -> Option<Box<dyn Tool>> {
+    crate::tools::create_tool(name, data_dir)
 }

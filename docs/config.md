@@ -127,17 +127,20 @@ Example with multiple providers:
 
 ### `tools` — Tool Definitions
 
-Lists tools available to the agent. Each tool can be individually enabled or disabled.
+Lists tools available to the agent. If the array is empty, all 6 built-in tools are enabled by default.
+
+Available tools: `shell`, `file_reader`, `file_writer`, `file_editor`, `list_dir`, `make_dir`.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `name` | string | **Yes** | — | Tool identifier |
+| `name` | string | **Yes** | — | Tool identifier (see [docs/tools.md](tools.md) for full descriptions) |
 | `enabled` | bool | No | `true` | Whether the tool is active |
 
 ```json
 {
   "tools": [
-    { "name": "bash", "enabled": true },
+    { "name": "shell", "enabled": true },
+    { "name": "file_reader", "enabled": true },
     { "name": "file_editor", "enabled": false }
   ]
 }
@@ -229,7 +232,7 @@ When running `cargo run -- setup` on an existing config, the following normaliza
     }
   },
   "tools": [
-    { "name": "bash", "enabled": true }
+    { "name": "shell", "enabled": true }
   ],
   "channels": [
     { "type": "cli", "enabled": true, "config": {} }

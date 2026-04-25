@@ -1,5 +1,6 @@
 mod config;
 mod tool;
+mod tools;
 mod provider;
 mod session;
 mod context;

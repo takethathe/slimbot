@@ -5,11 +5,11 @@
 ## 特性
 
 - **ReAct 循环** — Agent 按周期运行：构建上下文 → 调用 LLM → 执行工具 → 重复直到得出最终答案。
-- **工具调用** — 可扩展的 `Tool` trait 工具系统，支持 OpenAI function calling 格式转换。
+- **工具调用** — 6 个内置工具（shell、file_reader、file_writer、file_editor、list_dir、make_dir），可扩展的 `Tool` trait 系统，支持 OpenAI function calling 格式转换。
 - **多通道** — 通过 `Channel` / `ChannelFactory` trait 实现可插拔通道架构，内置 CLI 通道。
 - **会话持久化** — 基于 JSONL 的会话存储，自动加载和保存。
 - **工作区驱动的上下文** — System prompt 由工作区文件（`agent.md`、`user.md`、`soul.md`、`tools.md`）和可选的技能文件（`skills/*.md`）组装而成。
-- **完全可配置** — LLM 提供商、Agent 行为、通道和工具均通过单一 `config.json` 驱动。
+- **完全可配置** — LLM 提供商、Agent 行为、通道和工具均通过单一 `config.json` 驱动。详见 [docs/tools.md](docs/tools.md) 了解内置工具。
 
 ## 快速开始
 
@@ -115,6 +115,14 @@ slimbot/
     ├── main.rs         # 入口：加载配置 → 初始化 AgentLoop → MessageBus → ChannelManager
     ├── config.rs       # 配置结构体：JSON 加载、ProviderConfig、AgentConfig、ChannelEntry
     ├── tool.rs         # Tool trait + ToolManager：工具注册与 OpenAI function calling 转换
+    ├── tools/          # 内置工具模块
+    │   ├── mod.rs      # 工厂函数 + resolve_data_path() 路径校验
+    │   ├── shell.rs    # Shell 命令执行工具
+    │   ├── file_reader.rs  # 文件读取工具
+    │   ├── file_writer.rs  # 文件写入工具
+    │   ├── file_editor.rs  # 文件编辑工具
+    │   ├── list_dir.rs     # 目录列表工具
+    │   └── make_dir.rs     # 目录创建工具
     ├── provider/       # LLM 提供商抽象
     │   ├── mod.rs      # Provider trait、ChatResponse、FinishReason
     │   └── openai.rs   # OpenAIProvider 实现

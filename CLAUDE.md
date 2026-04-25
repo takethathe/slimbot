@@ -19,10 +19,21 @@
 slimbot/
 ├── Cargo.toml          # 包清单
 ├── .gitignore          # 排除 /target
+├── docs/
+│   ├── config.md       # 配置指南
+│   └── tools.md        # 内置工具说明
 └── src/
     ├── main.rs         # Entry: load config → init AgentLoop → MessageBus → ChannelManager
     ├── config.rs       # Config: config.json read/write, AgentConfig/ProviderConfig/ChannelEntry
     ├── tool.rs         # Tool trait + ToolManager: tool registration & OpenAI function calling conversion
+    ├── tools/          # Built-in tool implementations
+    │   ├── mod.rs      # Factory function + resolve_data_path() path validation
+    │   ├── shell.rs    # Shell command execution
+    │   ├── file_reader.rs  # File reading
+    │   ├── file_writer.rs  # File writing
+    │   ├── file_editor.rs  # Search-and-replace editing
+    │   ├── list_dir.rs     # Directory listing
+    │   └── make_dir.rs     # Directory creation
     ├── provider/       # Provider trait + OpenAIProvider: LLM API request/response
     │   ├── mod.rs      # Provider trait, ChatResponse, FinishReason
     │   └── openai.rs   # OpenAIProvider implementation
