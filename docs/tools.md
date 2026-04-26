@@ -1,23 +1,23 @@
-# Built-in Tools
+# 内置工具
 
-SlimBot ships with 6 built-in tools for shell execution and file operations. All tools are enabled by default and can be individually disabled in `config.json`.
+SlimBot 内置 6 个工具，用于 Shell 执行和文件操作。所有工具默认启用，可在 `config.json` 中单独禁用。
 
-## Tool List
+## 工具列表
 
 ### `shell`
 
-Execute arbitrary shell commands via `sh -c`.
+通过 `sh -c` 执行任意 Shell 命令。
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `command` | string | Yes | The shell command to execute |
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `command` | string | 是 | 要执行的 Shell 命令 |
 
-**Behavior:**
-- Returns stdout and stderr (prefixed with `stdout:` / `stderr:` labels)
-- Default timeout: 30 seconds. If the command exceeds this, an error is returned.
-- Exit code is appended to the output if non-zero.
+**行为：**
+- 返回 stdout 和 stderr（分别带有 `stdout:` / `stderr:` 前缀）
+- 默认超时时间：30 秒。超过此时间将返回错误。
+- 退出码非零时会附加到输出末尾。
 
-**Example:**
+**示例：**
 ```json
 { "command": "ls -la /tmp" }
 ```
@@ -26,17 +26,17 @@ Execute arbitrary shell commands via `sh -c`.
 
 ### `file_reader`
 
-Read the contents of a file within the data directory.
+读取数据目录内的文件内容。
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | string | Yes | File path (relative to data directory) |
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 文件路径（相对于数据目录） |
 
-**Behavior:**
-- Output is truncated to 50,000 characters to prevent context explosion.
-- Returns an error if the path is not a file or does not exist.
+**行为：**
+- 输出被截断到 50,000 字符，防止上下文爆炸。
+- 如果路径不是文件或不存，返回错误。
 
-**Example:**
+**示例：**
 ```json
 { "path": "workspace/agent.md" }
 ```
@@ -45,44 +45,44 @@ Read the contents of a file within the data directory.
 
 ### `file_writer`
 
-Write content to a file, creating it and any parent directories as needed.
+将内容写入文件，自动创建文件及父目录。
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | string | Yes | File path (relative to data directory) |
-| `content` | string | Yes | Content to write |
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 文件路径（相对于数据目录） |
+| `content` | string | 是 | 要写入的内容 |
 
-**Behavior:**
-- Creates the file if it does not exist, or overwrites if it does.
-- Automatically creates parent directories.
+**行为：**
+- 如果文件不存在则创建，已存在则覆盖。
+- 自动创建父目录。
 
-**Example:**
+**示例：**
 ```json
-{ "path": "workspace/notes.md", "content": "# Notes\n\nSome content here." }
+{ "path": "workspace/notes.md", "content": "# 笔记\n\n这里是内容。" }
 ```
 
 ---
 
 ### `file_editor`
 
-Perform an exact search-and-replace in a file.
+在文件中执行精确的搜索和替换。
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | string | Yes | File path (relative to data directory) |
-| `old_string` | string | Yes | The exact text to find (must appear **exactly once**) |
-| `new_string` | string | Yes | The replacement text |
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 文件路径（相对于数据目录） |
+| `old_string` | string | 是 | 要查找的精确文本（必须**恰好出现一次**） |
+| `new_string` | string | 是 | 替换后的文本 |
 
-**Behavior:**
-- Rejects the edit if `old_string` is not found or appears more than once.
-- This ensures surgical precision — no accidental mass replacements.
+**行为：**
+- 如果未找到 `old_string` 或出现多次，拒绝该编辑。
+- 这确保了精确操作——不会意外批量替换。
 
-**Example:**
+**示例：**
 ```json
 {
   "path": "workspace/agent.md",
-  "old_string": "You are a helpful assistant.",
-  "new_string": "You are a concise assistant."
+  "old_string": "你是一个有帮助的助手。",
+  "new_string": "你是一个简洁的助手。"
 }
 ```
 
@@ -90,20 +90,20 @@ Perform an exact search-and-replace in a file.
 
 ### `list_dir`
 
-List the contents of a directory within the data directory.
+列出数据目录内的目录内容。
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | string | Yes | Directory path (relative to data directory) |
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 目录路径（相对于数据目录） |
 
-**Behavior:**
-- Entries are sorted alphabetically.
-- Each entry is prefixed with a type indicator:
-  - `[D]` — Directory
-  - `[F]` — File
-  - `[L]` — Symlink or other
+**行为：**
+- 条目按字母顺序排序。
+- 每个条目前带有类型标识符：
+  - `[D]` — 目录
+  - `[F]` — 文件
+  - `[L]` — 符号链接或其他
 
-**Example:**
+**示例：**
 ```json
 { "path": "workspace" }
 ```
@@ -112,31 +112,31 @@ List the contents of a directory within the data directory.
 
 ### `make_dir`
 
-Create a directory, including all parent directories.
+创建目录，包括所有父目录。
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | string | Yes | Directory path (relative to data directory) |
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 目录路径（相对于数据目录） |
 
-**Behavior:**
-- Equivalent to `mkdir -p`. No error if the directory already exists.
+**行为：**
+- 等价于 `mkdir -p`。目录已存在时不报错。
 
-**Example:**
+**示例：**
 ```json
 { "path": "workspace/skills/new-skill" }
 ```
 
-## Security
+## 安全
 
-All file operations are restricted to the `workspace_dir` configured in `config.json`.
+所有文件操作仅限于 `config.json` 中配置的 `workspace_dir` 范围内。
 
-- **Path validation**: Every file path is resolved against `workspace_dir` and validated using canonical absolute paths. Paths that escape the workspace directory (via `../`, symlinks, etc.) are rejected.
-- **Shell isolation**: The `shell` tool has no directory restriction but is subject to a 30-second timeout.
-- **Read size limit**: `file_reader` output is capped at 50,000 characters.
+- **路径验证**：每个文件路径都相对于 `workspace_dir` 解析，并使用规范绝对路径进行验证。试图通过 `../`、符号链接等方式逃逸工作目录的路径会被拒绝。
+- **Shell 隔离**：`shell` 工具不受目录限制，但受 30 秒超时约束。
+- **读取大小限制**：`file_reader` 输出上限为 50,000 字符。
 
-## Configuration
+## 配置
 
-Tools are configured in `config.json` under the `tools` array. If the array is empty, all 6 built-in tools are enabled by default.
+工具在 `config.json` 的 `tools` 数组中配置。如果该数组为空，所有 6 个内置工具默认启用。
 
 ```json
 {
@@ -151,11 +151,11 @@ Tools are configured in `config.json` under the `tools` array. If the array is e
 }
 ```
 
-To disable a tool, set its `enabled` field to `false`, or remove the entry entirely.
+要禁用某个工具，将其 `enabled` 字段设为 `false`，或直接移除该条目。
 
-## Adding Custom Tools
+## 添加自定义工具
 
-New tools can be added by implementing the `Tool` trait from `src/tool.rs`:
+新工具可以通过实现 `src/tool.rs` 中的 `Tool` trait 来添加：
 
 ```rust
 #[async_trait]
@@ -167,8 +167,8 @@ pub trait Tool: Send + Sync {
 }
 ```
 
-1. Create a new module in `src/tools/` with the tool struct.
-2. Register the tool in the `create_tool()` factory function in `src/tools/mod.rs`.
-3. Optionally add the tool name to the default list in `ToolManager::init_from_config()`.
+1. 在 `src/tools/` 下创建新模块定义工具结构体。
+2. 在 `src/tools/mod.rs` 的 `create_tool()` 工厂函数中注册。
+3. 可选在 `ToolManager::init_from_config()` 的默认列表中添加该工具名称。
 
-The `parameters()` method returns a JSON Schema object that describes the tool's arguments, which is converted to OpenAI function calling format.
+`parameters()` 方法返回一个 JSON Schema 对象，描述工具的参数，随后会被转换为 OpenAI 函数调用格式。

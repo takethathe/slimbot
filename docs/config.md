@@ -1,45 +1,45 @@
-# Configuration Guide
+# 配置指南
 
-This document describes how to configure slimbot.
+本文档描述如何配置 slimbot。
 
-## Quick Start
+## 快速开始
 
-Run the setup command to generate a default configuration file:
+运行 setup 命令生成默认配置文件：
 
 ```bash
-cargo run -- setup          # creates ~/.slimbot/config.json
-cargo run -- setup /path/to/custom.json   # custom path
+cargo run -- setup          # 创建 ~/.slimbot/config.json
+cargo run -- setup /path/to/custom.json   # 自定义路径
 ```
 
-If the config file already exists, `setup` will load it, fill in any missing default values, normalize invalid entries, and write it back.
+如果配置文件已存在，`setup` 会加载它，填补缺失的默认值，规范化无效条目，然后写回。
 
-## Config File Location
+## 配置文件位置
 
-| Method | Path |
-|--------|------|
-| Default (no argument) | `~/.slimbot/config.json` |
-| CLI argument | `cargo run -- <config.json路径>` |
-| Setup command | `cargo run -- setup [config.json路径]` |
+| 方式 | 路径 |
+|------|------|
+| 默认（无参数） | `~/.slimbot/config.json` |
+| CLI 参数 | `cargo run -- <config.json路径>` |
+| Setup 命令 | `cargo run -- setup [config.json路径]` |
 
-## Data Directory
+## 数据目录
 
-Session data and workspace files are stored in separate directories. The directory structure:
+会话数据和工作区文件存储在不同的目录中。目录结构如下：
 
 ```
-~/.slimbot/                         # data_dir (runtime/session data)
-└── workspace/                      # workspace_dir (agent files, skills, sessions)
-    ├── agent.md                    # Agent behavior definition
-    ├── user.md                     # User profile
-    ├── soul.md                     # Agent personality
-    ├── tools.md                    # Tool usage guide
-    ├── skills/                     # Optional skill files (*.md)
+~/.slimbot/                         # data_dir（运行时/会话数据）
+└── workspace/                      # workspace_dir（Agent 文件、技能、会话）
+    ├── agent.md                    # Agent 行为定义
+    ├── user.md                     # 用户画像
+    ├── soul.md                     # Agent 人格
+    ├── tools.md                    # 工具使用指南
+    ├── skills/                     # 可选技能文件 (*.md)
     └── sessions/
-        └── {session_id}.jsonl      # Session message persistence
+        └── {session_id}.jsonl      # 会话消息持久化
 ```
 
-`data_dir` and `workspace_dir` are independently configurable. By default, `workspace_dir` is `{data_dir}/workspace`.
+`data_dir` 和 `workspace_dir` 是两个独立的配置项。默认情况下，`workspace_dir` 为 `{data_dir}/workspace`。
 
-## Configuration Structure
+## 配置结构
 
 ```json
 {
@@ -52,26 +52,26 @@ Session data and workspace files are stored in separate directories. The directo
 }
 ```
 
-### Top-Level Fields
+### 顶层字段
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `data_dir` | string | No | `~/.slimbot` | Base directory for runtime session data |
-| `workspace_dir` | string | No | `{data_dir}/workspace` | Directory for agent files, skills, and sessions |
-| `agent` | object | **Yes** | — | Single agent configuration |
-| `providers` | object | **Yes** | — | Named provider definitions (keyed map) |
-| `tools` | array | No | `[]` | Registered tool definitions |
-| `channels` | array | No | `[]` | Communication channel definitions |
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `data_dir` | string | 否 | `~/.slimbot` | 运行时会话数据的基目录 |
+| `workspace_dir` | string | 否 | `{data_dir}/workspace` | Agent 文件、技能和会话的目录 |
+| `agent` | object | **是** | — | 单个 Agent 配置 |
+| `providers` | object | **是** | — | 命名 Provider 定义（键值映射） |
+| `tools` | array | 否 | `[]` | 注册的工具定义列表 |
+| `channels` | array | 否 | `[]` | 通信通道定义列表 |
 
-### `agent` — Agent Configuration
+### `agent` — Agent 配置
 
-Slimbot has exactly one agent. The agent references a provider by name from the `providers` map.
+SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用一个 Provider。
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `provider` | string | **Yes** | — | Name of the provider to use (must match a key in `providers`) |
-| `max_iterations` | uint | No | `40` | Maximum tool-use iterations per turn |
-| `timeout_seconds` | uint | No | `120` | Maximum time (seconds) per agent turn |
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `provider` | string | **是** | — | 要使用的 Provider 名称（必须匹配 `providers` 中的一个键） |
+| `max_iterations` | uint | 否 | `40` | 每轮最大工具调用迭代次数 |
+| `timeout_seconds` | uint | 否 | `120` | 每轮 Agent 超时时间（秒） |
 
 ```json
 {
@@ -83,30 +83,30 @@ Slimbot has exactly one agent. The agent references a provider by name from the 
 }
 ```
 
-### `providers` — LLM Provider Definitions
+### `providers` — LLM Provider 定义
 
-A keyed map of named providers. Each provider can be referenced by the agent via its key name.
+一个命名 Provider 的键值映射。每个 Provider 可以通过其键名被 Agent 引用。
 
-Provider-level fields:
+Provider 级别字段：
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `type` | string | No | `"openai"` | Provider type: `"openai"` or `"custom"` |
-| `api_url` | string | No | see below | Full API endpoint URL |
-| `base_url` | string | No | — | Base URL of the provider (e.g. `"https://api.openai.com"`) |
-| `api_key` | string | **Yes** | — | API authentication key (validated on load) |
-| `model` | string | **Yes** | — | Model name to use (validated on load) |
-| `temperature` | float | No | `0.7` | Sampling temperature (0.0–2.0) |
-| `max_tokens` | uint | No | `4096` | Maximum tokens per response |
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `type` | string | 否 | `"openai"` | Provider 类型：`"openai"` 或 `"custom"` |
+| `api_url` | string | 否 | 见下文 | 完整 API 端点 URL |
+| `base_url` | string | 否 | — | Provider 基础 URL（例如 `"https://api.openai.com"`） |
+| `api_key` | string | **是** | — | API 认证密钥（加载时验证） |
+| `model` | string | **是** | — | 模型名称（加载时验证） |
+| `temperature` | float | 否 | `0.7` | 采样温度（0.0–2.0） |
+| `max_tokens` | uint | 否 | `4096` | 单次最大响应 token 数 |
 
-**URL resolution logic:** `api_url` takes priority. If empty, `api_url` is derived from `base_url + "/v1/chat/completions"`. If neither is set, defaults to `https://api.openai.com/v1/chat/completions`.
+**URL 解析逻辑：** `api_url` 优先级更高。如果为空，则从 `base_url + "/v1/chat/completions"` 推导。如果两者都未设置，默认为 `https://api.openai.com/v1/chat/completions`。
 
-**Provider types:**
+**Provider 类型：**
 
-- `"openai"` — Default. Uses OpenAI's API endpoint.
-- `"custom"` — Any OpenAI-compatible API. Set `base_url` to your provider's root URL.
+- `"openai"` — 默认。使用 OpenAI API 端点。
+- `"custom"` — 任意 OpenAI 兼容 API。将 `base_url` 设置为你自己的 Provider 根 URL。
 
-Example with multiple providers:
+多 Provider 示例：
 
 ```json
 {
@@ -126,16 +126,16 @@ Example with multiple providers:
 }
 ```
 
-### `tools` — Tool Definitions
+### `tools` — 工具定义
 
-Lists tools available to the agent. If the array is empty, all 6 built-in tools are enabled by default.
+列出 Agent 可用的工具。如果数组为空，默认启用全部 6 个内置工具。
 
-Available tools: `shell`, `file_reader`, `file_writer`, `file_editor`, `list_dir`, `make_dir`.
+可用工具：`shell`、`file_reader`、`file_writer`、`file_editor`、`list_dir`、`make_dir`。
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `name` | string | **Yes** | — | Tool identifier (see [docs/tools.md](tools.md) for full descriptions) |
-| `enabled` | bool | No | `true` | Whether the tool is active |
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `name` | string | **是** | — | 工具标识符（完整描述参见 [docs/tools.md](tools.md)） |
+| `enabled` | bool | 否 | `true` | 是否启用该工具 |
 
 ```json
 {
@@ -147,15 +147,15 @@ Available tools: `shell`, `file_reader`, `file_writer`, `file_editor`, `list_dir
 }
 ```
 
-### `channels` — Communication Channels
+### `channels` — 通信通道
 
-Defines input/output channels for the agent. Each entry specifies a channel type and optional configuration.
+定义 Agent 的输入/输出通道。每个条目指定一个通道类型和可选配置。
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `type` | string | **Yes** | — | Channel type identifier (e.g. `"cli"`) |
-| `enabled` | bool | No | `true` | Whether the channel is active |
-| `config` | object | No | `{}` | Channel-specific configuration (arbitrary JSON) |
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `type` | string | **是** | — | 通道类型标识符（例如 `"cli"`） |
+| `enabled` | bool | 否 | `true` | 是否启用该通道 |
+| `config` | object | 否 | `{}` | 通道特定配置（任意 JSON） |
 
 ```json
 {
@@ -165,9 +165,9 @@ Defines input/output channels for the agent. Each entry specifies a channel type
 }
 ```
 
-## Minimal Config
+## 最小配置
 
-Only `agent.provider`, the referenced provider's `api_key` and `model` are required:
+仅需配置 `agent.provider` 及其引用的 Provider 的 `api_key` 和 `model`：
 
 ```json
 {
@@ -183,37 +183,37 @@ Only `agent.provider`, the referenced provider's `api_key` and `model` are requi
 }
 ```
 
-## Validation Rules
+## 验证规则
 
-On config load, the following validations are enforced:
+加载配置时强制执行以下验证：
 
-- `agent.provider` must not be empty
-- The referenced provider must exist in `providers`
-- The referenced provider's `api_key` must not be empty
-- The referenced provider's `model` must not be empty
+- `agent.provider` 不能为空
+- 引用的 Provider 必须存在于 `providers` 中
+- 引用的 Provider 的 `api_key` 不能为空
+- 引用的 Provider 的 `model` 不能为空
 
-If validation fails, the application will exit with an error message.
+如果验证失败，应用程序将打印错误消息并退出。
 
-## Normalization
+## 规范化
 
-When running `cargo run -- setup` on an existing config, the following normalization rules apply:
+对已有配置运行 `cargo run -- setup` 时，应用以下规范化规则：
 
-- Empty `data_dir` → `~/.slimbot`
-- Empty `workspace_dir` → `{data_dir}/workspace`
-- Empty `agent.provider` → `"default"`
-- Empty `agent.max_iterations` → `40`
-- Empty `agent.timeout_seconds` → `120`
-- For each provider:
-  - Empty `type` → `"openai"`
-  - Empty `api_url` with `base_url` set → `base_url + "/v1/chat/completions"`
-  - Empty `api_url` and `base_url` → `https://api.openai.com/v1/chat/completions`
-  - Empty `model` → `gpt-4o`
-  - `temperature` ≤ 0.0 or > 2.0 → `0.7`
+- 空 `data_dir` → `~/.slimbot`
+- 空 `workspace_dir` → `{data_dir}/workspace`
+- 空 `agent.provider` → `"default"`
+- 空 `agent.max_iterations` → `40`
+- 空 `agent.timeout_seconds` → `120`
+- 对每个 Provider：
+  - 空 `type` → `"openai"`
+  - 空 `api_url` 且设置了 `base_url` → `base_url + "/v1/chat/completions"`
+  - `api_url` 和 `base_url` 都为空 → `https://api.openai.com/v1/chat/completions`
+  - 空 `model` → `gpt-4o`
+  - `temperature` ≤ 0.0 或 > 2.0 → `0.7`
   - `max_tokens` = 0 → `4096`
-  - `api_key` is **never** normalized or overwritten
-- Tools/channels with empty `name`/`type` are removed
+  - `api_key` **永不**被规范化或覆盖
+- `name`/`type` 为空的 tools/channels 条目会被移除
 
-## Complete Example
+## 完整示例
 
 ```json
 {
@@ -243,9 +243,9 @@ When running `cargo run -- setup` on an existing config, the following normaliza
 }
 ```
 
-## Multiple Providers Example
+## 多 Provider 示例
 
-Define multiple providers and switch which one the agent uses by changing `agent.provider`:
+定义多个 Provider，通过修改 `agent.provider` 来切换：
 
 ```json
 {
