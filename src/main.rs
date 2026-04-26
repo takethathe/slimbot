@@ -10,6 +10,7 @@ mod session;
 mod setup;
 mod tool;
 mod tools;
+mod utils;
 
 use std::sync::Arc;
 

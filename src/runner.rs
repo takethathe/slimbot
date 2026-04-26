@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -6,7 +7,7 @@ use crate::config::AgentConfig;
 use crate::context::ContextBuilder;
 use crate::provider::Provider;
 use crate::session::{Message, SessionManager, SessionTask, SharedSessionManager, TaskState};
-use crate::tool::ToolManager;
+use crate::tool::{ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
 
 pub struct AgentRunner {
     context_builder: ContextBuilder,
@@ -14,6 +15,7 @@ pub struct AgentRunner {
     provider: Arc<dyn Provider>,
     session_manager: SharedSessionManager,
     config: AgentConfig,
+    workspace_dir: PathBuf,
 }
 
 impl AgentRunner {
@@ -23,6 +25,7 @@ impl AgentRunner {
         provider: Arc<dyn Provider>,
         session_manager: SharedSessionManager,
         config: AgentConfig,
+        workspace_dir: PathBuf,
     ) -> Self {
         Self {
             context_builder,
@@ -30,6 +33,7 @@ impl AgentRunner {
             provider,
             session_manager,
             config,
+            workspace_dir,
         }
     }
 
@@ -90,10 +94,14 @@ impl AgentRunner {
             }
 
             // Build context
-            let ctx = self
+            let mut ctx = self
                 .context_builder
                 .build(session_id, channel_inject.clone())
                 .await;
+
+            // History governance: clean orphans and backfill missing tool results
+            Self::drop_orphan_tool_results(&mut ctx.messages);
+            Self::backfill_missing_tool_results(&mut ctx.messages);
 
             // Request model
             let response = self
@@ -153,12 +161,30 @@ impl AgentRunner {
 
                 // 2. Execute tools and write Tool messages
                 for call in calls {
-                    let raw_result = self
+                    let raw_result = match self
                         .tool_manager
                         .execute(&call.name, call.args.clone())
-                        .await?;
-                    let processed_result =
-                        task.hook.process_tool_result(&call.name, &raw_result)?;
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => format_tool_error(&e.to_string()),
+                    };
+
+                    let ensured = ensure_nonempty_tool_result(&call.name, &raw_result);
+
+                    let processed = if self.config.persist_tool_results {
+                        persist_tool_result(
+                            &self.workspace_dir,
+                            &call.id,
+                            &ensured,
+                            self.config.max_tool_result_chars as usize,
+                        )
+                    } else {
+                        ensured
+                    };
+
+                    let final_content =
+                        truncate_text_head_tail(&processed, self.config.max_tool_result_chars as usize);
 
                     {
                         let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
@@ -166,8 +192,9 @@ impl AgentRunner {
                         sm.add_message(
                             session_id,
                             Message::Tool {
-                                content: processed_result,
+                                content: final_content,
                                 tool_call_id: call.id.clone(),
+                                name: Some(call.name.clone()),
                             },
                         )
                         .await?;
@@ -185,6 +212,87 @@ impl AgentRunner {
                         .await;
                 }
                 task.hook.notify_status_change(&running_state);
+            }
+        }
+    }
+}
+
+impl AgentRunner {
+    /// Drop tool result messages that have no matching assistant tool_call.
+    fn drop_orphan_tool_results(messages: &mut Vec<Message>) {
+        let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut orphan_indices: Vec<usize> = Vec::new();
+        for (i, msg) in messages.iter().enumerate() {
+            match msg {
+                Message::Assistant { tool_calls, .. } => {
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            declared.insert(call.id.clone());
+                        }
+                    }
+                }
+                Message::Tool { tool_call_id, .. } => {
+                    if !declared.contains(tool_call_id) {
+                        orphan_indices.push(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Remove orphans in reverse order to preserve indices
+        for i in orphan_indices.into_iter().rev() {
+            messages.remove(i);
+        }
+    }
+
+    /// Insert synthetic error Tool messages for assistant tool_calls that lack a result.
+    fn backfill_missing_tool_results(messages: &mut Vec<Message>) {
+        let backfill_content = "[Tool result unavailable — call was interrupted or lost]";
+
+        // Collect all declared tool calls and fulfilled tool_call_ids
+        let mut declared: Vec<(usize, String, String)> = Vec::new(); // (assistant_idx, call_id, tool_name)
+        let mut fulfilled: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (i, msg) in messages.iter().enumerate() {
+            match msg {
+                Message::Assistant { tool_calls, .. } => {
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            declared.push((i, call.id.clone(), call.name.clone()));
+                        }
+                    }
+                }
+                Message::Tool { tool_call_id, .. } => {
+                    fulfilled.insert(tool_call_id.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let missing: Vec<_> = declared
+            .into_iter()
+            .filter(|(_, id, _)| !fulfilled.contains(id))
+            .collect();
+
+        if missing.is_empty() {
+            return;
+        }
+
+        // Group by assistant index, then insert each group in reverse to avoid index shifting.
+        let mut by_assistant: std::collections::BTreeMap<usize, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+        for (_asst_idx, call_id, tool_name) in missing {
+            by_assistant.entry(_asst_idx).or_default().push((call_id, tool_name));
+        }
+
+        for (assistant_idx, calls) in by_assistant.into_iter().rev() {
+            // Insert each call in reverse so they end up in original order
+            for (call_id, tool_name) in calls.into_iter().rev() {
+                messages.insert(assistant_idx + 1, Message::Tool {
+                    content: backfill_content.to_string(),
+                    tool_call_id: call_id,
+                    name: Some(tool_name),
+                });
             }
         }
     }
@@ -351,7 +459,7 @@ mod tests {
         workspace_dir: PathBuf,
     ) -> AgentRunner {
         AgentRunner::new(
-            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir),
+            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone()),
             tm,
             provider,
             sm,
@@ -359,7 +467,10 @@ mod tests {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
             },
+            workspace_dir,
         )
     }
 
@@ -428,7 +539,7 @@ mod tests {
             other => panic!("Expected Assistant with content and tool_calls, got {:?}", other),
         }
         match &msgs[2] {
-            Message::Tool { content, tool_call_id } => {
+            Message::Tool { content, tool_call_id, .. } => {
                 assert_eq!(content, "echo-result");
                 assert_eq!(tool_call_id, "tc-1");
             }
@@ -495,10 +606,10 @@ mod tests {
 
         // Verify both tool results are recorded
         assert!(
-            matches!(&msgs[2], Message::Tool { content, tool_call_id } if content == "listing-contents" && tool_call_id == "tc-list")
+            matches!(&msgs[2], Message::Tool { content, tool_call_id, .. } if content == "listing-contents" && tool_call_id == "tc-list")
         );
         assert!(
-            matches!(&msgs[3], Message::Tool { content, tool_call_id } if content == "file-contents" && tool_call_id == "tc-read")
+            matches!(&msgs[3], Message::Tool { content, tool_call_id, .. } if content == "file-contents" && tool_call_id == "tc-read")
         );
     }
 
@@ -608,7 +719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tool_error_stops_loop() {
+    async fn test_tool_error_continues_loop() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path();
         let session_dir = path.join("sessions");
@@ -622,19 +733,34 @@ mod tests {
         let tm = Arc::new(tm);
         sm.lock().await.get_or_create("test-session").await.unwrap();
 
-        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
-            content: Some("trying...".to_string()),
-            tool_calls: Some(vec![tool_call("tc-fail", "fail_tool")]),
-            finish_reason: FinishReason::ToolCalls,
-        }]));
+        // Provider returns tool_error first, then a final reply after seeing the error
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                content: Some("trying...".to_string()),
+                tool_calls: Some(vec![tool_call("tc-fail", "fail_tool")]),
+                finish_reason: FinishReason::ToolCalls,
+            },
+            ChatResponse {
+                content: Some("Got the error, stopping.".to_string()),
+                tool_calls: None,
+                finish_reason: FinishReason::Stop,
+            },
+        ]));
         let runner = make_runner(sm.clone(), tm, provider, workspace_dir);
         let mut task = make_task("test");
 
-        let err = runner
-            .run(&mut task, "test-session", None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("Tool execution failed"));
+        let result = runner.run(&mut task, "test-session", None).await.unwrap();
+        assert_eq!(result, "Got the error, stopping.");
+
+        let msgs = sm.lock().await.get_messages("test-session").await;
+        // user + assistant(tool_calls) + tool(error) + assistant(final)
+        assert_eq!(msgs.len(), 4);
+        assert!(
+            matches!(&msgs[2], Message::Tool { content, .. } if content.contains("Error:"))
+        );
+        assert!(
+            matches!(&msgs[2], Message::Tool { content, .. } if content.contains("Analyze the error"))
+        );
     }
 
     #[tokio::test]
@@ -667,5 +793,226 @@ mod tests {
         assert!(
             matches!(&msgs[1], Message::Assistant { content: Some(c), tool_calls: None } if c == "persist me")
         );
+    }
+
+    #[test]
+    fn test_ensure_nonempty_tool_result() {
+        assert_eq!(
+            ensure_nonempty_tool_result("echo", ""),
+            "(echo completed with no output)"
+        );
+        assert_eq!(
+            ensure_nonempty_tool_result("shell", "   "),
+            "(shell completed with no output)"
+        );
+        assert_eq!(
+            ensure_nonempty_tool_result("echo", "hello"),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn test_truncate_text_head_tail() {
+        let short = "hello world";
+        assert_eq!(truncate_text_head_tail(short, 100), short);
+
+        // Long text: head(2000) + tail(2000)
+        let long = "A".repeat(10_000);
+        let truncated = truncate_text_head_tail(&long, 8000);
+        assert!(truncated.contains("... (truncated,"));
+        assert!(truncated.contains("chars omitted)"));
+        assert!(truncated.len() < long.len());
+        assert!(truncated.starts_with("A"));
+        assert!(truncated.ends_with("A"));
+    }
+
+    #[test]
+    fn test_truncate_text_head_tail_utf8() {
+        // CJK: each char is 3 bytes. 10000 chars = 30000 bytes.
+        let cjk = "测试文本".repeat(2500);
+        assert!(std::str::from_utf8(cjk.as_bytes()).is_ok());
+
+        let truncated = truncate_text_head_tail(&cjk, 8000);
+        // Verify valid UTF-8 — no panics or broken boundaries
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        assert!(truncated.starts_with("测试"));
+        assert!(truncated.ends_with("文本"));
+    }
+
+    #[test]
+    fn test_format_tool_error() {
+        let formatted = format_tool_error("Connection refused");
+        assert!(formatted.contains("Error: Connection refused"));
+        assert!(formatted.contains("Analyze the error above"));
+        assert!(formatted.contains("try a different approach"));
+    }
+
+    #[test]
+    fn test_persist_tool_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long_content = "X".repeat(20_000);
+        let result = persist_tool_result(tmp.path(), "call-123", &long_content, 8000);
+        assert!(result.contains("[tool output persisted]"));
+        assert!(result.contains("call-123.txt"));
+        assert!(result.contains("Original size: 20000"));
+        assert!(result.contains("Preview:"));
+
+        let file_path = tmp.path().join("tool-results/call-123.txt");
+        assert!(file_path.exists());
+        let saved = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(saved, long_content);
+    }
+
+    #[test]
+    fn test_drop_orphan_tool_results() {
+        let mut messages = vec![
+            Message::User { content: "test".to_string() },
+            Message::Assistant {
+                content: Some("calling".to_string()),
+                tool_calls: Some(vec![tool_call("tc-1", "echo")]),
+            },
+            Message::Tool {
+                content: "orphan".to_string(),
+                tool_call_id: "tc-999".to_string(),
+                name: Some("echo".to_string()),
+            },
+            Message::Tool {
+                content: "valid".to_string(),
+                tool_call_id: "tc-1".to_string(),
+                name: Some("echo".to_string()),
+            },
+        ];
+
+        AgentRunner::drop_orphan_tool_results(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(&messages[2], Message::Tool { content, .. } if content == "valid"));
+    }
+
+    #[test]
+    fn test_backfill_missing_tool_results() {
+        let mut messages = vec![
+            Message::User { content: "test".to_string() },
+            Message::Assistant {
+                content: Some("calling".to_string()),
+                tool_calls: Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]),
+            },
+            Message::Tool {
+                content: "result-1".to_string(),
+                tool_call_id: "tc-1".to_string(),
+                name: Some("echo".to_string()),
+            },
+            // tc-2 has no result
+        ];
+
+        AgentRunner::backfill_missing_tool_results(&mut messages);
+
+        // tc-2 is backfilled right after the assistant, before tc-1's result
+        assert_eq!(messages.len(), 4);
+        assert!(
+            matches!(&messages[2], Message::Tool { content, tool_call_id, .. }
+                if tool_call_id == "tc-2" && content.contains("interrupted or lost"))
+        );
+        assert!(
+            matches!(&messages[3], Message::Tool { tool_call_id, .. } if tool_call_id == "tc-1")
+        );
+    }
+
+    #[test]
+    fn test_backfill_missing_multiple_assistants() {
+        // Two assistants, each with missing tool calls
+        let mut messages = vec![
+            Message::User { content: "first".to_string() },
+            Message::Assistant {
+                content: Some("a1".to_string()),
+                tool_calls: Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]),
+            },
+            Message::Tool {
+                content: "r1".to_string(),
+                tool_call_id: "tc-1".to_string(),
+                name: Some("echo".to_string()),
+            },
+            Message::User { content: "second".to_string() },
+            Message::Assistant {
+                content: Some("a2".to_string()),
+                tool_calls: Some(vec![tool_call("tc-3", "write"), tool_call("tc-4", "list")]),
+            },
+            Message::Tool {
+                content: "r4".to_string(),
+                tool_call_id: "tc-4".to_string(),
+                name: Some("list".to_string()),
+            },
+            // tc-2 and tc-3 are missing
+        ];
+
+        AgentRunner::backfill_missing_tool_results(&mut messages);
+
+        assert_eq!(messages.len(), 8);
+        // After A1 (index 1): tc-2 should be at index 2
+        assert!(
+            matches!(&messages[2], Message::Tool { tool_call_id, .. } if tool_call_id == "tc-2")
+        );
+        // After A2 (originally index 4, now 5): tc-3 should be at index 6
+        assert!(
+            matches!(&messages[6], Message::Tool { tool_call_id, .. } if tool_call_id == "tc-3")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runner_persist_long_output() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path();
+        let session_dir = path.join("sessions");
+        let workspace_dir = path.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let long_result = "X".repeat(12_000);
+
+        let sm: SharedSessionManager =
+            Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap()));
+        let mut tm = ToolManager::new(workspace_dir.clone());
+        tm.register(Box::new(MockEchoTool::new("big", &long_result)));
+        let tm = Arc::new(tm);
+        sm.lock().await.get_or_create("test-session").await.unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                content: Some("calling tool".to_string()),
+                tool_calls: Some(vec![tool_call("tc-big", "big")]),
+                finish_reason: FinishReason::ToolCalls,
+            },
+            ChatResponse {
+                content: Some("done".to_string()),
+                tool_calls: None,
+                finish_reason: FinishReason::Stop,
+            },
+        ]));
+        let runner = AgentRunner::new(
+            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone()),
+            tm,
+            provider,
+            sm.clone(),
+            AgentConfig {
+                provider: "test".to_string(),
+                max_iterations: 40,
+                timeout_seconds: 120,
+                max_tool_result_chars: 8000,
+                persist_tool_results: true,
+            },
+            workspace_dir.clone(),
+        );
+        let mut task = make_task("test persist");
+
+        let result = runner.run(&mut task, "test-session", None).await.unwrap();
+        assert_eq!(result, "done");
+
+        let msgs = sm.lock().await.get_messages("test-session").await;
+        match &msgs[2] {
+            Message::Tool { content, .. } => {
+                // Long content persisted to file → reference string + truncation
+                assert!(content.contains("[tool output persisted]"));
+            }
+            other => panic!("Expected Tool message, got {:?}", other),
+        }
     }
 }

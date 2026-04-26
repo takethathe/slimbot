@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -6,6 +7,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ToolEntry;
+use crate::utils::{
+    TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS, build_persisted_reference,
+    write_file_atomic,
+};
+
+// Re-export for runner.rs
+pub use crate::utils::truncate_text_head_tail;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -114,4 +123,49 @@ impl ToolManager {
 
 fn create_builtin_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
     crate::tools::create_tool(name, workspace_dir)
+}
+
+/// Replace semantically empty tool results with a short marker string.
+pub fn ensure_nonempty_tool_result(tool_name: &str, content: &str) -> String {
+    if content.is_empty() || content.trim().is_empty() {
+        format!("({} completed with no output)", tool_name)
+    } else {
+        content.to_string()
+    }
+}
+
+/// Format a tool execution error into a model-friendly message.
+pub fn format_tool_error(error_msg: &str) -> String {
+    format!(
+        "Error: {}\n\n[Analyze the error above and try a different approach.]",
+        error_msg,
+    )
+}
+
+/// Persist oversized tool result to disk and return a reference string.
+pub fn persist_tool_result(
+    workspace_dir: &Path,
+    tool_call_id: &str,
+    content: &str,
+    max_chars: usize,
+) -> String {
+    if content.len() <= max_chars {
+        return content.to_string();
+    }
+
+    let results_dir = workspace_dir.join(TOOL_RESULTS_DIR);
+    if let Err(e) = fs::create_dir_all(&results_dir) {
+        eprintln!("Failed to create tool-results dir: {}", e);
+        return content.to_string();
+    }
+
+    let file_path = results_dir.join(format!("{}.txt", tool_call_id));
+    if !file_path.exists() {
+        if let Err(e) = write_file_atomic(&file_path, content) {
+            eprintln!("Failed to persist tool result: {}", e);
+            return content.to_string();
+        }
+    }
+
+    build_persisted_reference(&file_path, content, TOOL_RESULT_PREVIEW_CHARS)
 }

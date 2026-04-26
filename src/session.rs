@@ -29,6 +29,8 @@ pub enum Message {
     Tool {
         content: String,
         tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
 }
 
@@ -51,7 +53,6 @@ pub struct SessionTask {
 pub struct TaskHook {
     status_tx: Option<tokio::sync::mpsc::Sender<(String, TaskState)>>,
     session_id: String,
-    on_tool_result: Option<Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>>,
 }
 
 impl TaskHook {
@@ -59,7 +60,6 @@ impl TaskHook {
         Self {
             status_tx: None,
             session_id: session_id.to_string(),
-            on_tool_result: None,
         }
     }
 
@@ -67,32 +67,12 @@ impl TaskHook {
         Self {
             status_tx: Some(tx),
             session_id: self.session_id,
-            on_tool_result: self.on_tool_result,
-        }
-    }
-
-    pub fn with_tool_result<F>(self, f: F) -> Self
-    where
-        F: Fn(&str, &str) -> Result<String> + Send + Sync + 'static,
-    {
-        Self {
-            status_tx: self.status_tx,
-            session_id: self.session_id,
-            on_tool_result: Some(Arc::new(f)),
         }
     }
 
     pub fn notify_status_change(&self, state: &TaskState) {
         if let Some(ref tx) = self.status_tx {
             let _ = tx.try_send((self.session_id.clone(), state.clone()));
-        }
-    }
-
-    pub fn process_tool_result(&self, tool_name: &str, raw: &str) -> Result<String> {
-        if let Some(ref f) = self.on_tool_result {
-            f(tool_name, raw)
-        } else {
-            Ok(raw.to_string())
         }
     }
 }

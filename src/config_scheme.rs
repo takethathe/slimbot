@@ -144,6 +144,8 @@ impl ConfigScheme {
             provider: provider_ref.to_string(),
             max_iterations: Self::DEFAULT_MAX_ITERATIONS,
             timeout_seconds: Self::DEFAULT_TIMEOUT,
+            max_tool_result_chars: 8000,
+            persist_tool_results: true,
         }
     }
 }

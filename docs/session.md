@@ -15,9 +15,11 @@ pub enum Message {
     System { content: String },           // 系统提示
     User { content: String },             // 用户消息
     Assistant { content: Option<String>, tool_calls: Option<Vec<ToolCall>> },  // 助手回复
-    Tool { content: String, tool_call_id: String },                            // 工具结果
+    Tool { content: String, tool_call_id: String, name: Option<String> },  // 工具结果
 }
 ```
+
+Tool 消息的 `name` 字段记录工具名称，用于历史消息治理中的孤立检测。
 
 ### SessionTask
 
@@ -47,7 +49,6 @@ pub enum TaskState {
 pub struct TaskHook {
     status_tx: Option<tokio::sync::mpsc::Sender<(String, TaskState)>>,  // 状态通道
     session_id: String,                                       // 所属 Session ID
-    on_tool_result: Option<Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>>,  // 工具结果处理
 }
 ```
 
@@ -55,10 +56,6 @@ pub struct TaskHook {
 ```rust
 TaskHook::new(&session_id)
     .with_status_channel(status_tx)   // 绑定状态通知通道
-    .with_tool_result(|name, raw| {   // 绑定工具结果处理函数
-        // 处理原始工具结果
-        Ok(processed)
-    })
 ```
 
 ### Session

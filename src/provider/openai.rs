@@ -124,12 +124,17 @@ impl crate::provider::Provider for OpenAIProvider {
                 Message::Tool {
                     content,
                     tool_call_id,
+                    name,
                 } => {
-                    serde_json::json!({
+                    let mut obj = serde_json::json!({
                         "role": "tool",
                         "content": content,
                         "tool_call_id": tool_call_id,
-                    })
+                    });
+                    if let Some(n) = name {
+                        obj["name"] = serde_json::json!(n);
+                    }
+                    obj
                 }
             })
             .collect();

@@ -27,6 +27,14 @@ fn default_max_iterations() -> u32 {
     40
 }
 
+fn default_max_tool_result_chars() -> u32 {
+    8000
+}
+
+fn default_persist_tool_results() -> bool {
+    true
+}
+
 fn default_timeout() -> u64 {
     120
 }
@@ -67,6 +75,12 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+    /// Maximum characters for a tool result before truncation.
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: u32,
+    /// Whether to persist oversized tool results to disk.
+    #[serde(default = "default_persist_tool_results")]
+    pub persist_tool_results: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
