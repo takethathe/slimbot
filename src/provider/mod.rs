@@ -27,7 +27,7 @@ impl std::fmt::Display for FinishReason {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChatResponse {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<crate::tool::ToolCall>>,

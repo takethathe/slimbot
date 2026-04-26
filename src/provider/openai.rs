@@ -55,8 +55,17 @@ struct ApiMessage {
     tool_calls: Option<Vec<ApiToolCall>>,
 }
 
+fn deserialize_null_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct ApiToolCall {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     id: String,
     r#type: String,
     function: ApiFunction,
@@ -182,11 +191,18 @@ impl crate::provider::Provider for OpenAIProvider {
         let tool_calls = choice.message.tool_calls.as_ref().map(|calls| {
             calls
                 .iter()
-                .map(|call| crate::tool::ToolCall {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    args: serde_json::from_str(&call.function.arguments)
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                .map(|call| {
+                    let id = if call.id.is_empty() {
+                        uuid::Uuid::new_v4().to_string()
+                    } else {
+                        call.id.clone()
+                    };
+                    crate::tool::ToolCall {
+                        id,
+                        name: call.function.name.clone(),
+                        args: serde_json::from_str(&call.function.arguments)
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                    }
                 })
                 .collect()
         });
@@ -196,5 +212,140 @@ impl crate::provider::Provider for OpenAIProvider {
             tool_calls,
             finish_reason,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_call_with_id() {
+        let json = r#"{
+            "id": "call-abc123",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"test.md\"}"}
+        }"#;
+        let call: ApiToolCall = serde_json::from_str(json).unwrap();
+        assert_eq!(call.id, "call-abc123");
+        assert_eq!(call.function.name, "read_file");
+    }
+
+    #[test]
+    fn test_tool_call_without_id_generates_empty() {
+        let json = r#"{
+            "type": "function",
+            "function": {"name": "write_file", "arguments": "{}"}
+        }"#;
+        let call: ApiToolCall = serde_json::from_str(json).unwrap();
+        assert!(call.id.is_empty());
+    }
+
+    #[test]
+    fn test_tool_call_with_null_id() {
+        let json = r#"{
+            "id": null,
+            "type": "function",
+            "function": {"name": "shell", "arguments": "{}"}
+        }"#;
+        let call: ApiToolCall = serde_json::from_str(json).unwrap();
+        assert!(call.id.is_empty());
+    }
+
+    #[test]
+    fn test_full_response_with_missing_tool_call_ids() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "content": "Running tools",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "tool_a", "arguments": "{}"}
+                        },
+                        {
+                            "type": "function",
+                            "function": {"name": "tool_b", "arguments": "{\"key\":\"val\"}"}
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let choice = resp.choices.first().unwrap();
+        let calls = choice.message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].id.is_empty());
+        assert!(calls[1].id.is_empty());
+
+        // Verify the mapping generates UUIDs
+        let mapped: Vec<crate::tool::ToolCall> = calls
+            .iter()
+            .map(|call| {
+                let id = if call.id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    call.id.clone()
+                };
+                crate::tool::ToolCall {
+                    id,
+                    name: call.function.name.clone(),
+                    args: serde_json::from_str(&call.function.arguments)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                }
+            })
+            .collect();
+
+        assert_eq!(mapped.len(), 2);
+        // Generated IDs should be non-empty UUIDs
+        assert!(!mapped[0].id.is_empty());
+        assert!(!mapped[1].id.is_empty());
+        // Should look like a UUID (36 chars with dashes)
+        assert_eq!(mapped[0].id.len(), 36);
+        assert_eq!(mapped[1].id.len(), 36);
+        assert_eq!(mapped[0].name, "tool_a");
+        assert_eq!(mapped[1].name, "tool_b");
+    }
+
+    #[test]
+    fn test_full_response_with_existing_ids() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call-xyz",
+                            "type": "function",
+                            "function": {"name": "my_tool", "arguments": "{}"}
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let choice = resp.choices.first().unwrap();
+        let calls = choice.message.tool_calls.as_ref().unwrap();
+
+        let mapped: Vec<crate::tool::ToolCall> = calls
+            .iter()
+            .map(|call| {
+                let id = if call.id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    call.id.clone()
+                };
+                crate::tool::ToolCall {
+                    id,
+                    name: call.function.name.clone(),
+                    args: serde_json::from_str(&call.function.arguments)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                }
+            })
+            .collect();
+
+        assert_eq!(mapped[0].id, "call-xyz");
     }
 }
