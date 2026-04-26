@@ -58,15 +58,21 @@ impl MessageBus {
         .ok_or_else(|| anyhow!("Queue is empty"))?;
 
         // 5. Execute
-        let result = self
+        let agent_result = self
             .agent_loop
             .run_task(&request.session_id, &mut task, request.channel_inject)
-            .await?;
+            .await;
+
+        let content = if agent_result.success {
+            agent_result.content
+        } else {
+            format!("Error: {}", agent_result.content)
+        };
 
         Ok(BusResult {
             session_id: request.session_id,
             task_id: task.id,
-            content: result,
+            content,
         })
     }
 }

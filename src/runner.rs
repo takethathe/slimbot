@@ -1,13 +1,32 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
-
 use crate::config::AgentConfig;
 use crate::context::ContextBuilder;
-use crate::provider::Provider;
+use crate::provider::{Provider, Usage};
 use crate::session::{Message, SessionManager, SessionTask, SharedSessionManager, TaskState};
 use crate::tool::{ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
+
+/// Result returned by AgentRunner after a ReAct loop completes.
+#[derive(Debug, Clone, Default)]
+pub struct AgentResult {
+    pub success: bool,
+    pub content: String,
+    pub total_tokens: u32,
+    pub prompt_tokens: u32,
+    pub prompt_cache_hit_tokens: u32,
+    pub completion_tokens: u32,
+    pub iterations: u32,
+}
+
+impl AgentResult {
+    fn accumulate(&mut self, usage: &Usage) {
+        self.total_tokens += usage.total_tokens;
+        self.prompt_tokens += usage.prompt_tokens;
+        self.prompt_cache_hit_tokens += usage.prompt_cache_hit_tokens;
+        self.completion_tokens += usage.completion_tokens;
+    }
+}
 
 pub struct AgentRunner {
     context_builder: ContextBuilder,
@@ -42,18 +61,22 @@ impl AgentRunner {
         task: &mut SessionTask,
         session_id: &str,
         channel_inject: Option<String>,
-    ) -> Result<String> {
+    ) -> AgentResult {
         // 1. Write user message
         {
             let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                 self.session_manager.lock().await;
-            sm.add_message(
-                session_id,
-                Message::User {
-                    content: task.content.clone(),
-                },
-            )
-            .await?;
+            if let Err(e) = sm
+                .add_message(
+                    session_id,
+                    Message::User {
+                        content: task.content.clone(),
+                    },
+                )
+                .await
+            {
+                return self.fail_result(task, session_id, &format!("Failed to write user message: {}", e), 0).await;
+            }
         }
 
         // 2. Update task state to Running
@@ -70,11 +93,15 @@ impl AgentRunner {
 
         let max_iterations = self.config.max_iterations;
         let mut iterations: u32 = 0;
+        let mut result = AgentResult::default();
 
         loop {
             // Exceeded max iterations
             if iterations >= max_iterations {
                 let err_msg = format!("Reached max iterations {}", max_iterations);
+                result.success = false;
+                result.content = err_msg.clone();
+                result.iterations = iterations;
                 let failed_state = TaskState::Failed {
                     error: err_msg.clone(),
                 };
@@ -83,14 +110,10 @@ impl AgentRunner {
                         self.session_manager.lock().await;
                     sm.update_task_state(session_id, &task.id, failed_state.clone())
                         .await;
+                    let _ = sm.persist(session_id).await;
                 }
                 task.hook.notify_status_change(&failed_state);
-                {
-                    let sm: tokio::sync::MutexGuard<'_, SessionManager> =
-                        self.session_manager.lock().await;
-                    sm.persist(session_id).await?;
-                }
-                return Err(anyhow::anyhow!(err_msg));
+                return result;
             }
 
             // Build context
@@ -104,10 +127,29 @@ impl AgentRunner {
             Self::backfill_missing_tool_results(&mut ctx.messages);
 
             // Request model
-            let response = self
+            let response = match self
                 .provider
                 .chat(&ctx.messages, ctx.tools.as_deref())
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_msg = format!("LLM API request failed - {}", e);
+                    result.success = false;
+                    result.content = err_msg.clone();
+                    result.iterations = iterations;
+                    let failed_state = TaskState::Failed { error: err_msg };
+                    {
+                        let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
+                            self.session_manager.lock().await;
+                        sm.update_task_state(session_id, &task.id, failed_state.clone())
+                            .await;
+                        let _ = sm.persist(session_id).await;
+                    }
+                    task.hook.notify_status_change(&failed_state);
+                    return result;
+                }
+            };
 
             // No tool calls → done
             let has_tool_calls = response
@@ -117,46 +159,60 @@ impl AgentRunner {
 
             if !has_tool_calls {
                 let text = response.content.clone().unwrap_or_default();
+                result.accumulate(&response.usage);
+                result.success = true;
+                result.content = text.clone();
+                result.iterations = iterations;
                 {
                     let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                         self.session_manager.lock().await;
-                    sm.add_message(
-                        session_id,
-                        Message::Assistant {
-                            content: Some(text.clone()),
-                            tool_calls: None,
-                        },
-                    )
-                    .await?;
+                    if let Err(e) = sm
+                        .add_message(
+                            session_id,
+                            Message::Assistant {
+                                content: Some(text.clone()),
+                                tool_calls: None,
+                            },
+                        )
+                        .await
+                    {
+                        return self.fail_result(task, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
+                    }
 
                     let completed_state = TaskState::Completed {
                         result: text.clone(),
                     };
                     sm.update_task_state(session_id, &task.id, completed_state.clone())
                         .await;
-                    sm.persist(session_id).await?;
+                    let _ = sm.persist(session_id).await;
                 }
                 task.hook.notify_status_change(&TaskState::Completed {
                     result: text.clone(),
                 });
-                return Ok(text);
+                return result;
             }
 
             // Has tool calls → write ONE assistant message with content + all tool_calls,
             // then execute each tool and append its Tool message.
             if let Some(calls) = &response.tool_calls {
+                result.accumulate(&response.usage);
+
                 // 1. Persist the assistant reply (preserves model's content text)
                 {
                     let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                         self.session_manager.lock().await;
-                    sm.add_message(
-                        session_id,
-                        Message::Assistant {
-                            content: response.content.clone(),
-                            tool_calls: Some(calls.clone()),
-                        },
-                    )
-                    .await?;
+                    if let Err(e) = sm
+                        .add_message(
+                            session_id,
+                            Message::Assistant {
+                                content: response.content.clone(),
+                                tool_calls: Some(calls.clone()),
+                            },
+                        )
+                        .await
+                    {
+                        return self.fail_result(task, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
+                    }
                 }
 
                 // 2. Execute tools and write Tool messages
@@ -189,15 +245,19 @@ impl AgentRunner {
                     {
                         let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                             self.session_manager.lock().await;
-                        sm.add_message(
-                            session_id,
-                            Message::Tool {
-                                content: final_content,
-                                tool_call_id: call.id.clone(),
-                                name: Some(call.name.clone()),
-                            },
-                        )
-                        .await?;
+                        if let Err(e) = sm
+                            .add_message(
+                                session_id,
+                                Message::Tool {
+                                    content: final_content,
+                                    tool_call_id: call.id.clone(),
+                                    name: Some(call.name.clone()),
+                                },
+                            )
+                            .await
+                        {
+                            return self.fail_result(task, session_id, &format!("Failed to write tool message: {}", e), iterations).await;
+                        }
                     }
                 }
 
@@ -214,6 +274,29 @@ impl AgentRunner {
                 task.hook.notify_status_change(&running_state);
             }
         }
+    }
+
+    async fn fail_result(
+        &self,
+        task: &mut SessionTask,
+        session_id: &str,
+        error: &str,
+        iterations: u32,
+    ) -> AgentResult {
+        let mut result = AgentResult::default();
+        result.success = false;
+        result.content = error.to_string();
+        result.iterations = iterations;
+        let failed_state = TaskState::Failed { error: error.to_string() };
+        {
+            let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
+                self.session_manager.lock().await;
+            sm.update_task_state(session_id, &task.id, failed_state.clone())
+                .await;
+            let _ = sm.persist(session_id).await;
+        }
+        task.hook.notify_status_change(&failed_state);
+        result
     }
 }
 
@@ -308,18 +391,18 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::provider::{ChatResponse, FinishReason};
+    use crate::provider::{LLMResponse, Provider, Usage, FinishReason};
     use crate::session::{Message, SessionTask, TaskHook, TaskState};
     use crate::tool::{Tool, ToolCall, ToolDefinition};
 
     /// Mock provider that returns predefined responses in order.
     struct MockProvider {
-        responses: std::sync::Mutex<Vec<ChatResponse>>,
+        responses: std::sync::Mutex<Vec<LLMResponse>>,
         call_count: std::sync::atomic::AtomicU32,
     }
 
     impl MockProvider {
-        fn new(responses: Vec<ChatResponse>) -> Self {
+        fn new(responses: Vec<LLMResponse>) -> Self {
             Self {
                 responses: std::sync::Mutex::new(responses),
                 call_count: std::sync::atomic::AtomicU32::new(0),
@@ -337,7 +420,7 @@ mod tests {
             &self,
             _messages: &[Message],
             _tools: Option<&[ToolDefinition]>,
-        ) -> Result<ChatResponse> {
+        ) -> Result<LLMResponse> {
             let idx = self
                 .call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -478,16 +561,19 @@ mod tests {
     async fn test_direct_reply_no_tool_calls() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (sm, tm, wd) = make_test_env(&tmp, &[]).await;
-        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
+        let provider = Arc::new(MockProvider::new(vec![LLMResponse {
             content: Some("Hello, world!".to_string()),
             tool_calls: None,
             finish_reason: FinishReason::Stop,
+            usage: Usage { prompt_tokens: 10, prompt_cache_hit_tokens: 0, completion_tokens: 5, total_tokens: 15 },
         }]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("Say hi");
 
-        let result = runner.run(&mut task, "test-session", None).await.unwrap();
-        assert_eq!(result, "Hello, world!");
+        let result = runner.run(&mut task, "test-session", None).await;
+        assert_eq!(result.content, "Hello, world!");
+        assert_eq!(result.success, true);
+        assert_eq!(result.total_tokens, 15);
         assert_eq!(provider.call_count(), 1);
 
         let msgs = sm.lock().await.get_messages("test-session").await;
@@ -505,22 +591,27 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (sm, tm, wd) = make_test_env(&tmp, &[("echo", "echo-result")]).await;
         let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
+            LLMResponse {
                 content: Some("Let me echo that for you.".to_string()),
                 tool_calls: Some(vec![tool_call("tc-1", "echo")]),
                 finish_reason: FinishReason::ToolCalls,
+                usage: Usage { prompt_tokens: 20, prompt_cache_hit_tokens: 0, completion_tokens: 10, total_tokens: 30 },
             },
-            ChatResponse {
+            LLMResponse {
                 content: Some("Done!".to_string()),
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
+                usage: Usage { prompt_tokens: 40, prompt_cache_hit_tokens: 0, completion_tokens: 5, total_tokens: 45 },
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("Run echo");
 
-        let result = runner.run(&mut task, "test-session", None).await.unwrap();
-        assert_eq!(result, "Done!");
+        let result = runner.run(&mut task, "test-session", None).await;
+        assert_eq!(result.content, "Done!");
+        assert_eq!(result.success, true);
+        assert_eq!(result.total_tokens, 75); // 30 + 45
+        assert_eq!(result.prompt_cache_hit_tokens, 0);
         assert_eq!(provider.call_count(), 2);
 
         let msgs = sm.lock().await.get_messages("test-session").await;
@@ -559,30 +650,34 @@ mod tests {
         )
         .await;
         let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
+            LLMResponse {
                 content: Some("I'll check both the list and the file for you.".to_string()),
                 tool_calls: Some(vec![
                     tool_call("tc-list", "list"),
                     tool_call("tc-read", "read"),
                 ]),
                 finish_reason: FinishReason::ToolCalls,
+                usage: Usage { prompt_tokens: 50, prompt_cache_hit_tokens: 0, completion_tokens: 20, total_tokens: 70 },
             },
-            ChatResponse {
+            LLMResponse {
                 content: Some(
                     "Here are the results: listing-contents and file-contents.".to_string(),
                 ),
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
+                usage: Usage { prompt_tokens: 80, prompt_cache_hit_tokens: 0, completion_tokens: 15, total_tokens: 95 },
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("List and read");
 
-        let result = runner.run(&mut task, "test-session", None).await.unwrap();
+        let result = runner.run(&mut task, "test-session", None).await;
         assert_eq!(
-            result,
+            result.content,
             "Here are the results: listing-contents and file-contents."
         );
+        assert_eq!(result.success, true);
+        assert_eq!(result.total_tokens, 165); // 70 + 95
         assert_eq!(provider.call_count(), 2);
 
         let msgs = sm.lock().await.get_messages("test-session").await;
@@ -619,22 +714,25 @@ mod tests {
         let (sm, tm, wd) =
             make_test_env(&tmp, &[("tool_a", "result-a"), ("tool_b", "result-b")]).await;
         let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
+            LLMResponse {
                 content: None,
                 tool_calls: Some(vec![tool_call("tc-a", "tool_a"), tool_call("tc-b", "tool_b")]),
                 finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
             },
-            ChatResponse {
+            LLMResponse {
                 content: Some("Final answer".to_string()),
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("Run two tools");
 
-        let result = runner.run(&mut task, "test-session", None).await.unwrap();
-        assert_eq!(result, "Final answer");
+        let result = runner.run(&mut task, "test-session", None).await;
+        assert_eq!(result.content, "Final answer");
+        assert_eq!(result.success, true);
 
         let msgs = sm.lock().await.get_messages("test-session").await;
         match &msgs[1] {
@@ -651,10 +749,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (sm, tm, wd) = make_test_env(&tmp, &[("loop_tool", "x")]).await;
         // Provider always returns tool_calls, forcing the loop to continue
-        let base_response = ChatResponse {
+        let base_response = LLMResponse {
             content: None,
             tool_calls: Some(vec![tool_call("tc", "loop_tool")]),
             finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
         };
         let provider = Arc::new(MockProvider::new(
             std::iter::repeat(base_response).take(50).collect(),
@@ -662,11 +761,9 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("Loop forever");
 
-        let err = runner
-            .run(&mut task, "test-session", None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("Reached max iterations 40"));
+        let result = runner.run(&mut task, "test-session", None).await;
+        assert_eq!(result.success, false);
+        assert!(result.content.contains("Reached max iterations 40"));
 
         // Verify session was persisted
         let msgs = sm.lock().await.get_messages("test-session").await;
@@ -686,22 +783,24 @@ mod tests {
             tokio::sync::mpsc::channel::<(String, TaskState)>(32);
 
         let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
+            LLMResponse {
                 content: Some("running tool".to_string()),
                 tool_calls: Some(vec![tool_call("tc-1", "tool1")]),
                 finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
             },
-            ChatResponse {
+            LLMResponse {
                 content: Some("done".to_string()),
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider, wd);
         let mut task = make_task("test");
         task.hook = TaskHook::new("test-session").with_status_channel(status_tx);
 
-        let _ = runner.run(&mut task, "test-session", None).await.unwrap();
+        let _ = runner.run(&mut task, "test-session", None).await;
 
         // Collect all status events
         let mut states = Vec::new();
@@ -735,22 +834,24 @@ mod tests {
 
         // Provider returns tool_error first, then a final reply after seeing the error
         let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
+            LLMResponse {
                 content: Some("trying...".to_string()),
                 tool_calls: Some(vec![tool_call("tc-fail", "fail_tool")]),
                 finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
             },
-            ChatResponse {
+            LLMResponse {
                 content: Some("Got the error, stopping.".to_string()),
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider, workspace_dir);
         let mut task = make_task("test");
 
-        let result = runner.run(&mut task, "test-session", None).await.unwrap();
-        assert_eq!(result, "Got the error, stopping.");
+        let result = runner.run(&mut task, "test-session", None).await;
+        assert_eq!(result.content, "Got the error, stopping.");
 
         let msgs = sm.lock().await.get_messages("test-session").await;
         // user + assistant(tool_calls) + tool(error) + assistant(final)
@@ -768,16 +869,17 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (sm, tm, wd) = make_test_env(&tmp, &[]).await;
 
-        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
+        let provider = Arc::new(MockProvider::new(vec![LLMResponse {
             content: Some("persist me".to_string()),
             tool_calls: None,
             finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
         }]));
         let runner = make_runner(sm.clone(), tm, provider, wd);
         let mut task = make_task("hello");
 
-        let result = runner.run(&mut task, "test-session", None).await.unwrap();
-        assert_eq!(result, "persist me");
+        let result = runner.run(&mut task, "test-session", None).await;
+        assert_eq!(result.content, "persist me");
 
         // Create a new SessionManager and reload from disk
         let session_dir = tmp.path().join("sessions");
@@ -976,15 +1078,17 @@ mod tests {
         sm.lock().await.get_or_create("test-session").await.unwrap();
 
         let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
+            LLMResponse {
                 content: Some("calling tool".to_string()),
                 tool_calls: Some(vec![tool_call("tc-big", "big")]),
                 finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
             },
-            ChatResponse {
+            LLMResponse {
                 content: Some("done".to_string()),
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
             },
         ]));
         let runner = AgentRunner::new(
@@ -1003,8 +1107,8 @@ mod tests {
         );
         let mut task = make_task("test persist");
 
-        let result = runner.run(&mut task, "test-session", None).await.unwrap();
-        assert_eq!(result, "done");
+        let result = runner.run(&mut task, "test-session", None).await;
+        assert_eq!(result.content, "done");
 
         let msgs = sm.lock().await.get_messages("test-session").await;
         match &msgs[2] {

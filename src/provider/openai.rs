@@ -6,7 +6,7 @@ use crate::config::ProviderConfig;
 use crate::session::Message;
 use crate::tool::ToolDefinition;
 
-use super::{ChatResponse, FinishReason};
+use super::{LLMResponse, Usage, FinishReason};
 
 pub struct OpenAIProvider {
     client: reqwest::Client,
@@ -40,6 +40,15 @@ impl OpenAIProvider {
 #[derive(Deserialize)]
 struct ApiResponse {
     choices: Vec<ApiChoice>,
+    usage: Option<ApiUsage>,
+}
+
+#[derive(Deserialize)]
+struct ApiUsage {
+    prompt_tokens: Option<u32>,
+    prompt_cache_hit_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -83,7 +92,7 @@ impl crate::provider::Provider for OpenAIProvider {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-    ) -> Result<ChatResponse> {
+    ) -> Result<LLMResponse> {
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| match m {
@@ -212,10 +221,18 @@ impl crate::provider::Provider for OpenAIProvider {
                 .collect()
         });
 
-        Ok(ChatResponse {
+        let usage = api_resp.usage.as_ref().map(|u| Usage {
+            prompt_tokens: u.prompt_tokens.unwrap_or(0),
+            prompt_cache_hit_tokens: u.prompt_cache_hit_tokens.unwrap_or(0),
+            completion_tokens: u.completion_tokens.unwrap_or(0),
+            total_tokens: u.total_tokens.unwrap_or(0),
+        }).unwrap_or_default();
+
+        Ok(LLMResponse {
             content: choice.message.content.clone(),
             tool_calls,
             finish_reason,
+            usage,
         })
     }
 }

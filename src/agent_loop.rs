@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::context::ContextBuilder;
 use crate::provider::{OpenAIProvider, Provider};
-use crate::runner::AgentRunner;
+use crate::runner::{AgentResult, AgentRunner};
 use crate::session::{SessionManager, SessionTask, SharedSessionManager};
 use crate::tool::{Tool, ToolManager};
 
@@ -57,7 +57,7 @@ impl AgentLoop {
         session_id: &str,
         task: &mut SessionTask,
         channel_inject: Option<String>,
-    ) -> Result<String> {
+    ) -> AgentResult {
         let runner = AgentRunner::new(
             ContextBuilder::new(
                 self.session_manager.clone(),
