@@ -69,7 +69,8 @@ impl AgentLoop {
             self.session_manager.clone(),
             self.config.agent.clone(),
             self.config.workspace_dir(),
+            channel_inject,
         );
-        runner.run(task, session_id, channel_inject).await
+        runner.run(task, session_id).await
     }
 }

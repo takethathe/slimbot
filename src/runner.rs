@@ -35,6 +35,7 @@ pub struct AgentRunner {
     session_manager: SharedSessionManager,
     config: AgentConfig,
     workspace_dir: PathBuf,
+    channel_inject: Option<String>,
 }
 
 impl AgentRunner {
@@ -45,6 +46,7 @@ impl AgentRunner {
         session_manager: SharedSessionManager,
         config: AgentConfig,
         workspace_dir: PathBuf,
+        channel_inject: Option<String>,
     ) -> Self {
         Self {
             context_builder,
@@ -53,6 +55,7 @@ impl AgentRunner {
             session_manager,
             config,
             workspace_dir,
+            channel_inject,
         }
     }
 
@@ -60,7 +63,6 @@ impl AgentRunner {
         &self,
         task: &mut SessionTask,
         session_id: &str,
-        channel_inject: Option<String>,
     ) -> AgentResult {
         // 1. Write user message
         {
@@ -70,7 +72,7 @@ impl AgentRunner {
                 .add_message(
                     session_id,
                     Message::User {
-                        content: task.content.clone(),
+                        content: std::mem::take(&mut task.content),
                     },
                 )
                 .await
@@ -119,7 +121,7 @@ impl AgentRunner {
             // Build context
             let mut ctx = self
                 .context_builder
-                .build(session_id, channel_inject.clone())
+                .build(session_id, self.channel_inject.clone())
                 .await;
 
             // History governance: clean orphans and backfill missing tool results
@@ -554,6 +556,7 @@ mod tests {
                 persist_tool_results: false,
             },
             workspace_dir,
+            None,
         )
     }
 
@@ -570,7 +573,7 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("Say hi");
 
-        let result = runner.run(&mut task, "test-session", None).await;
+        let result = runner.run(&mut task, "test-session").await;
         assert_eq!(result.content, "Hello, world!");
         assert_eq!(result.success, true);
         assert_eq!(result.total_tokens, 15);
@@ -607,7 +610,7 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("Run echo");
 
-        let result = runner.run(&mut task, "test-session", None).await;
+        let result = runner.run(&mut task, "test-session").await;
         assert_eq!(result.content, "Done!");
         assert_eq!(result.success, true);
         assert_eq!(result.total_tokens, 75); // 30 + 45
@@ -671,7 +674,7 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("List and read");
 
-        let result = runner.run(&mut task, "test-session", None).await;
+        let result = runner.run(&mut task, "test-session").await;
         assert_eq!(
             result.content,
             "Here are the results: listing-contents and file-contents."
@@ -730,7 +733,7 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("Run two tools");
 
-        let result = runner.run(&mut task, "test-session", None).await;
+        let result = runner.run(&mut task, "test-session").await;
         assert_eq!(result.content, "Final answer");
         assert_eq!(result.success, true);
 
@@ -761,7 +764,7 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
         let mut task = make_task("Loop forever");
 
-        let result = runner.run(&mut task, "test-session", None).await;
+        let result = runner.run(&mut task, "test-session").await;
         assert_eq!(result.success, false);
         assert!(result.content.contains("Reached max iterations 40"));
 
@@ -800,7 +803,7 @@ mod tests {
         let mut task = make_task("test");
         task.hook = TaskHook::new("test-session").with_status_channel(status_tx);
 
-        let _ = runner.run(&mut task, "test-session", None).await;
+        let _ = runner.run(&mut task, "test-session").await;
 
         // Collect all status events
         let mut states = Vec::new();
@@ -850,7 +853,7 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider, workspace_dir);
         let mut task = make_task("test");
 
-        let result = runner.run(&mut task, "test-session", None).await;
+        let result = runner.run(&mut task, "test-session").await;
         assert_eq!(result.content, "Got the error, stopping.");
 
         let msgs = sm.lock().await.get_messages("test-session").await;
@@ -878,7 +881,7 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider, wd);
         let mut task = make_task("hello");
 
-        let result = runner.run(&mut task, "test-session", None).await;
+        let result = runner.run(&mut task, "test-session").await;
         assert_eq!(result.content, "persist me");
 
         // Create a new SessionManager and reload from disk
@@ -1104,10 +1107,11 @@ mod tests {
                 persist_tool_results: true,
             },
             workspace_dir.clone(),
+            None,
         );
         let mut task = make_task("test persist");
 
-        let result = runner.run(&mut task, "test-session", None).await;
+        let result = runner.run(&mut task, "test-session").await;
         assert_eq!(result.content, "done");
 
         let msgs = sm.lock().await.get_messages("test-session").await;
