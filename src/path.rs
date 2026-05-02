@@ -52,7 +52,7 @@ impl PathManager {
 
     fn resolve_data_dir(input: Option<&str>) -> PathBuf {
         match input {
-            Some(dir) => PathBuf::from(dir),
+            Some(dir) => expand_home(dir),
             None => default_data_dir(),
         }
     }
@@ -170,6 +170,17 @@ impl PathManager {
     }
 }
 
+/// Expand a leading `~` or `~/` in a path to the user's home directory.
+fn expand_home(path: &str) -> PathBuf {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            let rest = path.trim_start_matches('~');
+            return home.join(rest.trim_start_matches('/'));
+        }
+    }
+    PathBuf::from(path)
+}
+
 fn default_data_dir() -> PathBuf {
     dirs::home_dir()
         .map(|p| p.join(".slimbot"))
@@ -180,6 +191,17 @@ fn default_data_dir() -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_expand_home() {
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_home("~/.slimbot"), home.join(".slimbot"));
+            assert_eq!(expand_home("~"), home);
+            assert_eq!(expand_home("~/foo/bar"), home.join("foo/bar"));
+        }
+        assert_eq!(expand_home("/absolute/path"), PathBuf::from("/absolute/path"));
+        assert_eq!(expand_home("relative/path"), PathBuf::from("relative/path"));
+    }
 
     #[test]
     fn test_resolve_defaults() {

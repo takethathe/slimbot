@@ -1,5 +1,10 @@
+use std::io::{self, Write};
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+use crate::agent_loop::AgentLoop;
+use crate::session::{SessionManager, TaskHook};
 
 #[derive(Parser, Debug)]
 #[command(name = "slimbot", about = "SlimBot AI agent")]
@@ -32,6 +37,12 @@ pub enum Commands {
         #[arg(short = 'c', long = "config")]
         config: Option<PathBuf>,
     },
+    /// Start CLI interactive agent session
+    Agent {
+        /// Session ID (auto-generated if omitted)
+        #[arg(short = 's', long = "session")]
+        session_id: Option<String>,
+    },
 }
 
 impl CliArgs {
@@ -52,4 +63,53 @@ impl CliArgs {
     pub fn workspace_dir(&self) -> Option<&str> {
         self.workspace_dir.as_ref().and_then(|p| p.to_str())
     }
+}
+
+/// Run an interactive CLI agent session.
+/// Reads user input from stdin, submits tasks to the AgentLoop, and prints results.
+pub async fn run_agent_session(agent_loop: &AgentLoop, session_id: Option<&str>) -> anyhow::Result<()> {
+    let session_id_owned: Option<String>;
+    let session_id = match session_id {
+        Some(s) => s,
+        None => {
+            session_id_owned = Some(SessionManager::create_id());
+            session_id_owned.as_deref().unwrap()
+        }
+    };
+    eprintln!("SlimBot CLI agent session: {}", session_id);
+    eprintln!("Type your message (Ctrl+D to exit):\n");
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+
+    loop {
+        eprint!("> ");
+        io::stderr().flush()?;
+
+        line.clear();
+        let bytes = stdin.read_line(&mut line)?;
+        if bytes == 0 {
+            eprintln!("\nBye!");
+            break;
+        }
+
+        let input = line.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+
+        let hook = TaskHook::new(session_id);
+        let result = agent_loop
+            .run_task(session_id, input, hook, None)
+            .await;
+
+        if result.success {
+            println!("{}", result.content);
+        } else {
+            eprintln!("Error: {}", result.content);
+        }
+        println!();
+    }
+
+    Ok(())
 }
