@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::AgentConfig;
-use crate::context::ContextBuilder;
 use crate::memory::MemoryStore;
 use crate::message_bus::BusResult;
 use crate::provider::Provider;
@@ -223,20 +222,15 @@ impl SessionTaskBuilder {
         let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> =
             Box::new(move || {
                 Box::pin(async move {
-                    let runner = AgentRunner::new(
-                        ContextBuilder::new(
-                            session_manager.clone(),
-                            tool_manager.clone(),
-                            workspace_dir.clone(),
-                            memory_store.clone(),
-                        ),
-                        tool_manager,
-                        provider,
-                        session_manager,
-                        config,
-                        workspace_dir,
-                        self.channel_inject,
-                    );
+                    let runner = AgentRunner::builder()
+                        .session_manager(session_manager)
+                        .tool_manager(tool_manager)
+                        .provider(provider)
+                        .config(config)
+                        .workspace_dir(workspace_dir)
+                        .memory_store(memory_store)
+                        .channel_inject(self.channel_inject)
+                        .build();
                     let result = runner.run(content, hook, &sid1).await;
 
                     // Send result outbound

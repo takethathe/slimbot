@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::config::AgentConfig;
 use crate::context::ContextBuilder;
+use crate::memory::MemoryStore;
 use crate::provider::{Provider, Usage};
 use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState};
 use crate::tool::{ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
@@ -28,6 +29,92 @@ impl AgentResult {
     }
 }
 
+/// Builder for constructing an `AgentRunner`.
+/// Encapsulates the composition of `ContextBuilder` and `AgentRunner`,
+/// shielding callers from internal construction details.
+pub struct AgentRunnerBuilder {
+    session_manager: Option<SharedSessionManager>,
+    tool_manager: Option<Arc<ToolManager>>,
+    provider: Option<Arc<dyn Provider>>,
+    config: Option<AgentConfig>,
+    workspace_dir: Option<PathBuf>,
+    memory_store: Option<Arc<MemoryStore>>,
+    channel_inject: Option<String>,
+}
+
+impl AgentRunnerBuilder {
+    pub fn new() -> Self {
+        Self {
+            session_manager: None,
+            tool_manager: None,
+            provider: None,
+            config: None,
+            workspace_dir: None,
+            memory_store: None,
+            channel_inject: None,
+        }
+    }
+
+    pub fn session_manager(mut self, sm: SharedSessionManager) -> Self {
+        self.session_manager = Some(sm);
+        self
+    }
+
+    pub fn tool_manager(mut self, tm: Arc<ToolManager>) -> Self {
+        self.tool_manager = Some(tm);
+        self
+    }
+
+    pub fn provider(mut self, p: Arc<dyn Provider>) -> Self {
+        self.provider = Some(p);
+        self
+    }
+
+    pub fn config(mut self, c: AgentConfig) -> Self {
+        self.config = Some(c);
+        self
+    }
+
+    pub fn workspace_dir(mut self, wd: PathBuf) -> Self {
+        self.workspace_dir = Some(wd);
+        self
+    }
+
+    pub fn memory_store(mut self, ms: Arc<MemoryStore>) -> Self {
+        self.memory_store = Some(ms);
+        self
+    }
+
+    pub fn channel_inject(mut self, ci: Option<String>) -> Self {
+        self.channel_inject = ci;
+        self
+    }
+
+    pub fn build(self) -> AgentRunner {
+        let session_manager = self.session_manager.expect("session_manager required");
+        let tool_manager = self.tool_manager.expect("tool_manager required");
+        let provider = self.provider.expect("provider required");
+        let config = self.config.expect("config required");
+        let workspace_dir = self.workspace_dir.expect("workspace_dir required");
+        let memory_store = self.memory_store.expect("memory_store required");
+
+        AgentRunner::new(
+            ContextBuilder::new(
+                session_manager.clone(),
+                tool_manager.clone(),
+                workspace_dir.clone(),
+                memory_store,
+            ),
+            tool_manager,
+            provider,
+            session_manager,
+            config,
+            workspace_dir,
+            self.channel_inject,
+        )
+    }
+}
+
 pub struct AgentRunner {
     context_builder: ContextBuilder,
     tool_manager: Arc<ToolManager>,
@@ -39,6 +126,11 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
+    /// Create a new builder for constructing an `AgentRunner`.
+    pub fn builder() -> AgentRunnerBuilder {
+        AgentRunnerBuilder::new()
+    }
+
     pub fn new(
         context_builder: ContextBuilder,
         tool_manager: Arc<ToolManager>,
@@ -529,21 +621,20 @@ mod tests {
         workspace_dir: PathBuf,
         ms: Arc<MemoryStore>,
     ) -> AgentRunner {
-        AgentRunner::new(
-            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms),
-            tm,
-            provider,
-            sm,
-            AgentConfig {
+        AgentRunner::builder()
+            .session_manager(sm)
+            .tool_manager(tm)
+            .provider(provider)
+            .config(AgentConfig {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
                 max_tool_result_chars: 8000,
                 persist_tool_results: false,
-            },
-            workspace_dir,
-            None,
-        )
+            })
+            .workspace_dir(workspace_dir)
+            .memory_store(ms)
+            .build()
     }
 
     #[tokio::test]
@@ -1087,21 +1178,20 @@ mod tests {
                 usage: Usage::default(),
             },
         ]));
-        let runner = AgentRunner::new(
-            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms),
-            tm,
-            provider,
-            sm.clone(),
-            AgentConfig {
+        let runner = AgentRunner::builder()
+            .session_manager(sm.clone())
+            .tool_manager(tm)
+            .provider(provider)
+            .config(AgentConfig {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
                 max_tool_result_chars: 8000,
                 persist_tool_results: true,
-            },
-            workspace_dir.clone(),
-            None,
-        );
+            })
+            .workspace_dir(workspace_dir.clone())
+            .memory_store(ms)
+            .build();
         let task = make_task("test persist");
 
         let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
