@@ -105,6 +105,23 @@ ChannelManager ── create channels from config → poll input → interact wi
 - **Session ID format**: `{channel_id}:{chat_id}`
 - **Loop termination**: exits when `max_iterations` is exceeded or the model responds without tool calls.
 
+## CLI Arguments
+
+```bash
+slimbot [CONFIG]              # Positional config path (backward compatible)
+slimbot -c, --config <PATH>   # Config file path
+slimbot -d, --data-dir <PATH> # Data directory
+slimbot -w, --workspace-dir <PATH>  # Workspace directory
+slimbot --log <LEVEL>         # Log level: 0=debug, 1=info (default), 2=warning, 3=error, 4=fatal
+slimbot --log-file <PATH>     # Also write logs to file (tilde expansion supported)
+```
+
+Subcommands:
+- `setup` — Run setup wizard (create/normalize config, initialize directories)
+- `agent [-s SESSION_ID]` — Start CLI interactive agent session
+
+See [docs/logging.md](docs/logging.md) for detailed logging configuration.
+
 ## Project Structure
 
 ```

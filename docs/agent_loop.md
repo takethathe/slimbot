@@ -10,7 +10,7 @@
 
 ```rust
 pub struct AgentLoop {
-    config: Config,
+    config: Arc<Config>,
     workspace_dir: PathBuf,
     provider: Arc<dyn Provider>,
     tool_manager: Arc<ToolManager>,
@@ -22,13 +22,12 @@ pub struct AgentLoop {
 
 ## 初始化流程
 
-`AgentLoop::from_config(paths, message_bus)` 按以下顺序初始化：
+`AgentLoop::from_config(paths, message_bus, config)` 按以下顺序初始化：
 
-1. **加载配置**：`Config::load(config_path)` 解析并验证配置文件
-2. **创建 Provider**：从 `config.providers` 中查找 agent 引用的 provider，创建 `OpenAIProvider`
-3. **创建 ToolManager**：以 `workspace_dir` 为根目录，调用 `init_from_config()` 注册内置工具
-4. **创建 SessionManager**：指向 session 目录，由 `Arc<Mutex<>>` 包装
-5. **创建 MemoryStore**：指向 workspace 目录
+1. **创建 Provider**：从 `config.providers` 中查找 agent 引用的 provider，创建 `OpenAIProvider`
+2. **创建 ToolManager**：以 `workspace_dir` 为根目录，调用 `init_from_config()` 注册内置工具
+3. **创建 SessionManager**：指向 session 目录，由 `Arc<Mutex<>>` 包装
+4. **创建 MemoryStore**：指向 workspace 目录，调用 `init()`
 
 ## 公共方法
 
@@ -57,12 +56,13 @@ loop:
 pub async fn run_task(
     &self,
     session_id: &str,
-    task: &mut SessionTask,
+    content: String,
+    hook: TaskHook,
     channel_inject: Option<String>,
 ) -> AgentResult
 ```
 
-每次调用时**新建**一个 `AgentRunner` 实例，传入 ContextBuilder、ToolManager、Provider、SessionManager、AgentConfig，然后执行 ReAct 循环。
+每次调用时**新建**一个 `AgentRunner` 实例，传入 ContextBuilder、ToolManager、Provider、SessionManager、AgentConfig，然后执行 ReAct 循环。返回 `AgentResult`（包含 `success`、`content` 字段）。
 
 ### `session_manager`
 
@@ -70,7 +70,7 @@ pub async fn run_task(
 
 ### `config`
 
-返回配置的可变引用。
+返回 `&Config` 的不可变引用。
 
 ### `register_tool`
 

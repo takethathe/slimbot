@@ -12,7 +12,8 @@
 pub struct ContextBuilder {
     session_manager: SharedSessionManager,    // 会话管理器
     tool_manager: Arc<ToolManager>,           // 工具管理器
-    data_dir: PathBuf,                        // 数据目录
+    workspace_dir: PathBuf,                   // 工作区目录
+    memory_store: Arc<MemoryStore>,           // 长期记忆存储
 }
 ```
 
@@ -67,7 +68,7 @@ RunContext { messages, tools }
 
 ## 技能文件加载
 
-扫描 `data_dir/skills/` 目录下所有 `.md` 文件，每个文件以 `[Skill: <文件名>]` 为前缀加入 system prompt。
+扫描 `workspace/skills/` 目录下所有 `.md` 文件，每个文件以 `[Skill: <文件名>]` 为前缀加入 system prompt。未修改的模板文件（与嵌入模板一致）会被跳过，以节省 token。
 
 ## 工具定义
 

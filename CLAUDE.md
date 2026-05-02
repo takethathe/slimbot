@@ -21,9 +21,13 @@ slimbot/
 ├── .gitignore          # 排除 /target
 ├── docs/
 │   ├── config.md       # 配置指南
-│   └── tools.md        # 内置工具说明
+│   ├── tools.md        # 内置工具说明
+│   └── logging.md      # 日志系统说明
 └── src/
-    ├── main.rs         # Entry: load config → init AgentLoop → MessageBus → ChannelManager
+    ├── main.rs         # Entry: load config → init Logger → AgentLoop → MessageBus → ChannelManager
+    ├── log.rs          # Logging: LogLevel enum, global singleton logger, init/log/should_log
+    ├── macros.rs       # Logging macros: debug!, info!, warn!, error!, fatal!
+    ├── cli.rs          # CLI: clap argument parsing, run_agent_session
     ├── config.rs       # Config: config.json read/write, AgentConfig/ProviderConfig/ChannelEntry
     ├── config_scheme.rs # ConfigScheme: default values, normalization, validation
     ├── bootstrap.rs    # Bootstrap templates: AGENTS.md, USER.md, SOUL.md, TOOLS.md

@@ -130,35 +130,49 @@ AgentRunner 状态变更 → TaskHook.notify_status()
 ## 目录结构与模块关系
 
 ```
-main.rs ── 入口，初始化 AgentLoop + MessageBus + ChannelManager
+main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   │
-  ├── agent_loop.rs ── 顶层编排 + inbound 监听任务
-  │     ├── config.rs + config_scheme.rs ── 配置加载、验证、规范化
-  │     ├── provider/openai.rs ── LLM API 调用
-  │     ├── tool.rs ── ToolManager + 工具注册
-  │     ├── session.rs ── Session + SessionManager
-  │     └── runner.rs ── ReAct 循环
-  │           └── context.rs ── 上下文构建
+  ├── setup.rs ── 配置规范化、目录创建、bootstrap 文件
+  │     ├── config_scheme.rs ── 默认值、规范化、URL 派生
+  │     └── bootstrap.rs + embed.rs ── 嵌入模板文件
   │
-  ├── message_bus.rs ── 纯异步通道端点
+  ├── cli.rs ── clap 参数解析、CLI agent session
   │
-  └── channel/mod.rs + cli.rs ── 通道管理 + CLI 实现
+  ├── agent (子命令) ── CLI agent 会话
+  │     ├── path.rs ── 路径管理、默认值、沙箱验证
+  │     ├── config.rs ── 配置加载、验证
+  │     ├── agent_loop.rs ── 顶层编排 + inbound 监听任务
+  │     │     ├── provider/openai.rs ── LLM API 调用
+  │     │     ├── tool.rs ── ToolManager + 工具注册
+  │     │     ├── session.rs ── Session + SessionManager
+  │     │     └── runner.rs ── ReAct 循环
+  │     │           └── context.rs ── 上下文构建
+  │     │
+  │     ├── message_bus.rs ── 纯异步通道端点
+  │     ├── memory.rs ── 长期记忆、历史记录
+  │     ├── worker.rs ── WorkerPool 异步执行池
+  │     └── io_scheduler.rs ── I/O 调度、阻塞读取
+  │
+  └── log.rs + macros.rs ── 日志系统、级别过滤、彩色输出
 ```
 
 ## main.rs 初始化流程
 
 ```rust
+// 0. CLI 解析 + 日志初始化
+let args = CliArgs::parse();
+let log_level = LogLevel::from_u8(args.log).unwrap_or(LogLevel::Info);
+crate::log::init(log_level, log_file_path.as_deref())?;
+
 // 1. 创建 MessageBus（纯通道，无后台任务）
 let message_bus = Arc::new(MessageBus::new());
 
 // 2. 创建 AgentLoop，启动 inbound 监听
-let agent_loop = AgentLoop::from_config(&paths, message_bus.clone()).await?;
+let agent_loop = AgentLoop::from_config(&paths, message_bus.clone(), config.clone()).await?;
 agent_loop.start_inbound();
 
-// 3. 创建 ChannelManager（自动注册内置工厂）
-let mut channel_manager = ChannelManager::new(message_bus);
-channel_manager.init_from_config(&config.channels).await?;
-
-// 4. 主线程阻塞，等待出站消息（通道全部关闭后退出）
-channel_manager.run().await;
+// 3. 启动 CLI agent session
+crate::cli::run_agent_session(&agent_loop, session_id).await;
 ```
+
+SlimBot 使用子命令模式：`setup` 执行初始化，`agent` 启动 CLI 交互会话。

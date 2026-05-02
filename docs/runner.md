@@ -16,6 +16,39 @@ pub struct AgentRunner {
     session_manager: SharedSessionManager,       // 会话管理器
     config: AgentConfig,                         // Agent 配置
     workspace_dir: PathBuf,                      // 工作区目录（用于持久化工具结果）
+    channel_inject: Option<String>,              // 通道注入内容
+}
+
+pub struct AgentRunnerBuilder { ... }  // 构建器模式
+```
+
+### `AgentRunnerBuilder`
+
+使用构建器模式创建 `AgentRunner`：
+
+```rust
+AgentRunner::builder()
+    .session_manager(sm)
+    .tool_manager(tm)
+    .provider(provider)
+    .config(agent_config)
+    .workspace_dir(workspace)
+    .memory_store(ms)
+    .channel_inject(None)
+    .build()
+```
+
+### `AgentResult`
+
+```rust
+pub struct AgentResult {
+    pub success: bool,
+    pub content: String,
+    pub total_tokens: u32,
+    pub prompt_tokens: u32,
+    pub prompt_cache_hit_tokens: u32,
+    pub completion_tokens: u32,
+    pub iterations: u32,
 }
 ```
 
@@ -33,15 +66,15 @@ pub struct AgentRunner {
 ```rust
 pub async fn run(
     &self,
-    task: &mut SessionTask,
+    content: String,
+    hook: TaskHook,
     session_id: &str,
-    channel_inject: Option<String>,
-) -> Result<String>
+) -> AgentResult
 ```
 
 ### 步骤 1：写入用户消息
 
-将 `task.content` 作为 `Message::User` 追加到 session 的消息列表中。
+将 `content` 作为 `Message::User` 追加到 session 的消息列表中。
 
 ### 步骤 2：更新任务状态为 Running
 

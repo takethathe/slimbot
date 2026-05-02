@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::agent_loop::AgentLoop;
 use crate::session::{SessionManager, TaskHook};
+use crate::fatal;
 
 #[derive(Parser, Debug)]
 #[command(name = "slimbot", about = "SlimBot AI agent")]
@@ -47,6 +48,10 @@ pub enum Commands {
     },
     /// Start CLI interactive agent session
     Agent {
+        /// Single-turn query (run one task and exit)
+        #[arg(value_name = "QUERY")]
+        query: Option<String>,
+
         /// Session ID (auto-generated if omitted)
         #[arg(short = 's', long = "session")]
         session_id: Option<String>,
@@ -73,9 +78,13 @@ impl CliArgs {
     }
 }
 
-/// Run an interactive CLI agent session.
+/// Run an interactive CLI agent session, or a single-turn query if provided.
 /// Reads user input from stdin, submits tasks to the AgentLoop, and prints results.
-pub async fn run_agent_session(agent_loop: &AgentLoop, session_id: Option<&str>) -> anyhow::Result<()> {
+pub async fn run_agent_session(
+    agent_loop: &AgentLoop,
+    session_id: Option<&str>,
+    query: Option<&str>,
+) -> anyhow::Result<()> {
     let session_id_owned: Option<String>;
     let session_id = match session_id {
         Some(s) => s,
@@ -84,6 +93,22 @@ pub async fn run_agent_session(agent_loop: &AgentLoop, session_id: Option<&str>)
             session_id_owned.as_deref().unwrap()
         }
     };
+
+    // Single-turn: run query and exit
+    if let Some(query) = query {
+        let hook = TaskHook::new(session_id);
+        let result = agent_loop
+            .run_task(session_id, query.to_string(), hook, None)
+            .await;
+
+        if result.success {
+            println!("{}", result.content);
+        } else {
+            fatal!("Agent task failed: {}", result.content);
+        }
+    }
+
+    // Interactive mode: existing stdin loop
     eprintln!("SlimBot CLI agent session: {}", session_id);
     eprintln!("Type your message (Ctrl+D to exit):\n");
 

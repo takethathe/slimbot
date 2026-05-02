@@ -59,20 +59,24 @@ async fn main() -> Result<()> {
             let data_dir = args.data_dir().unwrap_or("~/.slimbot");
             return setup::run_setup(config_path, data_dir, args.workspace_dir());
         }
-        Some(Commands::Agent { ref session_id }) => {
+        Some(Commands::Agent { ref session_id, ref query }) => {
             let paths = PathManager::resolve(
                 args.config_path(),
                 args.data_dir(),
                 args.workspace_dir(),
             )?;
-            return run_cli_agent(&paths, session_id.as_deref()).await;
+            return run_cli_agent(&paths, session_id.as_deref(), query.as_deref()).await;
         }
         None => unreachable!(),
     }
 }
 
 /// Run a CLI-only agent session: load config, start AgentLoop, prompt user, run tasks.
-async fn run_cli_agent(paths: &PathManager, session_id: Option<&str>) -> Result<()> {
+async fn run_cli_agent(
+    paths: &PathManager,
+    session_id: Option<&str>,
+    query: Option<&str>,
+) -> Result<()> {
     let message_bus = Arc::new(MessageBus::new());
     crate::worker::WorkerPool::init_global(64);
 
@@ -81,5 +85,5 @@ async fn run_cli_agent(paths: &PathManager, session_id: Option<&str>) -> Result<
     let agent_loop = AgentLoop::from_config(paths, message_bus.clone(), config.clone()).await?;
     agent_loop.start_inbound();
 
-    crate::cli::run_agent_session(&agent_loop, session_id).await
+    crate::cli::run_agent_session(&agent_loop, session_id, query).await
 }
