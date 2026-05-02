@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::agent_loop::AgentLoop;
-use crate::session::{SessionManager, SessionTask, TaskHook, TaskState, ensure_session};
+use crate::session::TaskHook;
 
 /// Capacity for inbound/outbound mpsc channels. Large enough to absorb bursts,
 /// small enough to bound memory. If inbound fills, the channel's I/O loop

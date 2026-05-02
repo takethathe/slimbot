@@ -16,6 +16,7 @@ mod setup;
 mod tool;
 mod tools;
 mod utils;
+mod worker;
 
 use std::sync::Arc;
 
@@ -52,6 +53,9 @@ async fn main() -> Result<()> {
 
     // Initialize MessageBus (pure channel endpoints, no background tasks)
     let message_bus = Arc::new(MessageBus::new());
+
+    // Initialize the global WorkerPool singleton
+    crate::worker::WorkerPool::init_global(64);
 
     // Load config once
     let config = Arc::new(crate::config::Config::load(paths.config_path().to_str().unwrap())?);

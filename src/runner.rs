@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::config::AgentConfig;
 use crate::context::ContextBuilder;
 use crate::provider::{Provider, Usage};
-use crate::session::{Message, SessionManager, SessionTask, SharedSessionManager, TaskState};
+use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState};
 use crate::tool::{ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
 
 /// Result returned by AgentRunner after a ReAct loop completes.
@@ -61,7 +61,8 @@ impl AgentRunner {
 
     pub async fn run(
         &self,
-        task: &mut SessionTask,
+        content: String,
+        hook: TaskHook,
         session_id: &str,
     ) -> AgentResult {
         // 1. Write user message
@@ -71,27 +72,19 @@ impl AgentRunner {
             if let Err(e) = sm
                 .add_message(
                     session_id,
-                    Message::User {
-                        content: std::mem::take(&mut task.content),
-                    },
+                    Message::User { content },
                 )
                 .await
             {
-                return self.fail_result(task, session_id, &format!("Failed to write user message: {}", e), 0).await;
+                return self.fail_result(&hook, session_id, &format!("Failed to write user message: {}", e), 0).await;
             }
         }
 
-        // 2. Update task state to Running
+        // 2. Notify running state
         let running_state = TaskState::Running {
             current_iteration: 0,
         };
-        {
-            let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
-                self.session_manager.lock().await;
-            sm.update_task_state(session_id, &task.id, running_state.clone())
-                .await;
-        }
-        task.hook.notify_status_change(&running_state);
+        hook.notify_status_change(&running_state);
 
         let max_iterations = self.config.max_iterations;
         let mut iterations: u32 = 0;
@@ -108,13 +101,11 @@ impl AgentRunner {
                     error: err_msg.clone(),
                 };
                 {
-                    let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
+                    let sm: tokio::sync::MutexGuard<'_, SessionManager> =
                         self.session_manager.lock().await;
-                    sm.update_task_state(session_id, &task.id, failed_state.clone())
-                        .await;
                     let _ = sm.persist(session_id).await;
                 }
-                task.hook.notify_status_change(&failed_state);
+                hook.notify_status_change(&failed_state);
                 return result;
             }
 
@@ -142,13 +133,11 @@ impl AgentRunner {
                     result.iterations = iterations;
                     let failed_state = TaskState::Failed { error: err_msg };
                     {
-                        let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
+                        let sm: tokio::sync::MutexGuard<'_, SessionManager> =
                             self.session_manager.lock().await;
-                        sm.update_task_state(session_id, &task.id, failed_state.clone())
-                            .await;
                         let _ = sm.persist(session_id).await;
                     }
-                    task.hook.notify_status_change(&failed_state);
+                    hook.notify_status_change(&failed_state);
                     return result;
                 }
             };
@@ -178,17 +167,15 @@ impl AgentRunner {
                         )
                         .await
                     {
-                        return self.fail_result(task, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
+                        return self.fail_result(&hook, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
                     }
 
-                    let completed_state = TaskState::Completed {
+                    let _completed_state = TaskState::Completed {
                         result: text.clone(),
                     };
-                    sm.update_task_state(session_id, &task.id, completed_state.clone())
-                        .await;
                     let _ = sm.persist(session_id).await;
                 }
-                task.hook.notify_status_change(&TaskState::Completed {
+                hook.notify_status_change(&TaskState::Completed {
                     result: text.clone(),
                 });
                 return result;
@@ -213,7 +200,7 @@ impl AgentRunner {
                         )
                         .await
                     {
-                        return self.fail_result(task, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
+                        return self.fail_result(&hook, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
                     }
                 }
 
@@ -258,7 +245,7 @@ impl AgentRunner {
                             )
                             .await
                         {
-                            return self.fail_result(task, session_id, &format!("Failed to write tool message: {}", e), iterations).await;
+                            return self.fail_result(&hook, session_id, &format!("Failed to write tool message: {}", e), iterations).await;
                         }
                     }
                 }
@@ -267,20 +254,14 @@ impl AgentRunner {
                 let running_state = TaskState::Running {
                     current_iteration: iterations,
                 };
-                {
-                    let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
-                        self.session_manager.lock().await;
-                    sm.update_task_state(session_id, &task.id, running_state.clone())
-                        .await;
-                }
-                task.hook.notify_status_change(&running_state);
+                hook.notify_status_change(&running_state);
             }
         }
     }
 
     async fn fail_result(
         &self,
-        task: &mut SessionTask,
+        hook: &TaskHook,
         session_id: &str,
         error: &str,
         iterations: u32,
@@ -291,13 +272,11 @@ impl AgentRunner {
         result.iterations = iterations;
         let failed_state = TaskState::Failed { error: error.to_string() };
         {
-            let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
+            let sm: tokio::sync::MutexGuard<'_, SessionManager> =
                 self.session_manager.lock().await;
-            sm.update_task_state(session_id, &task.id, failed_state.clone())
-                .await;
             let _ = sm.persist(session_id).await;
         }
-        task.hook.notify_status_change(&failed_state);
+        hook.notify_status_change(&failed_state);
         result
     }
 }
@@ -535,9 +514,11 @@ mod tests {
     fn make_task(content: &str) -> SessionTask {
         SessionTask {
             id: "task-1".to_string(),
+            session_id: "test-session".to_string(),
             content: content.to_string(),
             hook: TaskHook::new("test-session"),
             state: TaskState::Pending,
+            closure: None,
         }
     }
 
@@ -576,9 +557,9 @@ mod tests {
             usage: Usage { prompt_tokens: 10, prompt_cache_hit_tokens: 0, completion_tokens: 5, total_tokens: 15 },
         }]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-        let mut task = make_task("Say hi");
+        let task = make_task("Say hi");
 
-        let result = runner.run(&mut task, "test-session").await;
+        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
         assert_eq!(result.content, "Hello, world!");
         assert_eq!(result.success, true);
         assert_eq!(result.total_tokens, 15);
@@ -613,9 +594,9 @@ mod tests {
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-        let mut task = make_task("Run echo");
+        let task = make_task("Run echo");
 
-        let result = runner.run(&mut task, "test-session").await;
+        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
         assert_eq!(result.content, "Done!");
         assert_eq!(result.success, true);
         assert_eq!(result.total_tokens, 75); // 30 + 45
@@ -677,9 +658,9 @@ mod tests {
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-        let mut task = make_task("List and read");
+        let task = make_task("List and read");
 
-        let result = runner.run(&mut task, "test-session").await;
+        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
         assert_eq!(
             result.content,
             "Here are the results: listing-contents and file-contents."
@@ -736,9 +717,9 @@ mod tests {
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-        let mut task = make_task("Run two tools");
+        let task = make_task("Run two tools");
 
-        let result = runner.run(&mut task, "test-session").await;
+        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
         assert_eq!(result.content, "Final answer");
         assert_eq!(result.success, true);
 
@@ -767,9 +748,9 @@ mod tests {
             std::iter::repeat(base_response).take(50).collect(),
         ));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-        let mut task = make_task("Loop forever");
+        let task = make_task("Loop forever");
 
-        let result = runner.run(&mut task, "test-session").await;
+        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
         assert_eq!(result.success, false);
         assert!(result.content.contains("Reached max iterations 40"));
 
@@ -805,10 +786,11 @@ mod tests {
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider, wd, ms);
-        let mut task = make_task("test");
-        task.hook = TaskHook::new("test-session").with_status_channel(status_tx);
+        let task = make_task("test");
+        let hook = TaskHook::new("test-session").with_status_channel(status_tx);
+        let content = task.content.clone();
 
-        let _ = runner.run(&mut task, "test-session").await;
+        let _ = runner.run(content, hook, "test-session").await;
 
         // Collect all status events
         let mut states = Vec::new();
@@ -859,9 +841,9 @@ mod tests {
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider, workspace_dir, ms);
-        let mut task = make_task("test");
+        let task = make_task("test");
 
-        let result = runner.run(&mut task, "test-session").await;
+        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
         assert_eq!(result.content, "Got the error, stopping.");
 
         let msgs = sm.lock().await.get_messages("test-session").await;
@@ -887,9 +869,9 @@ mod tests {
             usage: Usage::default(),
         }]));
         let runner = make_runner(sm.clone(), tm, provider, wd, ms);
-        let mut task = make_task("hello");
+        let task = make_task("hello");
 
-        let result = runner.run(&mut task, "test-session").await;
+        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
         assert_eq!(result.content, "persist me");
 
         // Create a new SessionManager and reload from disk
@@ -1120,9 +1102,9 @@ mod tests {
             workspace_dir.clone(),
             None,
         );
-        let mut task = make_task("test persist");
+        let task = make_task("test persist");
 
-        let result = runner.run(&mut task, "test-session").await;
+        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
         assert_eq!(result.content, "done");
 
         let msgs = sm.lock().await.get_messages("test-session").await;
