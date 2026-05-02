@@ -128,7 +128,7 @@ impl Config {
         })?;
         if provider.api_key.is_empty() {
             anyhow::bail!(
-                "provider '{}'.api_key must not be empty",
+                "provider '{}'.api_key must not be empty. Set it in your config file.",
                 self.agent.provider
             );
         }

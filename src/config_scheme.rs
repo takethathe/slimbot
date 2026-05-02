@@ -101,6 +101,7 @@ impl ConfigScheme {
 
     // ── Default value constants ──
 
+    pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
     pub const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
     pub const DEFAULT_PROVIDER_TYPE: &str = "openai";
     pub const DEFAULT_MODEL: &str = "gpt-4o";
@@ -112,8 +113,8 @@ impl ConfigScheme {
     fn default_provider_config(&self) -> ProviderConfig {
         ProviderConfig {
             r#type: Self::DEFAULT_PROVIDER_TYPE.to_string(),
-            api_url: Self::DEFAULT_API_URL.to_string(),
-            base_url: String::new(),
+            api_url: String::new(),
+            base_url: Self::DEFAULT_BASE_URL.to_string(),
             api_key: String::new(), // must be set by user
             model: Self::DEFAULT_MODEL.to_string(),
             temperature: Self::DEFAULT_TEMPERATURE,
