@@ -1,0 +1,41 @@
+pub(crate) mod agent_loop;
+pub(crate) mod bootstrap;
+pub(crate) mod channel;
+pub(crate) mod cli;
+pub(crate) mod config;
+pub(crate) mod config_scheme;
+pub(crate) mod context;
+pub(crate) mod embed;
+pub(crate) mod io_scheduler;
+pub(crate) mod log;
+pub(crate) mod macros;
+pub(crate) mod memory;
+pub(crate) mod message_bus;
+pub(crate) mod path;
+pub(crate) mod provider;
+pub(crate) mod runner;
+pub(crate) mod session;
+pub(crate) mod setup;
+pub(crate) mod tool;
+pub(crate) mod tools;
+pub(crate) mod utils;
+pub(crate) mod worker;
+
+// Re-export key types for integration tests and binary usage.
+pub use config::{AgentConfig, Config, ChannelEntry, ProviderConfig, ToolEntry};
+pub use config_scheme::ConfigScheme;
+pub use log::{LogLevel, init as log_init, log, should_log};
+pub use message_bus::{BusRequest, BusResult, MessageBus};
+pub use path::PathManager;
+pub use path::expand_home;
+pub use session::{Message, Session, SessionManager, TaskHook, TaskState, SharedSessionManager};
+pub use tool::{ToolCall, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result};
+pub use utils::{truncate_text_head_tail, write_file_atomic, build_persisted_reference, TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS};
+pub use tools::create_tool;
+
+// Re-export for binary usage.
+pub use cli::{CliArgs, Commands, run_agent_session};
+pub use setup::run_setup;
+pub use worker::WorkerPool;
+pub use agent_loop::AgentLoop;
+pub use log as log_module;
