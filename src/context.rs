@@ -61,7 +61,7 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillMeta> {
 pub struct ContextBuilder {
     session_manager: SharedSessionManager,
     tool_manager: Arc<ToolManager>,
-    data_dir: PathBuf,
+    workspace_dir: PathBuf,
     memory_store: Arc<MemoryStore>,
 }
 
@@ -69,13 +69,13 @@ impl ContextBuilder {
     pub fn new(
         session_manager: SharedSessionManager,
         tool_manager: Arc<ToolManager>,
-        data_dir: PathBuf,
+        workspace_dir: PathBuf,
         memory_store: Arc<MemoryStore>,
     ) -> Self {
         Self {
             session_manager,
             tool_manager,
-            data_dir,
+            workspace_dir,
             memory_store,
         }
     }
@@ -88,7 +88,7 @@ impl ContextBuilder {
 
         // 2. Bootstrap workspace files (skip if unmodified from template)
         for (filename, template) in bootstrap_files() {
-            let path = self.data_dir.join(filename);
+            let path = self.workspace_dir.join(filename);
             if let Some(content) = read_if_modified(&path, template) {
                 if !content.is_empty() {
                     system_parts.push(format!("[{}] {}", filename, content));
@@ -97,7 +97,7 @@ impl ContextBuilder {
         }
 
         // 3. Skills import — parse frontmatter, load always skills fully, list others
-        let skills_dir = self.data_dir.join("skills");
+        let skills_dir = self.workspace_dir.join("skills");
         if skills_dir.exists() {
             let mut always_skills: Vec<String> = Vec::new();
             let mut available_skills: Vec<String> = Vec::new();

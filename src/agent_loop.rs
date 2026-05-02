@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -6,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::context::ContextBuilder;
 use crate::memory::MemoryStore;
+use crate::path::PathManager;
 use crate::provider::{OpenAIProvider, Provider};
 use crate::runner::{AgentResult, AgentRunner};
 use crate::session::{SessionManager, SessionTask, SharedSessionManager};
@@ -13,6 +15,7 @@ use crate::tool::{Tool, ToolManager};
 
 pub struct AgentLoop {
     config: Config,
+    workspace_dir: PathBuf,
     provider: Arc<dyn Provider>,
     tool_manager: Arc<ToolManager>,
     session_manager: SharedSessionManager,
@@ -20,8 +23,8 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
-    pub async fn from_config(config_path: &str) -> Result<Self> {
-        let config = Config::load(config_path)?;
+    pub async fn from_config(paths: &PathManager) -> Result<Self> {
+        let config = Config::load(paths.config_path().to_str().unwrap())?;
 
         let provider_config = config
             .providers
@@ -29,16 +32,18 @@ impl AgentLoop {
             .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", config.agent.provider))?;
         let provider = Arc::new(OpenAIProvider::new(provider_config));
 
-        let mut tool_manager = ToolManager::new(config.workspace_dir());
+        let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
         tool_manager.init_from_config(&config.tools);
 
-        let session_manager = Arc::new(Mutex::new(SessionManager::new(config.session_dir())?));
+        let session_manager =
+            Arc::new(Mutex::new(SessionManager::new(paths.session_dir())?));
 
-        let memory_store = Arc::new(MemoryStore::new(&config.workspace_dir()));
+        let memory_store = Arc::new(MemoryStore::new(paths.workspace_dir()));
         memory_store.init()?;
 
         Ok(Self {
             config,
+            workspace_dir: paths.workspace_dir().to_path_buf(),
             provider,
             tool_manager: Arc::new(tool_manager),
             session_manager,
@@ -68,14 +73,14 @@ impl AgentLoop {
             ContextBuilder::new(
                 self.session_manager.clone(),
                 self.tool_manager.clone(),
-                self.config.workspace_dir(),
+                self.workspace_dir.clone(),
                 self.memory_store.clone(),
             ),
             self.tool_manager.clone(),
             self.provider.clone(),
             self.session_manager.clone(),
             self.config.agent.clone(),
-            self.config.workspace_dir(),
+            self.workspace_dir.clone(),
             channel_inject,
         );
         runner.run(task, session_id).await

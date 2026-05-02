@@ -1,19 +1,8 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-
-fn default_data_dir() -> String {
-    let home = dirs::home_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
-    format!("{}/.slimbot", home)
-}
-
-fn default_workspace_dir_for_serde() -> String {
-    String::new()
-}
 
 fn default_temperature() -> f32 {
     0.7
@@ -101,12 +90,6 @@ pub struct ChannelEntry {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
-    #[serde(default = "default_data_dir")]
-    pub data_dir: String,
-    /// Directory for workspace files (agent.md, skills, sessions, etc.).
-    /// Defaults to `{data_dir}/workspace` if not set.
-    #[serde(default = "default_workspace_dir_for_serde")]
-    pub workspace_dir: String,
     pub agent: AgentConfig,
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -118,17 +101,9 @@ pub struct Config {
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("Failed to read config.json")?;
-        let mut config: Config =
+        let config: Config =
             serde_json::from_str(&content).context("Invalid config.json format")?;
         config.validate()?;
-
-        // Derive workspace_dir from data_dir if not explicitly set
-        if config.workspace_dir.is_empty() {
-            config.workspace_dir = format!("{}/workspace", config.data_dir);
-        }
-
-        std::fs::create_dir_all(config.session_dir())?;
-
         Ok(config)
     }
 
@@ -139,16 +114,6 @@ impl Config {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
-    }
-
-    /// Returns the workspace directory path.
-    pub fn workspace_dir(&self) -> PathBuf {
-        Path::new(&self.workspace_dir).to_path_buf()
-    }
-
-    /// Returns the sessions directory path.
-    pub fn session_dir(&self) -> PathBuf {
-        Path::new(&self.workspace_dir).join("sessions")
     }
 
     fn validate(&self) -> Result<()> {

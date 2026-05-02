@@ -1,9 +1,9 @@
 use anyhow::Result;
-use std::path::Path;
 
 use crate::bootstrap::{bootstrap_files, skill_files};
 use crate::config::{AgentConfig, Config, ProviderConfig};
 use crate::config_scheme::ConfigScheme;
+use crate::path::PathManager;
 
 fn default_fallback_provider() -> ProviderConfig {
     ProviderConfig {
@@ -34,12 +34,6 @@ fn load_config_with_defaults(path: &str, scheme: &ConfigScheme) -> Result<Config
     let mut config = scheme.default_config();
 
     // Merge top-level fields
-    if let Some(v) = value.get("data_dir").and_then(|v| v.as_str()) {
-        config.data_dir = v.to_string();
-    }
-    if let Some(v) = value.get("workspace_dir").and_then(|v| v.as_str()) {
-        config.workspace_dir = v.to_string();
-    }
     if let Some(obj) = value.get("agent").and_then(|v| v.as_object()) {
         merge_agent(&mut config.agent, obj);
     }
@@ -120,13 +114,15 @@ fn merge_agent(target: &mut AgentConfig, src: &serde_json::Map<String, serde_jso
 }
 
 /// Run the setup command: write default config or normalize existing one.
-pub fn run_setup(config_path: Option<&str>) -> Result<()> {
-    let path = config_path.unwrap_or_else(|| {
-        let home = dirs::home_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
-        Box::leak(format!("{}/.slimbot/config.json", home).into_boxed_str())
-    });
+pub fn run_setup(
+    config_path: Option<&str>,
+    data_dir: &str,
+    workspace_dir: Option<&str>,
+) -> Result<()> {
+    let paths = PathManager::resolve(config_path, Some(data_dir), workspace_dir)?;
+
+    // Use the config path from PathManager for setup
+    let path = paths.config_path().to_str().unwrap();
 
     let scheme = ConfigScheme::new();
 
@@ -159,13 +155,13 @@ pub fn run_setup(config_path: Option<&str>) -> Result<()> {
     scheme.normalize(&mut config);
 
     // Create directories and bootstrap files
-    if let Err(e) = create_directories_and_bootstrap(&config) {
+    if let Err(e) = create_directories_and_bootstrap(&paths) {
         eprintln!("Warning: failed to create workspace directories: {}", e);
     }
 
-    eprintln!("\nConfig summary:");
-    eprintln!("  data_dir: {}", config.data_dir);
-    eprintln!("  workspace_dir: {}", config.workspace_dir);
+    eprintln!("\nConfig preview:");
+    eprintln!("  data_dir: {}", paths.data_dir().display());
+    eprintln!("  workspace_dir: {}", paths.workspace_dir().display());
     eprintln!("  agent.provider: {}", config.agent.provider);
     eprintln!("  agent.max_iterations: {}", config.agent.max_iterations);
     eprintln!("  agent.timeout_seconds: {}", config.agent.timeout_seconds);
@@ -198,19 +194,15 @@ fn mask_api_key(key: &str) -> String {
 
 /// Create workspace directories and write bootstrap files.
 /// Skips files that already exist.
-fn create_directories_and_bootstrap(config: &Config) -> Result<()> {
-    let workspace = config.workspace_dir();
-    let data = Path::new(&config.data_dir);
-
-    // Create directories
-    std::fs::create_dir_all(data)?;
-    std::fs::create_dir_all(&workspace)?;
-    std::fs::create_dir_all(workspace.join("skills"))?;
-    std::fs::create_dir_all(workspace.join("memory"))?;
+fn create_directories_and_bootstrap(paths: &PathManager) -> Result<()> {
+    std::fs::create_dir_all(paths.data_dir())?;
+    std::fs::create_dir_all(paths.workspace_dir())?;
+    std::fs::create_dir_all(paths.skills_dir())?;
+    std::fs::create_dir_all(paths.memory_dir())?;
 
     // Write bootstrap files (skip if already exists)
     for (filename, template) in bootstrap_files() {
-        let path = workspace.join(filename);
+        let path = paths.bootstrap_file(filename);
         if path.exists() {
             eprintln!("  {} already exists, skipping.", filename);
         } else {
@@ -221,7 +213,7 @@ fn create_directories_and_bootstrap(config: &Config) -> Result<()> {
 
     // Write skill files (skip if already exists)
     for (_filename, content, dest) in skill_files() {
-        let path = workspace.join(dest);
+        let path = paths.workspace_dir().join(dest);
         if path.exists() {
             eprintln!("  {} already exists, skipping.", dest);
         } else {

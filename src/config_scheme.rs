@@ -24,8 +24,6 @@ impl ConfigScheme {
         );
 
         Config {
-            data_dir: Self::default_data_dir(),
-            workspace_dir: String::new(), // resolved by Config::load
             agent: self.default_agent_config(&default_provider_name),
             providers,
             tools: vec![],
@@ -36,15 +34,6 @@ impl ConfigScheme {
     /// Normalize an existing Config: fill missing defaults,
     /// and correct invalid values.
     pub fn normalize(&self, config: &mut Config) {
-        // data_dir
-        if config.data_dir.is_empty() {
-            config.data_dir = Self::default_data_dir();
-        }
-        // workspace_dir
-        if config.workspace_dir.is_empty() {
-            config.workspace_dir = format!("{}/workspace", config.data_dir);
-        }
-
         // agent
         if config.agent.provider.is_empty() {
             config.agent.provider = "default".to_string();
@@ -120,13 +109,6 @@ impl ConfigScheme {
     pub const DEFAULT_MAX_ITERATIONS: u32 = 40;
     pub const DEFAULT_TIMEOUT: u64 = 120;
 
-    fn default_data_dir() -> String {
-        let home = dirs::home_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
-        format!("{}/.slimbot", home)
-    }
-
     fn default_provider_config(&self) -> ProviderConfig {
         ProviderConfig {
             r#type: Self::DEFAULT_PROVIDER_TYPE.to_string(),
@@ -178,8 +160,6 @@ mod tests {
     fn test_default_config_has_all_fields() {
         let mut config = scheme().default_config();
         scheme().normalize(&mut config);
-        assert!(!config.data_dir.is_empty());
-        assert!(!config.workspace_dir.is_empty());
         assert_eq!(config.agent.provider, "default");
         let provider = default_provider(&config);
         assert_eq!(provider.r#type, "openai");
@@ -306,36 +286,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let mut parsed: Config = serde_json::from_str(&content).unwrap();
         scheme().normalize(&mut parsed);
-        assert!(!parsed.data_dir.is_empty());
-        assert!(!parsed.workspace_dir.is_empty());
         assert_eq!(default_provider(&parsed).model, "gpt-4o");
-    }
-
-    #[test]
-    fn test_data_dir_fallback_without_home() {
-        // default_config should always produce a non-empty data_dir
-        let config = scheme().default_config();
-        assert!(config.data_dir.ends_with(".slimbot"));
-    }
-
-    #[test]
-    fn test_workspace_dir_derived_from_data_dir() {
-        let mut config = scheme().default_config();
-        // Config::load resolves workspace_dir, but default_config leaves it empty
-        // ConfigScheme::normalize should also fill it
-        scheme().normalize(&mut config);
-        assert_eq!(
-            config.workspace_dir,
-            format!("{}/workspace", config.data_dir)
-        );
-    }
-
-    #[test]
-    fn test_workspace_dir_override() {
-        let mut config = scheme().default_config();
-        config.workspace_dir = "/custom/workspace".to_string();
-        scheme().normalize(&mut config);
-        assert_eq!(config.workspace_dir, "/custom/workspace");
     }
 
     #[test]

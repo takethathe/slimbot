@@ -7,44 +7,72 @@
 运行 setup 命令生成默认配置文件：
 
 ```bash
-cargo run -- setup          # 创建 ~/.slimbot/config.json
-cargo run -- setup /path/to/custom.json   # 自定义路径
+cargo run -- setup                     # 创建 ~/.slimbot/config.json
+cargo run -- -d /custom/path setup     # 自定义数据目录
+cargo run -- -c /path/to/custom.json setup  # 自定义配置文件路径
 ```
 
 如果配置文件已存在，`setup` 会加载它，填补缺失的默认值，规范化无效条目，然后写回。
 
-## 配置文件位置
+## 命令行参数
 
-| 方式 | 路径 |
-|------|------|
-| 默认（无参数） | `~/.slimbot/config.json` |
-| CLI 参数 | `cargo run -- <config.json路径>` |
-| Setup 命令 | `cargo run -- setup [config.json路径]` |
+| 参数 | 简写 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config PATH` | `-c` | `{data-dir}/config.json` | 配置文件路径（必须存在） |
+| `--data-dir PATH` | `-d` | `~/.slimbot` | 应用数据目录 |
+| `--workspace-dir PATH` | `-w` | `{data-dir}/workspace` | 工作区目录 |
+
+**向后兼容：** 第一个位置参数仍可作为配置文件路径（`cargo run -- config.json`）。
+
+### 路径推断逻辑
+
+- 未指定 `--data-dir` 时，默认为 `~/.slimbot`
+- 未指定 `--workspace-dir` 时，从 `--data-dir` 推断为 `{data-dir}/workspace`
+- 未指定 `--config` 时，默认为 `{data-dir}/config.json`
+- 如果显式指定了 `--config` 但文件不存在，程序会退出并报错
+
+### 使用示例
+
+```bash
+# 使用默认路径
+cargo run --
+
+# 指定配置文件（向后兼容的位置参数）
+cargo run -- /path/to/config.json
+
+# 指定数据目录，工作区自动推断为 /data/myapp/workspace
+cargo run -- -d /data/myapp
+
+# 完全自定义所有路径
+cargo run -- -c /etc/slimbot/config.json -d /opt/slimbot -w /opt/slimbot/ws
+
+# Setup 命令使用自定义路径
+cargo run -- -d /data/myapp setup
+```
 
 ## 数据目录
 
 会话数据和工作区文件存储在不同的目录中。目录结构如下：
 
 ```
-~/.slimbot/                         # data_dir（运行时/会话数据）
-└── workspace/                      # workspace_dir（Agent 文件、技能、会话）
-    ├── agent.md                    # Agent 行为定义
-    ├── user.md                     # 用户画像
-    ├── soul.md                     # Agent 人格
-    ├── tools.md                    # 工具使用指南
-    ├── skills/                     # 可选技能文件 (*.md)
+{data-dir}/                           # 应用数据目录（--data-dir）
+└── workspace/                        # 工作区目录（--workspace-dir 或默认推断）
+    ├── AGENTS.md                     # Agent 行为定义
+    ├── USER.md                       # 用户画像
+    ├── SOUL.md                       # Agent 人格
+    ├── TOOLS.md                      # 工具使用指南
+    ├── skills/                       # 可选技能文件 (*.md)
+    ├── memory/                       # MEMORY.md, history.jsonl
     └── sessions/
-        └── {session_id}.jsonl      # 会话消息持久化
+        └── {session_id}.jsonl        # 会话消息持久化
 ```
 
-`data_dir` 和 `workspace_dir` 是两个独立的配置项。默认情况下，`workspace_dir` 为 `{data_dir}/workspace`。
+`data-dir` 和 `workspace-dir` 通过命令行参数配置，不在 config.json 中存储。
 
 ## 配置结构
 
 ```json
 {
-  "data_dir": "~/.slimbot",
-  "workspace_dir": "~/.slimbot/workspace",
   "agent": { ... },
   "providers": { ... },
   "tools": [ ... ],
@@ -56,8 +84,6 @@ cargo run -- setup /path/to/custom.json   # 自定义路径
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `data_dir` | string | 否 | `~/.slimbot` | 运行时会话数据的基目录 |
-| `workspace_dir` | string | 否 | `{data_dir}/workspace` | Agent 文件、技能和会话的目录 |
 | `agent` | object | **是** | — | 单个 Agent 配置 |
 | `providers` | object | **是** | — | 命名 Provider 定义（键值映射） |
 | `tools` | array | 否 | `[]` | 注册的工具定义列表 |
@@ -198,8 +224,6 @@ Provider 级别字段：
 
 对已有配置运行 `cargo run -- setup` 时，应用以下规范化规则：
 
-- 空 `data_dir` → `~/.slimbot`
-- 空 `workspace_dir` → `{data_dir}/workspace`
 - 空 `agent.provider` → `"default"`
 - 空 `agent.max_iterations` → `40`
 - 空 `agent.timeout_seconds` → `120`
@@ -217,8 +241,6 @@ Provider 级别字段：
 
 ```json
 {
-  "data_dir": "/Users/takethat/.slimbot",
-  "workspace_dir": "/Users/takethat/.slimbot/workspace",
   "agent": {
     "provider": "siliconflow",
     "max_iterations": 40,
