@@ -11,6 +11,7 @@ use crate::utils::{
     TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS, build_persisted_reference,
     write_file_atomic,
 };
+use crate::{debug, error, warn};
 
 // Re-export for runner.rs
 pub use crate::utils::truncate_text_head_tail;
@@ -52,7 +53,7 @@ impl ToolManager {
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.name().to_string();
-        eprintln!("Registered tool: {}", name);
+        debug!("Registered tool: {}", name);
         self.tools.insert(name, tool);
     }
 
@@ -95,7 +96,7 @@ impl ToolManager {
                 if let Some(tool) = create_builtin_tool(&entry.name, &self.workspace_dir) {
                     self.register(tool);
                 } else {
-                    eprintln!("Unknown tool: {}", entry.name);
+                    warn!("Unknown tool: {}", entry.name);
                 }
             }
         }
@@ -155,14 +156,14 @@ pub fn persist_tool_result(
 
     let results_dir = workspace_dir.join(TOOL_RESULTS_DIR);
     if let Err(e) = fs::create_dir_all(&results_dir) {
-        eprintln!("Failed to create tool-results dir: {}", e);
+        error!("Failed to create tool-results dir: {}", e);
         return content.to_string();
     }
 
     let file_path = results_dir.join(format!("{}.txt", tool_call_id));
     if !file_path.exists() {
         if let Err(e) = write_file_atomic(&file_path, content) {
-            eprintln!("Failed to persist tool result: {}", e);
+            error!("Failed to persist tool result: {}", e);
             return content.to_string();
         }
     }

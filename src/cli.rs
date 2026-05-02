@@ -25,6 +25,14 @@ pub struct CliArgs {
     #[arg(short = 'w', long = "workspace-dir", global = true)]
     pub workspace_dir: Option<PathBuf>,
 
+    /// Log level: 0=debug, 1=info, 2=warning, 3=error, 4=fatal
+    #[arg(long = "log", default_value_t = 1, global = true)]
+    pub log: u8,
+
+    /// Log file path (writes to both stderr and file)
+    #[arg(long = "log-file", global = true)]
+    pub log_file: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

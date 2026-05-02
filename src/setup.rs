@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::bootstrap::{bootstrap_files, skill_files};
 use crate::config::{AgentConfig, Config, ProviderConfig};
 use crate::config_scheme::ConfigScheme;
+use crate::debug;
 use crate::path::PathManager;
 
 fn default_fallback_provider() -> ProviderConfig {
@@ -119,6 +120,7 @@ pub fn run_setup(
     data_dir: &str,
     workspace_dir: Option<&str>,
 ) -> Result<()> {
+    debug!("[setup] starting setup with data_dir={}", data_dir);
     let paths = PathManager::resolve(config_path, Some(data_dir), workspace_dir)?;
 
     // Use the config path from PathManager for setup

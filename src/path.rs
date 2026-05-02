@@ -171,7 +171,7 @@ impl PathManager {
 }
 
 /// Expand a leading `~` or `~/` in a path to the user's home directory.
-fn expand_home(path: &str) -> PathBuf {
+pub fn expand_home(path: &str) -> PathBuf {
     if path == "~" || path.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
             let rest = path.trim_start_matches('~');

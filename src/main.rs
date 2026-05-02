@@ -7,6 +7,8 @@ mod config_scheme;
 mod context;
 mod embed;
 mod io_scheduler;
+mod log;
+mod macros;
 mod memory;
 mod message_bus;
 mod path;
@@ -26,12 +28,21 @@ use clap::Parser;
 
 use crate::agent_loop::AgentLoop;
 use crate::cli::{CliArgs, Commands};
+use crate::log::LogLevel;
 use crate::message_bus::MessageBus;
 use crate::path::PathManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CliArgs::parse();
+
+    let log_level = LogLevel::from_u8(args.log).unwrap_or_else(|| {
+        LogLevel::Info
+    });
+    let log_file_path = args.log_file.as_ref().and_then(|p| {
+        p.to_str().map(|s| crate::path::expand_home(s))
+    });
+    crate::log::init(log_level, log_file_path.as_deref())?;
 
     // No subcommand: print help and exit
     if args.command.is_none() {

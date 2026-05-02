@@ -5,6 +5,7 @@ use tokio::task::JoinHandle;
 
 use crate::message_bus::BusRequest;
 use crate::session::TaskHook;
+use crate::{error, info, warn};
 
 /// Handle returned when a channel starts its I/O loop.
 /// Gives ChannelManager lifecycle visibility over channel I/O.
@@ -53,23 +54,23 @@ impl IoScheduler {
                             hook: hook.clone(),
                         };
                         if let Err(e) = tx.send(request).await {
-                            eprintln!("[{}] Failed to send inbound: {}", channel_name, e);
+                            error!("[{}] Failed to send inbound: {}", channel_name, e);
                             break;
                         }
                     }
                     Ok(Err(IoReadError::Eof)) => {
-                        eprintln!("[{}] EOF, exiting read loop", channel_name);
+                        info!("[{}] EOF, exiting read loop", channel_name);
                         break;
                     }
                     Ok(Err(IoReadError::Empty)) => {
                         continue;
                     }
                     Ok(Err(IoReadError::Other(e))) => {
-                        eprintln!("[{}] Read failed: {}", channel_name, e);
+                        warn!("[{}] Read failed: {}", channel_name, e);
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("[{}] Read task panicked: {}", channel_name, e);
+                        error!("[{}] Read task panicked: {}", channel_name, e);
                         break;
                     }
                 }

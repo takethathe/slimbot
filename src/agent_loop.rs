@@ -12,6 +12,7 @@ use crate::provider::{OpenAIProvider, Provider};
 use crate::runner::{AgentResult, AgentRunner};
 use crate::session::{SessionManager, SessionTaskBuilder, SharedSessionManager, TaskHook, ensure_session};
 use crate::tool::{Tool, ToolManager};
+use crate::error;
 
 pub struct AgentLoop {
     config: Arc<Config>,
@@ -116,7 +117,7 @@ impl AgentLoop {
                 };
 
                 if let Err(e) = ensure_session(&session_manager, &request.session_id).await {
-                    eprintln!("[AgentLoop] Session error: {}", e);
+                    error!("[AgentLoop] Session error: {}", e);
                     continue;
                 }
 

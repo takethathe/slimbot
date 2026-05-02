@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::TaskState;
+use crate::{debug, error};
 
 /// Channel trait, abstracts all I/O channels
 #[async_trait]
@@ -110,7 +111,7 @@ impl ChannelManager {
             let session_id = channel.session_id();
             let name = channel.name().to_string();
 
-            eprintln!("Registered channel: {} ({})", name, session_id);
+            debug!("Registered channel: {} ({})", name, session_id);
 
             // Start the channel's I/O loop via the scheduler
             let handle = channel.start_with_scheduler(&scheduler);
@@ -139,10 +140,10 @@ impl ChannelManager {
             let mut ch_guard = channels.lock().await;
             if let Some(channel) = ch_guard.get_mut(channel_id) {
                 if let Err(e) = channel.send_output(&result).await {
-                    eprintln!("[ChannelManager] Failed to send output to {}: {}", channel_id, e);
+                    error!("[ChannelManager] Failed to send output to {}: {}", channel_id, e);
                 }
             } else {
-                eprintln!("[ChannelManager] No channel found for id: {}", channel_id);
+                error!("[ChannelManager] No channel found for id: {}", channel_id);
             }
         }
     }
