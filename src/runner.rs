@@ -396,6 +396,7 @@ mod tests {
     use crate::provider::{LLMResponse, Provider, Usage, FinishReason};
     use crate::session::{Message, SessionTask, TaskHook, TaskState};
     use crate::tool::{Tool, ToolCall, ToolDefinition};
+    use crate::memory::MemoryStore;
 
     /// Mock provider that returns predefined responses in order.
     struct MockProvider {
@@ -509,7 +510,7 @@ mod tests {
     async fn make_test_env(
         tmp_dir: &tempfile::TempDir,
         tool_names: &[(&str, &str)],
-    ) -> (SharedSessionManager, Arc<ToolManager>, PathBuf) {
+    ) -> (SharedSessionManager, Arc<ToolManager>, PathBuf, Arc<MemoryStore>) {
         let path = tmp_dir.path();
         let session_dir = path.join("sessions");
         let workspace_dir = path.join("workspace");
@@ -522,10 +523,13 @@ mod tests {
             tm.register(Box::new(MockEchoTool::new(name, ret)));
         }
 
+        let ms = Arc::new(MemoryStore::new(&workspace_dir));
+        ms.init().unwrap();
+
         // Pre-create the default test session
         sm.lock().await.get_or_create("test-session").await.unwrap();
 
-        (sm, Arc::new(tm), workspace_dir)
+        (sm, Arc::new(tm), workspace_dir, ms)
     }
 
     fn make_task(content: &str) -> SessionTask {
@@ -542,9 +546,10 @@ mod tests {
         tm: Arc<ToolManager>,
         provider: Arc<dyn Provider>,
         workspace_dir: PathBuf,
+        ms: Arc<MemoryStore>,
     ) -> AgentRunner {
         AgentRunner::new(
-            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone()),
+            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms),
             tm,
             provider,
             sm,
@@ -563,14 +568,14 @@ mod tests {
     #[tokio::test]
     async fn test_direct_reply_no_tool_calls() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (sm, tm, wd) = make_test_env(&tmp, &[]).await;
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
         let provider = Arc::new(MockProvider::new(vec![LLMResponse {
             content: Some("Hello, world!".to_string()),
             tool_calls: None,
             finish_reason: FinishReason::Stop,
             usage: Usage { prompt_tokens: 10, prompt_cache_hit_tokens: 0, completion_tokens: 5, total_tokens: 15 },
         }]));
-        let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
+        let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let mut task = make_task("Say hi");
 
         let result = runner.run(&mut task, "test-session").await;
@@ -592,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_tool_call_with_content() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (sm, tm, wd) = make_test_env(&tmp, &[("echo", "echo-result")]).await;
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[("echo", "echo-result")]).await;
         let provider = Arc::new(MockProvider::new(vec![
             LLMResponse {
                 content: Some("Let me echo that for you.".to_string()),
@@ -607,7 +612,7 @@ mod tests {
                 usage: Usage { prompt_tokens: 40, prompt_cache_hit_tokens: 0, completion_tokens: 5, total_tokens: 45 },
             },
         ]));
-        let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
+        let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let mut task = make_task("Run echo");
 
         let result = runner.run(&mut task, "test-session").await;
@@ -644,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_tool_calls_content_preserved() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (sm, tm, wd) = make_test_env(
+        let (sm, tm, wd, ms) = make_test_env(
             &tmp,
             &[
                 ("list", "listing-contents"),
@@ -671,7 +676,7 @@ mod tests {
                 usage: Usage { prompt_tokens: 80, prompt_cache_hit_tokens: 0, completion_tokens: 15, total_tokens: 95 },
             },
         ]));
-        let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
+        let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let mut task = make_task("List and read");
 
         let result = runner.run(&mut task, "test-session").await;
@@ -714,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_tool_calls_with_empty_content() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (sm, tm, wd) =
+        let (sm, tm, wd, ms) =
             make_test_env(&tmp, &[("tool_a", "result-a"), ("tool_b", "result-b")]).await;
         let provider = Arc::new(MockProvider::new(vec![
             LLMResponse {
@@ -730,7 +735,7 @@ mod tests {
                 usage: Usage::default(),
             },
         ]));
-        let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
+        let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let mut task = make_task("Run two tools");
 
         let result = runner.run(&mut task, "test-session").await;
@@ -750,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn test_max_iterations_exceeded() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (sm, tm, wd) = make_test_env(&tmp, &[("loop_tool", "x")]).await;
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[("loop_tool", "x")]).await;
         // Provider always returns tool_calls, forcing the loop to continue
         let base_response = LLMResponse {
             content: None,
@@ -761,7 +766,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(
             std::iter::repeat(base_response).take(50).collect(),
         ));
-        let runner = make_runner(sm.clone(), tm, provider.clone(), wd);
+        let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let mut task = make_task("Loop forever");
 
         let result = runner.run(&mut task, "test-session").await;
@@ -779,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn test_task_state_transitions() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (sm, tm, wd) = make_test_env(&tmp, &[("tool1", "r1")]).await;
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[("tool1", "r1")]).await;
 
         // Capture state changes via TaskHook
         let (status_tx, mut status_rx) =
@@ -799,7 +804,7 @@ mod tests {
                 usage: Usage::default(),
             },
         ]));
-        let runner = make_runner(sm.clone(), tm, provider, wd);
+        let runner = make_runner(sm.clone(), tm, provider, wd, ms);
         let mut task = make_task("test");
         task.hook = TaskHook::new("test-session").with_status_channel(status_tx);
 
@@ -835,6 +840,9 @@ mod tests {
         let tm = Arc::new(tm);
         sm.lock().await.get_or_create("test-session").await.unwrap();
 
+        let ms = Arc::new(MemoryStore::new(&workspace_dir));
+        ms.init().unwrap();
+
         // Provider returns tool_error first, then a final reply after seeing the error
         let provider = Arc::new(MockProvider::new(vec![
             LLMResponse {
@@ -850,7 +858,7 @@ mod tests {
                 usage: Usage::default(),
             },
         ]));
-        let runner = make_runner(sm.clone(), tm, provider, workspace_dir);
+        let runner = make_runner(sm.clone(), tm, provider, workspace_dir, ms);
         let mut task = make_task("test");
 
         let result = runner.run(&mut task, "test-session").await;
@@ -870,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn test_persistence_and_reload() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (sm, tm, wd) = make_test_env(&tmp, &[]).await;
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
 
         let provider = Arc::new(MockProvider::new(vec![LLMResponse {
             content: Some("persist me".to_string()),
@@ -878,7 +886,7 @@ mod tests {
             finish_reason: FinishReason::Stop,
             usage: Usage::default(),
         }]));
-        let runner = make_runner(sm.clone(), tm, provider, wd);
+        let runner = make_runner(sm.clone(), tm, provider, wd, ms);
         let mut task = make_task("hello");
 
         let result = runner.run(&mut task, "test-session").await;
@@ -1080,6 +1088,9 @@ mod tests {
         let tm = Arc::new(tm);
         sm.lock().await.get_or_create("test-session").await.unwrap();
 
+        let ms = Arc::new(MemoryStore::new(&workspace_dir));
+        ms.init().unwrap();
+
         let provider = Arc::new(MockProvider::new(vec![
             LLMResponse {
                 content: Some("calling tool".to_string()),
@@ -1095,7 +1106,7 @@ mod tests {
             },
         ]));
         let runner = AgentRunner::new(
-            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone()),
+            ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms),
             tm,
             provider,
             sm.clone(),

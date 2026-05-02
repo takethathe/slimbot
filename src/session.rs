@@ -82,6 +82,9 @@ pub struct Session {
     pub task_queue: VecDeque<SessionTask>,
     pub tasks: HashMap<String, TaskState>,
     pub messages: Vec<Message>,
+    /// Number of messages already consolidated into history files.
+    /// Messages before this index are excluded from context building.
+    pub last_consolidated: usize,
 }
 
 pub struct SessionManager {
@@ -106,7 +109,8 @@ impl SessionManager {
         if self.sessions.contains_key(session_id) {
             return Ok(self.sessions.get(session_id).unwrap());
         }
-        let messages = Self::load_messages_from_jsonl(&self.session_dir, session_id)?;
+        let (messages, last_consolidated) =
+            Self::load_messages_from_jsonl(&self.session_dir, session_id)?;
         self.sessions.insert(
             session_id.to_string(),
             Session {
@@ -114,6 +118,7 @@ impl SessionManager {
                 task_queue: VecDeque::new(),
                 tasks: HashMap::new(),
                 messages,
+                last_consolidated,
             },
         );
         Ok(self.sessions.get(session_id).unwrap())
@@ -150,8 +155,23 @@ impl SessionManager {
     pub async fn get_messages(&self, session_id: &str) -> Vec<Message> {
         self.sessions
             .get(session_id)
+            .map(|s| s.messages[s.last_consolidated..].to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Return all messages including consolidated ones (for token counting).
+    pub async fn get_all_messages(&self, session_id: &str) -> Vec<Message> {
+        self.sessions
+            .get(session_id)
             .map(|s| s.messages.clone())
             .unwrap_or_default()
+    }
+
+    /// Update the consolidation cursor for a session.
+    pub async fn update_consolidation_cursor(&mut self, session_id: &str, new_cursor: usize) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.last_consolidated = new_cursor;
+        }
     }
 
     pub async fn persist(&self, session_id: &str) -> Result<()> {
@@ -161,6 +181,12 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
         let file_path = self.session_dir.join(format!("{}.jsonl", session_id));
         let mut file = std::fs::File::create(&file_path)?;
+        // Write metadata line first
+        let meta = serde_json::json!({
+            "_type": "metadata",
+            "last_consolidated": session.last_consolidated,
+        });
+        writeln!(file, "{}", serde_json::to_string(&meta)?)?;
         for msg in &session.messages {
             let line = serde_json::to_string(msg)?;
             writeln!(file, "{}", line)?;
@@ -168,24 +194,39 @@ impl SessionManager {
         Ok(())
     }
 
-    fn load_messages_from_jsonl(session_dir: &PathBuf, session_id: &str) -> Result<Vec<Message>> {
+    fn load_messages_from_jsonl(
+        session_dir: &PathBuf,
+        session_id: &str,
+    ) -> Result<(Vec<Message>, usize)> {
         let file_path = session_dir.join(format!("{}.jsonl", session_id));
         if !file_path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let file = std::fs::File::open(&file_path)?;
         let reader = std::io::BufReader::new(file);
         let mut messages = Vec::new();
+        let mut last_consolidated: usize = 0;
         for line in reader.lines() {
             let line = line?;
-            if line.trim().is_empty() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            let msg: Message =
-                serde_json::from_str(&line).context(format!("Invalid JSONL format: {}", line))?;
+            // Check for metadata line
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if meta.get("_type").and_then(|v| v.as_str()) == Some("metadata") {
+                    if let Some(lc) = meta.get("last_consolidated").and_then(|v| v.as_u64()) {
+                        last_consolidated = lc as usize;
+                    }
+                    continue;
+                }
+            }
+            // Regular message
+            let msg: Message = serde_json::from_str(trimmed)
+                .context(format!("Invalid JSONL format: {}", trimmed))?;
             messages.push(msg);
         }
-        Ok(messages)
+        Ok((messages, last_consolidated))
     }
 }
 
@@ -194,4 +235,39 @@ pub async fn ensure_session(sm: &SharedSessionManager, session_id: &str) -> Resu
     let mut guard: tokio::sync::MutexGuard<'_, SessionManager> = sm.lock().await;
     guard.get_or_create(session_id).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_last_consolidated_persistence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        // Add some messages
+        sm.add_message("s1", Message::User { content: "a".to_string() }).await.unwrap();
+        sm.add_message("s1", Message::Assistant { content: Some("b".to_string()), tool_calls: None }).await.unwrap();
+        sm.add_message("s1", Message::User { content: "c".to_string() }).await.unwrap();
+        sm.add_message("s1", Message::Assistant { content: Some("d".to_string()), tool_calls: None }).await.unwrap();
+
+        // Simulate consolidation: first 2 messages are consolidated
+        sm.update_consolidation_cursor("s1", 2).await;
+        sm.persist("s1").await.unwrap();
+
+        // Reload with a fresh SessionManager — load directly from disk
+        let (msgs, lc) = SessionManager::load_messages_from_jsonl(&session_dir, "s1").unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(lc, 2);
+
+        // Create a session manager and verify get_messages skips consolidated
+        let mut sm3 = SessionManager::new(session_dir).unwrap();
+        let session = sm3.get_or_create("s1").await.unwrap();
+        assert_eq!(session.last_consolidated, 2);
+        let unconsolidated = sm3.get_messages("s1").await;
+        assert_eq!(unconsolidated.len(), 2); // only messages after index 2
+    }
 }

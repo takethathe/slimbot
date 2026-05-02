@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::context::ContextBuilder;
+use crate::memory::MemoryStore;
 use crate::provider::{OpenAIProvider, Provider};
 use crate::runner::{AgentResult, AgentRunner};
 use crate::session::{SessionManager, SessionTask, SharedSessionManager};
@@ -15,6 +16,7 @@ pub struct AgentLoop {
     provider: Arc<dyn Provider>,
     tool_manager: Arc<ToolManager>,
     session_manager: SharedSessionManager,
+    memory_store: Arc<MemoryStore>,
 }
 
 impl AgentLoop {
@@ -32,11 +34,15 @@ impl AgentLoop {
 
         let session_manager = Arc::new(Mutex::new(SessionManager::new(config.session_dir())?));
 
+        let memory_store = Arc::new(MemoryStore::new(&config.workspace_dir()));
+        memory_store.init()?;
+
         Ok(Self {
             config,
             provider,
             tool_manager: Arc::new(tool_manager),
             session_manager,
+            memory_store,
         })
     }
 
@@ -63,6 +69,7 @@ impl AgentLoop {
                 self.session_manager.clone(),
                 self.tool_manager.clone(),
                 self.config.workspace_dir(),
+                self.memory_store.clone(),
             ),
             self.tool_manager.clone(),
             self.provider.clone(),

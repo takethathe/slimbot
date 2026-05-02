@@ -9,7 +9,7 @@
 ## 构建和运行
 
 - **构建：** `cargo build`
-- **运行：** `cargo run -- <config.json路径>` （默认 `~/.slimbot/config.json`）
+- **运行：** `cargo run -- setup` （初始化配置、目录和 bootstrap 文件），然后 `cargo run -- <config.json路径>` （默认 `~/.slimbot/config.json`）
 - **快速检查：** `cargo check`
 - **Rust Edition：** 2024
 
@@ -25,6 +25,9 @@ slimbot/
 └── src/
     ├── main.rs         # Entry: load config → init AgentLoop → MessageBus → ChannelManager
     ├── config.rs       # Config: config.json read/write, AgentConfig/ProviderConfig/ChannelEntry
+    ├── config_scheme.rs # ConfigScheme: default values, normalization, validation
+    ├── bootstrap.rs    # Bootstrap templates: AGENTS.md, USER.md, SOUL.md, TOOLS.md
+    ├── setup.rs        # Setup command: config normalization + directory + bootstrap creation
     ├── tool.rs         # Tool trait + ToolManager: tool registration & OpenAI function calling conversion
     ├── tools/          # Built-in tool implementations
     │   ├── mod.rs      # Factory function + resolve_data_path() path validation
@@ -71,16 +74,18 @@ ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 →
 ```
 ~/.slimbot/                         # data_dir (默认，运行时数据)
 └── workspace/                      # workspace_dir (默认，工作区)
-    ├── agent.md                    # Agent 行为定义
-    ├── user.md                     # 用户画像
-    ├── soul.md                     # Agent 人格
-    ├── tools.md                    # 工具使用指南
+    ├── AGENTS.md                   # Agent 行为定义（由 setup 生成）
+    ├── USER.md                     # 用户画像（由 setup 生成）
+    ├── SOUL.md                     # Agent 人格（由 setup 生成）
+    ├── TOOLS.md                    # 工具使用指南（由 setup 生成）
     ├── skills/                     # 可选 skill 文件 (*.md)
     └── sessions/
         └── {session_id}.jsonl      # 会话消息持久化
 ```
 
 `data_dir` 和 `workspace_dir` 是两个独立配置项。`workspace_dir` 默认值为 `{data_dir}/workspace`。
+
+运行 `cargo run -- setup` 时自动创建上述目录和 4 个 bootstrap 文件。若文件未修改（与模板一致），`context.rs` 加载时会跳过，节省 token。
 
 ## 关键设计决策
 
@@ -96,15 +101,17 @@ ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 →
 
 所有开发任务遵循 **规划 → 实现 → 测试 → 更新文档** 四步流程：
 
-1. **规划**：明确目标和实现方案，确认后再开始编码
-2. **实现**：按照设计方案编写代码，包括功能代码和对应的测试代码
-3. **测试**：使用 `cargo check` / `cargo build` / `cargo test` 验证代码正确性，确保新增测试通过
-4. **更新文档**：在 `docs/` 目录下补充或更新相关文档
+1. **确认需求**：收到用户需求后，先确认理解是否正确，再开始后续工作
+2. **规划**：明确目标和实现方案，确认后再开始编码
+3. **实现**：按照设计方案编写代码，包括功能代码和对应的测试代码
+4. **测试**：使用 `cargo check` / `cargo build` / `cargo test` 验证代码正确性，确保新增测试通过
+5. **更新文档**：在 `docs/` 目录下补充或更新相关文档
 
 ### 文档管理
 
 - **README 文档**：放在项目根目录
 - **其它所有文档**（设计文档、API 文档、模块说明等）：统一放在 `docs/` 目录下
+- **TODO 管理**：新增功能计划或代码中的 TODO 必须以简洁的语言记录到 `docs/TODO.md` 中。工作流程的"更新文档"步骤需包含：添加/完成 TODO 记录，以及编写相关技术文档
 
 ### Git 提交
 

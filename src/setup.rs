@@ -1,5 +1,7 @@
 use anyhow::Result;
+use std::path::Path;
 
+use crate::bootstrap::{bootstrap_files, skill_files};
 use crate::config::{AgentConfig, Config, ProviderConfig};
 use crate::config_scheme::ConfigScheme;
 
@@ -153,7 +155,14 @@ pub fn run_setup(config_path: Option<&str>) -> Result<()> {
     }
 
     // Print config summary (skip validation — api_key may be empty)
-    let config = load_config_with_defaults(path, &scheme)?;
+    let mut config = load_config_with_defaults(path, &scheme)?;
+    scheme.normalize(&mut config);
+
+    // Create directories and bootstrap files
+    if let Err(e) = create_directories_and_bootstrap(&config) {
+        eprintln!("Warning: failed to create workspace directories: {}", e);
+    }
+
     eprintln!("\nConfig summary:");
     eprintln!("  data_dir: {}", config.data_dir);
     eprintln!("  workspace_dir: {}", config.workspace_dir);
@@ -185,4 +194,44 @@ fn mask_api_key(key: &str) -> String {
         return "****".to_string();
     }
     format!("{}****{}", &key[..4], &key[key.len() - 4..])
+}
+
+/// Create workspace directories and write bootstrap files.
+/// Skips files that already exist.
+fn create_directories_and_bootstrap(config: &Config) -> Result<()> {
+    let workspace = config.workspace_dir();
+    let data = Path::new(&config.data_dir);
+
+    // Create directories
+    std::fs::create_dir_all(data)?;
+    std::fs::create_dir_all(&workspace)?;
+    std::fs::create_dir_all(workspace.join("skills"))?;
+    std::fs::create_dir_all(workspace.join("memory"))?;
+
+    // Write bootstrap files (skip if already exists)
+    for (filename, template) in bootstrap_files() {
+        let path = workspace.join(filename);
+        if path.exists() {
+            eprintln!("  {} already exists, skipping.", filename);
+        } else {
+            std::fs::write(&path, template)?;
+            eprintln!("  Created {}.", filename);
+        }
+    }
+
+    // Write skill files (skip if already exists)
+    for (_filename, content, dest) in skill_files() {
+        let path = workspace.join(dest);
+        if path.exists() {
+            eprintln!("  {} already exists, skipping.", dest);
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content)?;
+            eprintln!("  Created {}.", dest);
+        }
+    }
+
+    Ok(())
 }

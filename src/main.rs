@@ -1,8 +1,11 @@
 mod agent_loop;
+mod bootstrap;
 mod channel;
 mod config;
 mod config_scheme;
 mod context;
+mod embed;
+mod memory;
 mod message_bus;
 mod provider;
 mod runner;
