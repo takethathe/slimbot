@@ -53,16 +53,18 @@ async fn main() -> Result<()> {
     // Initialize MessageBus (pure channel endpoints, no background tasks)
     let message_bus = Arc::new(MessageBus::new());
 
+    // Load config once
+    let config = Arc::new(crate::config::Config::load(paths.config_path().to_str().unwrap())?);
+
     // Initialize AgentLoop (spawns inbound listener task)
-    let agent_loop = AgentLoop::from_config(&paths, message_bus.clone()).await?;
+    let agent_loop = AgentLoop::from_config(&paths, message_bus.clone(), config.clone()).await?;
     agent_loop.start_inbound();
 
     // Initialize ChannelManager (auto-registers built-in channel factories)
-    let mut channel_manager = ChannelManager::new(message_bus);
+    let mut channel_manager = ChannelManager::new(message_bus, config.clone());
 
-    // Load channels from config
-    let config = crate::config::Config::load(paths.config_path().to_str().unwrap())?;
-    channel_manager.init_from_config(&config.channels).await?;
+    // Initialize channels from config
+    channel_manager.init().await?;
 
     // Run outbound routing loop — blocks until all channels close
     channel_manager.run().await;

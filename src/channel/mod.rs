@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use crate::config::ChannelEntry;
+use crate::config::Config;
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::TaskState;
 
@@ -58,14 +58,16 @@ pub struct ChannelManager {
     channels: Arc<Mutex<HashMap<String, Box<dyn Channel>>>>,
     factories: HashMap<String, Box<dyn ChannelFactory>>,
     message_bus: Arc<MessageBus>,
+    config: Arc<Config>,
 }
 
 impl ChannelManager {
-    pub fn new(message_bus: Arc<MessageBus>) -> Self {
+    pub fn new(message_bus: Arc<MessageBus>, config: Arc<Config>) -> Self {
         let mut cm = Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
             factories: HashMap::new(),
             message_bus,
+            config,
         };
         // Auto-register all built-in channel factories
         cm.register_factory("cli", Box::new(CliChannelFactory));
@@ -77,12 +79,12 @@ impl ChannelManager {
         self.factories.insert(type_name.to_string(), factory);
     }
 
-    /// Initialize channels from config entries
-    pub async fn init_from_config(&mut self, entries: &[ChannelEntry]) -> Result<()> {
+    /// Initialize channels from stored config entries
+    pub async fn init(&mut self) -> Result<()> {
         let channels = self.channels.clone();
         let inbound_tx = self.message_bus.inbound_tx();
 
-        for entry in entries {
+        for entry in &self.config.channels {
             if !entry.enabled {
                 continue;
             }
@@ -136,7 +138,6 @@ impl ChannelManager {
 mod tests {
     use super::*;
     use crate::message_bus::BusResult;
-    use std::sync::Arc;
 
     /// Dummy channel for testing
     struct TestChannel {

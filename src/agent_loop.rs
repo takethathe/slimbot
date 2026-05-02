@@ -14,7 +14,7 @@ use crate::session::{SessionManager, SessionTask, SharedSessionManager, ensure_s
 use crate::tool::{Tool, ToolManager};
 
 pub struct AgentLoop {
-    config: Config,
+    config: Arc<Config>,
     workspace_dir: PathBuf,
     provider: Arc<dyn Provider>,
     tool_manager: Arc<ToolManager>,
@@ -24,8 +24,11 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
-    pub async fn from_config(paths: &PathManager, message_bus: Arc<MessageBus>) -> Result<Self> {
-        let config = Config::load(paths.config_path().to_str().unwrap())?;
+    pub async fn from_config(
+        paths: &PathManager,
+        message_bus: Arc<MessageBus>,
+        config: Arc<Config>,
+    ) -> Result<Self> {
 
         let provider_config = config
             .providers
