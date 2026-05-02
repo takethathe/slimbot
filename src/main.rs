@@ -23,7 +23,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::agent_loop::AgentLoop;
-use crate::channel::{ChannelManager, CliChannelFactory};
+use crate::channel::ChannelManager;
 use crate::cli::{CliArgs, Commands};
 use crate::message_bus::MessageBus;
 use crate::path::PathManager;
@@ -50,22 +50,22 @@ async fn main() -> Result<()> {
 
     eprintln!("SlimBot starting... config file: {}", paths.config_path().display());
 
-    // Initialize AgentLoop
-    let agent_loop = AgentLoop::from_config(&paths).await?;
-    let agent_loop = Arc::new(agent_loop);
+    // Initialize MessageBus (pure channel endpoints, no background tasks)
+    let message_bus = Arc::new(MessageBus::new());
 
-    // Initialize MessageBus
-    let message_bus = Arc::new(MessageBus::new(agent_loop));
+    // Initialize AgentLoop (spawns inbound listener task)
+    let agent_loop = AgentLoop::from_config(&paths, message_bus.clone()).await?;
+    agent_loop.start_inbound();
 
-    // Initialize ChannelManager
+    // Initialize ChannelManager (auto-registers built-in channel factories)
     let mut channel_manager = ChannelManager::new(message_bus);
 
     // Load channels from config
     let config = crate::config::Config::load(paths.config_path().to_str().unwrap())?;
-    channel_manager.init_from_config(&config.channels, &[Box::new(CliChannelFactory)])?;
+    channel_manager.init_from_config(&config.channels).await?;
 
-    // Start channel loop
-    channel_manager.run().await?;
+    // Run outbound routing loop — blocks until all channels close
+    channel_manager.run().await;
 
     Ok(())
 }

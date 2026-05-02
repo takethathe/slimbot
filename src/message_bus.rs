@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::agent_loop::AgentLoop;
 use crate::session::{SessionManager, SessionTask, TaskHook, TaskState, ensure_session};
 
-pub struct MessageBus {
-    agent_loop: Arc<AgentLoop>,
-}
+/// Capacity for inbound/outbound mpsc channels. Large enough to absorb bursts,
+/// small enough to bound memory. If inbound fills, the channel's I/O loop
+/// blocks on send_inbound — it stops reading user input until space frees up.
+const INBOUND_CAPACITY: usize = 32;
+const OUTBOUND_CAPACITY: usize = 32;
 
 pub struct BusRequest {
     pub session_id: String,
@@ -24,55 +27,45 @@ pub struct BusResult {
     pub content: String,
 }
 
+/// MessageBus: pure async channel endpoints. No background tasks.
+/// AgentLoop owns the inbound listener; ChannelManager owns the outbound listener.
+pub struct MessageBus {
+    inbound_tx: mpsc::Sender<BusRequest>,
+    inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<BusRequest>>>,
+    outbound_tx: mpsc::Sender<BusResult>,
+    outbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<BusResult>>>,
+}
+
 impl MessageBus {
-    pub fn new(agent_loop: Arc<AgentLoop>) -> Self {
-        Self { agent_loop }
+    pub fn new() -> Self {
+        let (inbound_tx, inbound_rx) = mpsc::channel::<BusRequest>(INBOUND_CAPACITY);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<BusResult>(OUTBOUND_CAPACITY);
+
+        Self {
+            inbound_tx,
+            inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
+            outbound_tx,
+            outbound_rx: Arc::new(tokio::sync::Mutex::new(outbound_rx)),
+        }
     }
 
-    pub async fn send(&self, request: BusRequest) -> Result<BusResult> {
-        // 1. Ensure session exists
-        ensure_session(&self.agent_loop.session_manager(), &request.session_id).await?;
+    /// Sender for channels to submit inbound requests
+    pub fn inbound_tx(&self) -> mpsc::Sender<BusRequest> {
+        self.inbound_tx.clone()
+    }
 
-        // 2. Wrap as SessionTask
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let task = SessionTask {
-            id: task_id.clone(),
-            content: request.content,
-            hook: request.hook,
-            state: TaskState::Pending,
-        };
+    /// Receiver for AgentLoop to listen on for inbound requests
+    pub fn inbound_rx(&self) -> Arc<tokio::sync::Mutex<mpsc::Receiver<BusRequest>>> {
+        self.inbound_rx.clone()
+    }
 
-        // 3. Enqueue
-        {
-            let sm = self.agent_loop.session_manager();
-            let mut guard: tokio::sync::MutexGuard<'_, SessionManager> = sm.lock().await;
-            guard.enqueue_task(&request.session_id, task).await;
-        }
+    /// Sender for AgentLoop to publish results
+    pub fn outbound_tx(&self) -> mpsc::Sender<BusResult> {
+        self.outbound_tx.clone()
+    }
 
-        // 4. Dequeue
-        let mut task = {
-            let sm = self.agent_loop.session_manager();
-            let mut guard: tokio::sync::MutexGuard<'_, SessionManager> = sm.lock().await;
-            guard.dequeue_task(&request.session_id).await
-        }
-        .ok_or_else(|| anyhow!("Queue is empty"))?;
-
-        // 5. Execute
-        let agent_result = self
-            .agent_loop
-            .run_task(&request.session_id, &mut task, request.channel_inject)
-            .await;
-
-        let content = if agent_result.success {
-            agent_result.content
-        } else {
-            format!("Error: {}", agent_result.content)
-        };
-
-        Ok(BusResult {
-            session_id: request.session_id,
-            task_id: task.id,
-            content,
-        })
+    /// Receiver for ChannelManager to listen on for outbound results
+    pub fn outbound_rx(&self) -> Arc<tokio::sync::Mutex<mpsc::Receiver<BusResult>>> {
+        self.outbound_rx.clone()
     }
 }

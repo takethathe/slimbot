@@ -3,12 +3,16 @@ mod cli;
 #[allow(unused_imports)]
 pub use cli::{CliChannel, CliChannelFactory};
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use crate::config::ChannelEntry;
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
-use crate::session::{TaskHook, TaskState};
+use crate::session::TaskState;
 
 /// Channel trait, abstracts all I/O channels
 #[async_trait]
@@ -31,6 +35,13 @@ pub trait Channel: Send + Sync {
     fn session_id(&self) -> String {
         format!("{}:{}", self.id(), self.chat_id())
     }
+    /// Start the channel's internal client read loop. Called by ChannelManager after creation.
+    fn start(&self, inbound_tx: tokio::sync::mpsc::Sender<BusRequest>);
+    /// Send output to client. Called by ChannelManager's outbound router.
+    /// Default implementation delegates to write_output.
+    async fn send_output(&mut self, result: &BusResult) -> Result<()> {
+        self.write_output(result).await
+    }
 }
 
 /// Channel factory trait, creates channels by type from config
@@ -41,140 +52,164 @@ pub trait ChannelFactory: Send + Sync {
     fn create(&self, config: &serde_json::Value) -> Result<Box<dyn Channel>>;
 }
 
-/// ChannelManager: manages all channel instances and drives I/O
+/// ChannelManager: manages all channel instances and routes outbound messages.
+/// Automatically registers all built-in channel factories on construction.
 pub struct ChannelManager {
-    channels: Vec<Box<dyn Channel>>,
-    message_bus: std::sync::Arc<MessageBus>,
+    channels: Arc<Mutex<HashMap<String, Box<dyn Channel>>>>,
+    factories: HashMap<String, Box<dyn ChannelFactory>>,
+    message_bus: Arc<MessageBus>,
 }
 
 impl ChannelManager {
-    pub fn new(message_bus: std::sync::Arc<MessageBus>) -> Self {
-        Self {
-            channels: Vec::new(),
+    pub fn new(message_bus: Arc<MessageBus>) -> Self {
+        let mut cm = Self {
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            factories: HashMap::new(),
             message_bus,
-        }
+        };
+        // Auto-register all built-in channel factories
+        cm.register_factory("cli", Box::new(CliChannelFactory));
+        cm
     }
 
-    /// Create and register channels from config and factory list
-    pub fn init_from_config(
-        &mut self,
-        entries: &[ChannelEntry],
-        factories: &[Box<dyn ChannelFactory>],
-    ) -> Result<()> {
+    /// Register a factory for a channel type
+    pub fn register_factory(&mut self, type_name: &str, factory: Box<dyn ChannelFactory>) {
+        self.factories.insert(type_name.to_string(), factory);
+    }
+
+    /// Initialize channels from config entries
+    pub async fn init_from_config(&mut self, entries: &[ChannelEntry]) -> Result<()> {
+        let channels = self.channels.clone();
+        let inbound_tx = self.message_bus.inbound_tx();
+
         for entry in entries {
             if !entry.enabled {
                 continue;
             }
-            let factory = factories
-                .iter()
-                .find(|f| f.channel_type() == entry.r#type)
+            let factory = self
+                .factories
+                .get(&entry.r#type)
                 .ok_or_else(|| anyhow::anyhow!("Unregistered channel type: {}", entry.r#type))?;
             let channel = factory.create(&entry.config)?;
-            eprintln!(
-                "Registered channel: {} ({})",
-                channel.name(),
-                channel.session_id()
-            );
-            self.channels.push(channel);
+            let id = channel.id().to_string();
+            let session_id = channel.session_id();
+            let name = channel.name().to_string();
+
+            eprintln!("Registered channel: {} ({})", name, session_id);
+
+            // Start the channel's internal read loop
+            channel.start(inbound_tx.clone());
+
+            // Insert into the shared map for outbound routing access
+            channels.lock().await.insert(id, channel);
         }
         Ok(())
     }
 
-    /// Register a channel
-    pub fn register(&mut self, channel: Box<dyn Channel>) {
-        eprintln!("Registered channel: {}", channel.name());
-        self.channels.push(channel);
+    /// Run the outbound routing loop. Blocks the calling task until the
+    /// outbound channel is closed. This is the main event loop for the system.
+    pub async fn run(&self) {
+        let channels = self.channels.clone();
+        let outbound_rx = self.message_bus.outbound_rx();
+
+        let mut rx_guard = outbound_rx.lock().await;
+        while let Some(result) = rx_guard.recv().await {
+            let channel_id = result
+                .session_id
+                .split(':')
+                .next()
+                .unwrap_or("");
+
+            let mut ch_guard = channels.lock().await;
+            if let Some(channel) = ch_guard.get_mut(channel_id) {
+                if let Err(e) = channel.send_output(&result).await {
+                    eprintln!("[ChannelManager] Failed to send output to {}: {}", channel_id, e);
+                }
+            } else {
+                eprintln!("[ChannelManager] No channel found for id: {}", channel_id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message_bus::BusResult;
+    use std::sync::Arc;
+
+    /// Dummy channel for testing
+    struct TestChannel {
+        channel_id: String,
+        chat_id: String,
     }
 
-    /// Start I/O loops for all channels
-    pub async fn run(&mut self) -> Result<()> {
-        // Take ownership of channels to move them into spawned tasks
-        let channels = std::mem::take(&mut self.channels);
-
-        for mut channel in channels {
-            let session_id = channel.session_id();
-
-            // Create status event channel for each channel
-            let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<(String, TaskState)>(32);
-
-            // Send state changes to Channel via TaskHook
-            let hook = TaskHook::new(&session_id).with_status_channel(status_tx);
-
-            // Background task: listen for status events from TaskHook, display via Channel
-            let sid = session_id.clone();
-            let channel_name = channel.name().to_string();
-            tokio::spawn(async move {
-                while let Some((_session_id, state)) = status_rx.recv().await {
-                    match &state {
-                        TaskState::Running { current_iteration } => {
-                            eprintln!(
-                                "[{}] [{}] Running - iteration {}",
-                                channel_name, sid, current_iteration
-                            );
-                        }
-                        TaskState::Completed { .. } => {
-                            eprintln!("[{}] [{}] Completed", channel_name, sid);
-                        }
-                        TaskState::Failed { error } => {
-                            eprintln!("[{}] [{}] Failed - {}", channel_name, sid, error);
-                        }
-                        TaskState::Pending => {}
-                    }
-                }
-            });
-
-            // Spawn a concurrent task for each channel's I/O loop
-            let message_bus = self.message_bus.clone();
-            tokio::spawn(async move {
-                loop {
-                    let input = match channel.read_input().await {
-                        Ok(s) if s.is_empty() => continue,
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("[{}] Read failed: {}", channel.name(), e);
-                            continue;
-                        }
-                    };
-
-                    // ChannelManager prepares inject content ahead of time
-                    let channel_inject = match channel.prepare_inject().await {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            eprintln!("[{}] Prepare inject failed: {}", channel.name(), e);
-                            None
-                        }
-                    };
-
-                    let request = BusRequest {
-                        session_id: channel.session_id(),
-                        content: input,
-                        channel_inject,
-                        hook: hook.clone(),
-                    };
-
-                    let bus = message_bus.clone();
-                    let result = match tokio::spawn(async move { bus.send(request).await }).await {
-                        Ok(Ok(r)) => r,
-                        Ok(Err(e)) => {
-                            eprintln!("[{}] Bus error: {}", channel.name(), e);
-                            continue;
-                        }
-                        Err(e) => {
-                            eprintln!("[{}] Spawn join error: {}", channel.name(), e);
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = channel.write_output(&result).await {
-                        eprintln!("[{}] Write output failed: {}", channel.name(), e);
-                    }
-                }
-            });
+    impl TestChannel {
+        fn new(id: &str, chat: &str) -> Self {
+            Self {
+                channel_id: id.to_string(),
+                chat_id: chat.to_string(),
+            }
         }
+    }
 
-        // Wait forever — each channel runs in its own spawned task
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    #[async_trait]
+    impl Channel for TestChannel {
+        fn id(&self) -> &str {
+            &self.channel_id
         }
+        fn name(&self) -> &str {
+            "Test"
+        }
+        fn chat_id(&self) -> &str {
+            &self.chat_id
+        }
+        async fn read_input(&mut self) -> Result<String> {
+            Ok("test input".to_string())
+        }
+        async fn write_output(&mut self, _result: &BusResult) -> Result<()> {
+            Ok(())
+        }
+        async fn write_status(&mut self, _session_id: &str, _state: &TaskState) -> Result<()> {
+            Ok(())
+        }
+        async fn prepare_inject(&self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn start(&self, _inbound_tx: tokio::sync::mpsc::Sender<BusRequest>) {
+            // no-op for test
+        }
+    }
+
+    /// Dummy factory for TestChannel
+    struct TestChannelFactory;
+
+    impl ChannelFactory for TestChannelFactory {
+        fn channel_type(&self) -> &str {
+            "test"
+        }
+        fn create(&self, _config: &serde_json::Value) -> Result<Box<dyn Channel>> {
+            Ok(Box::new(TestChannel::new("test", "default")))
+        }
+    }
+
+    #[test]
+    fn test_channel_session_id() {
+        let ch = TestChannel::new("cli", "abc123");
+        assert_eq!(ch.session_id(), "cli:abc123");
+    }
+
+    #[test]
+    fn test_channel_id_name_chat() {
+        let ch = TestChannel::new("web", "chat1");
+        assert_eq!(ch.id(), "web");
+        assert_eq!(ch.name(), "Test");
+        assert_eq!(ch.chat_id(), "chat1");
+    }
+
+    #[test]
+    fn test_factories_hashmap() {
+        let factories: HashMap<String, Box<dyn ChannelFactory>> = HashMap::new();
+        assert!(factories.is_empty());
     }
 }

@@ -1,9 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use std::io::Write;
 
 use super::{Channel, ChannelFactory};
-use crate::message_bus::BusResult;
-use crate::session::TaskState;
+use crate::message_bus::{BusRequest, BusResult};
+use crate::session::{TaskHook, TaskState};
+use tokio::sync::mpsc;
 
 /// CLI channel implementation
 pub struct CliChannel {
@@ -89,5 +91,52 @@ impl Channel for CliChannel {
 
     async fn prepare_inject(&self) -> Result<String> {
         Ok(String::new())
+    }
+
+    fn start(&self, inbound_tx: mpsc::Sender<BusRequest>) {
+        let session_id = self.session_id();
+        let channel_name = self.name().to_string();
+        let prompt = self.prompt.clone();
+        let hook = TaskHook::new(&session_id);
+
+        // Use spawn_blocking for blocking stdin read to avoid blocking the tokio runtime
+        tokio::task::spawn_blocking(move || {
+            loop {
+                print!("{}", prompt);
+                let _ = std::io::stdout().flush();
+                let mut input = String::new();
+                match std::io::stdin().read_line(&mut input) {
+                    Ok(0) => {
+                        eprintln!("[{}] EOF, exiting read loop", channel_name);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("[{}] Read failed: {}", channel_name, e);
+                        continue;
+                    }
+                }
+
+                let input = input.trim().to_string();
+                if input.is_empty() {
+                    continue;
+                }
+
+                let request = BusRequest {
+                    session_id: session_id.clone(),
+                    content: input,
+                    channel_inject: None,
+                    hook: hook.clone(),
+                };
+
+                let rt = tokio::runtime::Handle::current();
+                let tx = inbound_tx.clone();
+                rt.block_on(async {
+                    if let Err(e) = tx.send(request).await {
+                        eprintln!("[{}] Failed to send inbound: {}", channel_name, e);
+                    }
+                });
+            }
+        });
     }
 }
