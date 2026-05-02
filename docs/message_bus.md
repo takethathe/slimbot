@@ -4,92 +4,96 @@
 
 ## 概述
 
-`MessageBus` 是通道与 Agent 之间的桥梁，负责将通道传来的用户请求包装为任务，交由 AgentRunner 执行后返回结果。
+`MessageBus` 是纯异步 mpsc 通道端点，**不启动任何后台任务**。它仅为通道与 AgentLoop 之间提供消息传递通道，具体的任务处理逻辑由 AgentLoop 负责。
 
 ## 结构
 
 ```rust
 pub struct MessageBus {
-    agent_loop: Arc<AgentLoop>,    // Agent 循环的共享引用
+    inbound_tx: mpsc::Sender<BusRequest>,
+    inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<BusRequest>>>,
+    outbound_tx: mpsc::Sender<BusResult>,
+    outbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<BusResult>>>,
 }
 
 pub struct BusRequest {
-    pub session_id: String,         // 目标 Session ID
-    pub content: String,            // 用户输入内容
-    pub channel_inject: Option<String>,  // 通道注入的额外信息
-    pub hook: TaskHook,             // 状态通知钩子
+    pub session_id: String,
+    pub content: String,
+    pub channel_inject: Option<String>,
+    pub hook: TaskHook,
 }
 
 pub struct BusResult {
-    pub session_id: String,         // 所属 Session ID
-    pub task_id: String,            // 任务唯一 ID
-    pub content: String,            // Agent 回复内容
+    pub session_id: String,
+    pub task_id: String,
+    pub content: String,
 }
 ```
 
-## `send` 方法流程
+## 端点方法
+
+### `inbound_tx()`
+
+返回 `mpsc::Sender<BusRequest>`，通道使用此端点提交用户请求。
 
 ```rust
-pub async fn send(&self, request: BusRequest) -> Result<BusResult>
+let tx = message_bus.inbound_tx();
+tx.send(request).await?;
 ```
 
-执行以下步骤：
+### `inbound_rx()`
 
-### 1. 确保 Session 存在
-
-调用 `ensure_session()` 确保 `request.session_id` 对应的 Session 已创建。如果 Session 不存在，会自动创建并尝试从 JSONL 加载历史。
-
-### 2. 封装为 SessionTask
-
-生成 UUID 作为 task_id，将 `BusRequest` 包装为：
+返回 `Arc<Mutex<Receiver<BusRequest>>>`，AgentLoop 使用此端点监听入站请求。
 
 ```rust
-SessionTask {
-    id: task_id,
-    content: request.content,
-    hook: request.hook,
-    state: TaskState::Pending,
+let rx = message_bus.inbound_rx();
+while let Some(request) = rx.lock().await.recv().await {
+    // 处理请求
 }
 ```
 
-### 3. 入队
+### `outbound_tx()`
 
-将 SessionTask 加入对应 Session 的 `task_queue`（FIFO）。
-
-### 4. 出队
-
-立即从队列中取出该任务。（当前实现为同步入队后立即出队，预留了异步队列能力。）
-
-### 5. 执行
-
-调用 `AgentLoop.run_task()` 执行 ReAct 循环，等待结果返回。
-
-### 6. 返回结果
+返回 `mpsc::Sender<BusResult>`，AgentLoop 使用此端点发布处理结果。
 
 ```rust
-BusResult {
-    session_id: request.session_id,
-    task_id: task_id,
-    content: result,    // AgentRunner 返回的最终文本
+let tx = message_bus.outbound_tx();
+tx.send(result).await?;
+```
+
+### `outbound_rx()`
+
+返回 `Arc<Mutex<Receiver<BusResult>>>`，ChannelManager 使用此端点监听出站结果并路由到对应通道。
+
+```rust
+let rx = message_bus.outbound_rx();
+while let Some(result) = rx.lock().await.recv().await {
+    // 根据 session_id 提取 channel_id，路由到对应通道
 }
 ```
 
-## 设计说明
+## 通道容量
 
-当前 MessageBus 的实现是**同步**的：入队 → 出队 → 执行在一个 `send()` 调用内完成。这种设计简化了流程，但保留了队列结构，未来可以扩展为：
+- `INBOUND_CAPACITY`: 32
+- `OUTBOUND_CAPACITY`: 32
 
-- 真正的异步任务队列，支持多任务排队
-- 任务优先级
-- 任务取消和超时控制
+通道容量足够大以吸收突发请求。如果 inbound 满了，通道的 I/O 循环会在 `send` 上阻塞，暂停读取用户输入直到空间释放。
 
-## 与 ChannelManager 的关系
+## 设计原则
+
+MessageBus 是**纯通道**，不包含任何业务逻辑：
+- 不创建 session
+- 不执行 AgentRunner
+- 不启动后台任务
+
+所有处理逻辑由 AgentLoop 的 `start_inbound()` 和 ChannelManager 的 `run()` 分别负责监听 inbound/outbound 端点。
+
+## 与组件的关系
 
 ```
-ChannelManager
-  → 每个通道在 tokio::spawn 中轮询
-  → 读取输入后构建 BusRequest
-  → 在 tokio::spawn 中调用 MessageBus.send()
-  → 获取 BusResult 后输出到通道
+Channel ──inbound_tx──▶ MessageBus ──inbound_rx──▶ AgentLoop (处理)
+                                                    │
+                                         ──outbound_tx──▶ MessageBus
+                                                              │
+ChannelManager ◀──outbound_rx──◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀◀│
 ```
-
-每个通道的 I/O 循环都在独立的 tokio 任务中运行，通过 `tokio::spawn` 并发执行 MessageBus 调用。
