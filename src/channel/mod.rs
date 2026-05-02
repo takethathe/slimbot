@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
+use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::TaskState;
 
@@ -37,6 +38,15 @@ pub trait Channel: Send + Sync {
     }
     /// Start the channel's internal client read loop. Called by ChannelManager after creation.
     fn start(&self, inbound_tx: tokio::sync::mpsc::Sender<BusRequest>);
+    /// Start the channel with an IoScheduler. Default delegates to start() for backward compatibility.
+    fn start_with_scheduler(&self, _scheduler: &IoScheduler) -> IoHandle {
+        // Default: no-op handle. Override in channel implementations that use the scheduler.
+        IoHandle {
+            join_handle: None,
+            session_id: self.session_id(),
+            channel_name: self.name().to_string(),
+        }
+    }
     /// Send output to client. Called by ChannelManager's outbound router.
     /// Default implementation delegates to write_output.
     async fn send_output(&mut self, result: &BusResult) -> Result<()> {
@@ -59,6 +69,7 @@ pub struct ChannelManager {
     factories: HashMap<String, Box<dyn ChannelFactory>>,
     message_bus: Arc<MessageBus>,
     config: Arc<Config>,
+    io_handles: Arc<Mutex<HashMap<String, IoHandle>>>,
 }
 
 impl ChannelManager {
@@ -68,6 +79,7 @@ impl ChannelManager {
             factories: HashMap::new(),
             message_bus,
             config,
+            io_handles: Arc::new(Mutex::new(HashMap::new())),
         };
         // Auto-register all built-in channel factories
         cm.register_factory("cli", Box::new(CliChannelFactory));
@@ -82,7 +94,8 @@ impl ChannelManager {
     /// Initialize channels from stored config entries
     pub async fn init(&mut self) -> Result<()> {
         let channels = self.channels.clone();
-        let inbound_tx = self.message_bus.inbound_tx();
+        let io_handles = self.io_handles.clone();
+        let scheduler = IoScheduler::new(self.message_bus.inbound_tx());
 
         for entry in &self.config.channels {
             if !entry.enabled {
@@ -99,11 +112,12 @@ impl ChannelManager {
 
             eprintln!("Registered channel: {} ({})", name, session_id);
 
-            // Start the channel's internal read loop
-            channel.start(inbound_tx.clone());
+            // Start the channel's I/O loop via the scheduler
+            let handle = channel.start_with_scheduler(&scheduler);
 
             // Insert into the shared map for outbound routing access
-            channels.lock().await.insert(id, channel);
+            channels.lock().await.insert(id.clone(), channel);
+            io_handles.lock().await.insert(id, handle);
         }
         Ok(())
     }

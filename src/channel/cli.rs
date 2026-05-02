@@ -1,11 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use std::io::Write;
 
 use super::{Channel, ChannelFactory};
-use crate::message_bus::{BusRequest, BusResult};
-use crate::session::{TaskHook, TaskState};
-use tokio::sync::mpsc;
+use crate::io_scheduler::{IoHandle, IoScheduler};
+use crate::message_bus::BusResult;
+use crate::session::TaskState;
 
 /// CLI channel implementation
 pub struct CliChannel {
@@ -93,50 +92,27 @@ impl Channel for CliChannel {
         Ok(String::new())
     }
 
-    fn start(&self, inbound_tx: mpsc::Sender<BusRequest>) {
+    fn start(&self, _inbound_tx: tokio::sync::mpsc::Sender<crate::message_bus::BusRequest>) {
+        // Deprecated: use start_with_scheduler instead
+    }
+
+    fn start_with_scheduler(&self, scheduler: &IoScheduler) -> IoHandle {
         let session_id = self.session_id();
         let channel_name = self.name().to_string();
         let prompt = self.prompt.clone();
-        let hook = TaskHook::new(&session_id);
+        let hook = crate::session::TaskHook::new(&session_id);
 
-        // Use spawn_blocking for blocking stdin read to avoid blocking the tokio runtime
-        tokio::task::spawn_blocking(move || {
-            loop {
-                print!("{}", prompt);
-                let _ = std::io::stdout().flush();
-                let mut input = String::new();
-                match std::io::stdin().read_line(&mut input) {
-                    Ok(0) => {
-                        eprintln!("[{}] EOF, exiting read loop", channel_name);
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("[{}] Read failed: {}", channel_name, e);
-                        continue;
-                    }
-                }
+        let handle = scheduler.submit_blocking_read_loop(
+            session_id.clone(),
+            hook,
+            channel_name.clone(),
+            prompt,
+        );
 
-                let input = input.trim().to_string();
-                if input.is_empty() {
-                    continue;
-                }
-
-                let request = BusRequest {
-                    session_id: session_id.clone(),
-                    content: input,
-                    channel_inject: None,
-                    hook: hook.clone(),
-                };
-
-                let rt = tokio::runtime::Handle::current();
-                let tx = inbound_tx.clone();
-                rt.block_on(async {
-                    if let Err(e) = tx.send(request).await {
-                        eprintln!("[{}] Failed to send inbound: {}", channel_name, e);
-                    }
-                });
-            }
-        });
+        IoHandle {
+            join_handle: Some(handle),
+            session_id,
+            channel_name,
+        }
     }
 }

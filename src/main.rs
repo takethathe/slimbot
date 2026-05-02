@@ -6,6 +6,7 @@ mod config;
 mod config_scheme;
 mod context;
 mod embed;
+mod io_scheduler;
 mod memory;
 mod message_bus;
 mod path;

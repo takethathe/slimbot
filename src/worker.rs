@@ -141,37 +141,30 @@ impl WorkerPool {
     /// Submit a closure. The pool finds an idle worker or creates a new one
     /// (up to max_workers). If all workers are busy, queues to the least busy one.
     pub fn submit(&self, f: Box<dyn FnOnce() -> BoxFuture + Send>) {
+        let mut guard = self.workers.write().unwrap();
+
         // Try to find an idle worker
-        {
-            let guard = self.workers.read().unwrap();
-            for entry in guard.iter() {
-                if entry.worker.queue_len() == 0 {
-                    entry.worker.submit(f);
-                    return;
-                }
-            }
+        if let Some(entry) = guard.iter_mut().find(|e| e.worker.queue_len() == 0) {
+            entry.worker.submit(f);
+            entry.last_active = Instant::now();
+            return;
         }
 
         // No idle worker — try to create a new one
-        {
-            let mut guard = self.workers.write().unwrap();
-            if guard.len() < self.max_workers {
-                let worker = Worker::new();
-                worker.submit(f);
-                guard.push(WorkerEntry {
-                    worker,
-                    last_active: Instant::now(),
-                });
-                return;
-            }
+        if guard.len() < self.max_workers {
+            let worker = Worker::new();
+            worker.submit(f);
+            guard.push(WorkerEntry {
+                worker,
+                last_active: Instant::now(),
+            });
+            return;
         }
 
         // At capacity — submit to worker with the smallest queue
-        {
-            let guard = self.workers.read().unwrap();
-            if let Some(entry) = guard.iter().min_by_key(|e| e.worker.queue_len()) {
-                entry.worker.submit(f);
-            }
+        if let Some(entry) = guard.iter_mut().min_by_key(|e| e.worker.queue_len()) {
+            entry.worker.submit(f);
+            entry.last_active = Instant::now();
         }
     }
 
@@ -182,8 +175,7 @@ impl WorkerPool {
             if entry.worker.queue_len() > 0 {
                 return true;
             }
-            let idle_duration = entry.last_active.elapsed();
-            idle_duration < std::time::Duration::from_secs(120)
+            entry.last_active.elapsed() < std::time::Duration::from_secs(120)
         });
     }
 }
