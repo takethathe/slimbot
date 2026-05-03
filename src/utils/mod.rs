@@ -54,8 +54,13 @@ pub fn build_persisted_reference(
     content: &str,
     preview_max: usize,
 ) -> String {
-    let preview = &content[..preview_max.min(content.len())];
-    let truncated = content.len() > preview_max;
+    let preview_end = content
+        .char_indices()
+        .nth(preview_max)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+    let preview = &content[..preview_end];
+    let truncated = content.chars().count() > preview_max;
     let mut result = format!(
         "[tool output persisted]\nFull output saved to: {}\nOriginal size: {} chars\nPreview:\n{}",
         file_path.display(),
@@ -124,5 +129,12 @@ mod tests {
         assert!(ref_str.contains("[tool output persisted]"));
         assert!(ref_str.contains("Original size: 5000"));
         assert!(ref_str.contains("out.txt"));
+    }
+
+    #[test]
+    fn test_build_persisted_reference_utf8() {
+        let cjk = "测试文本".repeat(2000);
+        let ref_str = build_persisted_reference(Path::new("/tmp/out.txt"), &cjk, 1200);
+        assert!(std::str::from_utf8(ref_str.as_bytes()).is_ok());
     }
 }

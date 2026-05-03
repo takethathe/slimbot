@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::AgentConfig;
+use crate::consolidate::Consolidator;
 use crate::context::ContextBuilder;
-use crate::memory::MemoryStore;
+use crate::memory::SharedMemoryStore;
 use crate::provider::{Provider, Usage};
 use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState};
 use crate::tool::{ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
@@ -38,8 +39,9 @@ pub struct AgentRunnerBuilder {
     provider: Option<Arc<dyn Provider>>,
     config: Option<AgentConfig>,
     workspace_dir: Option<PathBuf>,
-    memory_store: Option<Arc<MemoryStore>>,
+    memory_store: Option<SharedMemoryStore>,
     channel_inject: Option<String>,
+    consolidator: Option<Arc<Consolidator>>,
 }
 
 impl AgentRunnerBuilder {
@@ -52,6 +54,7 @@ impl AgentRunnerBuilder {
             workspace_dir: None,
             memory_store: None,
             channel_inject: None,
+            consolidator: None,
         }
     }
 
@@ -80,13 +83,18 @@ impl AgentRunnerBuilder {
         self
     }
 
-    pub fn memory_store(mut self, ms: Arc<MemoryStore>) -> Self {
+    pub fn memory_store(mut self, ms: SharedMemoryStore) -> Self {
         self.memory_store = Some(ms);
         self
     }
 
     pub fn channel_inject(mut self, ci: Option<String>) -> Self {
         self.channel_inject = ci;
+        self
+    }
+
+    pub fn consolidator(mut self, c: Option<Arc<Consolidator>>) -> Self {
+        self.consolidator = c;
         self
     }
 
@@ -99,30 +107,26 @@ impl AgentRunnerBuilder {
         let memory_store = self.memory_store.expect("memory_store required");
 
         AgentRunner::new(
-            ContextBuilder::new(
-                session_manager.clone(),
-                tool_manager.clone(),
-                workspace_dir.clone(),
-                memory_store,
-            ),
             tool_manager,
             provider,
             session_manager,
             config,
             workspace_dir,
+            memory_store,
             self.channel_inject,
+            self.consolidator,
         )
-    }
-}
+    }}
 
 pub struct AgentRunner {
-    context_builder: ContextBuilder,
     tool_manager: Arc<ToolManager>,
     provider: Arc<dyn Provider>,
     session_manager: SharedSessionManager,
     config: AgentConfig,
     workspace_dir: PathBuf,
+    memory_store: SharedMemoryStore,
     channel_inject: Option<String>,
+    consolidator: Option<Arc<Consolidator>>,
 }
 
 impl AgentRunner {
@@ -132,22 +136,24 @@ impl AgentRunner {
     }
 
     pub fn new(
-        context_builder: ContextBuilder,
         tool_manager: Arc<ToolManager>,
         provider: Arc<dyn Provider>,
         session_manager: SharedSessionManager,
         config: AgentConfig,
         workspace_dir: PathBuf,
+        memory_store: SharedMemoryStore,
         channel_inject: Option<String>,
+        consolidator: Option<Arc<Consolidator>>,
     ) -> Self {
         Self {
-            context_builder,
             tool_manager,
             provider,
             session_manager,
             config,
             workspace_dir,
+            memory_store,
             channel_inject,
+            consolidator,
         }
     }
 
@@ -201,10 +207,20 @@ impl AgentRunner {
                 return result;
             }
 
-            // Build context
-            let mut ctx = self
-                .context_builder
-                .build(session_id, self.channel_inject.clone())
+            // Build context (with session summary from last consolidation)
+            let session_summary = {
+                let sm = self.session_manager.lock().await;
+                sm.get_last_summary(session_id).await
+            };
+            let session_summary_ref = session_summary.as_deref();
+            let context_builder = ContextBuilder::new(
+                self.session_manager.clone(),
+                self.tool_manager.clone(),
+                self.workspace_dir.clone(),
+                self.memory_store.clone(),
+            );
+            let mut ctx = context_builder
+                .build(session_id, self.channel_inject.clone(), session_summary_ref)
                 .await;
 
             // History governance: clean orphans and backfill missing tool results
@@ -242,6 +258,7 @@ impl AgentRunner {
 
             if !has_tool_calls {
                 let text = response.content.clone().unwrap_or_default();
+                let prompt_tokens = response.usage.prompt_tokens;
                 result.accumulate(&response.usage);
                 result.success = true;
                 result.content = text.clone();
@@ -259,6 +276,9 @@ impl AgentRunner {
                         return self.fail_result(&hook, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
                     }
 
+                    // Update token ratio so persist() saves it with the meta.
+                    sm.update_token_ratio(session_id, prompt_tokens);
+
                     let _completed_state = TaskState::Completed {
                         result: text.clone(),
                     };
@@ -267,6 +287,10 @@ impl AgentRunner {
                 hook.notify_status_change(&TaskState::Completed {
                     result: text.clone(),
                 });
+                // Trigger consolidation after successful turn.
+                if let Some(ref consolidator) = self.consolidator {
+                    let _ = consolidator.maybe_consolidate(session_id, prompt_tokens).await;
+                }
                 return result;
             }
 
@@ -571,7 +595,7 @@ mod tests {
     async fn make_test_env(
         tmp_dir: &tempfile::TempDir,
         tool_names: &[(&str, &str)],
-    ) -> (SharedSessionManager, Arc<ToolManager>, PathBuf, Arc<MemoryStore>) {
+    ) -> (SharedSessionManager, Arc<ToolManager>, PathBuf, Arc<tokio::sync::Mutex<MemoryStore>>) {
         let path = tmp_dir.path();
         let session_dir = path.join("sessions");
         let workspace_dir = path.join("workspace");
@@ -584,8 +608,8 @@ mod tests {
             tm.register(Box::new(MockEchoTool::new(name, ret)));
         }
 
-        let ms = Arc::new(MemoryStore::new(&workspace_dir));
-        ms.init().unwrap();
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
 
         // Pre-create the default test session
         sm.lock().await.get_or_create("test-session").await.unwrap();
@@ -609,7 +633,7 @@ mod tests {
         tm: Arc<ToolManager>,
         provider: Arc<dyn Provider>,
         workspace_dir: PathBuf,
-        ms: Arc<MemoryStore>,
+        ms: Arc<tokio::sync::Mutex<MemoryStore>>,
     ) -> AgentRunner {
         AgentRunner::builder()
             .session_manager(sm)
@@ -621,6 +645,7 @@ mod tests {
                 timeout_seconds: 120,
                 max_tool_result_chars: 8000,
                 persist_tool_results: false,
+                context_window_tokens: 8192,
             })
             .workspace_dir(workspace_dir)
             .memory_store(ms)
@@ -903,8 +928,8 @@ mod tests {
         let tm = Arc::new(tm);
         sm.lock().await.get_or_create("test-session").await.unwrap();
 
-        let ms = Arc::new(MemoryStore::new(&workspace_dir));
-        ms.init().unwrap();
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
 
         // Provider returns tool_error first, then a final reply after seeing the error
         let provider = Arc::new(MockProvider::new(vec![
@@ -1119,8 +1144,8 @@ mod tests {
         let tm = Arc::new(tm);
         sm.lock().await.get_or_create("test-session").await.unwrap();
 
-        let ms = Arc::new(MemoryStore::new(&workspace_dir));
-        ms.init().unwrap();
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
 
         let provider = Arc::new(MockProvider::new(vec![
             LLMResponse {
@@ -1146,6 +1171,7 @@ mod tests {
                 timeout_seconds: 120,
                 max_tool_result_chars: 8000,
                 persist_tool_results: true,
+                context_window_tokens: 8192,
             })
             .workspace_dir(workspace_dir.clone())
             .memory_store(ms)

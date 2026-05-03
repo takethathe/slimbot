@@ -32,22 +32,6 @@
 - [ ] 默认 config 包含完整的 `data_dir`、`workspace_dir`、`agent`、`providers`、`tools`、`channels` 配置
 - [ ] 用户只需修改必填项（如 `api_key`）即可直接使用
 
-## 缺失工具（对齐 nanobot）
-
-### 核心工具
-
-- [ ] **grep / glob** — 内容搜索和文件发现工具，支持 `output_mode`（`files_with_matches` / `count` / 默认带行号）、`glob` 过滤、`type` 过滤、`head_limit` / `offset` 分页、`context_before` / `context_after`
-- [ ] **web_search / web_fetch** — 网络搜索和网页抓取工具，支持搜索关键词和 URL 获取，返回纯文本内容
-
-### 高级工具
-
-- [ ] **spawn** — 后台子代理创建，支持传入指令和等待结果，用于并行任务执行
-- [ ] **mcp** — MCP 服务器客户端，连接外部 MCP 服务并将其工具包装为原生工具
-- [ ] **self** — 运行时状态检查，返回当前 session 信息、配置、可用工具列表等
-- [ ] **message** — 向用户发送消息（用于 channel 推送场景，如 telegram/whatsapp）
-- [ ] **notebook** — Jupyter notebook (`.ipynb`) 编辑工具，支持代码单元格和 markdown 单元格增删改
-- [ ] **sandbox** — shell 命令沙箱后端，支持不同的执行隔离策略（docker/ssh/local）
-
 ## Heartbeat 机制
 
 - [ ] 实现 heartbeat 调度器，固定间隔时间运行任务
@@ -73,13 +57,15 @@
 - [x] `ContextBuilder` 构建时将 `MEMORY.md` 内容注入 system prompt，标记 `# Memory` 段落
 - [x] history.jsonl 格式：每条包含 `cursor`（自增整数）、`timestamp`、`content`
 - [x] Dream cursor：`.dream_cursor` 文件记录 Dream 已处理的最后一条 history 游标
-- [ ] Token-budget 触发 consolidate：session 结束交互时检查 token 使用量，超出 `context_window_limit`（config 可配置，默认 6k）则启动 consolidate
-- [ ] Consolidate 由模型对当前 session 的对话进行摘要，结果追加到 `history.jsonl`
+- [x] Token-budget 触发 consolidate：LLM 返回 prompt_tokens 后检查预算（`context_window_tokens - max_completion_tokens - SAFETY_BUFFER`），超出时触发摘要
+- [x] Consolidate 由模型对当前 session 的对话进行摘要，结果追加到 `history.jsonl`
 - [x] Session 记录 `last_consolidated` 游标，已 consolidate 的 message 不再添加到上下文中
-- [ ] 用最后一次 consolidate 的摘要代替所有已 evict 的 message 内容，注入到 system prompt
-- [ ] Consolidate 在 user-turn 边界进行消息驱逐（eviction），保证语义完整性
-- [ ] Consolidate 支持多轮循环（nanobot 默认最多 5 轮），每轮重新估算 token 数
-- [ ] Consolidate 失败时降级为 raw archive（直接写入 history.jsonl 带 `[RAW]` 标记）
+- [x] 用最后一次 consolidate 的摘要（`last_summary` 字段）代替所有已 evict 的 message 内容，注入到 system prompt 的 `[Resumed Session]` 段落
+- [x] Consolidate 在 user-turn 边界进行消息驱逐（eviction），保证语义完整性
+- [x] Consolidate 支持会话摘要持久化到 `SessionMeta`，重启后可恢复
+- [x] Consolidate 使用 `char_per_token_ratio` 估算消息 token（`total_chars / prompt_tokens`，默认 4.0）
+- [x] Consolidate 失败时降级处理（`archive` 返回错误时静默跳过，不中断主循环）
+- [x] Session 持久化重构：meta 数据单独 `.meta.json` 文件，messages 使用 append-only 写入 JSONL，每条消息自增 ID，consolidation 游标基于 ID 而非数组索引
 - [ ] Agent 可通过工具调用主动读取/搜索/更新记忆
 - [x] 移除当前 `src/tools/memory.rs` 中的三个独立工具实现，改为 memory 模块内部管理
 

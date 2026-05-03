@@ -184,6 +184,7 @@ fn test_save_and_reload_round_trip() {
             timeout_seconds: 60,
             max_tool_result_chars: 4000,
             persist_tool_results: false,
+            context_window_tokens: 8192,
         },
         providers,
         tools: vec![ToolEntry {

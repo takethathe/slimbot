@@ -4,8 +4,9 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::context::ContextBuilder;
-use crate::memory::MemoryStore;
+use crate::config_scheme::ConfigScheme;
+use crate::consolidate::Consolidator;
+use crate::memory::{MemoryStore, SharedMemoryStore};
 use crate::message_bus::{MessageBus};
 use crate::path::PathManager;
 use crate::provider::{OpenAIProvider, Provider};
@@ -20,8 +21,9 @@ pub struct AgentLoop {
     provider: Arc<dyn Provider>,
     tool_manager: Arc<ToolManager>,
     session_manager: SharedSessionManager,
-    memory_store: Arc<MemoryStore>,
+    memory_store: SharedMemoryStore,
     message_bus: Arc<MessageBus>,
+    consolidator: Arc<Consolidator>,
 }
 
 impl AgentLoop {
@@ -43,8 +45,16 @@ impl AgentLoop {
         let session_manager = SessionManager::new(paths.session_dir())?;
         let session_manager_arc = Arc::new(tokio::sync::Mutex::new(session_manager));
 
-        let memory_store = Arc::new(MemoryStore::new(paths.workspace_dir()));
-        memory_store.init()?;
+        let memory_store = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(paths.workspace_dir())));
+        memory_store.lock().await.init()?;
+
+        let consolidator = Arc::new(Consolidator::new(
+            provider.clone(),
+            session_manager_arc.clone(),
+            memory_store.clone(),
+            config.agent.context_window_tokens,
+            ConfigScheme::DEFAULT_MAX_TOKENS,
+        ));
 
         Ok(Self {
             config,
@@ -54,6 +64,7 @@ impl AgentLoop {
             session_manager: session_manager_arc,
             memory_store,
             message_bus,
+            consolidator,
         })
     }
 
@@ -78,18 +89,14 @@ impl AgentLoop {
         channel_inject: Option<String>,
     ) -> AgentResult {
         let runner = AgentRunner::new(
-            ContextBuilder::new(
-                self.session_manager.clone(),
-                self.tool_manager.clone(),
-                self.workspace_dir.clone(),
-                self.memory_store.clone(),
-            ),
             self.tool_manager.clone(),
             self.provider.clone(),
             self.session_manager.clone(),
             self.config.agent.clone(),
             self.workspace_dir.clone(),
+            self.memory_store.clone(),
             channel_inject,
+            Some(self.consolidator.clone()),
         );
         runner.run(content, hook, session_id).await
     }
@@ -105,6 +112,7 @@ impl AgentLoop {
         let workspace_dir = self.workspace_dir.clone();
         let memory_store = self.memory_store.clone();
         let outbound_tx = self.message_bus.outbound_tx();
+        let consolidator = self.consolidator.clone();
 
         tokio::spawn(async move {
             loop {
@@ -134,6 +142,7 @@ impl AgentLoop {
                 .memory_store(memory_store.clone())
                 .outbound_tx(outbound_tx.clone())
                 .channel_inject(request.channel_inject)
+                .consolidator(Some(consolidator.clone()))
                 .build();
 
                 let mut guard = session_manager.lock().await;

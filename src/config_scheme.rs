@@ -109,6 +109,7 @@ impl ConfigScheme {
     pub const DEFAULT_MAX_TOKENS: u32 = 4096;
     pub const DEFAULT_MAX_ITERATIONS: u32 = 40;
     pub const DEFAULT_TIMEOUT: u64 = 120;
+    pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8192;
 
     fn default_provider_config(&self) -> ProviderConfig {
         ProviderConfig {
@@ -129,6 +130,7 @@ impl ConfigScheme {
             timeout_seconds: Self::DEFAULT_TIMEOUT,
             max_tool_result_chars: 8000,
             persist_tool_results: true,
+            context_window_tokens: Self::DEFAULT_CONTEXT_WINDOW_TOKENS,
         }
     }
 }

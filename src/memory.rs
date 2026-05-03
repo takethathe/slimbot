@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,9 @@ pub struct HistoryEntry {
     pub timestamp: String,
     pub content: String,
 }
+
+/// Shared access to the memory store.
+pub type SharedMemoryStore = Arc<tokio::sync::Mutex<MemoryStore>>;
 
 /// Pure file I/O layer for memory files.
 pub struct MemoryStore {

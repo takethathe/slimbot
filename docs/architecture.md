@@ -31,7 +31,7 @@
 │ (主线程阻塞)      │    │                                 │
 │                  │    │  1. drain inbound_rx             │
 │ 路由出站消息到    │◄───┤  2. ensure_session               │
-│ 对应 Channel     │    │  3. enqueue → dequeue            │
+│ 对应 Channel     │    │  3. SessionTaskBuilder → submit  │
 │ write_output()   │    │  4. AgentRunner.run()            │
 │                  │    │  5. publish outbound_tx           │
 └──────────────────┘    └─────────────────────────────────┘
@@ -50,22 +50,32 @@
 
 ### AgentLoop
 
-顶层编排组件，持有 Provider、ToolManager、SessionManager 的引用：
+顶层编排组件，持有 Provider、ToolManager、SessionManager、MemoryStore、Consolidator 的引用：
 
-1. 从配置加载 Provider、ToolManager、SessionManager
-2. 调用 `start_inbound()` 启动后台监听任务
-3. 该任务监听 `inbound_rx`，对每条请求执行 ReAct 循环，发布结果到 `outbound_tx`
+1. 从配置加载 Provider、ToolManager、SessionManager、MemoryStore
+2. 创建 `Arc<Consolidator>`（基于 context_window_tokens 配置）
+3. 调用 `start_inbound()` 启动后台监听任务
+4. 该任务通过 `SessionTaskBuilder` 构建任务（附带 Consolidator 的 Arc 引用），提交到 SessionRunner 顺序执行
 
 ### AgentRunner
 
 ReAct 循环的核心。每次处理任务时新建一个 Runner 实例：
 
 1. 将用户消息写入 Session
-2. 构建上下文（system prompt + 历史消息 + 工具定义）
-3. 调用 Provider 获取模型响应
-4. 如果响应包含 tool_calls，执行工具并追加消息，进入下一轮
-5. 如果响应不包含 tool_calls，返回最终文本
-6. 循环结束后将 Session 全量持久化为 JSONL
+2. 在 `run()` 内部创建 `ContextBuilder`，获取 last_summary
+3. 构建上下文（system prompt + 历史消息 + 工具定义 + 会话摘要）
+4. 调用 Provider 获取模型响应
+5. 如果响应包含 tool_calls，执行工具并追加消息，进入下一轮
+6. 如果响应不包含 tool_calls，更新 token ratio、持久化、触发 Consolidation、返回最终文本
+7. 循环结束后以追加模式写入 JSONL，并更新 meta 文件
+
+### SessionRunner
+
+每个 session 独立的执行协调器。通过 `AtomicBool` 和独立任务队列保证同一 session 的任务顺序执行，空闲时自动拉取下一个任务。
+
+### Consolidator
+
+Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLoop 初始化时创建，传入 AgentRunner。ReAct 循环完成后若 prompt_tokens 超过安全预算，自动选取旧消息进行 LLM 摘要，结果通过 MemoryStore 追加到 `history.jsonl`，并更新会话的 consolidation 游标和 last_summary。
 
 ### ChannelManager
 
@@ -91,7 +101,10 @@ ReAct 循环的核心。每次处理任务时新建一个 Runner 实例：
 AgentLoop.start_inbound() 后台任务:
   → inbound_rx.recv()
   → ensure_session()
-  → enqueue → dequeue → AgentRunner.run()
+  → SessionTaskBuilder 构建任务（附带 Consolidator）
+  → session_manager.submit_task(task)
+  → SessionRunner 顺序执行
+  → AgentRunner.run()
   → ReAct 循环（多次 LLM 调用 + 工具执行）
   → outbound_tx.send(BusResult)
 ```
@@ -120,12 +133,13 @@ AgentRunner 状态变更 → TaskHook.notify_status()
 | 决策 | 方案 | 原因 |
 |------|------|------|
 | Session 访问 | `Arc<Mutex<SessionManager>>` 共享 Mutex | 所有模块通过共享引用访问，保证线程安全 |
-| 消息持久化 | 全量写入 JSONL（非追加） | 简单可靠，避免部分写入导致的数据损坏 |
+| 消息持久化 | 追加写入 JSONL + 独立 meta 文件 | 简单可靠，增量写入避免全量覆盖 |
 | 通道并发 | 每个通道独立 `spawn_blocking` | 阻塞 I/O 不阻塞 tokio 运行时 |
 | Session ID | `{channel_id}:{chat_id}` | 通过通道标识和聊天标识唯一确定会话 |
 | 任务通知 | `TaskHook` + `tokio::sync::mpsc` | 异步非阻塞，避免工具执行时阻塞通道 |
 | MessageBus | 纯通道，无后台任务 | 职责单一，AgentLoop 自己负责处理逻辑 |
 | 工厂注册 | ChannelManager 内部自动注册 | 简化 main.rs，不需要手动注入工厂 |
+| Consolidator | 可选注入 `Arc<Consolidator>` | 不传入时跳过摘要，传入时自动触发 |
 
 ## 目录结构与模块关系
 
@@ -144,9 +158,10 @@ main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   │     ├── agent_loop.rs ── 顶层编排 + inbound 监听任务
   │     │     ├── provider/openai.rs ── LLM API 调用
   │     │     ├── tool.rs ── ToolManager + 工具注册
-  │     │     ├── session.rs ── Session + SessionManager
+  │     │     ├── session.rs ── Session + SessionManager + SessionRunner
+  │     │     ├── consolidate.rs ── Consolidator（token 预算触发摘要）
+  │     │     ├── context.rs ── 上下文构建
   │     │     └── runner.rs ── ReAct 循环
-  │     │           └── context.rs ── 上下文构建
   │     │
   │     ├── message_bus.rs ── 纯异步通道端点
   │     ├── memory.rs ── 长期记忆、历史记录

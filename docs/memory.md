@@ -20,6 +20,8 @@
 ## 结构
 
 ```rust
+pub type SharedMemoryStore = Arc<tokio::sync::Mutex<MemoryStore>>;
+
 pub struct MemoryStore {
     workspace_dir: PathBuf,
     memory_dir: PathBuf,
@@ -27,6 +29,8 @@ pub struct MemoryStore {
     history_file: PathBuf,
     cursor_file: PathBuf,
     dream_cursor_file: PathBuf,
+    cursor_cache: Option<u64>,         // 内存缓存的游标值
+    dream_cursor_cache: Option<u64>,   // 内存缓存的 Dream 游标值
 }
 ```
 

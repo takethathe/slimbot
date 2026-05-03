@@ -13,13 +13,13 @@ pub struct ContextBuilder {
     session_manager: SharedSessionManager,    // 会话管理器
     tool_manager: Arc<ToolManager>,           // 工具管理器
     workspace_dir: PathBuf,                   // 工作区目录
-    memory_store: Arc<MemoryStore>,           // 长期记忆存储
+    memory_store: SharedMemoryStore,          // 长期记忆存储（Arc<tokio::sync::Mutex<MemoryStore>>）
 }
 ```
 
 ## System Prompt 构建流程
 
-`ContextBuilder.build()` 按以下顺序组装 system prompt：
+`ContextBuilder.build(session_id, channel_inject, session_summary)` 按以下顺序组装 system prompt：
 
 ```
 system_parts = []
@@ -36,9 +36,22 @@ system_parts = []
    规则：文件必须存在、非空才会被加入
 
 3. 技能文件（skills/ 目录下的所有 *.md）
-   [Skill: <filename>] <content>
+   区分 always skills（完整加载）和可选 skills（仅显示名称列表）
 
-4. 通道注入内容（可选）
+4. 长期记忆（MEMORY.md）
+   ## Long-term Memory
+   <MEMORY.md content>
+
+4.5. 会话摘要（可选，来自 Consolidator 的 last_summary）
+   [Resumed Session] <summary bullet points>
+   代替已驱逐的消息，提供会话上下文
+
+5. 近期历史（history.jsonl 最近 50 条）
+   # Recent History
+   - [timestamp] content
+   - ...
+
+6. 通道注入内容（可选）
    来自 Channel.prepare_inject() 的返回值
 
 ↓ 用 "\n\n---\n\n" 拼接所有部分
@@ -48,7 +61,7 @@ system_prompt
 ↓ 包装为 Message::System
 ↓
 [Message::System { content: system_prompt }]
-  + session 历史消息
+  + session 历史消息（未驱逐的部分）
 ↓
 RunContext { messages, tools }
 ```
@@ -68,7 +81,15 @@ RunContext { messages, tools }
 
 ## 技能文件加载
 
-扫描 `workspace/skills/` 目录下所有 `.md` 文件，每个文件以 `[Skill: <文件名>]` 为前缀加入 system prompt。未修改的模板文件（与嵌入模板一致）会被跳过，以节省 token。
+扫描 `workspace/skills/` 目录下所有 `.md` 文件：
+
+- **Always skills**（`always: true` YAML frontmatter）：加载完整内容
+- **可选 skills**（`always: false`）：仅显示名称和描述列表，由 Agent 按需读取
+- 无 frontmatter 的遗留文件：视为 always skill，完整加载
+
+## 会话摘要注入
+
+当 `session_summary` 参数为 `Some` 且非空时，在系统 prompt 中注入 `[Resumed Session]` 段落。该摘要来自 `Consolidator` 的 `last_summary` 字段，代替已被驱逐的旧消息，提供跨轮次的上下文。
 
 ## 工具定义
 

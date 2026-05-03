@@ -17,6 +17,7 @@
 | [ReAct 执行器](runner.md) | `runner.rs` | ReAct 循环核心：迭代控制、工具调用流程 |
 | [上下文构建器](context.md) | `context.rs` | System Prompt 构建流程 |
 | [会话管理](session.md) | `session.rs` | 会话生命周期、任务队列、JSONL 持久化 |
+| [会话压缩](consolidate.md) | `consolidate.rs` | Token 预算触发摘要、消息驱逐、上下文注入 |
 | [消息总线](message_bus.md) | `message_bus.rs` | 请求分发、任务封装、结果路由 |
 | [Provider](provider.md) | `provider/` | Provider 接口、OpenAI 兼容 API 集成 |
 | [通道](channel.md) | `channel/` | 通道抽象、工厂模式、并发 I/O 循环 |

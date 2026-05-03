@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::bootstrap::{bootstrap_files, read_if_modified};
-use crate::memory::MemoryStore;
+use crate::memory::SharedMemoryStore;
 use crate::session::{Message, SharedSessionManager};
 use crate::tool::{ToolDefinition, ToolManager};
 
@@ -62,7 +62,7 @@ pub struct ContextBuilder {
     session_manager: SharedSessionManager,
     tool_manager: Arc<ToolManager>,
     workspace_dir: PathBuf,
-    memory_store: Arc<MemoryStore>,
+    memory_store: SharedMemoryStore,
 }
 
 impl ContextBuilder {
@@ -70,7 +70,7 @@ impl ContextBuilder {
         session_manager: SharedSessionManager,
         tool_manager: Arc<ToolManager>,
         workspace_dir: PathBuf,
-        memory_store: Arc<MemoryStore>,
+        memory_store: SharedMemoryStore,
     ) -> Self {
         Self {
             session_manager,
@@ -80,7 +80,7 @@ impl ContextBuilder {
         }
     }
 
-    pub async fn build(&self, session_id: &str, channel_inject: Option<String>) -> RunContext {
+    pub async fn build(&self, session_id: &str, channel_inject: Option<String>, session_summary: Option<&str>) -> RunContext {
         let mut system_parts: Vec<String> = Vec::new();
 
         // 1. Fixed brief intro
@@ -144,13 +144,21 @@ impl ContextBuilder {
         }
 
         // 4. Memory (long-term facts from MEMORY.md, skip if matches template)
-        let memory_content = self.memory_store.get_memory_context();
+        let ms = self.memory_store.lock().await;
+        let memory_content = ms.get_memory_context();
         if !memory_content.is_empty() {
             system_parts.push(memory_content);
         }
 
+        // 4.5. Session summary from consolidation (replaces evicted messages)
+        if let Some(summary) = session_summary {
+            if !summary.is_empty() {
+                system_parts.push(format!("[Resumed Session] {summary}"));
+            }
+        }
+
         // 5. Recent history from history.jsonl (last 50 entries, nanobot default)
-        let recent_entries = self.memory_store.read_recent_history(50);
+        let recent_entries = ms.read_recent_history(50);
         if !recent_entries.is_empty() {
             let history_text = recent_entries
                 .iter()
@@ -159,6 +167,7 @@ impl ContextBuilder {
                 .join("\n");
             system_parts.push(format!("# Recent History\n\n{history_text}"));
         }
+        drop(ms);
 
         // 6. History messages (unconsolidated session messages)
         let messages = {

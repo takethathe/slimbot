@@ -4,6 +4,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+fn default_context_window_tokens() -> u32 {
+    8192
+}
+
 fn default_temperature() -> f32 {
     0.7
 }
@@ -70,6 +74,10 @@ pub struct AgentConfig {
     /// Whether to persist oversized tool results to disk.
     #[serde(default = "default_persist_tool_results")]
     pub persist_tool_results: bool,
+    /// LLM context window size in tokens. Used by consolidate to trigger
+    /// summarization when prompt usage exceeds this budget.
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

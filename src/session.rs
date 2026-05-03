@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::AgentConfig;
-use crate::memory::MemoryStore;
+use crate::consolidate::Consolidator;
+use crate::memory::SharedMemoryStore;
 use crate::message_bus::BusResult;
 use crate::provider::Provider;
 use crate::runner::AgentRunner;
@@ -125,6 +126,13 @@ impl Message {
     }
 }
 
+/// Snapshot of session data for consolidation analysis.
+pub struct SessionData {
+    pub messages: Vec<Message>,
+    pub char_per_token_ratio: f64,
+    pub last_consolidated_id: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum TaskState {
     Pending,
@@ -184,9 +192,10 @@ pub struct SessionTaskBuilder {
     provider: Option<Arc<dyn Provider>>,
     config: Option<AgentConfig>,
     workspace_dir: Option<PathBuf>,
-    memory_store: Option<Arc<MemoryStore>>,
+    memory_store: Option<SharedMemoryStore>,
     outbound_tx: Option<tokio::sync::mpsc::Sender<BusResult>>,
     channel_inject: Option<String>,
+    consolidator: Option<Arc<Consolidator>>,
 }
 
 impl SessionTaskBuilder {
@@ -203,6 +212,7 @@ impl SessionTaskBuilder {
             memory_store: None,
             outbound_tx: None,
             channel_inject: None,
+            consolidator: None,
         }
     }
 
@@ -231,7 +241,7 @@ impl SessionTaskBuilder {
         self
     }
 
-    pub fn memory_store(mut self, ms: Arc<MemoryStore>) -> Self {
+    pub fn memory_store(mut self, ms: SharedMemoryStore) -> Self {
         self.memory_store = Some(ms);
         self
     }
@@ -243,6 +253,11 @@ impl SessionTaskBuilder {
 
     pub fn channel_inject(mut self, ci: Option<String>) -> Self {
         self.channel_inject = ci;
+        self
+    }
+
+    pub fn consolidator(mut self, c: Option<Arc<Consolidator>>) -> Self {
+        self.consolidator = c;
         self
     }
 
@@ -261,6 +276,8 @@ impl SessionTaskBuilder {
         let content = self.content;
         let hook = self.hook;
 
+        let consolidator = self.consolidator;
+
         let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> =
             Box::new(move || {
                 Box::pin(async move {
@@ -272,6 +289,7 @@ impl SessionTaskBuilder {
                         .workspace_dir(workspace_dir)
                         .memory_store(memory_store)
                         .channel_inject(self.channel_inject)
+                        .consolidator(consolidator)
                         .build();
                     let result = runner.run(content, hook, &sid1).await;
 
@@ -319,6 +337,10 @@ impl SessionTask {
     }
 }
 
+fn default_char_per_token_ratio() -> f64 {
+    4.0
+}
+
 /// Session metadata persisted alongside messages in the JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -326,6 +348,13 @@ pub struct SessionMeta {
     pub last_consolidated_id: usize,
     /// Next auto-increment message ID.
     pub next_message_id: usize,
+    /// Average characters per token observed from the last LLM call.
+    /// Used to estimate per-message token contribution without re-calling the API.
+    #[serde(default = "default_char_per_token_ratio")]
+    pub char_per_token_ratio: f64,
+    /// Summary text from the last consolidation round, injected into system prompt.
+    #[serde(default)]
+    pub last_summary: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -345,8 +374,65 @@ impl Session {
     pub fn next_message_id(&self) -> usize {
         self.meta.next_message_id
     }
+    pub fn char_per_token_ratio(&self) -> f64 {
+        self.meta.char_per_token_ratio
+    }
+    pub fn last_summary(&self) -> Option<&str> {
+        self.meta.last_summary.as_deref()
+    }
+    pub fn set_last_summary(&mut self, summary: &str) {
+        self.meta.last_summary = if summary.is_empty() || summary == "(nothing)" {
+            None
+        } else {
+            Some(summary.to_string())
+        };
+    }
     fn update_consolidated_id(&mut self, id: usize) {
         self.meta.last_consolidated_id = id;
+    }
+    /// Update the chars-per-token ratio based on the last LLM prompt tokens.
+    /// Keeps the previous ratio if there are no messages to measure against.
+    pub fn update_token_ratio(&mut self, prompt_tokens: u32) {
+        let total_chars: usize = self
+            .messages
+            .iter()
+            .map(message_content_chars)
+            .sum();
+        if total_chars > 0 && prompt_tokens > 0 {
+            self.meta.char_per_token_ratio = total_chars as f64 / prompt_tokens as f64;
+        }
+    }
+}
+
+/// Count visible text characters in a message.
+pub fn message_content_chars(msg: &Message) -> usize {
+    match msg {
+        Message::System { content, .. } => content.len(),
+        Message::User { content, .. } => content.len(),
+        Message::Assistant { content, tool_calls, .. } => {
+            let text_len = content.as_deref().map(|c| c.len()).unwrap_or(0);
+            let tc_len = tool_calls
+                .as_ref()
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|tc| tc.id.len() + tc.name.len() + tc.args.to_string().len())
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
+            text_len + tc_len
+        }
+        Message::Tool { content, .. } => content.len(),
+    }
+}
+
+/// Extract the content string from a message.
+pub fn message_content_str(msg: &Message) -> &str {
+    match msg {
+        Message::System { content, .. } => content,
+        Message::User { content, .. } => content,
+        Message::Assistant { content, .. } => content.as_deref().unwrap_or(""),
+        Message::Tool { content, .. } => content,
     }
 }
 
@@ -404,7 +490,7 @@ impl SessionManager {
         Ok(())
     }
 
-    fn save_session_meta(&self, session_id: &str) {
+    pub(crate) fn save_session_meta(&self, session_id: &str) {
         if let Some(meta) = self.sessions.get(session_id).map(|s| s.meta.clone()) {
             let _ = self.save_meta_file(session_id, &meta);
         }
@@ -417,9 +503,9 @@ impl SessionManager {
 
         // Load meta from separate file
         let meta = self.load_meta_file(session_id)?;
-        let (last_consolidated_id, mut next_id) = match &meta {
-            Some(m) => (m.last_consolidated_id, m.next_message_id),
-            None => (0, 1),
+        let (last_consolidated_id, mut next_id, char_per_token_ratio, last_summary) = match &meta {
+            Some(m) => (m.last_consolidated_id, m.next_message_id, m.char_per_token_ratio, m.last_summary.clone()),
+            None => (0, 1, 4.0, None),
         };
 
         // Load messages from append-only JSONL, skipping consolidated ones
@@ -434,7 +520,7 @@ impl SessionManager {
             Session {
                 id: session_id.to_string(),
                 messages,
-                meta: meta.unwrap_or(SessionMeta { last_consolidated_id, next_message_id: next_id }),
+                meta: meta.unwrap_or(SessionMeta { last_consolidated_id, next_message_id: next_id, char_per_token_ratio, last_summary }),
                 last_persisted_idx: 0, // nothing new to append since we just loaded from disk
             },
         );
@@ -467,6 +553,16 @@ impl SessionManager {
             .unwrap_or_default()
     }
 
+    /// Return a snapshot of session data for consolidation analysis.
+    pub fn get_session_data(&self, session_id: &str) -> Option<SessionData> {
+        let session = self.sessions.get(session_id)?;
+        Some(SessionData {
+            messages: session.messages.clone(),
+            char_per_token_ratio: session.char_per_token_ratio(),
+            last_consolidated_id: session.last_consolidated_id(),
+        })
+    }
+
     /// Update the consolidation cursor for a session.
     /// Messages with id <= new_cursor_id are physically removed from memory
     /// and the persist offset is set to the remaining message count (already on disk).
@@ -478,6 +574,26 @@ impl SessionManager {
         }
         // Save meta after releasing the mutable borrow
         self.save_session_meta(session_id);
+    }
+
+    /// Set the last consolidation summary for a session.
+    pub async fn set_last_summary(&mut self, session_id: &str, summary: &str) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.set_last_summary(summary);
+        }
+    }
+
+    /// Get the last consolidation summary for a session.
+    pub async fn get_last_summary(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|s| s.last_summary().map(|s| s.to_string()))
+    }
+
+    pub fn update_token_ratio(&mut self, session_id: &str, prompt_tokens: u32) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.update_token_ratio(prompt_tokens);
+        }
     }
 
     pub async fn persist(&mut self, session_id: &str) -> Result<()> {

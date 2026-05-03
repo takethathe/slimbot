@@ -10,13 +10,14 @@
 
 ```rust
 pub struct AgentRunner {
-    context_builder: ContextBuilder,             // 上下文构建器
     tool_manager: Arc<ToolManager>,              // 工具管理器
     provider: Arc<dyn Provider>,                 // LLM Provider
     session_manager: SharedSessionManager,       // 会话管理器
     config: AgentConfig,                         // Agent 配置
     workspace_dir: PathBuf,                      // 工作区目录（用于持久化工具结果）
+    memory_store: SharedMemoryStore,             // 长期记忆存储
     channel_inject: Option<String>,              // 通道注入内容
+    consolidator: Option<Arc<Consolidator>>,     // 可选的会话压缩器
 }
 
 pub struct AgentRunnerBuilder { ... }  // 构建器模式
@@ -35,6 +36,7 @@ AgentRunner::builder()
     .workspace_dir(workspace)
     .memory_store(ms)
     .channel_inject(None)
+    .consolidator(Some(consolidator))  // 可选
     .build()
 ```
 
@@ -88,7 +90,10 @@ pub async fn run(
   ├─ 检查是否超出 max_iterations
   │   └── 是 → TaskState::Failed → 持久化 → 返回错误
   │
-  ├─ ContextBuilder.build() → system prompt + 历史 + 工具定义
+  ├─ 获取 last_summary（来自 Consolidator）
+  │
+  ├─ ContextBuilder.build(session_id, channel_inject, last_summary)
+  │   → system prompt + 历史 + 工具定义 + 会话摘要
   │
   ├─ 历史治理预处理
   │   ├── drop_orphan_tool_results() → 丢弃无对应 tool_call 的 Tool 消息
@@ -100,8 +105,10 @@ pub async fn run(
   │   │
   │   ├── 无 tool_calls → 完成
   │   │   ├── 写入 Assistant 消息
+  │   │   ├── 更新 token_per_char_ratio
+  │   │   ├── 持久化（追加写入 JSONL + meta）
+  │   │   ├── 触发 Consolidator.maybe_consolidate()（如已配置）
   │   │   ├── TaskState::Completed → 通知通道
-  │   │   ├── 持久化
   │   │   └── 返回文本
   │   │
   │   └── 有 tool_calls → 执行工具
@@ -112,6 +119,8 @@ pub async fn run(
   │       │   ├── 超长 → persist_tool_result() → 写磁盘 + 引用
   │       │   ├── 截断 → truncate_text_head_tail() → 头+尾保留
   │       │   └── 写入 Tool { content, tool_call_id, name } 消息
+  │       ├── 写入 Assistant { tool_calls: ... } 消息
+  │       ├── 持久化
   │       ├── iterations += 1
   │       ├── TaskState::Running { current_iteration } → 通知
   │       └── 继续下一轮
@@ -142,6 +151,7 @@ pub async fn run(
 |------|------|--------|------|
 | `max_tool_result_chars` | `u32` | 8000 | 工具结果最大字符数（超过则截断） |
 | `persist_tool_results` | `bool` | true | 是否将超长工具结果持久化到磁盘 |
+| `context_window_tokens` | `u32` | 8192 | LLM 上下文窗口大小，用于 Consolidator 触发预算检查 |
 
 ## 并发安全
 
@@ -152,3 +162,9 @@ pub async fn run(
 ## 超时处理
 
 `AgentConfig.timeout_seconds` 字段定义了每轮 Agent 的超时时间，但实际的超时控制应在 `AgentRunner.run()` 的调用层（通过 `tokio::time::timeout`）实现。当前实现依赖 `max_iterations` 作为内置的保护机制。
+
+## Consolidation 集成
+
+当 `consolidator` 字段为 `Some(Arc<Consolidator>)` 时，ReAct 循环完成后（最终回复阶段）会调用 `consolidator.maybe_consolidate(session_id, prompt_tokens)`。若 prompt_tokens 超过安全预算，Consolidator 会自动选取旧消息进行摘要，摘要追加到 `history.jsonl` 并更新会话的 consolidation 游标。
+
+传入 `None` 时跳过摘要检查。
