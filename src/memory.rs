@@ -19,6 +19,9 @@ pub struct MemoryStore {
     history_file: PathBuf,
     cursor_file: PathBuf,
     dream_cursor_file: PathBuf,
+    // In-memory cache for cursors, lazily initialized.
+    cursor_cache: Option<u64>,
+    dream_cursor_cache: Option<u64>,
 }
 
 impl MemoryStore {
@@ -31,6 +34,8 @@ impl MemoryStore {
             history_file: memory_dir.join("history.jsonl"),
             cursor_file: memory_dir.join(".cursor"),
             dream_cursor_file: memory_dir.join(".dream_cursor"),
+            cursor_cache: None,
+            dream_cursor_cache: None,
         }
     }
 
@@ -87,7 +92,7 @@ impl MemoryStore {
     // -- history.jsonl (append-only JSONL) -----------------------------------
 
     /// Append an entry to history.jsonl and return its auto-incrementing cursor.
-    pub fn append_history(&self, entry: &str) -> Result<u64> {
+    pub fn append_history(&mut self, entry: &str) -> Result<u64> {
         let cursor = self.next_cursor();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
         let record = HistoryEntry {
@@ -97,10 +102,9 @@ impl MemoryStore {
         };
         let line = serde_json::to_string(&record)
             .context("Failed to serialize history entry")?;
-        // Write cursor first so a crash after this doesn't cause cursor reuse.
         std::fs::write(&self.cursor_file, cursor.to_string())
             .context("Failed to write history cursor")?;
-        // Then append to history file.
+        self.cursor_cache = Some(cursor);
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -112,7 +116,7 @@ impl MemoryStore {
     }
 
     /// Read history entries with cursor > `since_cursor`.
-    pub fn read_unprocessed_history(&self, since_cursor: u64) -> Vec<HistoryEntry> {
+    pub fn read_unprocessed_history(&mut self, since_cursor: u64) -> Vec<HistoryEntry> {
         self.read_entries()
             .into_iter()
             .filter(|e| e.cursor > since_cursor)
@@ -131,27 +135,40 @@ impl MemoryStore {
 
     // -- cursor management --------------------------------------------------
 
-    fn next_cursor(&self) -> u64 {
+    fn next_cursor(&mut self) -> u64 {
+        if let Some(cached) = self.cursor_cache {
+            return cached + 1;
+        }
         if let Ok(text) = std::fs::read_to_string(&self.cursor_file) {
             if let Ok(val) = text.trim().parse::<u64>() {
+                self.cursor_cache = Some(val);
                 return val + 1;
             }
         }
-        // Fallback: find max cursor from existing entries.
         let entries = self.read_entries();
-        entries.last().map(|e| e.cursor + 1).unwrap_or(1)
+        let cursor = entries.last().map(|e| e.cursor + 1).unwrap_or(1);
+        self.cursor_cache = Some(cursor - 1);
+        cursor
     }
 
-    pub fn get_last_dream_cursor(&self) -> u64 {
+    pub fn get_last_dream_cursor(&mut self) -> u64 {
+        if let Some(cached) = self.dream_cursor_cache {
+            return cached;
+        }
         if let Ok(text) = std::fs::read_to_string(&self.dream_cursor_file) {
             if let Ok(val) = text.trim().parse::<u64>() {
+                self.dream_cursor_cache = Some(val);
                 return val;
             }
         }
-        0
+        let entries = self.read_entries();
+        let cursor = entries.last().map(|e| e.cursor).unwrap_or(0);
+        self.dream_cursor_cache = Some(cursor);
+        cursor
     }
 
-    pub fn set_last_dream_cursor(&self, cursor: u64) -> Result<()> {
+    pub fn set_last_dream_cursor(&mut self, cursor: u64) -> Result<()> {
+        self.dream_cursor_cache = Some(cursor);
         std::fs::write(&self.dream_cursor_file, cursor.to_string())
             .context("Failed to write dream cursor")
     }
@@ -237,7 +254,7 @@ mod tests {
     #[test]
     fn test_history_append_and_read() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
+        let mut store = make_store(tmp.path());
 
         let c1 = store.append_history("first entry").unwrap();
         let c2 = store.append_history("second entry").unwrap();
@@ -253,7 +270,7 @@ mod tests {
     #[test]
     fn test_read_unprocessed_history() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
+        let mut store = make_store(tmp.path());
 
         store.append_history("entry 1").unwrap();
         store.append_history("entry 2").unwrap();
@@ -268,7 +285,7 @@ mod tests {
     #[test]
     fn test_read_recent_history_cap() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
+        let mut store = make_store(tmp.path());
 
         for i in 1..=10 {
             store.append_history(&format!("entry {}", i)).unwrap();
@@ -282,11 +299,28 @@ mod tests {
     #[test]
     fn test_dream_cursor() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
+        let mut store = make_store(tmp.path());
 
         assert_eq!(store.get_last_dream_cursor(), 0);
         store.set_last_dream_cursor(42).unwrap();
         assert_eq!(store.get_last_dream_cursor(), 42);
+    }
+
+    #[test]
+    fn test_cursor_cache_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        let c1 = store.append_history("first").unwrap();
+        assert_eq!(c1, 1);
+
+        // Second call uses cached cursor.
+        let c2 = store.append_history("second").unwrap();
+        assert_eq!(c2, 2);
+
+        // Third call confirms cache is still correct.
+        let c3 = store.append_history("third").unwrap();
+        assert_eq!(c3, 3);
     }
 
     #[test]
