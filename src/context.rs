@@ -5,6 +5,7 @@ use crate::bootstrap::{bootstrap_files, read_if_modified};
 use crate::memory::SharedMemoryStore;
 use crate::session::{Message, SharedSessionManager};
 use crate::tool::{ToolDefinition, ToolManager};
+use crate::debug;
 
 pub struct RunContext {
     pub messages: Vec<Message>,
@@ -81,6 +82,7 @@ impl ContextBuilder {
     }
 
     pub async fn build(&self, session_id: &str, channel_inject: Option<String>, session_summary: Option<&str>) -> RunContext {
+        debug!("[ContextBuilder] Starting build for session={}", session_id);
         let mut system_parts: Vec<String> = Vec::new();
 
         // 1. Fixed brief intro
@@ -174,6 +176,7 @@ impl ContextBuilder {
             let sm = self.session_manager.lock().await;
             sm.get_messages(session_id).await
         };
+        debug!("[ContextBuilder] Session messages count={}", messages.len());
 
         // 7. Channel self-injected info
         if let Some(inject) = channel_inject {
@@ -184,10 +187,12 @@ impl ContextBuilder {
 
         // Assemble system prompt
         let system_prompt = system_parts.join("\n\n---\n\n");
+        debug!("[ContextBuilder] System prompt total len={}", system_prompt.len());
         let mut all_messages = vec![Message::system(system_prompt)];
         all_messages.extend(messages);
 
         let tools = Some(self.tool_manager.to_openai_functions());
+        debug!("[ContextBuilder] Tools count={}", tools.as_ref().map(|t| t.len()).unwrap_or(0));
 
         RunContext {
             messages: all_messages,

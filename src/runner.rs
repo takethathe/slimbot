@@ -8,6 +8,7 @@ use crate::memory::SharedMemoryStore;
 use crate::provider::{Provider, Usage};
 use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState};
 use crate::tool::{ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
+use crate::{debug, warn_log};
 
 /// Result returned by AgentRunner after a ReAct loop completes.
 #[derive(Debug, Clone, Default)]
@@ -163,16 +164,19 @@ impl AgentRunner {
         hook: TaskHook,
         session_id: &str,
     ) -> AgentResult {
+        debug!("[AgentRunner] Starting run for session={}", session_id);
+
         // 1. Write user message
         {
             let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                 self.session_manager.lock().await;
-            if let Err(e) = sm
+            let add_result = sm
                 .add_message(
                     session_id,
                     Message::user(content),
                 )
-                .await
+                .await;
+            if let Err(e) = add_result
             {
                 return self.fail_result(&hook, session_id, &format!("Failed to write user message: {}", e), 0).await;
             }
@@ -192,6 +196,7 @@ impl AgentRunner {
             // Exceeded max iterations
             if iterations >= max_iterations {
                 let err_msg = format!("Reached max iterations {}", max_iterations);
+                warn_log!("[AgentRunner] {}", err_msg);
                 result.success = false;
                 result.content = err_msg.clone();
                 result.iterations = iterations;
@@ -222,12 +227,14 @@ impl AgentRunner {
             let mut ctx = context_builder
                 .build(session_id, self.channel_inject.clone(), session_summary_ref)
                 .await;
+            debug!("[AgentRunner] Context built: {} messages, tools={}", ctx.messages.len(), ctx.tools.as_ref().map(|t| t.len()).unwrap_or(0));
 
             // History governance: clean orphans and backfill missing tool results
             Self::drop_orphan_tool_results(&mut ctx.messages);
             Self::backfill_missing_tool_results(&mut ctx.messages);
 
             // Request model
+            debug!("[AgentRunner] Sending chat request to provider");
             let response = match self
                 .provider
                 .chat(&ctx.messages, ctx.tools.as_deref())
@@ -236,6 +243,7 @@ impl AgentRunner {
                 Ok(r) => r,
                 Err(e) => {
                     let err_msg = format!("LLM API request failed - {}", e);
+                    warn_log!("[AgentRunner] {}", err_msg);
                     result.success = false;
                     result.content = err_msg.clone();
                     result.iterations = iterations;
@@ -249,6 +257,15 @@ impl AgentRunner {
                     return result;
                 }
             };
+            debug!(
+                "[AgentRunner] Got response: content_len={}, tool_calls={}, prompt_tokens={}, prompt_cache_hit={}, completion_tokens={}, total_tokens={}",
+                response.content.as_ref().map(|s| s.len()).unwrap_or(0),
+                response.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0),
+                response.usage.prompt_tokens,
+                response.usage.prompt_cache_hit_tokens,
+                response.usage.completion_tokens,
+                response.usage.total_tokens,
+            );
 
             // No tool calls → done
             let has_tool_calls = response
@@ -263,6 +280,7 @@ impl AgentRunner {
                 result.success = true;
                 result.content = text.clone();
                 result.iterations = iterations;
+                debug!("[AgentRunner] No tool calls, final response (len={})", text.len());
                 {
                     let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                         self.session_manager.lock().await;
@@ -291,6 +309,7 @@ impl AgentRunner {
                 if let Some(ref consolidator) = self.consolidator {
                     let _ = consolidator.maybe_consolidate(session_id, prompt_tokens).await;
                 }
+                debug!("[AgentRunner] Run complete: success={}, iterations={}", result.success, result.iterations);
                 return result;
             }
 
@@ -298,6 +317,7 @@ impl AgentRunner {
             // then execute each tool and append its Tool message.
             if let Some(calls) = &response.tool_calls {
                 result.accumulate(&response.usage);
+                debug!("[AgentRunner] Executing {} tool calls", calls.len());
 
                 // 1. Persist the assistant reply (preserves model's content text)
                 {

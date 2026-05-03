@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::agent_loop::AgentLoop;
 use crate::session::{SessionManager, TaskHook};
-use crate::fatal;
+use crate::{debug, fatal};
 
 #[derive(Parser, Debug)]
 #[command(name = "slimbot", about = "SlimBot AI agent")]
@@ -96,16 +96,23 @@ pub async fn run_agent_session(
 
     // Single-turn: run query and exit
     if let Some(query) = query {
+        debug!("[cli] Single-turn query: {}", query);
+        // Ensure session exists before running
+        if let Err(e) = crate::session::ensure_session(&agent_loop.session_manager(), session_id).await {
+            fatal!("Failed to create session: {}", e);
+        }
         let hook = TaskHook::new(session_id);
         let result = agent_loop
             .run_task(session_id, query.to_string(), hook, None)
             .await;
+        debug!("[cli] run_task returned: success={}, content_len={}", result.success, result.content.len());
 
         if result.success {
             println!("{}", result.content);
         } else {
             fatal!("Agent task failed: {}", result.content);
         }
+        return Ok(());
     }
 
     // Interactive mode: existing stdin loop
