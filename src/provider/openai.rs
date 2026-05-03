@@ -96,15 +96,16 @@ impl crate::provider::Provider for OpenAIProvider {
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| match m {
-                Message::System { content } => {
+                Message::System { content, .. } => {
                     serde_json::json!({"role": "system", "content": content})
                 }
-                Message::User { content } => {
+                Message::User { content, .. } => {
                     serde_json::json!({"role": "user", "content": content})
                 }
                 Message::Assistant {
                     content,
                     tool_calls,
+                    ..
                 } => {
                     let mut obj = serde_json::json!({"role": "assistant"});
                     if let Some(c) = content {
@@ -134,6 +135,7 @@ impl crate::provider::Provider for OpenAIProvider {
                     content,
                     tool_call_id,
                     name,
+                    ..
                 } => {
                     let mut obj = serde_json::json!({
                         "role": "tool",

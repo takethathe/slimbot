@@ -164,7 +164,7 @@ impl AgentRunner {
             if let Err(e) = sm
                 .add_message(
                     session_id,
-                    Message::User { content },
+                    Message::user(content),
                 )
                 .await
             {
@@ -193,7 +193,7 @@ impl AgentRunner {
                     error: err_msg.clone(),
                 };
                 {
-                    let sm: tokio::sync::MutexGuard<'_, SessionManager> =
+                    let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                         self.session_manager.lock().await;
                     let _ = sm.persist(session_id).await;
                 }
@@ -225,7 +225,7 @@ impl AgentRunner {
                     result.iterations = iterations;
                     let failed_state = TaskState::Failed { error: err_msg };
                     {
-                        let sm: tokio::sync::MutexGuard<'_, SessionManager> =
+                        let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                             self.session_manager.lock().await;
                         let _ = sm.persist(session_id).await;
                     }
@@ -252,10 +252,7 @@ impl AgentRunner {
                     if let Err(e) = sm
                         .add_message(
                             session_id,
-                            Message::Assistant {
-                                content: Some(text.clone()),
-                                tool_calls: None,
-                            },
+                            Message::assistant(Some(text.clone()), None),
                         )
                         .await
                     {
@@ -285,10 +282,7 @@ impl AgentRunner {
                     if let Err(e) = sm
                         .add_message(
                             session_id,
-                            Message::Assistant {
-                                content: response.content.clone(),
-                                tool_calls: Some(calls.clone()),
-                            },
+                            Message::assistant(response.content.clone(), Some(calls.clone())),
                         )
                         .await
                     {
@@ -329,11 +323,7 @@ impl AgentRunner {
                         if let Err(e) = sm
                             .add_message(
                                 session_id,
-                                Message::Tool {
-                                    content: final_content,
-                                    tool_call_id: call.id.clone(),
-                                    name: Some(call.name.clone()),
-                                },
+                                Message::tool(final_content, call.id.clone(), Some(call.name.clone())),
                             )
                             .await
                         {
@@ -364,7 +354,7 @@ impl AgentRunner {
         result.iterations = iterations;
         let failed_state = TaskState::Failed { error: error.to_string() };
         {
-            let sm: tokio::sync::MutexGuard<'_, SessionManager> =
+            let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                 self.session_manager.lock().await;
             let _ = sm.persist(session_id).await;
         }
@@ -437,18 +427,18 @@ impl AgentRunner {
         // Group by assistant index, then insert each group in reverse to avoid index shifting.
         let mut by_assistant: std::collections::BTreeMap<usize, Vec<(String, String)>> =
             std::collections::BTreeMap::new();
-        for (_asst_idx, call_id, tool_name) in missing {
-            by_assistant.entry(_asst_idx).or_default().push((call_id, tool_name));
+        for (asst_idx, call_id, tool_name) in missing {
+            by_assistant.entry(asst_idx).or_default().push((call_id, tool_name));
         }
 
         for (assistant_idx, calls) in by_assistant.into_iter().rev() {
             // Insert each call in reverse so they end up in original order
             for (call_id, tool_name) in calls.into_iter().rev() {
-                messages.insert(assistant_idx + 1, Message::Tool {
-                    content: backfill_content.to_string(),
-                    tool_call_id: call_id,
-                    name: Some(tool_name),
-                });
+                messages.insert(assistant_idx + 1, Message::tool(
+                    backfill_content.to_string(),
+                    call_id,
+                    Some(tool_name),
+                ));
             }
         }
     }
@@ -659,10 +649,10 @@ mod tests {
         let msgs = sm.lock().await.get_messages("test-session").await;
         assert_eq!(msgs.len(), 2); // user + assistant (system prompt is not stored in session)
         assert!(
-            matches!(&msgs[0], Message::User { content } if content == "Say hi")
+            matches!(&msgs[0], Message::User { content, .. } if content == "Say hi")
         );
         assert!(
-            matches!(&msgs[1], Message::Assistant { content: Some(c), tool_calls: None } if c == "Hello, world!")
+            matches!(&msgs[1], Message::Assistant { content: Some(c), tool_calls: None, .. } if c == "Hello, world!")
         );
     }
 
@@ -698,7 +688,7 @@ mod tests {
         // user + assistant(content+tool_calls) + tool + assistant(final)
         assert_eq!(msgs.len(), 4);
         match &msgs[1] {
-            Message::Assistant { content, tool_calls } => {
+            Message::Assistant { content, tool_calls, .. } => {
                 assert_eq!(
                     content.as_deref(),
                     Some("Let me echo that for you.")
@@ -766,7 +756,7 @@ mod tests {
 
         // Verify assistant message has both content and both tool_calls
         match &msgs[1] {
-            Message::Assistant { content, tool_calls } => {
+            Message::Assistant { content, tool_calls, .. } => {
                 assert_eq!(
                     content.as_deref(),
                     Some("I'll check both the list and the file for you.")
@@ -816,7 +806,7 @@ mod tests {
 
         let msgs = sm.lock().await.get_messages("test-session").await;
         match &msgs[1] {
-            Message::Assistant { content, tool_calls } => {
+            Message::Assistant { content, tool_calls, .. } => {
                 assert!(content.is_none());
                 assert_eq!(tool_calls.as_ref().unwrap().len(), 2);
             }
@@ -974,10 +964,10 @@ mod tests {
         let msgs = sm2.lock().await.get_messages("test-session").await;
         assert_eq!(msgs.len(), 2); // user + assistant
         assert!(
-            matches!(&msgs[0], Message::User { content } if content == "hello")
+            matches!(&msgs[0], Message::User { content, .. } if content == "hello")
         );
         assert!(
-            matches!(&msgs[1], Message::Assistant { content: Some(c), tool_calls: None } if c == "persist me")
+            matches!(&msgs[1], Message::Assistant { content: Some(c), tool_calls: None, .. } if c == "persist me")
         );
     }
 
@@ -1052,21 +1042,10 @@ mod tests {
     #[test]
     fn test_drop_orphan_tool_results() {
         let mut messages = vec![
-            Message::User { content: "test".to_string() },
-            Message::Assistant {
-                content: Some("calling".to_string()),
-                tool_calls: Some(vec![tool_call("tc-1", "echo")]),
-            },
-            Message::Tool {
-                content: "orphan".to_string(),
-                tool_call_id: "tc-999".to_string(),
-                name: Some("echo".to_string()),
-            },
-            Message::Tool {
-                content: "valid".to_string(),
-                tool_call_id: "tc-1".to_string(),
-                name: Some("echo".to_string()),
-            },
+            Message::user("test".to_string()),
+            Message::assistant(Some("calling".to_string()), Some(vec![tool_call("tc-1", "echo")])),
+            Message::tool("orphan".to_string(), "tc-999".to_string(), Some("echo".to_string())),
+            Message::tool("valid".to_string(), "tc-1".to_string(), Some("echo".to_string())),
         ];
 
         AgentRunner::drop_orphan_tool_results(&mut messages);
@@ -1078,16 +1057,9 @@ mod tests {
     #[test]
     fn test_backfill_missing_tool_results() {
         let mut messages = vec![
-            Message::User { content: "test".to_string() },
-            Message::Assistant {
-                content: Some("calling".to_string()),
-                tool_calls: Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]),
-            },
-            Message::Tool {
-                content: "result-1".to_string(),
-                tool_call_id: "tc-1".to_string(),
-                name: Some("echo".to_string()),
-            },
+            Message::user("test".to_string()),
+            Message::assistant(Some("calling".to_string()), Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")])),
+            Message::tool("result-1".to_string(), "tc-1".to_string(), Some("echo".to_string())),
             // tc-2 has no result
         ];
 
@@ -1108,26 +1080,12 @@ mod tests {
     fn test_backfill_missing_multiple_assistants() {
         // Two assistants, each with missing tool calls
         let mut messages = vec![
-            Message::User { content: "first".to_string() },
-            Message::Assistant {
-                content: Some("a1".to_string()),
-                tool_calls: Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]),
-            },
-            Message::Tool {
-                content: "r1".to_string(),
-                tool_call_id: "tc-1".to_string(),
-                name: Some("echo".to_string()),
-            },
-            Message::User { content: "second".to_string() },
-            Message::Assistant {
-                content: Some("a2".to_string()),
-                tool_calls: Some(vec![tool_call("tc-3", "write"), tool_call("tc-4", "list")]),
-            },
-            Message::Tool {
-                content: "r4".to_string(),
-                tool_call_id: "tc-4".to_string(),
-                name: Some("list".to_string()),
-            },
+            Message::user("first".to_string()),
+            Message::assistant(Some("a1".to_string()), Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")])),
+            Message::tool("r1".to_string(), "tc-1".to_string(), Some("echo".to_string())),
+            Message::user("second".to_string()),
+            Message::assistant(Some("a2".to_string()), Some(vec![tool_call("tc-3", "write"), tool_call("tc-4", "list")])),
+            Message::tool("r4".to_string(), "tc-4".to_string(), Some("list".to_string())),
             // tc-2 and tc-3 are missing
         ];
 

@@ -175,9 +175,7 @@ impl ContextBuilder {
 
         // Assemble system prompt
         let system_prompt = system_parts.join("\n\n---\n\n");
-        let mut all_messages = vec![Message::System {
-            content: system_prompt,
-        }];
+        let mut all_messages = vec![Message::system(system_prompt)];
         all_messages.extend(messages);
 
         let tools = Some(self.tool_manager.to_openai_functions());
