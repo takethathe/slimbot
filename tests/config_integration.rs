@@ -174,6 +174,7 @@ fn test_save_and_reload_round_trip() {
             model: "gpt-4".to_string(),
             temperature: 0.5,
             max_tokens: 2048,
+            prompt_cache_enabled: true,
         },
     );
 

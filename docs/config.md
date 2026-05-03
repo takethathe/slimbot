@@ -125,8 +125,14 @@ Provider 级别字段：
 | `model` | string | **是** | — | 模型名称（加载时验证） |
 | `temperature` | float | 否 | `0.7` | 采样温度（0.0–2.0） |
 | `max_tokens` | uint | 否 | `4096` | 单次最大响应 token 数 |
+| `prompt_cache_enabled` | bool | 否 | `true` | 是否启用 prompt 缓存（见 [docs/provider.md](provider.md)） |
 
-**URL 解析逻辑：** `api_url` 优先级更高。如果为空，则从 `base_url + "/v1/chat/completions"` 推导。如果两者都未设置，默认为 `https://api.openai.com/v1/chat/completions`。
+**URL 解析逻辑：** `api_url` 优先级更高。如果为空，则从 `base_url` 推导：
+- `base_url` 以 `/chat/completions` 结尾 → 直接使用
+- `base_url` 以 `/v1` 结尾 → 追加 `/chat/completions`
+- 其他情况 → 追加 `/v1/chat/completions`
+
+如果两者都未设置，默认为 `https://api.openai.com/v1/chat/completions`。
 
 **Provider 类型：**
 
@@ -230,11 +236,12 @@ Provider 级别字段：
 - 空 `agent.timeout_seconds` → `120`
 - 对每个 Provider：
   - 空 `type` → `"openai"`
-  - 空 `api_url` 且设置了 `base_url` → `base_url + "/v1/chat/completions"`
+  - 空 `api_url` 且设置了 `base_url` → 根据 `base_url` 结尾推导（见上文 URL 解析逻辑）
   - `api_url` 和 `base_url` 都为空 → `https://api.openai.com/v1/chat/completions`
   - 空 `model` → `gpt-4o`
   - `temperature` ≤ 0.0 或 > 2.0 → `0.7`
   - `max_tokens` = 0 → `4096`
+  - `prompt_cache_enabled` → 尊重用户设置，不做规范化
   - `api_key` **永不**被规范化或覆盖
 - `name`/`type` 为空的 tools/channels 条目会被移除
 

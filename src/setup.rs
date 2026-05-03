@@ -15,6 +15,7 @@ fn default_fallback_provider() -> ProviderConfig {
         model: String::new(),
         temperature: ConfigScheme::DEFAULT_TEMPERATURE,
         max_tokens: ConfigScheme::DEFAULT_MAX_TOKENS,
+        prompt_cache_enabled: true,
     }
 }
 
@@ -99,6 +100,9 @@ fn merge_provider(target: &mut ProviderConfig, src: &serde_json::Map<String, ser
     }
     if let Some(v) = src.get("max_tokens").and_then(|v| v.as_u64()) {
         target.max_tokens = v as u32;
+    }
+    if let Some(v) = src.get("prompt_cache_enabled").and_then(|v| v.as_bool()) {
+        target.prompt_cache_enabled = v;
     }
 }
 

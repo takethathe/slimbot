@@ -58,6 +58,10 @@ pub struct ProviderConfig {
     pub temperature: f32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Whether to enable prompt caching via `cache_control` annotation on the
+    /// last message. Defaults to true.
+    #[serde(default = "default_true")]
+    pub prompt_cache_enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

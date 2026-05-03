@@ -211,6 +211,7 @@ fn test_normalize_multiple_providers() {
             model: "Qwen/Qwen2.5-72B-Instruct".to_string(),
             temperature: 0.7,
             max_tokens: 4096,
+            prompt_cache_enabled: true,
         },
     );
     config.agent.provider = "siliconflow".to_string();

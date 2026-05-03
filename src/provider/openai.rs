@@ -5,6 +5,7 @@ use serde::Deserialize;
 use crate::config::ProviderConfig;
 use crate::session::Message;
 use crate::tool::ToolDefinition;
+use crate::debug;
 
 use super::{LLMResponse, Usage, FinishReason};
 
@@ -31,6 +32,12 @@ impl OpenAIProvider {
         }
         if !config.base_url.is_empty() {
             let base = config.base_url.trim_end_matches('/');
+            if base.ends_with("/chat/completions") {
+                return base.to_string();
+            }
+            if base.ends_with("/v1") {
+                return format!("{}/chat/completions", base);
+            }
             return format!("{}/v1/chat/completions", base);
         }
         "https://api.openai.com/v1/chat/completions".to_string()
@@ -93,59 +100,77 @@ impl crate::provider::Provider for OpenAIProvider {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<LLMResponse> {
+        debug!("[OpenAIProvider] POST {} (model={}, messages={}, tools={})",
+            self.api_url, self.config.model, messages.len(), tools.map(|t| t.len()).unwrap_or(0));
+
+        // Find the index of the last system message for cache_control injection
+        let last_system_idx = messages.iter().enumerate().rev().find_map(|(i, m)| {
+            matches!(m, Message::System { .. }).then_some(i)
+        });
+
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
-            .map(|m| match m {
-                Message::System { content, .. } => {
-                    serde_json::json!({"role": "system", "content": content})
-                }
-                Message::User { content, .. } => {
-                    serde_json::json!({"role": "user", "content": content})
-                }
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                    ..
-                } => {
-                    let mut obj = serde_json::json!({"role": "assistant"});
-                    if let Some(c) = content {
-                        obj["content"] = serde_json::json!(c);
-                    } else {
-                        obj["content"] = serde_json::Value::Null;
+            .enumerate()
+            .map(|(i, m)| {
+                let is_cache_target = self.config.prompt_cache_enabled && Some(i) == last_system_idx;
+                match m {
+                    Message::System { content, .. } => {
+                        let mut obj = serde_json::json!({"role": "system", "content": content});
+                        if is_cache_target {
+                            obj["content"] = serde_json::json!([
+                                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                            ]);
+                        }
+                        obj
                     }
-                    if let Some(calls) = tool_calls {
-                        let tc: Vec<_> = calls
-                            .iter()
-                            .map(|call| {
-                                serde_json::json!({
-                                    "id": call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": call.name,
-                                        "arguments": call.args.to_string(),
-                                    }
+                    Message::User { content, .. } => {
+                        serde_json::json!({"role": "user", "content": content})
+                    }
+                    Message::Assistant {
+                        content,
+                        tool_calls,
+                        ..
+                    } => {
+                        let mut obj = serde_json::json!({"role": "assistant"});
+                        if let Some(c) = content {
+                            obj["content"] = serde_json::json!(c);
+                        } else {
+                            obj["content"] = serde_json::Value::Null;
+                        }
+                        if let Some(calls) = tool_calls {
+                            let tc: Vec<_> = calls
+                                .iter()
+                                .map(|call| {
+                                    serde_json::json!({
+                                        "id": call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call.name,
+                                            "arguments": call.args.to_string(),
+                                        }
+                                    })
                                 })
-                            })
-                            .collect();
-                        obj["tool_calls"] = serde_json::json!(tc);
+                                .collect();
+                            obj["tool_calls"] = serde_json::json!(tc);
+                        }
+                        obj
                     }
-                    obj
-                }
-                Message::Tool {
-                    content,
-                    tool_call_id,
-                    name,
-                    ..
-                } => {
-                    let mut obj = serde_json::json!({
-                        "role": "tool",
-                        "content": content,
-                        "tool_call_id": tool_call_id,
-                    });
-                    if let Some(n) = name {
-                        obj["name"] = serde_json::json!(n);
+                    Message::Tool {
+                        content,
+                        tool_call_id,
+                        name,
+                        ..
+                    } => {
+                        let mut obj = serde_json::json!({
+                            "role": "tool",
+                            "content": content,
+                            "tool_call_id": tool_call_id,
+                        });
+                        if let Some(n) = name {
+                            obj["name"] = serde_json::json!(n);
+                        }
+                        obj
                     }
-                    obj
                 }
             })
             .collect();
@@ -204,7 +229,7 @@ impl crate::provider::Provider for OpenAIProvider {
             _ => FinishReason::Error,
         };
 
-        let tool_calls = choice.message.tool_calls.as_ref().map(|calls| {
+        let tool_calls: Option<Vec<crate::tool::ToolCall>> = choice.message.tool_calls.as_ref().map(|calls| {
             calls
                 .iter()
                 .map(|call| {
@@ -230,6 +255,21 @@ impl crate::provider::Provider for OpenAIProvider {
             total_tokens: u.total_tokens.unwrap_or(0),
         }).unwrap_or_default();
 
+        let tool_call_count = match &tool_calls {
+            Some(calls) => calls.len(),
+            None => 0,
+        };
+        debug!(
+            "[OpenAIProvider] Response: finish_reason={:?}, content_len={}, tool_calls={}, prompt_tokens={}, prompt_cache_hit={}, completion_tokens={}, total_tokens={}",
+            finish_reason,
+            choice.message.content.as_ref().map(|s| s.len()).unwrap_or(0),
+            tool_call_count,
+            usage.prompt_tokens,
+            usage.prompt_cache_hit_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+        );
+
         Ok(LLMResponse {
             content: choice.message.content.clone(),
             tool_calls,
@@ -242,6 +282,61 @@ impl crate::provider::Provider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_config(api_url: &str, base_url: &str) -> ProviderConfig {
+        ProviderConfig {
+            r#type: "openai".to_string(),
+            api_url: api_url.to_string(),
+            base_url: base_url.to_string(),
+            api_key: "test-key".to_string(),
+            model: "gpt-4".to_string(),
+            temperature: 0.7,
+            max_tokens: 4096,
+            prompt_cache_enabled: true,
+        }
+    }
+
+    #[test]
+    fn test_resolve_api_url_full_endpoint() {
+        let provider = OpenAIProvider::new(&make_config("https://custom.url/full/path", "https://other.url"));
+        assert_eq!(provider.api_url, "https://custom.url/full/path");
+    }
+
+    #[test]
+    fn test_resolve_api_url_base_ends_with_v1() {
+        let provider = OpenAIProvider::new(&make_config(
+            "", "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ));
+        assert_eq!(provider.api_url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_resolve_api_url_base_ends_with_v1_trailing_slash() {
+        let provider = OpenAIProvider::new(&make_config(
+            "", "https://dashscope.aliyuncs.com/compatible-mode/v1/",
+        ));
+        assert_eq!(provider.api_url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_resolve_api_url_base_already_has_chat_completions() {
+        let provider = OpenAIProvider::new(&make_config(
+            "", "https://example.com/v1/chat/completions",
+        ));
+        assert_eq!(provider.api_url, "https://example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_resolve_api_url_generic_base() {
+        let provider = OpenAIProvider::new(&make_config("", "https://example.com"));
+        assert_eq!(provider.api_url, "https://example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_resolve_api_url_no_base() {
+        let provider = OpenAIProvider::new(&make_config("", ""));
+        assert_eq!(provider.api_url, "https://api.openai.com/v1/chat/completions");
+    }
 
     #[test]
     fn test_tool_call_with_id() {

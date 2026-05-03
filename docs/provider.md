@@ -61,14 +61,33 @@ OpenAIProvider::new(provider_config)
 - `model` — 模型名称
 - `temperature` — 采样温度
 - `max_tokens` — 最大响应 token 数
+- `prompt_cache_enabled` — 是否启用 prompt 缓存（默认 `true`）
 
 ### URL 解析逻辑
 
 ```
 if api_url 不为空 → 使用 api_url
-else if base_url 不为空 → base_url + "/v1/chat/completions"
+else if base_url 不为空:
+    if base_url 以 "/chat/completions" 结尾 → 直接使用
+    else if base_url 以 "/v1" 结尾 → base_url + "/chat/completions"
+    else → base_url + "/v1/chat/completions"
 else → "https://api.openai.com/v1/chat/completions"
 ```
+
+### Prompt Cache
+
+当 `prompt_cache_enabled` 为 `true`（默认）时，OpenAIProvider 会在最后一条 system message 的 content 字段上注入 `cache_control: {"type": "ephemeral"}`。这使得支持该格式的 provider（如 Anthropic 兼容接口）能够缓存该消息，减少重复请求的 token 消耗。
+
+```json
+{
+  "role": "system",
+  "content": [
+    {"type": "text", "text": "...", "cache_control": {"type": "ephemeral"}}
+  ]
+}
+```
+
+设置为 `false` 时，所有消息以纯字符串 content 发送。
 
 ### 请求格式
 

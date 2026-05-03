@@ -101,3 +101,23 @@
 - [ ] 使用 Consolidator 对剩余消息进行 LLM 摘要
 - [ ] Session 重新加载时注入摘要到 system prompt，代替已归档的消息
 - [ ] 压缩结果持久化到 session JSONL 文件
+
+## 用户命令处理机制
+
+- [ ] 增加用户命令处理机制，支持用户在多轮对话中输入斜杠命令
+- [ ] 实现 `/quit`（或 `/exit`）命令，用于退出 agent 的多轮对话
+- [ ] 命令解析在 channel 层或 agent loop 层拦截以 `/` 开头的输入
+- [ ] 命令处理结果反馈给用户（如退出提示）
+
+## CLI Markdown 输出支持
+
+- [ ] 增加 CLI 输出的 Markdown 格式处理
+- [ ] 解析 LLM 返回的 Markdown 内容并在终端中渲染（加粗、代码块、列表等）
+- [ ] 可选使用 `comfy-table` / `termimad` / `bat` 等库实现终端 Markdown 渲染
+- [ ] 保持与非 Markdown 通道（如 Telegram）输出兼容性
+
+## LLM Cache 功能
+
+- [x] `ProviderConfig` 新增 `prompt_cache_enabled` 字段（默认 true），通过 serde 自动反序列化
+- [x] OpenAI provider 在最后一条 system message 的 content 上注入 `cache_control: {"type": "ephemeral"}`
+- [x] `setup.rs` `merge_provider` 支持 partial config 中的 `prompt_cache_enabled` 字段

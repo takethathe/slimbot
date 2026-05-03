@@ -93,7 +93,13 @@ impl ConfigScheme {
         }
         if !provider.base_url.is_empty() {
             let base = provider.base_url.trim_end_matches('/');
-            provider.api_url = format!("{}/v1/chat/completions", base);
+            if base.ends_with("/chat/completions") {
+                provider.api_url = base.to_string();
+            } else if base.ends_with("/v1") {
+                provider.api_url = format!("{}/chat/completions", base);
+            } else {
+                provider.api_url = format!("{}/v1/chat/completions", base);
+            }
         } else {
             provider.api_url = Self::DEFAULT_API_URL.to_string();
         }
@@ -120,6 +126,7 @@ impl ConfigScheme {
             model: Self::DEFAULT_MODEL.to_string(),
             temperature: Self::DEFAULT_TEMPERATURE,
             max_tokens: Self::DEFAULT_MAX_TOKENS,
+            prompt_cache_enabled: true,
         }
     }
 
@@ -305,6 +312,7 @@ mod tests {
                 model: "Qwen/Qwen2.5-72B-Instruct".to_string(),
                 temperature: 0.7,
                 max_tokens: 4096,
+                prompt_cache_enabled: true,
             },
         );
         config.agent.provider = "siliconflow".to_string();
