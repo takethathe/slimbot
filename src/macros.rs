@@ -17,7 +17,7 @@ macro_rules! info {
 }
 
 #[macro_export]
-macro_rules! warn {
+macro_rules! warn_log {
     ($($arg:tt)*) => {
         if $crate::log::should_log($crate::log::LogLevel::Warning) {
             $crate::log::log($crate::log::LogLevel::Warning, &format_args!($($arg)*));

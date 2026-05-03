@@ -5,7 +5,7 @@ use tokio::task::JoinHandle;
 
 use crate::message_bus::BusRequest;
 use crate::session::TaskHook;
-use crate::{error, info, warn};
+use crate::{error, info, warn_log};
 
 /// Handle returned when a channel starts its I/O loop.
 /// Gives ChannelManager lifecycle visibility over channel I/O.
@@ -66,7 +66,7 @@ impl IoScheduler {
                         continue;
                     }
                     Ok(Err(IoReadError::Other(e))) => {
-                        warn!("[{}] Read failed: {}", channel_name, e);
+                        warn_log!("[{}] Read failed: {}", channel_name, e);
                         continue;
                     }
                     Err(e) => {

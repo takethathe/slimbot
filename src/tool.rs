@@ -11,7 +11,7 @@ use crate::utils::{
     TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS, build_persisted_reference,
     write_file_atomic,
 };
-use crate::{debug, error, warn};
+use crate::{debug, error, warn_log};
 
 // Re-export for runner.rs
 pub use crate::utils::truncate_text_head_tail;
@@ -96,7 +96,7 @@ impl ToolManager {
                 if let Some(tool) = create_builtin_tool(&entry.name, &self.workspace_dir) {
                     self.register(tool);
                 } else {
-                    warn!("Unknown tool: {}", entry.name);
+                    warn_log!("Unknown tool: {}", entry.name);
                 }
             }
         }
