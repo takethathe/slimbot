@@ -1,10 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use super::types::*;
-use super::types::MAX_RUN_HISTORY;
 use crate::debug;
 
 pub type CronJobCallback = Arc<dyn Fn(CronJob) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
@@ -12,7 +10,7 @@ pub type CronJobCallback = Arc<dyn Fn(CronJob) -> std::pin::Pin<Box<dyn std::fut
 pub struct CronService {
     store_path: PathBuf,
     action_path: PathBuf,
-    jobs: Arc<Mutex<Vec<CronJob>>>,
+    jobs: Arc<std::sync::Mutex<Vec<CronJob>>>,
     on_job: Option<CronJobCallback>,
     running: AtomicBool,
 }
@@ -24,7 +22,7 @@ impl CronService {
         Self {
             store_path: cron_dir.join("jobs.json"),
             action_path: cron_dir.join("action.jsonl"),
-            jobs: Arc::new(Mutex::new(Vec::new())),
+            jobs: Arc::new(std::sync::Mutex::new(Vec::new())),
             on_job: None,
             running: AtomicBool::new(false),
         }
@@ -34,19 +32,19 @@ impl CronService {
         self.on_job = Some(cb);
     }
 
-    pub fn load(&self) -> Vec<CronJob> {
+    pub fn load(&self) {
         if self.store_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&self.store_path) {
                 if let Ok(store) = serde_json::from_str::<CronStore>(&content) {
-                    return store.jobs;
+                    let mut guard = self.jobs.lock().unwrap();
+                    *guard = store.jobs;
                 }
             }
         }
-        Vec::new()
     }
 
     pub fn save(&self) {
-        let jobs = self.jobs.blocking_lock().clone();
+        let jobs = self.jobs.lock().unwrap().clone();
         let store = CronStore {
             version: 1,
             jobs,
@@ -57,14 +55,14 @@ impl CronService {
     }
 
     pub fn add_job(&self, job: CronJob) {
-        let mut guard = self.jobs.blocking_lock();
+        let mut guard = self.jobs.lock().unwrap();
         guard.push(job);
         drop(guard);
         self.save();
     }
 
     pub fn remove_job(&self, job_id: &str) -> bool {
-        let mut guard = self.jobs.blocking_lock();
+        let mut guard = self.jobs.lock().unwrap();
         let before = guard.len();
         guard.retain(|j| j.id != job_id);
         let removed = guard.len() < before;
@@ -76,7 +74,7 @@ impl CronService {
     }
 
     pub fn list_jobs(&self) -> Vec<CronJob> {
-        self.jobs.blocking_lock().clone()
+        self.jobs.lock().unwrap().clone()
     }
 
     pub fn start(&self) {
@@ -91,7 +89,7 @@ impl CronService {
 
     fn recompute_next_runs(&self) {
         let now = now_ms();
-        let mut guard = self.jobs.blocking_lock();
+        let mut guard = self.jobs.lock().unwrap();
         for job in guard.iter_mut() {
             if job.enabled {
                 job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
@@ -105,8 +103,10 @@ impl CronService {
         }
 
         let now = now_ms();
+
+        // Collect due jobs outside the lock
         let due_jobs: Vec<CronJob> = {
-            let guard = self.jobs.lock().await;
+            let guard = self.jobs.lock().unwrap();
             guard.iter()
                 .filter(|j| j.enabled && j.state.next_run_at_ms.map_or(false, |t| now >= t))
                 .cloned()
@@ -123,12 +123,13 @@ impl CronService {
         let start = now_ms();
         debug!("[cron] executing job '{}' ({})", job.name, job.id);
 
+        // Execute callback outside the lock to avoid deadlock
         if let Some(ref cb) = self.on_job {
             cb(job.clone()).await;
         }
 
         let end = now_ms();
-        let mut guard = self.jobs.lock().await;
+        let mut guard = self.jobs.lock().unwrap();
         if let Some(j) = guard.iter_mut().find(|j| j.id == job.id) {
             j.state.last_run_at_ms = Some(start);
             j.state.last_status = Some("ok".to_string());
@@ -144,9 +145,15 @@ impl CronService {
                 j.state.run_history.drain(..drain_to);
             }
 
-            if matches!(&j.schedule, CronSchedule::At { .. }) {
+            if matches!(&j.schedule, CronSchedule::At { .. }) || j.delete_after_run {
                 j.enabled = false;
                 j.state.next_run_at_ms = None;
+                if j.delete_after_run {
+                    let id = j.id.clone();
+                    drop(guard);
+                    self.remove_job(&id);
+                    return;
+                }
             } else {
                 j.state.next_run_at_ms = compute_next_run(&j.schedule, now_ms());
             }
@@ -278,7 +285,7 @@ mod tests {
         }
         // Reload
         let svc = CronService::new(tmp.path());
-        let loaded = svc.load();
-        assert_eq!(loaded.len(), 1);
+        svc.load();
+        assert_eq!(svc.list_jobs().len(), 1);
     }
 }

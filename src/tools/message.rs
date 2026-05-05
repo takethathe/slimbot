@@ -1,0 +1,146 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use anyhow::Result;
+use async_trait::async_trait;
+use serde_json::json;
+
+use crate::tool::Tool;
+
+type SendCallback = Arc<dyn Fn(String, String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+pub struct MessageTool {
+    default_channel: Arc<std::sync::Mutex<String>>,
+    default_chat_id: Arc<std::sync::Mutex<String>>,
+    send_callback: Option<SendCallback>,
+    sent_in_turn: AtomicBool,
+}
+
+impl MessageTool {
+    pub fn new() -> Self {
+        Self {
+            default_channel: Arc::new(std::sync::Mutex::new(String::new())),
+            default_chat_id: Arc::new(std::sync::Mutex::new(String::new())),
+            send_callback: None,
+            sent_in_turn: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_context(&self, channel: &str, chat_id: &str) {
+        *self.default_channel.lock().unwrap() = channel.to_string();
+        *self.default_chat_id.lock().unwrap() = chat_id.to_string();
+    }
+
+    pub fn set_send_callback(&mut self, cb: SendCallback) {
+        self.send_callback = Some(cb);
+    }
+
+    pub fn start_turn(&self) {
+        self.sent_in_turn.store(false, Ordering::Relaxed);
+    }
+
+    pub fn sent_in_turn(&self) -> bool {
+        self.sent_in_turn.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl Tool for MessageTool {
+    fn name(&self) -> &str {
+        "message"
+    }
+
+    fn description(&self) -> &str {
+        "Send a message to the user. This is the primary way to deliver results to a channel."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "string", "description": "The message content to send" },
+                "channel": { "type": "string", "description": "Optional: target channel (defaults to originating channel)" },
+                "chat_id": { "type": "string", "description": "Optional: target chat_id (defaults to originating chat)" }
+            },
+            "required": ["content"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String> {
+        let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        let channel = match args.get("channel").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => self.default_channel.lock().unwrap().clone(),
+        };
+        let chat_id = match args.get("chat_id").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => self.default_chat_id.lock().unwrap().clone(),
+        };
+
+        if channel.is_empty() || chat_id.is_empty() {
+            return Ok("Error: No target channel/chat specified".to_string());
+        }
+
+        if let Some(ref cb) = self.send_callback {
+            cb(channel.clone(), chat_id.clone(), content.clone()).await;
+            let default_ch = self.default_channel.lock().unwrap().clone();
+            let default_chat = self.default_chat_id.lock().unwrap().clone();
+            if channel == default_ch && chat_id == default_chat {
+                self.sent_in_turn.store(true, Ordering::Relaxed);
+            }
+            Ok(format!("Message sent to {}:{}", channel, chat_id))
+        } else {
+            Ok("Error: Message sending not configured".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_message_tool_defaults_context() {
+        let mut tool = MessageTool::new();
+        tool.set_context("webui", "chat-1");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
+        tool.set_send_callback(Arc::new(move |ch, cid, content| {
+            let tx = tx.clone();
+            Box::pin(async move { let _ = tx.send((ch, cid, content)).await; })
+        }));
+
+        let result = tool.execute(serde_json::json!({ "content": "hello" })).await.unwrap();
+        assert!(result.contains("webui:chat-1"));
+        assert!(tool.sent_in_turn());
+
+        let (ch, cid, content) = rx.recv().await.unwrap();
+        assert_eq!(ch, "webui");
+        assert_eq!(cid, "chat-1");
+        assert_eq!(content, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_message_tool_explicit_target() {
+        let mut tool = MessageTool::new();
+        tool.set_context("webui", "chat-1");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
+        tool.set_send_callback(Arc::new(move |ch, cid, content| {
+            let tx = tx.clone();
+            Box::pin(async move { let _ = tx.send((ch, cid, content)).await; })
+        }));
+
+        let result = tool.execute(serde_json::json!({
+            "content": "cross channel",
+            "channel": "cli",
+            "chat_id": "other"
+        })).await.unwrap();
+        assert!(result.contains("cli:other"));
+        assert!(!tool.sent_in_turn());
+
+        let (ch, cid, _content) = rx.recv().await.unwrap();
+        assert_eq!(ch, "cli");
+        assert_eq!(cid, "other");
+    }
+}
