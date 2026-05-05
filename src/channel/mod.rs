@@ -1,8 +1,5 @@
-mod cli;
 mod webui;
 
-#[allow(unused_imports)]
-pub use cli::{CliChannel, CliChannelFactory};
 #[allow(unused_imports)]
 pub use webui::WebuiChannelFactory;
 
@@ -81,7 +78,7 @@ pub struct ChannelManager {
 impl ChannelManager {
     pub fn new(message_bus: Arc<MessageBus>, config: Arc<Config>) -> Self {
         let io_scheduler = IoScheduler::new(message_bus.inbound_tx());
-        let mut cm = Self {
+        let cm = Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
             factories: HashMap::new(),
             message_bus,
@@ -90,7 +87,6 @@ impl ChannelManager {
             io_scheduler,
         };
         // Auto-register all built-in channel factories
-        cm.register_factory("cli", Box::new(CliChannelFactory));
         cm
     }
 

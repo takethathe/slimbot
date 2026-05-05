@@ -118,9 +118,15 @@ where
             A: de::SeqAccess<'de>,
         {
             let mut m = HashMap::new();
+            let mut idx = 0;
             while let Some(entry) = seq.next_element::<ChannelEntryCompat>()? {
-                let r#type = entry.r#type.clone();
-                m.insert(r#type, entry.into_channel_config());
+                let key = if entry.r#type.is_empty() {
+                    format!("legacy_{idx}")
+                } else {
+                    entry.r#type.clone()
+                };
+                m.insert(key, entry.into_channel_config());
+                idx += 1;
             }
             Ok(m)
         }
@@ -131,6 +137,7 @@ where
 
 #[derive(Debug, Deserialize)]
 struct ChannelEntryCompat {
+    #[serde(default)]
     r#type: String,
     #[serde(default = "default_true")]
     enabled: bool,
