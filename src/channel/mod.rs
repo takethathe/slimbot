@@ -1,7 +1,10 @@
 mod cli;
+mod webui;
 
 #[allow(unused_imports)]
 pub use cli::{CliChannel, CliChannelFactory};
+#[allow(unused_imports)]
+pub use webui::WebuiChannelFactory;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +16,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::io_scheduler::{ChannelCommandCallback, IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
-use crate::session::TaskState;
+use crate::session::{SharedSessionManager, TaskState};
 use crate::{debug, error, info};
 use tokio::sync::broadcast;
 
@@ -133,6 +136,12 @@ impl ChannelManager {
     /// Register a factory for a channel type
     pub fn register_factory(&mut self, type_name: &str, factory: Box<dyn ChannelFactory>) {
         self.factories.insert(type_name.to_string(), factory);
+    }
+
+    /// Register the webui channel factory (requires session_manager for chat listing).
+    pub fn register_webui_factory(&mut self, session_manager: SharedSessionManager) {
+        let factory = WebuiChannelFactory::new(self.message_bus.clone(), session_manager);
+        self.factories.insert("webui".to_string(), Box::new(factory));
     }
 
     /// Initialize channels from stored config entries.

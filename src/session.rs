@@ -677,6 +677,14 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
+    /// Return all session IDs that match a prefix.
+    pub fn list_session_ids(&self, prefix: &str) -> Vec<String> {
+        self.sessions.keys()
+            .filter(|k| k.starts_with(prefix))
+            .map(|k| k.to_string())
+            .collect()
+    }
+
     /// Check if a session exists in memory.
     pub fn has_session(&self, session_id: &str) -> bool {
         self.sessions.contains_key(session_id)
