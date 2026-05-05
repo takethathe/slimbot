@@ -55,22 +55,32 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         tool_manager,
     ).await?);
 
-    // Set up cron service callback (now takes &self via interior mutability)
+    // Set up cron service callback
     let agent_loop_for_cron = agent_loop.clone();
+    let mb_for_cron = message_bus.clone();
     cron_service_arc.set_on_job(Arc::new(move |job| {
         let al = agent_loop_for_cron.clone();
+        let mb = mb_for_cron.clone();
         let job_clone = job.clone();
         Box::pin(async move {
-            if job.name == "dream" {
-                return;
-            }
             let session_id = format!("cron:{}", job_clone.id);
             let hook = TaskHook::new(&session_id);
             let content = format!(
                 "[Scheduled Task] Timer finished.\n\nTask '{}' has been triggered.\nScheduled instruction: {}",
                 job_clone.name, job_clone.payload.message
             );
-            let _ = al.run_task(&session_id, content, hook, None).await;
+            let result = al.run_task(&session_id, content, hook, None).await;
+
+            // Deliver result to user channel if configured
+            if job_clone.payload.deliver {
+                if let (Some(channel), Some(chat_id)) = (&job_clone.payload.channel, &job_clone.payload.to) {
+                    let _ = mb.outbound_tx().send(BusResult {
+                        session_id: format!("{}:{}", channel, chat_id),
+                        task_id: String::new(),
+                        content: result.content,
+                    }).await;
+                }
+            }
         })
     }));
 

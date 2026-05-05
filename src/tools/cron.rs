@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolContext};
 use crate::cron::{CronService, CronJob, CronSchedule, CronPayload};
 
 pub struct CronTool {
@@ -22,15 +22,6 @@ impl CronTool {
             default_chat_id: Arc::new(std::sync::Mutex::new(String::new())),
             in_cron_context: AtomicBool::new(false),
         }
-    }
-
-    pub fn set_context(&self, channel: &str, chat_id: &str) {
-        *self.default_channel.lock().unwrap() = channel.to_string();
-        *self.default_chat_id.lock().unwrap() = chat_id.to_string();
-    }
-
-    pub fn set_cron_context(&self, active: bool) {
-        self.in_cron_context.store(active, Ordering::Relaxed);
     }
 
     fn now_ms() -> i64 {
@@ -66,10 +57,19 @@ impl CronTool {
             let tz = args.get("tz").and_then(|v| v.as_str()).map(|s| s.to_string());
             CronSchedule::cron(expr.to_string(), tz)
         } else if let Some(at_str) = args.get("at").and_then(|v| v.as_str()) {
-            match chrono::DateTime::parse_from_rfc3339(at_str) {
-                Ok(dt) => CronSchedule::at(dt.timestamp_millis()),
-                Err(_) => return Ok("Error: invalid ISO datetime format for 'at'".to_string()),
-            }
+            // Treat all datetimes as local wall-clock time.
+            let naive = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(at_str) {
+                dt.naive_local()
+            } else if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(at_str, "%Y-%m-%dT%H:%M:%S") {
+                ndt
+            } else if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(at_str, "%Y-%m-%dT%H:%M:%S%.f") {
+                ndt
+            } else {
+                return Ok("Error: invalid datetime format for 'at'. Use '2026-05-05T10:30:00' (local time)".to_string());
+            };
+            let offset = *chrono::Local::now().offset();
+            let ts = chrono::DateTime::<chrono::Utc>::from(naive.and_local_timezone(offset).unwrap()).timestamp_millis();
+            CronSchedule::at(ts)
         } else {
             return Ok("Error: either every_seconds, cron_expr, or at is required".to_string());
         };
@@ -178,6 +178,11 @@ impl Tool for CronTool {
             _ => Ok(format!("Unknown action: {}", action)),
         }
     }
+
+    fn set_context(&self, ctx: &ToolContext) {
+        *self.default_channel.lock().unwrap() = ctx.channel.clone();
+        *self.default_chat_id.lock().unwrap() = ctx.chat_id.clone();
+    }
 }
 
 fn format_schedule(schedule: &CronSchedule) -> String {
@@ -211,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_and_list() {
         let tool = make_cron_tool();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let result = tool.execute(serde_json::json!({
             "action": "add",
@@ -230,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_and_remove() {
         let tool = make_cron_tool();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let add_result = tool.execute(serde_json::json!({
             "action": "add",
@@ -250,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_missing_message() {
         let tool = make_cron_tool();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let result = tool.execute(serde_json::json!({
             "action": "add",
@@ -296,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_cron_expression() {
         let tool = make_cron_tool();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let result = tool.execute(serde_json::json!({
             "action": "add",
@@ -316,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_at_schedule() {
         let tool = make_cron_tool();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let result = tool.execute(serde_json::json!({
             "action": "add",
@@ -335,20 +340,20 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_at_invalid_date() {
         let tool = make_cron_tool();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let result = tool.execute(serde_json::json!({
             "action": "add",
             "message": "bad date",
             "at": "not-a-date"
         })).await.unwrap();
-        assert!(result.contains("invalid ISO datetime"));
+        assert!(result.contains("invalid datetime format"));
     }
 
     #[tokio::test]
     async fn test_cron_tool_add_no_schedule_type() {
         let tool = make_cron_tool();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let result = tool.execute(serde_json::json!({
             "action": "add",
@@ -382,5 +387,66 @@ mod tests {
         assert_eq!(format_schedule(&CronSchedule::every(3_600_000)), "every 1h");
         assert_eq!(format_schedule(&CronSchedule::every(1_000)), "every 1s");
         assert_eq!(format_schedule(&CronSchedule::every(500)), "every 500ms");
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_add_job_sets_delivery_fields() {
+        let tool = make_cron_tool();
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-42".into() });
+
+        let result = tool.execute(serde_json::json!({
+            "action": "add",
+            "name": "remind me",
+            "message": "go to sleep",
+            "every_seconds": 60
+        })).await.unwrap();
+        assert!(result.contains("Created job"));
+
+        // Verify the job payload has delivery fields set correctly
+        let jobs = tool.cron_service.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert!(job.payload.deliver, "deliver must be true so results are sent to user");
+        assert_eq!(job.payload.channel, Some("webui".to_string()),
+            "channel must be set so gateway knows where to route");
+        assert_eq!(job.payload.to, Some("chat-42".to_string()),
+            "to (chat_id) must be set so gateway knows where to route");
+        assert_eq!(job.payload.message, "go to sleep",
+            "payload message must contain the original instruction");
+        assert_eq!(job.payload.kind, "agent_turn",
+            "payload kind must be agent_turn for gateway execution");
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_add_at_accepts_naive_local_time() {
+        // Regression test: the model may output naive datetime without timezone
+        // (e.g. "2030-01-01T10:30:00"). This should be accepted directly as local
+        // time, not rejected and force the model to retry.
+        let tool = make_cron_tool();
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+
+        let result = tool.execute(serde_json::json!({
+            "action": "add",
+            "name": "naive test",
+            "message": "test",
+            "at": "2030-01-01T10:30:00"
+        })).await.unwrap();
+        assert!(result.contains("Created job"));
+
+        // Also verify UTC (Z) format is accepted and treated as local time
+        let tool2 = make_cron_tool();
+        tool2.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+
+        let result2 = tool2.execute(serde_json::json!({
+            "action": "add",
+            "name": "utc test",
+            "message": "test",
+            "at": "2030-01-01T10:30:00Z"
+        })).await.unwrap();
+        assert!(result2.contains("Created job"));
+
+        // Both jobs should have been created on first call (no error-retry needed)
+        assert_eq!(tool.cron_service.list_jobs().len(), 1);
+        assert_eq!(tool2.cron_service.list_jobs().len(), 1);
     }
 }

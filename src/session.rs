@@ -118,6 +118,8 @@ impl SessionRunner {
 pub struct MessageMeta {
     #[serde(default)]
     id: usize,
+    #[serde(default)]
+    timestamp: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,20 +162,27 @@ impl Message {
         }
     }
 
+    pub fn timestamp(&self) -> &str {
+        match self {
+            Message::System { meta, .. } | Message::User { meta, .. }
+            | Message::Assistant { meta, .. } | Message::Tool { meta, .. } => &meta.timestamp,
+        }
+    }
+
     pub fn user(content: String) -> Self {
-        Message::User { meta: MessageMeta { id: 0 }, content }
+        Message::User { meta: MessageMeta { id: 0, timestamp: String::new() }, content }
     }
 
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
-        Message::Assistant { meta: MessageMeta { id: 0 }, content, tool_calls }
+        Message::Assistant { meta: MessageMeta { id: 0, timestamp: String::new() }, content, tool_calls }
     }
 
     pub fn system(content: String) -> Self {
-        Message::System { meta: MessageMeta { id: 0 }, content }
+        Message::System { meta: MessageMeta { id: 0, timestamp: String::new() }, content }
     }
 
     pub fn tool(content: String, tool_call_id: String, name: Option<String>) -> Self {
-        Message::Tool { meta: MessageMeta { id: 0 }, content, tool_call_id, name }
+        Message::Tool { meta: MessageMeta { id: 0, timestamp: String::new() }, content, tool_call_id, name }
     }
 }
 
@@ -516,15 +525,16 @@ impl FrontendMessage {
     }
 }
 
-/// Builder for assigning auto-increment IDs to messages.
+/// Builder for assigning auto-increment IDs and timestamps to messages.
 fn assign_message_id(msg: &mut Message, next_id: &mut usize) {
     let id = *next_id;
+    let ts = chrono::Local::now().to_rfc3339();
     *next_id += 1;
     match msg {
-        Message::System { meta, .. } => meta.id = id,
-        Message::User { meta, .. } => meta.id = id,
-        Message::Assistant { meta, .. } => meta.id = id,
-        Message::Tool { meta, .. } => meta.id = id,
+        Message::System { meta, .. } => { meta.id = id; meta.timestamp = ts; }
+        Message::User { meta, .. } => { meta.id = id; meta.timestamp = ts; }
+        Message::Assistant { meta, .. } => { meta.id = id; meta.timestamp = ts; }
+        Message::Tool { meta, .. } => { meta.id = id; meta.timestamp = ts; }
     }
 }
 
@@ -637,6 +647,7 @@ impl SessionManager {
         if max_loaded_id >= next_id {
             next_id = max_loaded_id + 1;
         }
+        let loaded_count = messages.len();
 
         self.sessions.insert(
             session_id.to_string(),
@@ -644,7 +655,7 @@ impl SessionManager {
                 id: session_id.to_string(),
                 messages,
                 meta: meta.unwrap_or(SessionMeta { last_consolidated_id, next_message_id: next_id, char_per_token_ratio, last_summary }),
-                last_persisted_idx: 0, // nothing new to append since we just loaded from disk
+                last_persisted_idx: loaded_count, // all loaded messages are already on disk
             },
         );
         self.runners.insert(session_id.to_string(), SessionRunner::new());
@@ -868,11 +879,11 @@ mod tests {
     use super::*;
 
     fn user_msg(content: &str) -> Message {
-        Message::User { meta: MessageMeta { id: 0 }, content: content.to_string() }
+        Message::User { meta: MessageMeta { id: 0, timestamp: String::new() }, content: content.to_string() }
     }
 
     fn assistant_msg(content: &str) -> Message {
-        Message::Assistant { meta: MessageMeta { id: 0 }, content: Some(content.to_string()), tool_calls: None }
+        Message::Assistant { meta: MessageMeta { id: 0, timestamp: String::new() }, content: Some(content.to_string()), tool_calls: None }
     }
 
     #[tokio::test]
@@ -1076,6 +1087,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reload_then_persist_no_duplication() {
+        // Regression test: when a session is loaded from disk (via get_or_create),
+        // last_persisted_idx must be set to the loaded message count so that
+        // subsequent persist() calls do not re-write already-persisted messages.
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+
+        // Phase 1: create session, add messages, persist
+        {
+            let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+            sm.get_or_create("s1").await.unwrap();
+            sm.add_message("s1", user_msg("msg1")).await.unwrap();
+            sm.add_message("s1", assistant_msg("reply1")).await.unwrap();
+            sm.add_message("s1", user_msg("msg2")).await.unwrap();
+            sm.persist("s1").await.unwrap();
+        }
+
+        // Verify 3 lines on disk
+        let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
+        assert_eq!(jsonl.lines().count(), 3);
+
+        // Phase 2: reload session from disk (fresh SessionManager)
+        let mut sm2 = SessionManager::new(session_dir.clone()).unwrap();
+        sm2.get_or_create("s1").await.unwrap();
+
+        // Persist again without adding new messages — should NOT create duplicates
+        sm2.persist("s1").await.unwrap();
+        let jsonl2 = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
+        assert_eq!(jsonl2.lines().count(), 3);
+
+        // Phase 3: add a new message after reload, persist — should only add the new one
+        sm2.add_message("s1", user_msg("msg3")).await.unwrap();
+        sm2.persist("s1").await.unwrap();
+        let jsonl3 = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
+        assert_eq!(jsonl3.lines().count(), 4);
+
+        // Phase 4: reload again and verify all 4 messages with no duplicates
+        let mut sm3 = SessionManager::new(session_dir).unwrap();
+        sm3.get_or_create("s1").await.unwrap();
+        let msgs = sm3.get_messages("s1").await;
+        assert_eq!(msgs.len(), 4);
+
+        // Verify all IDs are unique
+        let mut ids: Vec<usize> = msgs.iter().map(|m| m.id()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "all message IDs should be unique");
+    }
+
+    #[tokio::test]
     async fn test_consolidation_resets_persist_offset() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = tmp.path().join("sessions");
@@ -1178,7 +1239,7 @@ mod tests {
         assert_eq!(session.messages[0].id(), 3);
         assert_eq!(session.messages[1].id(), 4);
         assert_eq!(session.last_consolidated_id(), 2);
-        assert_eq!(session.last_persisted_idx, 0); // fresh load, nothing new to append
+        assert_eq!(session.last_persisted_idx, 2); // loaded messages already on disk, nothing new to append
     }
 
     #[tokio::test]
@@ -1368,19 +1429,19 @@ mod tests {
 
     #[test]
     fn test_frontend_message_from_message() {
-        let user = Message::User { meta: MessageMeta { id: 1 }, content: "hello".to_string() };
+        let user = Message::User { meta: MessageMeta { id: 1, timestamp: String::new() }, content: "hello".to_string() };
         let fm = FrontendMessage::from_message(&user);
         assert!(fm.is_some());
         assert!(matches!(fm.unwrap(), FrontendMessage::User { content } if content == "hello"));
 
-        let asst = Message::Assistant { meta: MessageMeta { id: 2 }, content: Some("hi".to_string()), tool_calls: None };
+        let asst = Message::Assistant { meta: MessageMeta { id: 2, timestamp: String::new() }, content: Some("hi".to_string()), tool_calls: None };
         let fm = FrontendMessage::from_message(&asst);
         assert!(matches!(fm.unwrap(), FrontendMessage::Assistant { content } if content == "hi"));
 
-        let system = Message::System { meta: MessageMeta { id: 0 }, content: "sys".to_string() };
+        let system = Message::System { meta: MessageMeta { id: 0, timestamp: String::new() }, content: "sys".to_string() };
         assert!(FrontendMessage::from_message(&system).is_none());
 
-        let tool = Message::Tool { meta: MessageMeta { id: 3 }, content: "tool".to_string(), tool_call_id: "t1".to_string(), name: None };
+        let tool = Message::Tool { meta: MessageMeta { id: 3, timestamp: String::new() }, content: "tool".to_string(), tool_call_id: "t1".to_string(), name: None };
         assert!(FrontendMessage::from_message(&tool).is_none());
     }
 
@@ -1394,5 +1455,78 @@ mod tests {
         let asst = FrontendMessage::Assistant { content: "hi".to_string() };
         let json = serde_json::to_string(&asst).unwrap();
         assert!(json.contains("\"role\":\"assistant\""));
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_is_set_on_add_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        let before = chrono::Local::now().to_rfc3339();
+        sm.add_message("s1", user_msg("hello")).await.unwrap();
+        let after = chrono::Local::now().to_rfc3339();
+
+        let msgs = sm.get_messages("s1").await;
+        assert_eq!(msgs.len(), 1);
+        let ts = msgs[0].timestamp();
+        assert!(!ts.is_empty(), "timestamp should not be empty");
+        assert!(ts >= before.as_str() && ts <= after.as_str(), "timestamp {} should be in [{}, {}]", ts, before, after);
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_persists_and_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        {
+            let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+            sm.get_or_create("s1").await.unwrap();
+            sm.add_message("s1", user_msg("hello")).await.unwrap();
+            sm.add_message("s1", assistant_msg("hi")).await.unwrap();
+            sm.persist("s1").await.unwrap();
+        }
+
+        let mut sm2 = SessionManager::new(session_dir).unwrap();
+        sm2.get_or_create("s1").await.unwrap();
+        let msgs = sm2.get_messages("s1").await;
+        assert_eq!(msgs.len(), 2);
+        assert!(!msgs[0].timestamp().is_empty(), "user message should have timestamp");
+        assert!(!msgs[1].timestamp().is_empty(), "assistant message should have timestamp");
+    }
+
+    #[tokio::test]
+    async fn test_backward_compat_old_jsonl_no_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let jsonl_path = session_dir.join("s1.jsonl");
+        std::fs::write(&jsonl_path, r#"{"role":"user","content":"old msg","id":1}
+{"role":"assistant","content":"old reply","id":2}
+"#).unwrap();
+
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        let msgs = sm.get_messages("s1").await;
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].timestamp(), ""); // defaults to empty string
+        assert_eq!(msgs[1].timestamp(), "");
+    }
+
+    #[tokio::test]
+    async fn test_timestamps_increase_across_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        sm.add_message("s1", user_msg("first")).await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        sm.add_message("s1", assistant_msg("second")).await.unwrap();
+
+        let msgs = sm.get_messages("s1").await;
+        assert!(msgs[1].timestamp() >= msgs[0].timestamp());
     }
 }

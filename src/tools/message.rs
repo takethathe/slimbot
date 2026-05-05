@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolContext};
 
 type SendCallback = Arc<dyn Fn(String, String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
@@ -23,11 +23,6 @@ impl MessageTool {
             send_callback: None,
             sent_in_turn: AtomicBool::new(false),
         }
-    }
-
-    pub fn set_context(&self, channel: &str, chat_id: &str) {
-        *self.default_channel.lock().unwrap() = channel.to_string();
-        *self.default_chat_id.lock().unwrap() = chat_id.to_string();
     }
 
     pub fn set_send_callback(&mut self, cb: SendCallback) {
@@ -93,6 +88,11 @@ impl Tool for MessageTool {
             Ok("Error: Message sending not configured".to_string())
         }
     }
+
+    fn set_context(&self, ctx: &ToolContext) {
+        *self.default_channel.lock().unwrap() = ctx.channel.clone();
+        *self.default_chat_id.lock().unwrap() = ctx.chat_id.clone();
+    }
 }
 
 #[cfg(test)]
@@ -102,7 +102,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_tool_defaults_context() {
         let mut tool = MessageTool::new();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
         tool.set_send_callback(Arc::new(move |ch, cid, content| {
@@ -123,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_tool_explicit_target() {
         let mut tool = MessageTool::new();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
         tool.set_send_callback(Arc::new(move |ch, cid, content| {
@@ -147,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_tool_no_content() {
         let mut tool = MessageTool::new();
-        tool.set_context("cli", "chat-1");
+        tool.set_context(&ToolContext { channel: "cli".into(), chat_id: "chat-1".into() });
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
         tool.set_send_callback(Arc::new(move |_ch, _cid, _content| {
@@ -164,7 +164,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_tool_no_callback() {
         let tool = MessageTool::new();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let result = tool.execute(serde_json::json!({
             "content": "hello"
@@ -192,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_tool_sent_in_turn_tracking() {
         let mut tool = MessageTool::new();
-        tool.set_context("webui", "chat-1");
+        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
         tool.set_send_callback(Arc::new(move |ch, cid, content| {

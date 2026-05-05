@@ -7,7 +7,7 @@ use crate::context::ContextBuilder;
 use crate::memory::SharedMemoryStore;
 use crate::provider::{Provider, Usage};
 use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState};
-use crate::tool::{ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
+use crate::tool::{ToolContext, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
 use crate::{debug, warn_log};
 use tokio_util::sync::CancellationToken;
 
@@ -216,7 +216,17 @@ impl AgentRunner {
         let mut iterations: u32 = 0;
         let mut result = AgentResult::default();
 
+        // Inject session context into tools (once, before the loop).
+        if let Some((channel, chat_id)) = session_id.split_once(':') {
+            let ctx = ToolContext {
+                channel: channel.to_string(),
+                chat_id: chat_id.to_string(),
+            };
+            self.tool_manager.set_context(&ctx);
+        }
+
         loop {
+
             // Exceeded max iterations
             if iterations >= max_iterations {
                 let err_msg = format!("Reached max iterations {}", max_iterations);
@@ -372,6 +382,7 @@ impl AgentRunner {
                             return self.cancelled_result(&hook, session_id).await;
                         }
                     }
+                    debug!("[tool_call] name={}, args={}", call.name, call.args);
                     let raw_result = match self
                         .tool_manager
                         .execute(&call.name, call.args.clone())

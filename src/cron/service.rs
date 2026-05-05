@@ -56,6 +56,9 @@ impl CronService {
 
     pub fn add_job(&self, job: CronJob) {
         let mut guard = self.jobs.lock().unwrap();
+        let now = now_ms();
+        let mut job = job;
+        job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
         guard.push(job);
         drop(guard);
         self.save();
@@ -112,6 +115,10 @@ impl CronService {
                 .cloned()
                 .collect()
         };
+
+        if due_jobs.is_empty() {
+            return;
+        }
 
         for job in due_jobs {
             self.execute_job(&job).await;
@@ -183,7 +190,6 @@ fn compute_next_cron(expr: &str, _now_ms: i64) -> Option<i64> {
     use std::str::FromStr;
     match Schedule::from_str(expr) {
         Ok(schedule) => {
-            let now = chrono::Utc::now();
             schedule
                 .upcoming(chrono::Utc)
                 .take(1)
@@ -536,10 +542,12 @@ mod tests {
         };
         svc.add_job(job);
 
-        // Before start, next_run_at_ms is None
-        assert!(svc.list_jobs()[0].state.next_run_at_ms.is_none());
+        // add_job() now computes next_run_at_ms
+        let jobs = svc.list_jobs();
+        assert!(jobs[0].state.next_run_at_ms.is_some());
+        assert!(jobs[0].state.next_run_at_ms.unwrap() > now_ms());
 
-        // After start, it should be computed
+        // After start, recompute_next_runs() may update it (same value for Every schedule)
         svc.start();
         let jobs = svc.list_jobs();
         assert!(jobs[0].state.next_run_at_ms.is_some());
@@ -624,5 +632,95 @@ mod tests {
     fn test_compute_next_run_every_negative() {
         let schedule = CronSchedule::every(-1000);
         assert_eq!(compute_next_run(&schedule, now_ms()), None);
+    }
+
+    #[tokio::test]
+    async fn test_add_job_sets_next_run_at_ms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        let job = CronJob {
+            id: "timing-1".to_string(),
+            name: "timing test".to_string(),
+            enabled: true,
+            schedule: CronSchedule::every(1000),
+            payload: CronPayload {
+                kind: "test".to_string(),
+                message: "execute".to_string(),
+                deliver: false,
+                channel: None,
+                to: None,
+            },
+            state: CronJobState::default(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+
+        // next_run_at_ms should be set immediately after add_job, before start()
+        let jobs = svc.list_jobs();
+        assert!(jobs[0].state.next_run_at_ms.is_some(),
+            "add_job must set next_run_at_ms so tick() can select the job");
+        assert!(jobs[0].state.next_run_at_ms.unwrap() > now_ms());
+    }
+
+    #[tokio::test]
+    async fn test_tick_executes_job_added_via_add_job() {
+        // End-to-end regression: a job added via add_job() (without manually
+        // setting next_run_at_ms) must be picked up and executed by tick().
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        let executed = std::sync::atomic::AtomicBool::new(false);
+        let executed_ref = std::sync::Arc::new(executed);
+        let executed_for_cb = executed_ref.clone();
+
+        svc.set_on_job(Arc::new(move |job| {
+            let ref_clone = executed_for_cb.clone();
+            Box::pin(async move {
+                ref_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                drop(job);
+            })
+        }));
+
+        let job = CronJob {
+            id: "e2e-1".to_string(),
+            name: "e2e timing test".to_string(),
+            enabled: true,
+            schedule: CronSchedule::every(60_000),
+            payload: CronPayload {
+                kind: "test".to_string(),
+                message: "run".to_string(),
+                deliver: false,
+                channel: None,
+                to: None,
+            },
+            state: CronJobState::default(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+
+        // Override next_run_at_ms to 0 so the job is immediately due,
+        // AFTER start() since start() calls recompute_next_runs() which
+        // would overwrite our manual value.
+        svc.start();
+        {
+            let mut guard = svc.jobs.lock().unwrap();
+            if let Some(j) = guard.iter_mut().find(|j| j.id == "e2e-1") {
+                j.state.next_run_at_ms = Some(0);
+            }
+        }
+
+        svc.tick().await;
+
+        assert!(executed_ref.load(std::sync::atomic::Ordering::Relaxed),
+            "tick() must execute a job that was added via add_job()");
+        let jobs = svc.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].state.last_run_at_ms.is_some(), "job should have been executed");
+        assert_eq!(jobs[0].state.last_status, Some("ok".to_string()));
     }
 }

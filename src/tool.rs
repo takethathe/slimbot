@@ -23,6 +23,13 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
+/// Channel and chat_id context injected into tools at the start of each turn.
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    pub channel: String,
+    pub chat_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
@@ -36,6 +43,9 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> serde_json::Value;
     async fn execute(&self, args: serde_json::Value) -> Result<String>;
+
+    /// Set the current session context. Default is no-op.
+    fn set_context(&self, _ctx: &ToolContext) {}
 }
 
 pub struct ToolManager {
@@ -119,6 +129,13 @@ impl ToolManager {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Tool not found: {}", name))?;
         tool.execute(args).await
+    }
+
+    /// Inject session context into all tools that support it.
+    pub fn set_context(&self, ctx: &ToolContext) {
+        for tool in self.tools.values() {
+            tool.set_context(ctx);
+        }
     }
 }
 
