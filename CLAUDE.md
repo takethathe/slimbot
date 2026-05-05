@@ -10,7 +10,8 @@
 
 - **构建：** `cargo build`
 - **运行：** `cargo run -- setup` （初始化配置、目录和 bootstrap 文件），然后 `cargo run -- <config.json路径>` （默认 `~/.slimbot/config.json`）
-- **快速检查：** `cargo check`
+- **Gateway 模式：** `cargo run -- gateway` （启动 cron、heartbeat 和 enabled channels，包括 WebUI）
+- **快速检查：** `cargo check --message-format=json 2>/dev/null | jq -c 'select(.reason == "compiler-message") | {level: .message.level, location: (.message.spans[0] | "\(.file_name):\(.line_start)"), message: .message.message}'` （JSON 输出 + jq 压缩，仅保留诊断信息，减少 token 消耗）
 - **Rust Edition：** 2024
 
 ## 目录结构
@@ -28,7 +29,7 @@ slimbot/
     ├── log.rs          # Logging: LogLevel enum, global singleton logger, init/log/should_log
     ├── macros.rs       # Logging macros: debug!, info!, warn!, error!, fatal!
     ├── cli.rs          # CLI: clap argument parsing, run_agent_session
-    ├── config.rs       # Config: config.json read/write, AgentConfig/ProviderConfig/ChannelEntry
+    ├── config.rs       # Config: config.json read/write, AgentConfig/ProviderConfig/ChannelConfig/GatewayConfig
     ├── config_scheme.rs # ConfigScheme: default values, normalization, validation
     ├── bootstrap.rs    # Bootstrap templates: AGENTS.md, USER.md, SOUL.md, TOOLS.md
     ├── setup.rs        # Setup command: config normalization + directory + bootstrap creation
@@ -40,7 +41,17 @@ slimbot/
     │   ├── file_writer.rs  # File writing
     │   ├── file_editor.rs  # Search-and-replace editing
     │   ├── list_dir.rs     # Directory listing
-    │   └── make_dir.rs     # Directory creation
+    │   ├── make_dir.rs     # Directory creation
+    │   ├── message.rs      # Message delivery to channels
+    │   └── cron.rs         # Cron job management (add/list/remove)
+    ├── gateway.rs      # Gateway mode: cron + heartbeat + channels + ctrl+c
+    ├── cron/           # Cron service: scheduling, persistence, tick execution
+    │   ├── mod.rs
+    │   ├── types.rs    # CronSchedule, CronJob, CronPayload, CronStore
+    │   └── service.rs  # CronService: CRUD, load/save, tick, compute_next_run
+    ├── heartbeat/      # Heartbeat service
+    │   ├── mod.rs
+    │   └── service.rs  # HeartbeatService: periodic HEARTBEAT.md reading + LLM execution
     ├── provider/       # Provider trait + OpenAIProvider: LLM API request/response
     │   ├── mod.rs      # Provider trait, ChatResponse, FinishReason
     │   └── openai.rs   # OpenAIProvider implementation
@@ -49,12 +60,15 @@ slimbot/
     ├── runner.rs       # AgentRunner: ReAct loop core
     ├── agent_loop.rs   # AgentLoop: top-level orchestration, initializes all components
     ├── message_bus.rs  # MessageBus: user request & result delivery
-    └── channel/        # Channel trait + CliChannel + ChannelManager + ChannelFactory
+    └── channel/        # Channel trait + CliChannel + WebuiChannel + ChannelManager + ChannelFactory
         ├── mod.rs      # Channel/ChannelFactory traits, ChannelManager
-        └── cli.rs      # CliChannel & CliChannelFactory
+        ├── cli.rs      # CliChannel & CliChannelFactory
+        └── webui.rs    # WebuiChannel: axum HTTP server with SSE, embedded index.html
 ```
 
 ## 架构
+
+### CLI 模式
 
 ```
 AgentLoop ── 初始化 Provider、ToolManager、SessionManager
@@ -73,6 +87,22 @@ MessageBus ── 接收 BusRequest → 封装 SessionTask → 入队/出队 →
 ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 → 与 MessageBus 交互
 ```
 
+### Gateway 模式
+
+```
+run_gateway()
+   ├── CronService ── 定时任务调度，JSON 持久化，tick 驱动
+   │   └── on_job → AgentLoop.run_task()
+   ├── HeartbeatService ── 定期读取 HEARTBEAT.md，LLM 判断执行
+   │   └── on_execute → AgentLoop.run_task()
+   ├── AgentLoop ── 预注册 message + cron 工具的 ToolManager
+   │   ├── message tool ── 通过 MessageBus 发送结果到指定 channel:chat_id
+   │   └── cron tool ── 通过 CronService 管理定时任务
+   └── ChannelManager ── 启动 enabled channels (CLI + WebUI)
+       ├── CLI channel ── stdin/stdout
+       └── WebUI channel ── axum HTTP server (SSE + REST API)
+```
+
 ## 数据目录
 
 ```
@@ -82,7 +112,10 @@ ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 →
     ├── USER.md                     # 用户画像（由 setup 生成）
     ├── SOUL.md                     # Agent 人格（由 setup 生成）
     ├── TOOLS.md                    # 工具使用指南（由 setup 生成）
+    ├── HEARTBEAT.md                # Heartbeat 任务定义（gateway 模式）
     ├── skills/                     # 可选 skill 文件 (*.md)
+    ├── cron/                       # Cron 持久化目录（gateway 模式）
+    │   └── jobs.json               # 定时任务 JSON 存储
     └── sessions/
         └── {session_id}.jsonl      # 会话消息持久化
 ```
@@ -108,7 +141,7 @@ ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 →
 1. **确认需求**：收到用户需求后，先确认理解是否正确，再开始后续工作
 2. **规划**：明确目标和实现方案，确认后再开始编码
 3. **实现**：按照设计方案编写代码，包括功能代码和对应的测试代码
-4. **测试**：使用 `cargo check` / `cargo build` / `cargo test` 验证代码正确性，确保新增测试通过
+4. **测试**：使用 `cargo check --message-format=json`（配合 jq 压缩输出）/ `cargo build` / `cargo test` 验证代码正确性，确保新增测试通过
 5. **更新文档**：在 `docs/` 目录下补充或更新相关文档
 
 ### 文档管理
