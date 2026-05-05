@@ -57,6 +57,8 @@ pub enum Commands {
         #[arg(short = 's', long = "session")]
         session_id: Option<String>,
     },
+    /// Start gateway mode (cron + heartbeat + channels)
+    Gateway,
 }
 
 impl CliArgs {

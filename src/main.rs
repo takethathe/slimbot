@@ -13,6 +13,7 @@ use slimbot::LogLevel;
 use slimbot::MessageBus;
 use slimbot::PathManager;
 use slimbot::run_agent_session;
+use slimbot::run_gateway;
 use slimbot::run_setup;
 use slimbot::WorkerPool;
 
@@ -50,6 +51,14 @@ async fn main() -> Result<()> {
                 args.workspace_dir(),
             )?;
             return run_cli_agent(&paths, session_id.as_deref(), query.as_deref()).await;
+        }
+        Some(Commands::Gateway) => {
+            let paths = PathManager::resolve(
+                args.config_path(),
+                args.data_dir(),
+                args.workspace_dir(),
+            )?;
+            return run_gateway(&paths).await;
         }
         None => unreachable!(),
     }
