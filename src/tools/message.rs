@@ -143,4 +143,90 @@ mod tests {
         assert_eq!(ch, "cli");
         assert_eq!(cid, "other");
     }
+
+    #[tokio::test]
+    async fn test_message_tool_no_content() {
+        let mut tool = MessageTool::new();
+        tool.set_context("cli", "chat-1");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
+        tool.set_send_callback(Arc::new(move |_ch, _cid, _content| {
+            let _tx = tx.clone();
+            Box::pin(async move {})
+        }));
+
+        // Empty content defaults to ""
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        // Should still send (empty string is valid)
+        assert!(result.contains("cli:chat-1"));
+    }
+
+    #[tokio::test]
+    async fn test_message_tool_no_callback() {
+        let tool = MessageTool::new();
+        tool.set_context("webui", "chat-1");
+
+        let result = tool.execute(serde_json::json!({
+            "content": "hello"
+        })).await.unwrap();
+        assert!(result.contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn test_message_tool_no_context() {
+        let mut tool = MessageTool::new();
+        // No set_context called
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
+        tool.set_send_callback(Arc::new(move |_ch, _cid, _content| {
+            let _tx = tx.clone();
+            Box::pin(async move {})
+        }));
+
+        let result = tool.execute(serde_json::json!({
+            "content": "test"
+        })).await.unwrap();
+        assert!(result.contains("No target channel"));
+    }
+
+    #[tokio::test]
+    async fn test_message_tool_sent_in_turn_tracking() {
+        let mut tool = MessageTool::new();
+        tool.set_context("webui", "chat-1");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
+        tool.set_send_callback(Arc::new(move |ch, cid, content| {
+            let _tx = tx.clone();
+            Box::pin(async move { let _ = (ch, cid, content); })
+        }));
+
+        tool.start_turn();
+        assert!(!tool.sent_in_turn());
+
+        // Send to default context
+        tool.execute(serde_json::json!({ "content": "msg" })).await.unwrap();
+        assert!(tool.sent_in_turn());
+
+        // Start new turn
+        tool.start_turn();
+        assert!(!tool.sent_in_turn());
+
+        // Send to different context
+        tool.execute(serde_json::json!({
+            "content": "msg",
+            "channel": "other"
+        })).await.unwrap();
+        assert!(!tool.sent_in_turn());
+    }
+
+    #[test]
+    fn test_message_tool_description_and_parameters() {
+        let tool = MessageTool::new();
+        assert_eq!(tool.name(), "message");
+        assert!(!tool.description().is_empty());
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"]["content"].is_object());
+        assert!(params["required"].as_array().unwrap().contains(&serde_json::json!("content")));
+    }
 }

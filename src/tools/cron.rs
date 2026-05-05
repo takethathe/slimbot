@@ -269,4 +269,118 @@ mod tests {
         })).await.unwrap();
         assert!(result.contains("not found"));
     }
+
+    #[tokio::test]
+    async fn test_cron_tool_add_without_context() {
+        let tool = make_cron_tool();
+        // No set_context called — channel/chat_id will be empty
+
+        let result = tool.execute(serde_json::json!({
+            "action": "add",
+            "message": "test",
+            "every_seconds": 60
+        })).await.unwrap();
+        assert!(result.contains("no session context"));
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_unknown_action() {
+        let tool = make_cron_tool();
+
+        let result = tool.execute(serde_json::json!({
+            "action": "invalid"
+        })).await.unwrap();
+        assert!(result.contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_add_cron_expression() {
+        let tool = make_cron_tool();
+        tool.set_context("webui", "chat-1");
+
+        let result = tool.execute(serde_json::json!({
+            "action": "add",
+            "name": "cron job",
+            "message": "run at 9am",
+            "cron_expr": "0 0 9 * * *"
+        })).await.unwrap();
+        assert!(result.contains("Created job"));
+
+        let list = tool.execute(serde_json::json!({
+            "action": "list"
+        })).await.unwrap();
+        assert!(list.contains("cron job"));
+        assert!(list.contains("cron:"));
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_add_at_schedule() {
+        let tool = make_cron_tool();
+        tool.set_context("webui", "chat-1");
+
+        let result = tool.execute(serde_json::json!({
+            "action": "add",
+            "name": "one shot",
+            "message": "once",
+            "at": "2030-01-01T00:00:00Z"
+        })).await.unwrap();
+        assert!(result.contains("Created job"));
+
+        // At-schedule jobs have delete_after_run=true
+        let jobs = tool.cron_service.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].delete_after_run);
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_add_at_invalid_date() {
+        let tool = make_cron_tool();
+        tool.set_context("webui", "chat-1");
+
+        let result = tool.execute(serde_json::json!({
+            "action": "add",
+            "message": "bad date",
+            "at": "not-a-date"
+        })).await.unwrap();
+        assert!(result.contains("invalid ISO datetime"));
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_add_no_schedule_type() {
+        let tool = make_cron_tool();
+        tool.set_context("webui", "chat-1");
+
+        let result = tool.execute(serde_json::json!({
+            "action": "add",
+            "message": "no timing",
+            "name": "no timing"
+        })).await.unwrap();
+        assert!(result.contains("either every_seconds, cron_expr, or at"));
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_remove_missing_job_id() {
+        let tool = make_cron_tool();
+
+        let result = tool.execute(serde_json::json!({
+            "action": "remove"
+        })).await.unwrap();
+        assert!(result.contains("job_id is required"));
+    }
+
+    #[tokio::test]
+    async fn test_cron_tool_no_action() {
+        let tool = make_cron_tool();
+
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.contains("Unknown action"));
+    }
+
+    #[test]
+    fn test_format_schedule_every() {
+        assert_eq!(format_schedule(&CronSchedule::every(60_000)), "every 1m");
+        assert_eq!(format_schedule(&CronSchedule::every(3_600_000)), "every 1h");
+        assert_eq!(format_schedule(&CronSchedule::every(1_000)), "every 1s");
+        assert_eq!(format_schedule(&CronSchedule::every(500)), "every 500ms");
+    }
 }

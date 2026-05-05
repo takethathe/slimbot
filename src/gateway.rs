@@ -116,12 +116,19 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     // ChannelManager: init channels from config
     let mut channel_manager = ChannelManager::new(message_bus.clone(), config.clone());
 
-    // Register webui factory if webui channel is in config
+    // Create shutdown broadcast for channel servers (webui etc.)
+    let (channel_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
+    // Register webui factory with shutdown channel
     if config.channels.contains_key("webui") {
-        channel_manager.register_webui_factory(agent_loop.session_manager());
+        channel_manager.register_webui_factory(
+            agent_loop.session_manager(),
+            channel_shutdown_tx.clone(),
+        );
     }
 
     channel_manager.init().await?;
+    channel_manager.start_channels().await;
 
     // Start inbound listener
     agent_loop.start_inbound(None);
@@ -166,6 +173,9 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         crate::error!("[gateway] Ctrl+C handler error: {}", e);
     }
     info!("[gateway] Shutdown signal received");
+
+    // Signal channel servers to stop (webui etc.)
+    let _ = channel_shutdown_tx.send(());
 
     // Graceful shutdown
     hb_for_shutdown.stop();

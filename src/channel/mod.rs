@@ -135,8 +135,8 @@ impl ChannelManager {
     }
 
     /// Register the webui channel factory (requires session_manager for chat listing).
-    pub fn register_webui_factory(&mut self, session_manager: SharedSessionManager) {
-        let factory = WebuiChannelFactory::new(self.message_bus.clone(), session_manager);
+    pub fn register_webui_factory(&mut self, session_manager: SharedSessionManager, shutdown_tx: tokio::sync::broadcast::Sender<()>) {
+        let factory = WebuiChannelFactory::new(self.message_bus.clone(), session_manager, shutdown_tx);
         self.factories.insert("webui".to_string(), Box::new(factory));
     }
 
@@ -162,6 +162,20 @@ impl ChannelManager {
             channels.lock().await.insert(id, channel);
         }
         Ok(())
+    }
+
+    /// Start all registered channels' I/O loops via the IoScheduler.
+    /// Called in Gateway mode after init() to start HTTP/WebSocket servers etc.
+    pub async fn start_channels(&self) {
+        let channels = self.channels.lock().await;
+        for (id, channel) in channels.iter() {
+            let handle = channel.start_with_scheduler(&self.io_scheduler);
+            if handle.join_handle.is_some() {
+                let mut guard = self.io_handles.lock().await;
+                debug!("Started channel I/O: {} ({})", handle.channel_name, handle.session_id);
+                guard.insert(id.clone(), handle);
+            }
+        }
     }
 
     /// Signal I/O loops to exit on their next iteration.
@@ -325,5 +339,144 @@ mod tests {
     fn test_factories_hashmap() {
         let factories: HashMap<String, Box<dyn ChannelFactory>> = HashMap::new();
         assert!(factories.is_empty());
+    }
+
+    fn make_test_config() -> Config {
+        Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 40,
+                timeout_seconds: 120,
+                max_tool_result_chars: 10000,
+                persist_tool_results: false,
+                context_window_tokens: 8192,
+            },
+            providers: {
+                let mut m = HashMap::new();
+                m.insert("default".to_string(), crate::config::ProviderConfig {
+                    r#type: "openai".to_string(),
+                    api_url: String::new(),
+                    base_url: String::new(),
+                    api_key: "sk-test".to_string(),
+                    model: "gpt-4o".to_string(),
+                    temperature: 0.7,
+                    max_tokens: 4096,
+                    prompt_cache_enabled: true,
+                });
+                m
+            },
+            tools: vec![],
+            channels: HashMap::new(),
+            gateway: crate::config::GatewayConfig::default(),
+        }
+    }
+
+    #[test]
+    fn test_channel_manager_register_factory() {
+        let mb = Arc::new(MessageBus::new());
+        let config = Arc::new(make_test_config());
+        let mut cm = ChannelManager::new(mb, config);
+
+        cm.register_factory("test", Box::new(TestChannelFactory));
+        assert!(cm.factories.contains_key("test"));
+        assert!(!cm.factories.contains_key("unknown"));
+    }
+
+    #[tokio::test]
+    async fn test_channel_manager_init_enabled_channel() {
+        let mut config = make_test_config();
+        config.channels.insert(
+            "test".to_string(),
+            crate::config::ChannelConfig {
+                enabled: true,
+                extra: Default::default(),
+            },
+        );
+        let mb = Arc::new(MessageBus::new());
+        let config = Arc::new(config);
+        let mut cm = ChannelManager::new(mb, config);
+        cm.register_factory("test", Box::new(TestChannelFactory));
+
+        cm.init().await.unwrap();
+        assert!(!cm.channels.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_channel_manager_init_skips_disabled() {
+        let mut config = make_test_config();
+        config.channels.insert(
+            "test".to_string(),
+            crate::config::ChannelConfig {
+                enabled: false,
+                extra: Default::default(),
+            },
+        );
+        let mb = Arc::new(MessageBus::new());
+        let config = Arc::new(config);
+        let mut cm = ChannelManager::new(mb, config);
+        cm.register_factory("test", Box::new(TestChannelFactory));
+
+        cm.init().await.unwrap();
+        assert!(cm.channels.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_channel_manager_init_unknown_type() {
+        let mut config = make_test_config();
+        config.channels.insert(
+            "unknown".to_string(),
+            crate::config::ChannelConfig {
+                enabled: true,
+                extra: Default::default(),
+            },
+        );
+        let mb = Arc::new(MessageBus::new());
+        let config = Arc::new(config);
+        let mut cm = ChannelManager::new(mb, config);
+        // No factory registered for "unknown"
+
+        let result = cm.init().await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_channel_manager_shutdown_io() {
+        let mb = Arc::new(MessageBus::new());
+        let config = Arc::new(make_test_config());
+        let cm = ChannelManager::new(mb, config);
+        // Should not panic even with no handles
+        cm.shutdown_io();
+    }
+
+    #[test]
+    fn test_channel_manager_channel_info_default() {
+        let mb = Arc::new(MessageBus::new());
+        let config = Arc::new(make_test_config());
+        let cm = ChannelManager::new(mb, config);
+        let (sid, prompt) = cm.channel_info();
+        assert_eq!(sid, "cli:default");
+        assert_eq!(prompt, "> ");
+    }
+
+    #[tokio::test]
+    async fn test_channel_manager_start_channels_no_handles() {
+        // TestChannel.start_with_scheduler returns no join_handle,
+        // so start_channels should be a no-op but not panic.
+        let mut config = make_test_config();
+        config.channels.insert(
+            "test".to_string(),
+            crate::config::ChannelConfig {
+                enabled: true,
+                extra: Default::default(),
+            },
+        );
+        let mb = Arc::new(MessageBus::new());
+        let config = Arc::new(config);
+        let mut cm = ChannelManager::new(mb, config);
+        cm.register_factory("test", Box::new(TestChannelFactory));
+        cm.init().await.unwrap();
+        cm.start_channels().await;
+        // No panic; io_handles should remain empty since TestChannel returns no join_handle
+        assert!(cm.io_handles.lock().await.is_empty());
     }
 }

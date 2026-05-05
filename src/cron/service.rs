@@ -289,4 +289,340 @@ mod tests {
         svc.load();
         assert_eq!(svc.list_jobs().len(), 1);
     }
+
+    #[test]
+    fn test_cron_service_tick_only_when_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+        let job = CronJob {
+            id: "tick-1".to_string(),
+            name: "tick test".to_string(),
+            enabled: true,
+            schedule: CronSchedule::at(0), // past time, always due
+            payload: CronPayload {
+                kind: "test".to_string(),
+                message: "tick".to_string(),
+                deliver: false,
+                channel: None,
+                to: None,
+            },
+            state: CronJobState::default(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+
+        // Not running — tick should be a no-op
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            svc.tick().await;
+        });
+
+        // Job should still be in the list (wasn't executed/removed)
+        assert_eq!(svc.list_jobs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cron_service_tick_executes_due_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        let job = CronJob {
+            id: "due-1".to_string(),
+            name: "due job".to_string(),
+            enabled: true,
+            schedule: CronSchedule::every(1000),
+            payload: CronPayload {
+                kind: "test".to_string(),
+                message: "execute me".to_string(),
+                deliver: false,
+                channel: None,
+                to: None,
+            },
+            state: CronJobState::default(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+        svc.start();
+
+        // start() calls recompute_next_runs which sets next_run_at_ms to a future time.
+        // Reset it to make the job immediately due.
+        {
+            let mut guard = svc.jobs.lock().unwrap();
+            if let Some(j) = guard.iter_mut().find(|j| j.id == "due-1") {
+                j.state.next_run_at_ms = Some(0);
+            }
+        }
+
+        svc.tick().await;
+
+        // At-schedule job should be disabled after execution
+        let jobs = svc.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        // Every-schedule stays enabled; check that it was executed
+        assert!(jobs[0].state.last_run_at_ms.is_some());
+        assert_eq!(jobs[0].state.last_status, Some("ok".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cron_service_tick_skips_non_due_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        let future_time = now_ms() + 60_000; // 1 minute from now
+        let job = CronJob {
+            id: "future-1".to_string(),
+            name: "future job".to_string(),
+            enabled: true,
+            schedule: CronSchedule::at(future_time),
+            payload: CronPayload::default(),
+            state: CronJobState {
+                next_run_at_ms: Some(future_time),
+                ..Default::default()
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+        svc.start();
+
+        svc.tick().await;
+
+        // Future job should NOT have been executed
+        let jobs = svc.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].state.last_run_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cron_service_tick_every_schedule_recomputes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        let job = CronJob {
+            id: "every-1".to_string(),
+            name: "every job".to_string(),
+            enabled: true,
+            schedule: CronSchedule::every(1000), // every 1 second
+            payload: CronPayload::default(),
+            state: CronJobState {
+                next_run_at_ms: Some(0), // due now
+                ..Default::default()
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+        svc.start();
+
+        let old_next = 0i64;
+        svc.tick().await;
+
+        let jobs = svc.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        // Every-schedule should have recomputed next_run_at_ms
+        assert!(jobs[0].state.next_run_at_ms.is_some());
+        assert!(jobs[0].state.next_run_at_ms.unwrap() > old_next);
+        assert!(jobs[0].enabled); // recurring job stays enabled
+    }
+
+    #[tokio::test]
+    async fn test_cron_service_delete_after_run_removes_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        let job = CronJob {
+            id: "delete-1".to_string(),
+            name: "one-shot".to_string(),
+            enabled: true,
+            schedule: CronSchedule::every(1000),
+            payload: CronPayload::default(),
+            state: CronJobState {
+                next_run_at_ms: Some(0),
+                ..Default::default()
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: true,
+        };
+        svc.add_job(job);
+
+        // Don't call start() — it calls recompute_next_runs which would overwrite
+        // next_run_at_ms to a future time. Just set running directly.
+        svc.start();
+        // Manually reset next_run_at_ms to make the job due
+        {
+            let mut guard = svc.jobs.lock().unwrap();
+            if let Some(j) = guard.iter_mut().find(|j| j.id == "delete-1") {
+                j.state.next_run_at_ms = Some(0);
+            }
+        }
+
+        assert_eq!(svc.list_jobs().len(), 1);
+        let jobs_before = svc.list_jobs();
+        assert!(jobs_before[0].delete_after_run, "delete_after_run should be true");
+        svc.tick().await;
+
+        // Job should have been removed
+        assert_eq!(svc.list_jobs().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cron_service_callback_is_invoked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let called_ref = std::sync::Arc::new(called);
+        let called_for_callback = called_ref.clone();
+
+        svc.set_on_job(Arc::new(move |_job| {
+            let ref_clone = called_for_callback.clone();
+            Box::pin(async move {
+                ref_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        }));
+
+        let job = CronJob {
+            id: "cb-1".to_string(),
+            name: "callback test".to_string(),
+            enabled: true,
+            schedule: CronSchedule::every(1000),
+            payload: CronPayload::default(),
+            state: CronJobState {
+                next_run_at_ms: Some(0),
+                ..Default::default()
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+        svc.start();
+        // start() calls recompute_next_runs which overwrites next_run_at_ms to a future time.
+        // Reset it to make the job immediately due.
+        {
+            let mut guard = svc.jobs.lock().unwrap();
+            if let Some(j) = guard.iter_mut().find(|j| j.id == "cb-1") {
+                j.state.next_run_at_ms = Some(0);
+            }
+        }
+
+        svc.tick().await;
+
+        assert!(called_ref.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_cron_service_recompute_next_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        let job = CronJob {
+            id: "recompute-1".to_string(),
+            name: "recompute test".to_string(),
+            enabled: true,
+            schedule: CronSchedule::every(5000),
+            payload: CronPayload::default(),
+            state: CronJobState::default(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+
+        // Before start, next_run_at_ms is None
+        assert!(svc.list_jobs()[0].state.next_run_at_ms.is_none());
+
+        // After start, it should be computed
+        svc.start();
+        let jobs = svc.list_jobs();
+        assert!(jobs[0].state.next_run_at_ms.is_some());
+        assert!(jobs[0].state.next_run_at_ms.unwrap() > now_ms());
+    }
+
+    #[test]
+    fn test_cron_service_start_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        // Default is stopped
+        assert!(!svc.running.load(std::sync::atomic::Ordering::Relaxed));
+
+        svc.start();
+        assert!(svc.running.load(std::sync::atomic::Ordering::Relaxed));
+
+        svc.stop();
+        assert!(!svc.running.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_cron_service_run_history_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CronService::new(tmp.path());
+
+        // Create a job that runs many times
+        let job = CronJob {
+            id: "history-1".to_string(),
+            name: "history test".to_string(),
+            enabled: true,
+            schedule: CronSchedule::every(1000),
+            payload: CronPayload::default(),
+            state: CronJobState {
+                next_run_at_ms: Some(0),
+                ..Default::default()
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            delete_after_run: false,
+        };
+        svc.add_job(job);
+        svc.start();
+
+        // Run more than MAX_RUN_HISTORY times
+        for _ in 0..25 {
+            // Reset next_run_at_ms to 0 so it's always due
+            {
+                let mut guard = svc.jobs.lock().unwrap();
+                if let Some(j) = guard.iter_mut().find(|j| j.id == "history-1") {
+                    j.state.next_run_at_ms = Some(0);
+                }
+            }
+            svc.tick().await;
+        }
+
+        let jobs = svc.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].state.run_history.len() <= MAX_RUN_HISTORY);
+    }
+
+    #[test]
+    fn test_cron_service_load_corrupted_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cron_dir = tmp.path().join("cron");
+        std::fs::create_dir_all(&cron_dir).unwrap();
+        std::fs::write(cron_dir.join("jobs.json"), "not valid json").unwrap();
+
+        let svc = CronService::new(tmp.path());
+        // Should not panic — should gracefully skip bad file
+        svc.load();
+        assert_eq!(svc.list_jobs().len(), 0);
+    }
+
+    #[test]
+    fn test_compute_next_run_every_zero() {
+        let schedule = CronSchedule::every(0);
+        assert_eq!(compute_next_run(&schedule, now_ms()), None);
+    }
+
+    #[test]
+    fn test_compute_next_run_every_negative() {
+        let schedule = CronSchedule::every(-1000);
+        assert_eq!(compute_next_run(&schedule, now_ms()), None);
+    }
 }

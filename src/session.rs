@@ -496,6 +496,26 @@ pub fn message_content_str(msg: &Message) -> &str {
     }
 }
 
+/// Simplified message for frontend display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum FrontendMessage {
+    User { content: String },
+    Assistant { content: String },
+}
+
+impl FrontendMessage {
+    pub fn from_message(msg: &Message) -> Option<Self> {
+        match msg {
+            Message::User { content, .. } => Some(Self::User { content: content.clone() }),
+            Message::Assistant { content, .. } => {
+                content.as_ref().map(|c| Self::Assistant { content: c.clone() })
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Builder for assigning auto-increment IDs to messages.
 fn assign_message_id(msg: &mut Message, next_id: &mut usize) {
     let id = *next_id;
@@ -527,6 +547,49 @@ impl SessionManager {
 
     pub fn create_id() -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+
+    /// List all persisted session files on disk matching the given prefix.
+    /// Returns (session_id, message_count, created_time_ms).
+    pub fn list_persisted_sessions(&self, prefix: &str) -> Vec<(String, usize, i64)> {
+        let mut results = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.session_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.ends_with(".jsonl") {
+                    continue;
+                }
+                let session_id = name.trim_end_matches(".jsonl").to_string();
+                if !session_id.starts_with(prefix) {
+                    continue;
+                }
+                let msg_count = Self::count_messages_in_jsonl(&entry.path());
+                let created = entry.metadata()
+                    .ok()
+                    .and_then(|m| m.created().ok())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64)
+                    .unwrap_or(0);
+                results.push((session_id, msg_count, created));
+            }
+        }
+        results.sort_by(|a, b| a.2.cmp(&b.2).reverse());
+        results
+    }
+
+    fn count_messages_in_jsonl(path: &std::path::Path) -> usize {
+        std::fs::File::open(path)
+            .map(|f| {
+                let reader = std::io::BufReader::new(f);
+                reader.lines().filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)).count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Load messages from a persisted session file for API response.
+    /// Returns messages suitable for frontend display (user + assistant only).
+    pub fn load_session_messages(&self, session_id: &str) -> Result<Vec<FrontendMessage>> {
+        let msgs = Self::load_messages_from_jsonl(&self.session_dir, session_id, 0)?;
+        Ok(msgs.iter().filter_map(|m| FrontendMessage::from_message(m)).collect())
     }
 
     fn meta_path(&self, session_id: &str) -> PathBuf {
@@ -1248,5 +1311,88 @@ mod tests {
         // No running tasks → should return immediately
         sm.wait_all_idle().await;
         assert!(sm.runners.get("s1").unwrap().is_idle());
+    }
+
+    #[tokio::test]
+    async fn test_list_persisted_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        {
+            let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+            // Create and persist two sessions with prefix "webui:"
+            sm.get_or_create("webui:chat1").await.unwrap();
+            sm.add_message("webui:chat1", user_msg("hello")).await.unwrap();
+            sm.add_message("webui:chat1", assistant_msg("hi")).await.unwrap();
+            sm.persist("webui:chat1").await.unwrap();
+
+            sm.get_or_create("webui:chat2").await.unwrap();
+            sm.add_message("webui:chat2", user_msg("second")).await.unwrap();
+            sm.persist("webui:chat2").await.unwrap();
+
+            // Also create a session with different prefix (should be filtered out)
+            sm.get_or_create("cli:default").await.unwrap();
+            sm.add_message("cli:default", user_msg("cli msg")).await.unwrap();
+            sm.persist("cli:default").await.unwrap();
+        }
+
+        // Fresh session manager to test disk-only listing
+        let sm = SessionManager::new(session_dir).unwrap();
+        let sessions = sm.list_persisted_sessions("webui:");
+        assert_eq!(sessions.len(), 2);
+        // Should contain chat1 and chat2 with correct message counts
+        let ids: Vec<&str> = sessions.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(ids.contains(&"webui:chat1"));
+        assert!(ids.contains(&"webui:chat2"));
+    }
+
+    #[tokio::test]
+    async fn test_load_session_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        {
+            let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+            sm.get_or_create("webui:chat1").await.unwrap();
+            sm.add_message("webui:chat1", user_msg("hello")).await.unwrap();
+            sm.add_message("webui:chat1", assistant_msg("hi there")).await.unwrap();
+            sm.add_message("webui:chat1", user_msg("how are you")).await.unwrap();
+            sm.add_message("webui:chat1", assistant_msg("good thanks")).await.unwrap();
+            sm.persist("webui:chat1").await.unwrap();
+        }
+
+        let sm = SessionManager::new(session_dir).unwrap();
+        let messages = sm.load_session_messages("webui:chat1").unwrap();
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(&messages[0], FrontendMessage::User { .. }));
+        assert!(matches!(&messages[1], FrontendMessage::Assistant { .. }));
+    }
+
+    #[test]
+    fn test_frontend_message_from_message() {
+        let user = Message::User { meta: MessageMeta { id: 1 }, content: "hello".to_string() };
+        let fm = FrontendMessage::from_message(&user);
+        assert!(fm.is_some());
+        assert!(matches!(fm.unwrap(), FrontendMessage::User { content } if content == "hello"));
+
+        let asst = Message::Assistant { meta: MessageMeta { id: 2 }, content: Some("hi".to_string()), tool_calls: None };
+        let fm = FrontendMessage::from_message(&asst);
+        assert!(matches!(fm.unwrap(), FrontendMessage::Assistant { content } if content == "hi"));
+
+        let system = Message::System { meta: MessageMeta { id: 0 }, content: "sys".to_string() };
+        assert!(FrontendMessage::from_message(&system).is_none());
+
+        let tool = Message::Tool { meta: MessageMeta { id: 3 }, content: "tool".to_string(), tool_call_id: "t1".to_string(), name: None };
+        assert!(FrontendMessage::from_message(&tool).is_none());
+    }
+
+    #[test]
+    fn test_frontend_message_serde() {
+        let user = FrontendMessage::User { content: "hello".to_string() };
+        let json = serde_json::to_string(&user).unwrap();
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"content\":\"hello\""));
+
+        let asst = FrontendMessage::Assistant { content: "hi".to_string() };
+        let json = serde_json::to_string(&asst).unwrap();
+        assert!(json.contains("\"role\":\"assistant\""));
     }
 }

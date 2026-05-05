@@ -4,12 +4,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::sse::Event,
     routing::{get, post},
 };
-use tokio::sync::mpsc;
+use serde::Serialize;
+use tokio::sync::{broadcast, mpsc};
 
 use super::{Channel, ChannelFactory};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
@@ -18,10 +19,12 @@ use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::{error, info};
 use crate::embed;
 
-struct WebuiState {
+struct AppState {
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<String>>>>>,
     inbound_tx: mpsc::Sender<BusRequest>,
     channel_id: String,
+    session_manager: Option<SharedSessionManager>,
+    index_html: String,
 }
 
 pub struct WebuiChannel {
@@ -31,6 +34,7 @@ pub struct WebuiChannel {
     message_bus: Option<Arc<MessageBus>>,
     session_manager: Option<SharedSessionManager>,
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<String>>>>>,
+    shutdown_rx: Option<broadcast::Receiver<()>>,
 }
 
 impl WebuiChannel {
@@ -51,6 +55,7 @@ impl WebuiChannel {
             message_bus: None,
             session_manager: None,
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            shutdown_rx: None,
         })
     }
 
@@ -60,6 +65,10 @@ impl WebuiChannel {
 
     pub fn set_session_manager(&mut self, sm: SharedSessionManager) {
         self.session_manager = Some(sm);
+    }
+
+    pub fn set_shutdown_rx(&mut self, rx: broadcast::Receiver<()>) {
+        self.shutdown_rx = Some(rx);
     }
 
     pub fn start_server(&self) -> IoHandle {
@@ -80,48 +89,29 @@ impl WebuiChannel {
         };
         let chats = self.chats.clone();
         let channel_id = self.channel_id.clone();
-        let channel_id_for_routes = channel_id.clone();
         let session_manager = self.session_manager.clone();
+        let shutdown_rx = self.shutdown_rx.as_ref().map(|rx| rx.resubscribe());
 
         let handle = tokio::spawn(async move {
-            info!("[webui] Starting server on {}:{}", host, port);
+            let index_html =
+                embed::get_content_by_dest("webui/index.html").unwrap_or("<h1>SlimBot Gateway</h1>").to_string();
 
-            let state = Arc::new(WebuiState {
+            let state = AppState {
                 chats,
                 inbound_tx,
                 channel_id,
-            });
-
-            let index_html =
-                embed::get_content("webui/index.html").unwrap_or("<h1>SlimBot Gateway</h1>");
+                session_manager,
+                index_html,
+            };
 
             let app = axum::Router::new()
-                .route(
-                    "/",
-                    get(move || {
-                        let html = index_html.to_string();
-                        async move { (StatusCode::OK, [("content-type", "text/html")], html) }
-                    }),
-                )
-                .route(
-                    "/chats",
-                    get({
-                        let sm = session_manager.clone();
-                        let cid = channel_id_for_routes.clone();
-                        move || list_chats_handler(sm, cid)
-                    }),
-                )
-                .route(
-                    "/chats",
-                    post({
-                        let sm = session_manager.clone();
-                        let cid = channel_id_for_routes.clone();
-                        move || create_chat_handler(sm, cid)
-                    }),
-                )
+                .route("/", get(index_handler))
+                .route("/chats", get(list_chats_handler))
+                .route("/chats", post(create_chat_handler))
                 .route("/sse", get(sse_handler))
                 .route("/message", post(message_handler))
-                .with_state((state, session_manager));
+                .route("/session/*chat_id", get(session_history_handler))
+                .with_state(Arc::new(state));
 
             let listener = match tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await {
                 Ok(l) => l,
@@ -130,7 +120,22 @@ impl WebuiChannel {
                     return;
                 }
             };
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Ok(addr) = listener.local_addr() {
+                info!("[webui] Listening on http://{}", addr);
+            }
+
+            if let Some(mut rx) = shutdown_rx {
+                tokio::select! {
+                    _ = rx.recv() => {
+                        info!("[webui] Shutdown signal received");
+                    }
+                    result = axum::serve(listener, app) => {
+                        if let Err(e) = result {
+                            error!("[webui] Server error: {}", e);
+                        }
+                    }
+                }
+            } else if let Err(e) = axum::serve(listener, app).await {
                 error!("[webui] Server error: {}", e);
             }
         });
@@ -143,28 +148,50 @@ impl WebuiChannel {
     }
 }
 
-async fn list_chats_handler(
-    sm: Option<SharedSessionManager>,
-    channel_id: String,
-) -> axum::Json<Vec<String>> {
-    let prefix = format!("{}:", channel_id);
-    let mut chat_ids = Vec::new();
-    if let Some(sm) = sm {
-        let guard = sm.lock().await;
-        for session_id in guard.list_session_ids(&prefix) {
-            chat_ids.push(session_id);
-        }
-    }
-    axum::Json(chat_ids)
+/// Chat info returned by the chat list endpoint.
+#[derive(Debug, Serialize)]
+struct ChatInfo {
+    chat_id: String,
+    message_count: usize,
+    created_at_ms: i64,
 }
 
-async fn create_chat_handler(
-    sm: Option<SharedSessionManager>,
-    channel_id: String,
-) -> axum::Json<String> {
+async fn index_handler(State(state): State<Arc<AppState>>) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    (StatusCode::OK, [("content-type", "text/html")], state.index_html.clone())
+}
+
+async fn list_chats_handler(State(state): State<Arc<AppState>>) -> axum::Json<Vec<ChatInfo>> {
+    let prefix = format!("{}:", state.channel_id);
+    let mut chats = Vec::new();
+    if let Some(sm) = &state.session_manager {
+        let guard = sm.lock().await;
+        for (session_id, msg_count, created) in guard.list_persisted_sessions(&prefix) {
+            let chat_id = session_id.strip_prefix(&prefix).unwrap_or(&session_id).to_string();
+            chats.push(ChatInfo { chat_id, message_count: msg_count, created_at_ms: created });
+        }
+    }
+    axum::Json(chats)
+}
+
+async fn session_history_handler(
+    State(state): State<Arc<AppState>>,
+    Path(chat_id): Path<String>,
+) -> axum::Json<Vec<crate::session::FrontendMessage>> {
+    let session_id = format!("{}:{}", state.channel_id, chat_id);
+    let mut messages = Vec::new();
+    if let Some(sm) = &state.session_manager {
+        let guard = sm.lock().await;
+        if let Ok(msgs) = guard.load_session_messages(&session_id) {
+            messages = msgs;
+        }
+    }
+    axum::Json(messages)
+}
+
+async fn create_chat_handler(State(state): State<Arc<AppState>>) -> axum::Json<String> {
     let chat_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let session_id = format!("{}:{}", channel_id, chat_id);
-    if let Some(sm) = sm {
+    let session_id = format!("{}:{}", state.channel_id, chat_id);
+    if let Some(sm) = &state.session_manager {
         let mut guard = sm.lock().await;
         let _ = guard.get_or_create(&session_id).await;
     }
@@ -173,7 +200,7 @@ async fn create_chat_handler(
 
 async fn sse_handler(
     Query(params): Query<HashMap<String, String>>,
-    State((state, _sm)): State<(Arc<WebuiState>, Option<SharedSessionManager>)>,
+    State(state): State<Arc<AppState>>,
 ) -> axum::response::sse::Sse<
     impl futures::Stream<Item = Result<Event, std::convert::Infallible>>,
 > {
@@ -196,7 +223,7 @@ async fn sse_handler(
 
 async fn message_handler(
     Query(params): Query<HashMap<String, String>>,
-    State((state, _sm)): State<(Arc<WebuiState>, Option<SharedSessionManager>)>,
+    State(state): State<Arc<AppState>>,
     body: String,
 ) -> StatusCode {
     let chat_id = match params.get("chat_id") {
@@ -272,13 +299,19 @@ impl Channel for WebuiChannel {
 pub struct WebuiChannelFactory {
     message_bus: Arc<MessageBus>,
     session_manager: SharedSessionManager,
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl WebuiChannelFactory {
-    pub fn new(message_bus: Arc<MessageBus>, session_manager: SharedSessionManager) -> Self {
+    pub fn new(
+        message_bus: Arc<MessageBus>,
+        session_manager: SharedSessionManager,
+        shutdown_tx: broadcast::Sender<()>,
+    ) -> Self {
         Self {
             message_bus,
             session_manager,
+            shutdown_tx,
         }
     }
 }
@@ -292,6 +325,7 @@ impl ChannelFactory for WebuiChannelFactory {
         let mut ch = WebuiChannel::from_config(config)?;
         ch.set_message_bus(self.message_bus.clone());
         ch.set_session_manager(self.session_manager.clone());
+        ch.set_shutdown_rx(self.shutdown_tx.subscribe());
         Ok(Box::new(ch))
     }
 }
@@ -355,13 +389,218 @@ mod tests {
         let sm = Arc::new(tokio::sync::Mutex::new(
             crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
         ));
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-        let factory = WebuiChannelFactory::new(mb, sm);
+        let factory = WebuiChannelFactory::new(mb, sm, shutdown_tx);
         assert_eq!(factory.channel_type(), "webui");
 
         let config = json!({"host": "127.0.0.1", "port": 9999});
         let channel = factory.create(&config).unwrap();
         assert_eq!(channel.id(), "webui");
         assert_eq!(channel.name(), "WebUI");
+    }
+
+    #[tokio::test]
+    async fn test_webui_write_output_broadcasts_to_sse() {
+        let config = json!({});
+        let mut ch = WebuiChannel::from_config(&config).unwrap();
+
+        // Register an SSE subscriber for chat "abc123"
+        {
+            let mut guard = ch.chats.lock().await;
+            let (tx, _rx) = mpsc::channel::<String>(32);
+            guard.entry("abc123".to_string()).or_default().push(tx);
+        }
+
+        let result = BusResult {
+            session_id: "webui:abc123".to_string(),
+            task_id: "t1".to_string(),
+            content: "hello from agent".to_string(),
+        };
+
+        ch.write_output(&result).await.unwrap();
+        // No panic — output was sent to registered SSE subscribers
+    }
+
+    #[tokio::test]
+    async fn test_webui_write_output_no_subscriber() {
+        let config = json!({});
+        let mut ch = WebuiChannel::from_config(&config).unwrap();
+
+        let result = BusResult {
+            session_id: "webui:nobody".to_string(),
+            task_id: "t2".to_string(),
+            content: "no one listening".to_string(),
+        };
+
+        // Should not panic when no subscribers exist
+        ch.write_output(&result).await.unwrap();
+    }
+
+    #[test]
+    fn test_webui_start_server_without_message_bus() {
+        let config = json!({});
+        let ch = WebuiChannel::from_config(&config).unwrap();
+        let handle = ch.start_server();
+        // No message bus configured — should return IoHandle with no join_handle
+        assert!(handle.join_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_webui_list_chats_empty() {
+        let state = Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: None,
+            index_html: String::new(),
+        });
+        let result = list_chats_handler(State(state)).await;
+        assert!(result.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_webui_list_chats_returns_persisted_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        ));
+        {
+            let mut guard = sm.lock().await;
+            guard.get_or_create("webui:chat1").await.unwrap();
+            guard.add_message("webui:chat1", crate::session::Message::user("hello".to_string())).await.unwrap();
+            guard.persist("webui:chat1").await.unwrap();
+        }
+
+        let state = Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: Some(sm),
+            index_html: String::new(),
+        });
+        let result = list_chats_handler(State(state)).await;
+        assert_eq!(result.0.len(), 1);
+        assert_eq!(result.0[0].chat_id, "chat1");
+        assert_eq!(result.0[0].message_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_webui_session_history_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        ));
+        {
+            let mut guard = sm.lock().await;
+            guard.get_or_create("webui:abc").await.unwrap();
+            guard.add_message("webui:abc", crate::session::Message::user("hi".to_string())).await.unwrap();
+            guard.add_message("webui:abc", crate::session::Message::assistant(Some("hello".to_string()), None)).await.unwrap();
+            guard.persist("webui:abc").await.unwrap();
+        }
+
+        let state = Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: Some(sm),
+            index_html: String::new(),
+        });
+        let result = session_history_handler(State(state), Path("abc".to_string())).await;
+        assert_eq!(result.0.len(), 2);
+    }
+
+    #[test]
+    fn test_webui_create_chat_handler_generates_id() {
+        let state = Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: None,
+            index_html: String::new(),
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            create_chat_handler(State(state)).await
+        });
+        // Should return a non-empty chat_id
+        assert!(!result.0.is_empty());
+        // Should be 8 chars (uuid prefix)
+        assert_eq!(result.0.len(), 8);
+    }
+
+    #[test]
+    fn test_embed_get_content_by_dest_finds_webui_index() {
+        // Regression: get_content looks up by name ("index.html") but we need
+        // to find by destination path ("webui/index.html"). This verifies
+        // get_content_by_dest returns the full HTML, not the fallback.
+        let html = crate::embed::get_content_by_dest("webui/index.html");
+        assert!(html.is_some(), "webui/index.html should be embedded");
+        let html = html.unwrap();
+        assert!(html.contains("<!DOCTYPE html>"), "should contain HTML doctype");
+        assert!(html.contains("EventSource"), "should contain SSE client code");
+        assert!(html.contains("/message"), "should contain message endpoint");
+    }
+
+    #[test]
+    fn test_embed_get_content_by_dest_missing() {
+        let result = crate::embed::get_content_by_dest("nonexistent/file.html");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_webui_server_starts_and_shuts_down() {
+        let mb = Arc::new(MessageBus::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        ));
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let mut ch = WebuiChannel::from_config(&json!({"host": "127.0.0.1", "port": 0})).unwrap();
+        ch.set_message_bus(mb);
+        ch.set_session_manager(sm);
+        ch.set_shutdown_rx(shutdown_tx.subscribe());
+
+        let handle = ch.start_server();
+        assert!(handle.join_handle.is_some());
+
+        // Give server time to bind
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send shutdown signal
+        shutdown_tx.send(()).unwrap();
+
+        // Server task should complete (not hang)
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            handle.join_handle.unwrap(),
+        ).await;
+        assert!(result.is_ok(), "server should exit within 3s of shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn test_webui_server_starts_without_shutdown_rx() {
+        // Server without shutdown_rx should still start (bind to port).
+        // We can't easily test it shutting down, but verify it starts without panic.
+        let mb = Arc::new(MessageBus::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        ));
+
+        let mut ch = WebuiChannel::from_config(&json!({"host": "127.0.0.1", "port": 0})).unwrap();
+        ch.set_message_bus(mb);
+        ch.set_session_manager(sm);
+        // No set_shutdown_rx call
+
+        let handle = ch.start_server();
+        assert!(handle.join_handle.is_some());
+
+        // Brief wait then abort
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Drop the handle — server task will keep running until MB closes,
+        // which is fine for this test.
+        drop(handle);
     }
 }

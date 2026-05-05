@@ -126,3 +126,13 @@
 - [x] `ProviderConfig` 新增 `prompt_cache_enabled` 字段（默认 true），通过 serde 自动反序列化
 - [x] OpenAI provider 在最后一条 system message 的 content 上注入 `cache_control: {"type": "ephemeral"}`
 - [x] `setup.rs` `merge_provider` 支持 partial config 中的 `prompt_cache_enabled` 字段
+
+## Gateway 模式
+
+- [x] `slimbot gateway` 命令启动 cron、heartbeat 和 enabled channels
+- [x] CLI channel 不在 config.channels 中配置，仅在 CLI/agent 模式隐式启用
+- [x] Channel 配置 key 即为 type，无需 `type` 字段
+- [x] WebUI channel：axum HTTP server，SSE 流式输出，嵌入 index.html
+- [x] Gateway 主线程为 ChannelManager 监听 output message
+- [x] Cron 与 Heartbeat 集成到 AgentLoop 通过 callback 触发任务
+- [x] 完整的单元测试覆盖：cron service (38 tests), heartbeat service (12 tests), webui channel (11 tests), channel manager (9 tests), message tool (6 tests), cron tool (13 tests)

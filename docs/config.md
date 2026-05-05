@@ -93,23 +93,30 @@ cargo run -- -d /data/myapp setup
 
 ### `channels` — 通信通道
 
-定义 Agent 的输入/输出通道。每个条目是一个键值对，键为通道名称，值为通道配置。
+定义 Agent 的输入/输出通道。每个条目是一个键值对，**键为通道类型标识符**（如 `"webui"`），值为通道配置。
+
+**注意：** CLI 通道不需要在 `channels` 中配置。CLI 模式始终隐式启用 CLI 通道，仅用于非 Gateway 模式的交互式终端会话。Gateway 模式不启动 CLI 通道。
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `type` | string | **是** | — | 通道类型标识符（例如 `"cli"`、`"webui"`） |
 | `enabled` | bool | 否 | `true` | 是否启用该通道 |
 | 其他 | any | 否 | — | 通道特定的任意配置字段（通过 `#[serde(flatten)]` 捕获） |
+
+可用通道类型：
+
+- **`webui`** — Web 界面通道，内置 HTTP 服务器（基于 axum），支持 SSE 流式输出。配置字段见下表。
+
+#### WebUI 通道配置
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `host` | string | 否 | `"0.0.0.0"` | 监听地址 |
+| `port` | integer | 否 | `8080` | 监听端口 |
 
 ```json
 {
   "channels": {
-    "cli": {
-      "type": "cli",
-      "enabled": true
-    },
     "webui": {
-      "type": "webui",
       "enabled": true,
       "host": "127.0.0.1",
       "port": 8080
@@ -118,7 +125,7 @@ cargo run -- -d /data/myapp setup
 }
 ```
 
-**向后兼容：** 仍支持旧的数组格式（`[{ "type": "cli", ... }]`），加载时会自动转换。
+**向后兼容：** 仍支持旧的数组格式（`[{ "type": "cli", ... }]`），加载时会自动转换为 HashMap 格式。旧格式中的 `type` 字段会被忽略，配置键即为通道类型。
 
 ### `gateway` — Gateway 模式配置
 
@@ -242,9 +249,10 @@ Provider 级别字段：
 ```json
 {
   "channels": {
-    "cli": {
-      "type": "cli",
-      "enabled": true
+    "webui": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8080
     }
   }
 }
@@ -295,7 +303,7 @@ Provider 级别字段：
   - `max_tokens` = 0 → `4096`
   - `prompt_cache_enabled` → 尊重用户设置，不做规范化
   - `api_key` **永不**被规范化或覆盖
-- `name`/`type` 为空的 tools/channels 条目会被移除（channels 按空键名过滤）
+- `name`/`type` 为空的 tools 条目会被移除；channels 按空键名过滤
 
 ## 完整示例
 
@@ -320,7 +328,7 @@ Provider 级别字段：
     { "name": "shell", "enabled": true }
   ],
   "channels": {
-    "cli": { "type": "cli", "enabled": true }
+    "webui": { "enabled": true, "host": "127.0.0.1", "port": 8080 }
   },
   "gateway": {
     "cron": { "enabled": true },

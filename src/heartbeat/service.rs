@@ -143,4 +143,129 @@ mod tests {
         let svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, true);
         assert!(svc.read_heartbeat_content().is_none());
     }
+
+    #[test]
+    fn test_heartbeat_sleep_duration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = HeartbeatService::new(tmp.path().to_path_buf(), 120, true);
+        assert_eq!(svc.sleep_duration(), std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_heartbeat_start_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, false);
+        svc.start();
+        // start() should not set running when disabled
+        assert!(!svc.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_heartbeat_start_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, true);
+        assert!(!svc.running.load(Ordering::Relaxed));
+        svc.start();
+        assert!(svc.running.load(Ordering::Relaxed));
+        svc.stop();
+        assert!(!svc.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_heartbeat_tick_when_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("HEARTBEAT.md"), "do something").unwrap();
+        let svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, true);
+        // Not started — tick should be a no-op
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            svc.tick().await;
+        });
+        // No panic, no callback called
+    }
+
+    #[test]
+    fn test_heartbeat_tick_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, true);
+        svc.start();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            svc.tick().await;
+        });
+        // Should not panic when file is missing
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tick_executes_callback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("HEARTBEAT.md"), "check status").unwrap();
+        let mut svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, true);
+
+        let executed = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let exec_clone = executed.clone();
+
+        svc.set_on_execute(Arc::new(move |content| {
+            let c = exec_clone.clone();
+            Box::pin(async move {
+                *c.lock().await = content;
+                "result".to_string()
+            })
+        }));
+
+        let notified = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let notif_clone = notified.clone();
+
+        svc.set_on_notify(Arc::new(move |result| {
+            let n = notif_clone.clone();
+            Box::pin(async move {
+                *n.lock().await = result;
+            })
+        }));
+
+        svc.start();
+        svc.tick().await;
+
+        assert_eq!(*executed.lock().await, "check status");
+        assert_eq!(*notified.lock().await, "result");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tick_empty_result_skips_notify() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("HEARTBEAT.md"), "content").unwrap();
+        let mut svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, true);
+
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notif_clone = notified.clone();
+
+        svc.set_on_execute(Arc::new(move |_content| {
+            Box::pin(async move {
+                "".to_string() // empty result
+            })
+        }));
+
+        svc.set_on_notify(Arc::new(move |_result| {
+            let n = notif_clone.clone();
+            Box::pin(async move {
+                n.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        }));
+
+        svc.start();
+        svc.tick().await;
+
+        // Notify should NOT have been called
+        assert!(!notified.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tick_no_callback_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("HEARTBEAT.md"), "content").unwrap();
+        let svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, true);
+        svc.start();
+        // Should not panic when on_execute is None
+        svc.tick().await;
+    }
 }
