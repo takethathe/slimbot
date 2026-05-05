@@ -76,7 +76,8 @@ cargo run -- -d /data/myapp setup
   "agent": { ... },
   "providers": { ... },
   "tools": [ ... ],
-  "channels": [ ... ]
+  "channels": { ... },
+  "gateway": { ... }
 }
 ```
 
@@ -87,7 +88,61 @@ cargo run -- -d /data/myapp setup
 | `agent` | object | **是** | — | 单个 Agent 配置 |
 | `providers` | object | **是** | — | 命名 Provider 定义（键值映射） |
 | `tools` | array | 否 | `[]` | 注册的工具定义列表 |
-| `channels` | array | 否 | `[]` | 通信通道定义列表 |
+| `channels` | object | 否 | `{}` | 通信通道定义（键值映射） |
+| `gateway` | object | 否 | 见下文 | Gateway 模式配置 |
+
+### `channels` — 通信通道
+
+定义 Agent 的输入/输出通道。每个条目是一个键值对，键为通道名称，值为通道配置。
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `type` | string | **是** | — | 通道类型标识符（例如 `"cli"`、`"webui"`） |
+| `enabled` | bool | 否 | `true` | 是否启用该通道 |
+| 其他 | any | 否 | — | 通道特定的任意配置字段（通过 `#[serde(flatten)]` 捕获） |
+
+```json
+{
+  "channels": {
+    "cli": {
+      "type": "cli",
+      "enabled": true
+    },
+    "webui": {
+      "type": "webui",
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8080
+    }
+  }
+}
+```
+
+**向后兼容：** 仍支持旧的数组格式（`[{ "type": "cli", ... }]`），加载时会自动转换。
+
+### `gateway` — Gateway 模式配置
+
+控制 `slimbot gateway` 模式下启动的后台服务。
+
+```json
+{
+  "gateway": {
+    "cron": {
+      "enabled": true
+    },
+    "heartbeat": {
+      "enabled": true,
+      "interval_s": 1800
+    }
+  }
+}
+```
+
+| 子字段 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `cron.enabled` | bool | `true` | 是否启用 cron 定时调度 |
+| `heartbeat.enabled` | bool | `true` | 是否启用 heartbeat 定期检查 |
+| `heartbeat.interval_s` | uint | `1800` | heartbeat 检查间隔（秒），默认 30 分钟 |
 
 ### `agent` — Agent 配置
 
@@ -161,9 +216,9 @@ Provider 级别字段：
 
 ### `tools` — 工具定义
 
-列出 Agent 可用的工具。如果数组为空，默认启用全部 6 个内置工具。
+列出 Agent 可用的工具。如果数组为空，默认启用全部 8 个内置工具。
 
-可用工具：`shell`、`file_reader`、`file_writer`、`file_editor`、`list_dir`、`make_dir`。
+可用工具：`shell`、`file_reader`、`file_writer`、`file_editor`、`list_dir`、`make_dir`、`message`、`cron`。
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -180,21 +235,18 @@ Provider 级别字段：
 }
 ```
 
-### `channels` — 通信通道
+### `channels` — 通信通道（已移至上方）
 
-定义 Agent 的输入/输出通道。每个条目指定一个通道类型和可选配置。
-
-| 字段 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `type` | string | **是** | — | 通道类型标识符（例如 `"cli"`） |
-| `enabled` | bool | 否 | `true` | 是否启用该通道 |
-| `config` | object | 否 | `{}` | 通道特定配置（任意 JSON） |
+参见上方的 `channels` 章节。
 
 ```json
 {
-  "channels": [
-    { "type": "cli", "enabled": true, "config": {} }
-  ]
+  "channels": {
+    "cli": {
+      "type": "cli",
+      "enabled": true
+    }
+  }
 }
 ```
 
@@ -243,7 +295,7 @@ Provider 级别字段：
   - `max_tokens` = 0 → `4096`
   - `prompt_cache_enabled` → 尊重用户设置，不做规范化
   - `api_key` **永不**被规范化或覆盖
-- `name`/`type` 为空的 tools/channels 条目会被移除
+- `name`/`type` 为空的 tools/channels 条目会被移除（channels 按空键名过滤）
 
 ## 完整示例
 
@@ -267,9 +319,13 @@ Provider 级别字段：
   "tools": [
     { "name": "shell", "enabled": true }
   ],
-  "channels": [
-    { "type": "cli", "enabled": true, "config": {} }
-  ]
+  "channels": {
+    "cli": { "type": "cli", "enabled": true }
+  },
+  "gateway": {
+    "cron": { "enabled": true },
+    "heartbeat": { "enabled": true, "interval_s": 1800 }
+  }
 }
 ```
 
