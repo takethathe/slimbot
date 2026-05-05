@@ -114,13 +114,13 @@ impl ChannelManager {
 
         // The channels map is populated; try to find a CLI channel.
         // Since we can't block here, use a best-effort approach via the config.
-        for entry in &self.config.channels {
-            if entry.enabled && entry.r#type == "cli" {
-                let sid = format!("{}:{}", entry.r#type, entry.config.get("chat_id")
+        for (name, entry) in &self.config.channels {
+            if entry.enabled && name == "cli" {
+                let sid = format!("{}:{}", name, entry.extra.get("chat_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default"));
                 session_id = sid;
-                prompt = entry.config.get("prompt")
+                prompt = entry.extra.get("prompt")
                     .and_then(|v| v.as_str())
                     .unwrap_or("> ")
                     .to_string();
@@ -141,15 +141,13 @@ impl ChannelManager {
     pub async fn init(&mut self) -> Result<()> {
         let channels = self.channels.clone();
 
-        for entry in &self.config.channels {
+        for (name, entry) in &self.config.channels {
             if !entry.enabled {
                 continue;
             }
-            let factory = self
-                .factories
-                .get(&entry.r#type)
-                .ok_or_else(|| anyhow::anyhow!("Unregistered channel type: {}", entry.r#type))?;
-            let channel = factory.create(&entry.config)?;
+            let factory = self.factories.get(name).ok_or_else(|| anyhow::anyhow!("Unregistered channel type: {}", name))?;
+            let config_value = serde_json::Value::Object(entry.extra.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<serde_json::Map<_, _>>());
+            let channel = factory.create(&config_value)?;
             let id = channel.id().to_string();
             let session_id = channel.session_id();
             let name = channel.name().to_string();
@@ -300,7 +298,7 @@ mod tests {
             "test"
         }
         fn create(&self, _config: &serde_json::Value) -> Result<Box<dyn Channel>> {
-            Ok(Box::new(TestChannel::new("test", "default")))
+            Ok(Box::new(TestChannel::new("test", "default")) as Box<dyn Channel>)
         }
     }
 

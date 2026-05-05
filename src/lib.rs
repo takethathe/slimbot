@@ -24,7 +24,7 @@ pub(crate) mod utils;
 pub(crate) mod worker;
 
 // Re-export key types for integration tests and binary usage.
-pub use config::{AgentConfig, Config, ChannelEntry, ProviderConfig, ToolEntry};
+pub use config::{AgentConfig, ChannelConfig, Config, GatewayConfig, ProviderConfig, ToolEntry};
 pub use config_scheme::ConfigScheme;
 pub use log::{LogLevel, init as log_init, log, should_log};
 pub use message_bus::{BusRequest, BusResult, MessageBus};

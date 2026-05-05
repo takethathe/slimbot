@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{AgentConfig, Config, ProviderConfig};
+use crate::config::{AgentConfig, Config, GatewayConfig, ProviderConfig};
 
 /// ConfigScheme holds all default values and validation rules
 /// for the application configuration.
@@ -27,7 +27,8 @@ impl ConfigScheme {
             agent: self.default_agent_config(&default_provider_name),
             providers,
             tools: vec![],
-            channels: vec![],
+            channels: HashMap::new(),
+            gateway: GatewayConfig::default(),
         }
     }
 
@@ -65,7 +66,7 @@ impl ConfigScheme {
 
         // tools & channels: remove entries with empty name/type
         config.tools.retain(|t| !t.name.is_empty());
-        config.channels.retain(|c| !c.r#type.is_empty());
+        config.channels.retain(|name, _| !name.is_empty());
     }
 
     /// Write the default config.json to the given path.
