@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SlimBot Gateway</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 800px; margin: 0 auto; padding: 1rem; background: #f5f5f5; }
+#chat-list { list-style: none; padding: 0; }
+#chat-list li { padding: 0.5rem 1rem; margin: 0.25rem 0; background: white; border-radius: 4px; cursor: pointer; }
+#chat-list li:hover { background: #e0e0e0; }
+#messages { max-height: 60vh; overflow-y: auto; background: white; padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+.msg { margin: 0.5rem 0; padding: 0.5rem; border-radius: 4px; }
+.msg.user { background: #e3f2fd; text-align: right; }
+.msg.assistant { background: #f3e5f5; }
+#input-form { display: flex; gap: 0.5rem; }
+#input-form textarea { flex: 1; padding: 0.5rem; resize: vertical; min-height: 40px; }
+button { padding: 0.5rem 1rem; cursor: pointer; }
+#new-chat { margin-bottom: 1rem; }
+#view { display: none; }
+</style>
+</head>
+<body>
+<div id="chat-select">
+  <h2>SlimBot Gateway</h2>
+  <button id="new-chat">New Chat</button>
+  <ul id="chat-list"></ul>
+</div>
+<div id="view">
+  <h2 id="chat-title"></h2>
+  <div id="messages"></div>
+  <form id="input-form">
+    <textarea id="input" placeholder="Type a message..."></textarea>
+    <button type="submit">Send</button>
+  </form>
+  <button id="back" style="margin-top:0.5rem">Back to chats</button>
+</div>
+<script>
+let currentChat = null;
+let evtSource = null;
+
+async function loadChats() {
+  const res = await fetch('/chats');
+  const chats = await res.json();
+  const list = document.getElementById('chat-list');
+  list.innerHTML = '';
+  chats.forEach(c => {
+    const li = document.createElement('li');
+    li.textContent = c;
+    li.onclick = () => enterChat(c);
+    list.appendChild(li);
+  });
+}
+
+async function newChat() {
+  const res = await fetch('/chats', { method: 'POST' });
+  const chat = await res.json();
+  enterChat(chat);
+}
+
+function enterChat(chatId) {
+  currentChat = chatId;
+  document.getElementById('chat-select').style.display = 'none';
+  document.getElementById('view').style.display = 'block';
+  document.getElementById('chat-title').textContent = chatId;
+  document.getElementById('messages').innerHTML = '';
+
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource('/sse?chat_id=' + encodeURIComponent(chatId));
+  evtSource.onmessage = (e) => {
+    const msg = document.createElement('div');
+    msg.className = 'msg assistant';
+    msg.textContent = e.data;
+    document.getElementById('messages').appendChild(msg);
+    document.getElementById('messages').scrollTop = 999999;
+  };
+}
+
+document.getElementById('new-chat').onclick = newChat;
+document.getElementById('back').onclick = () => {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  currentChat = null;
+  document.getElementById('chat-select').style.display = 'block';
+  document.getElementById('view').style.display = 'none';
+  loadChats();
+};
+
+document.getElementById('input-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('input');
+  const msg = input.value.trim();
+  if (!msg || !currentChat) return;
+  input.value = '';
+
+  const userDiv = document.createElement('div');
+  userDiv.className = 'msg user';
+  userDiv.textContent = msg;
+  document.getElementById('messages').appendChild(userDiv);
+
+  await fetch('/message?chat_id=' + encodeURIComponent(currentChat), {
+    method: 'POST', body: msg
+  });
+};
+
+loadChats();
+</script>
+</body>
+</html>

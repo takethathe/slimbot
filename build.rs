@@ -33,6 +33,10 @@ fn main() {
     let mut all_entries = Vec::new();
     all_entries.extend(scan_dir_recursive(&templates_dir, ""));
     all_entries.extend(scan_dir_recursive(&skills_dir, "skills/"));
+
+    let webui_dir = Path::new(&manifest_dir).join("resources/webui");
+    all_entries.extend(scan_dir_recursive(&webui_dir, "webui/"));
+
     all_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut code = String::new();
@@ -70,4 +74,5 @@ pub fn get_dest(name: &str) -> Option<&'static str> {
 
     println!("cargo:rerun-if-changed=resources/templates");
     println!("cargo:rerun-if-changed=resources/skills");
+    println!("cargo:rerun-if-changed=resources/webui");
 }
