@@ -12,7 +12,7 @@
 - [ ] **spawn** — 后台子代理创建，支持传入指令和等待结果，用于并行任务执行
 - [ ] **mcp** — MCP 服务器客户端，连接外部 MCP 服务并将其工具包装为原生工具
 - [ ] **self** — 运行时状态检查，返回当前 session 信息、配置、可用工具列表等
-- [ ] **message** — 向用户发送消息（用于 channel 推送场景，如 telegram/whatsapp）
+- [x] **message** — 向用户发送消息（用于 channel 推送场景，如 telegram/whatsapp）
 - [ ] **notebook** — Jupyter notebook (`.ipynb`) 编辑工具，支持代码单元格和 markdown 单元格增删改
 - [ ] **sandbox** — shell 命令沙箱后端，支持不同的执行隔离策略（docker/ssh/local）
 
@@ -34,20 +34,21 @@
 
 ## Heartbeat 机制
 
-- [ ] 实现 heartbeat 调度器，固定间隔时间运行任务
-- [ ] 支持 `config.json` 配置 `agent.heartbeat_interval_minutes`，默认 30 分钟
-- [ ] 定义 `workspace/heartbeat.jsonl` 任务格式（任务描述、调度信息、状态）
-- [ ] `AgentLoop` 初始化时启动 heartbeat 定时器
-- [ ] 定时器触发时读取 `heartbeat.jsonl`，通过 `MessageBus` 提交任务
-- [ ] 执行完成后标记任务状态（completed/failed）
+- [x] 实现 heartbeat 调度器，固定间隔时间运行任务
+- [x] 支持 `config.json` 配置 `gateway.heartbeat.enabled` 和 `interval_s`
+- [x] `AgentLoop` 初始化时启动 heartbeat 定时器（gateway 模式）
+- [x] 定时器触发时读取 `workspace/HEARTBEAT.md`，通过 `AgentLoop.run_task()` 执行任务
+- [x] 执行完成后通过 outbound 投递结果到默认 channel
+- [ ] 支持 `workspace/heartbeat.jsonl` 任务格式（多任务调度）
 
 ## Cron 定时任务机制
 
-- [ ] 实现 `cron_add` / `cron_list` / `cron_remove` 工具，供 Agent 管理定时任务
-- [ ] 定义 `workspace/cron.jsonl` 格式（cron 表达式、任务描述、创建者 channel_id/chat_id、创建时间、状态）
-- [ ] 实现后台 cron 调度器，每分钟检查并匹配应执行的任务
-- [ ] 触发的任务通过 `MessageBus` 提交到 `AgentRunner` 作为后台任务运行
-- [ ] 模型判断执行结果是否需要 deliver 到创建任务的 channel，需要则投递
+- [x] 实现 `cron` 工具（add/list/remove actions），供 Agent 管理定时任务
+- [x] Cron 服务实现：`CronService` 支持 `at`/`every`/`cron` 三种调度
+- [x] JSON 持久化存储（`workspace/cron/jobs.json`）
+- [x] 后台 cron 调度器，每秒 tick 检查并触发到期任务
+- [x] 触发的任务通过 `AgentLoop.run_task()` 执行
+- [x] 模型判断执行结果是否需要 deliver 到 channel（`payload.deliver` + `channel`/`to` 字段）
 
 ## Memory 记忆系统
 
