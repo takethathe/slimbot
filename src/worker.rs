@@ -111,6 +111,17 @@ impl WorkerPool {
     /// Initialize the global singleton. Must be called once before `global()`.
     pub fn init_global(max_workers: usize) {
         let _ = GLOBAL_POOL.set(WorkerPool::new(max_workers));
+
+        // Spawn idle reaper — access pool through OnceLock since it's now
+        // in its final static location.
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Some(pool) = GLOBAL_POOL.get() {
+                    pool.reap_idle_workers();
+                }
+            }
+        });
     }
 
     /// Get the global WorkerPool instance. Panics if `init_global` was not called.
@@ -121,27 +132,16 @@ impl WorkerPool {
     }
 
     fn new(max_workers: usize) -> Self {
-        let pool = Self {
+        Self {
             max_workers,
             workers: RwLock::new(Vec::new()),
-        };
-
-        // Spawn idle reaper
-        let pool_ref: &'static WorkerPool = unsafe { &*(&pool as *const _) };
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                pool_ref.reap_idle_workers();
-            }
-        });
-
-        pool
+        }
     }
 
     /// Submit a closure. The pool finds an idle worker or creates a new one
     /// (up to max_workers). If all workers are busy, queues to the least busy one.
     pub fn submit(&self, f: Box<dyn FnOnce() -> BoxFuture + Send>) {
-        let mut guard = self.workers.write().unwrap();
+        let mut guard = self.workers.write().unwrap_or_else(|e| e.into_inner());
 
         // Try to find an idle worker
         if let Some(entry) = guard.iter_mut().find(|e| e.worker.queue_len() == 0) {
@@ -169,7 +169,7 @@ impl WorkerPool {
     }
 
     fn reap_idle_workers(&self) {
-        let mut guard = self.workers.write().unwrap();
+        let mut guard = self.workers.write().unwrap_or_else(|e| e.into_inner());
         guard.retain(|entry| {
             // Keep workers that have pending messages or were active recently
             if entry.worker.queue_len() > 0 {

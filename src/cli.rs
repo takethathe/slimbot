@@ -4,8 +4,9 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::agent_loop::AgentLoop;
-use crate::session::{SessionManager, TaskHook};
-use crate::{debug, fatal};
+use crate::commands::{classify_command, CommandTier};
+use crate::session::TaskHook;
+use crate::{debug, fatal, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "slimbot", about = "SlimBot AI agent")]
@@ -89,7 +90,7 @@ pub async fn run_agent_session(
     let session_id = match session_id {
         Some(s) => s,
         None => {
-            session_id_owned = Some(SessionManager::create_id());
+            session_id_owned = Some("cli:default".to_string());
             session_id_owned.as_deref().unwrap()
         }
     };
@@ -115,9 +116,14 @@ pub async fn run_agent_session(
         return Ok(());
     }
 
-    // Interactive mode: existing stdin loop
+    // Interactive mode: existing stdin loop — all I/O on main thread.
+    // Ensure session exists before the loop.
+    if let Err(e) = crate::session::ensure_session(&agent_loop.session_manager(), session_id).await {
+        fatal!("Failed to create session: {}", e);
+    }
+
     eprintln!("SlimBot CLI agent session: {}", session_id);
-    eprintln!("Type your message (Ctrl+D to exit):\n");
+    eprintln!("Type your message (Ctrl+D or /quit to exit):\n");
 
     let stdin = io::stdin();
     let mut line = String::new();
@@ -138,6 +144,26 @@ pub async fn run_agent_session(
             continue;
         }
 
+        // Classify slash commands on the main thread.
+        let cmd = classify_command(&input);
+        if cmd.is_command {
+            match cmd.tier {
+                CommandTier::Channel => {
+                    // /quit, /exit — exit the loop.
+                    break;
+                }
+                CommandTier::AgentLoop => {
+                    // /stop, /clear, /status — handle directly.
+                    handle_cli_command(agent_loop, session_id, &input).await;
+                    continue;
+                }
+                CommandTier::AgentRunner => {
+                    // Recognized as a command but let the model handle it
+                    // (e.g. /help). Fall through to run_task.
+                }
+            }
+        }
+
         let hook = TaskHook::new(session_id);
         let result = agent_loop
             .run_task(session_id, input, hook, None)
@@ -151,5 +177,43 @@ pub async fn run_agent_session(
         println!();
     }
 
+    // Graceful shutdown on Ctrl+D or /quit
+    agent_loop.shutdown_for_cli().await;
+
     Ok(())
+}
+
+/// Handle AgentLoop-tier commands directly on the main thread.
+async fn handle_cli_command(agent_loop: &AgentLoop, session_id: &str, input: &str) {
+    match input {
+        "/stop" => {
+            let sm = agent_loop.session_manager();
+            let new_token = {
+                let guard = sm.lock().await;
+                guard.cancel_and_reset_session(session_id)
+            };
+            if new_token.is_some() {
+                eprintln!("Session stopped. Use /new to start fresh.");
+            } else {
+                eprintln!("No active session to stop.");
+            }
+        }
+        "/clear" | "/new" => {
+            let sm = agent_loop.session_manager();
+            let mut guard = sm.lock().await;
+            guard.clear_session(session_id);
+            drop(guard);
+            eprintln!("Session cleared. Starting fresh.");
+        }
+        "/status" => {
+            let sm = agent_loop.session_manager();
+            let guard = sm.lock().await;
+            let msg_count = guard.message_count(session_id);
+            drop(guard);
+            eprintln!("Session: {}\nMessages: {}", session_id, msg_count);
+        }
+        _ => {
+            info!("[cli] Unhandled command: {}", input);
+        }
+    }
 }

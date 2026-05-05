@@ -9,6 +9,7 @@ use crate::provider::{Provider, Usage};
 use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState};
 use crate::tool::{ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
 use crate::{debug, warn_log};
+use tokio_util::sync::CancellationToken;
 
 /// Result returned by AgentRunner after a ReAct loop completes.
 #[derive(Debug, Clone, Default)]
@@ -43,6 +44,7 @@ pub struct AgentRunnerBuilder {
     memory_store: Option<SharedMemoryStore>,
     channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
+    cancel_token: Option<CancellationToken>,
 }
 
 impl AgentRunnerBuilder {
@@ -56,6 +58,7 @@ impl AgentRunnerBuilder {
             memory_store: None,
             channel_inject: None,
             consolidator: None,
+            cancel_token: None,
         }
     }
 
@@ -99,6 +102,11 @@ impl AgentRunnerBuilder {
         self
     }
 
+    pub fn cancel_token(mut self, ct: Option<CancellationToken>) -> Self {
+        self.cancel_token = ct;
+        self
+    }
+
     pub fn build(self) -> AgentRunner {
         let session_manager = self.session_manager.expect("session_manager required");
         let tool_manager = self.tool_manager.expect("tool_manager required");
@@ -116,6 +124,7 @@ impl AgentRunnerBuilder {
             memory_store,
             self.channel_inject,
             self.consolidator,
+            self.cancel_token,
         )
     }}
 
@@ -128,6 +137,7 @@ pub struct AgentRunner {
     memory_store: SharedMemoryStore,
     channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
+    cancel_token: Option<CancellationToken>,
 }
 
 impl AgentRunner {
@@ -145,6 +155,7 @@ impl AgentRunner {
         memory_store: SharedMemoryStore,
         channel_inject: Option<String>,
         consolidator: Option<Arc<Consolidator>>,
+        cancel_token: Option<CancellationToken>,
     ) -> Self {
         Self {
             tool_manager,
@@ -155,6 +166,7 @@ impl AgentRunner {
             memory_store,
             channel_inject,
             consolidator,
+            cancel_token,
         }
     }
 
@@ -165,6 +177,18 @@ impl AgentRunner {
         session_id: &str,
     ) -> AgentResult {
         debug!("[AgentRunner] Starting run for session={}", session_id);
+
+        // Sentinel /stop message: all prior tasks were cancelled and drained.
+        if self.cancel_token.is_some() && content == "/stop" {
+            return self.cancelled_result(&hook, session_id).await;
+        }
+
+        // Check cancellation before starting.
+        if let Some(ref ct) = self.cancel_token {
+            if ct.is_cancelled() {
+                return self.cancelled_result(&hook, session_id).await;
+            }
+        }
 
         // 1. Write user message
         {
@@ -235,6 +259,12 @@ impl AgentRunner {
 
             // Request model
             debug!("[AgentRunner] Sending chat request to provider");
+            // Check cancellation before LLM request.
+            if let Some(ref ct) = self.cancel_token {
+                if ct.is_cancelled() {
+                    return self.cancelled_result(&hook, session_id).await;
+                }
+            }
             let response = match self
                 .provider
                 .chat(&ctx.messages, ctx.tools.as_deref())
@@ -336,6 +366,12 @@ impl AgentRunner {
 
                 // 2. Execute tools and write Tool messages
                 for call in calls {
+                    // Check cancellation before each tool call.
+                    if let Some(ref ct) = self.cancel_token {
+                        if ct.is_cancelled() {
+                            return self.cancelled_result(&hook, session_id).await;
+                        }
+                    }
                     let raw_result = match self
                         .tool_manager
                         .execute(&call.name, call.args.clone())
@@ -397,6 +433,25 @@ impl AgentRunner {
         result.content = error.to_string();
         result.iterations = iterations;
         let failed_state = TaskState::Failed { error: error.to_string() };
+        {
+            let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
+                self.session_manager.lock().await;
+            let _ = sm.persist(session_id).await;
+        }
+        hook.notify_status_change(&failed_state);
+        result
+    }
+
+    async fn cancelled_result(
+        &self,
+        hook: &TaskHook,
+        session_id: &str,
+    ) -> AgentResult {
+        let msg = "Task cancelled.".to_string();
+        let mut result = AgentResult::default();
+        result.success = false;
+        result.content = msg.clone();
+        let failed_state = TaskState::Failed { error: msg };
         {
             let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                 self.session_manager.lock().await;
@@ -1209,5 +1264,69 @@ mod tests {
             }
             other => panic!("Expected Tool message, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_stop_sentinel_returns_cancelled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
+
+        // Create a runner with a cancellation token that is already cancelled.
+        let ct = CancellationToken::new();
+        ct.cancel();
+
+        let runner = AgentRunner::builder()
+            .session_manager(sm.clone())
+            .tool_manager(tm)
+            .provider(Arc::new(MockProvider::new(vec![]))) // no responses needed
+            .config(AgentConfig {
+                provider: "test".to_string(),
+                max_iterations: 40,
+                timeout_seconds: 120,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 8192,
+            })
+            .workspace_dir(wd)
+            .memory_store(ms)
+            .cancel_token(Some(ct))
+            .build();
+
+        // Sentinel /stop message should be detected immediately.
+        let result = runner.run("/stop".to_string(), TaskHook::new("test-session"), "test-session").await;
+        assert!(!result.success);
+        assert_eq!(result.content, "Task cancelled.");
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_token_before_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
+
+        // Create a runner with a cancelled token but non-sentinel content.
+        let ct = CancellationToken::new();
+        ct.cancel();
+
+        let runner = AgentRunner::builder()
+            .session_manager(sm.clone())
+            .tool_manager(tm)
+            .provider(Arc::new(MockProvider::new(vec![])))
+            .config(AgentConfig {
+                provider: "test".to_string(),
+                max_iterations: 40,
+                timeout_seconds: 120,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 8192,
+            })
+            .workspace_dir(wd)
+            .memory_store(ms)
+            .cancel_token(Some(ct))
+            .build();
+
+        // Should return cancelled before making any LLM call.
+        let result = runner.run("hello".to_string(), TaskHook::new("test-session"), "test-session").await;
+        assert!(!result.success);
+        assert_eq!(result.content, "Task cancelled.");
     }
 }

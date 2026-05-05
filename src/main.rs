@@ -61,13 +61,9 @@ async fn run_cli_agent(
     session_id: Option<&str>,
     query: Option<&str>,
 ) -> Result<()> {
-    let message_bus = Arc::new(MessageBus::new());
     WorkerPool::init_global(64);
-
     let config = Arc::new(Config::load(paths.config_path().to_str().unwrap())?);
-
+    let message_bus = Arc::new(MessageBus::new());
     let agent_loop = AgentLoop::from_config(paths, message_bus.clone(), config.clone()).await?;
-    agent_loop.start_inbound();
-
     run_agent_session(&agent_loop, session_id, query).await
 }

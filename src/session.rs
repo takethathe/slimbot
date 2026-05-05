@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
 use crate::consolidate::Consolidator;
@@ -28,6 +29,9 @@ pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
 pub struct SessionRunner {
     running: Arc<AtomicBool>,
     task_queue: Arc<std::sync::Mutex<VecDeque<Box<dyn FnOnce() -> BoxFuture + Send>>>>,
+    cancel_token: Arc<std::sync::Mutex<CancellationToken>>,
+    /// Notified by on_task_complete so shutdown can wait for the running task.
+    task_done: Arc<tokio::sync::Notify>,
 }
 
 impl SessionRunner {
@@ -35,6 +39,8 @@ impl SessionRunner {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             task_queue: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            cancel_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
+            task_done: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -60,6 +66,51 @@ impl SessionRunner {
     fn on_task_complete(&self) {
         self.running.store(false, Ordering::Relaxed);
         self.maybe_start_next();
+        self.task_done.notify_waiters();
+    }
+
+    /// Cancel the current token and replace it with a fresh one.
+    /// Returns a clone of the new (non-cancelled) token for the sentinel task.
+    /// Tasks already queued hold a clone of the old token and will observe cancellation.
+    fn cancel_and_reset(&self) -> CancellationToken {
+        let mut guard = self.cancel_token.lock().unwrap();
+        guard.cancel();
+        let new_token = CancellationToken::new();
+        let old = std::mem::replace(&mut *guard, new_token.clone());
+        drop(old);
+        new_token
+    }
+
+    /// Return a clone of the session's current cancellation token.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.lock().unwrap().clone()
+    }
+
+    /// Whether the runner is currently idle.
+    fn is_idle(&self) -> bool {
+        !self.running.load(Ordering::Relaxed)
+    }
+
+    /// Shutdown: clear pending queue and cancel running tasks.
+    /// Does NOT wait for the running task — callers use `wait_idle()` for that.
+    fn shutdown(&self) {
+        self.cancel_token.lock().unwrap().cancel();
+        self.task_queue.lock().unwrap().clear();
+    }
+
+    /// Wait until the currently running task (if any) finishes.
+    async fn wait_idle(&self) {
+        if self.is_idle() {
+            return;
+        }
+        // Poll in a loop: the running task calls on_task_complete() which
+        // stores running=false AND notifies, so we'll see idle after the notify.
+        loop {
+            if self.is_idle() {
+                return;
+            }
+            self.task_done.notified().await;
+        }
     }
 }
 
@@ -196,6 +247,7 @@ pub struct SessionTaskBuilder {
     outbound_tx: Option<tokio::sync::mpsc::Sender<BusResult>>,
     channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
+    cancel_token: Option<CancellationToken>,
 }
 
 impl SessionTaskBuilder {
@@ -213,6 +265,7 @@ impl SessionTaskBuilder {
             outbound_tx: None,
             channel_inject: None,
             consolidator: None,
+            cancel_token: None,
         }
     }
 
@@ -261,6 +314,11 @@ impl SessionTaskBuilder {
         self
     }
 
+    pub fn cancel_token(mut self, ct: Option<CancellationToken>) -> Self {
+        self.cancel_token = ct;
+        self
+    }
+
     pub fn build(self) -> SessionTask {
         let session_manager = self.session_manager.expect("session_manager required");
         let tool_manager = self.tool_manager.expect("tool_manager required");
@@ -277,6 +335,7 @@ impl SessionTaskBuilder {
         let hook = self.hook;
 
         let consolidator = self.consolidator;
+        let cancel_token = self.cancel_token;
 
         let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> =
             Box::new(move || {
@@ -290,6 +349,7 @@ impl SessionTaskBuilder {
                         .memory_store(memory_store)
                         .channel_inject(self.channel_inject)
                         .consolidator(consolidator)
+                        .cancel_token(cancel_token)
                         .build();
                     let result = runner.run(content, hook, &sid1).await;
 
@@ -593,6 +653,75 @@ impl SessionManager {
     pub fn update_token_ratio(&mut self, session_id: &str, prompt_tokens: u32) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.update_token_ratio(prompt_tokens);
+        }
+    }
+
+    /// Clear all messages and reset consolidation state for a session.
+    pub fn clear_session(&mut self, session_id: &str) -> bool {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.messages.clear();
+            session.last_persisted_idx = 0;
+            session.meta.last_consolidated_id = 0;
+            session.meta.last_summary = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get the number of unconsolidated messages for a session.
+    pub fn message_count(&self, session_id: &str) -> usize {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.messages.len())
+            .unwrap_or(0)
+    }
+
+    /// Check if a session exists in memory.
+    pub fn has_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
+    /// Cancel all pending and running tasks for a session and reset to a fresh token.
+    /// Returns the new (non-cancelled) token, which the sentinel task should use.
+    /// Already-queued tasks hold clones of the old token and will observe cancellation.
+    pub fn cancel_and_reset_session(&self, session_id: &str) -> Option<CancellationToken> {
+        self.runners.get(session_id).map(|r| r.cancel_and_reset())
+    }
+
+    /// Get a clone of the session's cancellation token.
+    pub fn session_cancel_token(&self, session_id: &str) -> Option<CancellationToken> {
+        self.runners.get(session_id).map(|r| r.cancel_token())
+    }
+
+    /// Shutdown all sessions: cancel tokens, clear pending queues.
+    pub fn shutdown_all(&self) {
+        for (_, runner) in &self.runners {
+            runner.shutdown();
+        }
+    }
+
+    /// Wait for all running tasks to finish.
+    pub async fn wait_all_idle(&self) {
+        let runners: Vec<_> = self.runners.values().cloned().collect();
+        for runner in runners {
+            runner.wait_idle().await;
+        }
+    }
+
+    /// Persist all session meta files and sync message + meta files to disk.
+    pub fn sync_all_meta(&self) {
+        for session_id in self.sessions.keys() {
+            self.save_session_meta(session_id);
+            // Sync the session's message JSONL file.
+            let jsonl_path = self.session_dir.join(format!("{}.jsonl", session_id));
+            if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&jsonl_path) {
+                let _ = file.sync_all();
+            }
+        }
+        // Sync the session directory to ensure all files are durable.
+        if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(&self.session_dir) {
+            let _ = dir.sync_all();
         }
     }
 
@@ -979,5 +1108,137 @@ mod tests {
         assert_eq!(session.messages[1].id(), 4);
         assert_eq!(session.last_consolidated_id(), 2);
         assert_eq!(session.last_persisted_idx, 0); // fresh load, nothing new to append
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        // Token should not be cancelled initially
+        let old_token = sm.session_cancel_token("s1").unwrap();
+        assert!(!old_token.is_cancelled());
+
+        // Cancel and reset: old token is cancelled, new token is fresh
+        let new_token = sm.cancel_and_reset_session("s1").unwrap();
+        assert!(old_token.is_cancelled());
+        assert!(!new_token.is_cancelled());
+
+        // Subsequent tasks get the new token
+        let current = sm.session_cancel_token("s1").unwrap();
+        assert!(!current.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_session_nonexistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let sm = SessionManager::new(session_dir).unwrap();
+
+        // Should not panic for non-existent session
+        assert!(sm.cancel_and_reset_session("nonexistent").is_none());
+        assert!(sm.session_cancel_token("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_session_runner_cancel_and_reset() {
+        let runner = SessionRunner::new();
+        let old_token = runner.cancel_token();
+
+        // Cancel and reset returns a new, non-cancelled token
+        let new_token = runner.cancel_and_reset();
+
+        // Old clone is cancelled, new one is not
+        assert!(old_token.is_cancelled());
+        assert!(!new_token.is_cancelled());
+
+        // Subsequent callers also see the new token
+        let current = runner.cancel_token();
+        assert!(!current.is_cancelled());
+    }
+
+    #[test]
+    fn test_stop_semantics_before_and_after() {
+        // Simulates the full /stop lifecycle:
+        // 1. Tasks A and B capture the current token (like being queued)
+        // 2. /stop triggers cancel_and_reset
+        // 3. Sentinel task captures the new token
+        // 4. Task C (queued after /stop) captures the new token
+        let runner = SessionRunner::new();
+
+        // Step 1: Tasks queued before /stop
+        let task_a_token = runner.cancel_token();
+        let task_b_token = runner.cancel_token();
+
+        // Step 2: /stop arrives — cancel old, get new
+        let sentinel_token = runner.cancel_and_reset();
+
+        // Step 3: New task queued after /stop
+        let task_c_token = runner.cancel_token();
+
+        // Verify: pre-/stop tasks see cancellation
+        assert!(task_a_token.is_cancelled());
+        assert!(task_b_token.is_cancelled());
+
+        // Verify: sentinel and post-/stop tasks see a fresh token
+        assert!(!sentinel_token.is_cancelled());
+        assert!(!task_c_token.is_cancelled());
+
+        // Another cancel_and_reset creates yet another fresh token
+        let token_v2 = runner.cancel_and_reset();
+        assert!(!token_v2.is_cancelled());
+        assert!(sentinel_token.is_cancelled()); // old one is now cancelled
+        assert!(!runner.cancel_token().is_cancelled()); // current is fresh
+    }
+
+    #[test]
+    fn test_session_runner_shutdown_clears_queue_and_cancels_token() {
+        let runner = SessionRunner::new();
+
+        // Token is not cancelled initially
+        assert!(!runner.cancel_token().is_cancelled());
+
+        // Shutdown should cancel token
+        runner.shutdown();
+        assert!(runner.cancel_token().is_cancelled());
+
+        // Queue is empty (nothing was pushed)
+        assert!(runner.task_queue.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_shutdown_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+        sm.get_or_create("s2").await.unwrap();
+
+        // Get tokens before shutdown
+        let t1 = sm.session_cancel_token("s1").unwrap();
+        let t2 = sm.session_cancel_token("s2").unwrap();
+        assert!(!t1.is_cancelled());
+        assert!(!t2.is_cancelled());
+
+        // Shutdown all
+        sm.shutdown_all();
+
+        // All tokens cancelled
+        assert!(t1.is_cancelled());
+        assert!(t2.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_wait_all_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        // No running tasks → should return immediately
+        sm.wait_all_idle().await;
+        assert!(sm.runners.get("s1").unwrap().is_idle());
     }
 }

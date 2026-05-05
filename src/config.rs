@@ -84,14 +84,14 @@ pub struct AgentConfig {
     pub context_window_tokens: u32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolEntry {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelEntry {
     pub r#type: String,
     #[serde(default = "default_true")]
@@ -100,7 +100,7 @@ pub struct ChannelEntry {
     pub config: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub agent: AgentConfig,
     pub providers: HashMap<String, ProviderConfig>,

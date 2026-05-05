@@ -104,10 +104,14 @@
 
 ## 用户命令处理机制
 
-- [ ] 增加用户命令处理机制，支持用户在多轮对话中输入斜杠命令
-- [ ] 实现 `/quit`（或 `/exit`）命令，用于退出 agent 的多轮对话
-- [ ] 命令解析在 channel 层或 agent loop 层拦截以 `/` 开头的输入
-- [ ] 命令处理结果反馈给用户（如退出提示）
+- [x] 实现三层命令处理架构
+- [x] **Channel 层**：`/quit`、`/exit` 在 IoScheduler 中拦截，绕过 MessageBus 直接触发退出
+- [x] **AgentLoop 层**：`/stop`（停止所有运行中任务）、`/clear` 或 `/new`（清空当前会话）、`/status`（显示会话状态）
+- [x] **AgentRunner 层**：其他斜杠命令（如 `/help`）作为正常任务流经 ReAct 循环，由模型处理
+- [x] `/stop` 使用 per-session CancellationToken 机制取消当前和队列中的所有任务
+- [x] `/stop` 取消后 enqueue 哨兵 `/stop` User 消息，等待所有 pending task 排空后返回 "all tasks cancelled"
+- [x] AgentRunner 在运行开始、LLM 请求前、每个 tool call 前检查取消状态
+- [x] 退出命令直接触发：cancel 所有 task、停止所有 channel、shutdown thread pool，然后正常退出
 
 ## CLI Markdown 输出支持
 

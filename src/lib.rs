@@ -2,6 +2,7 @@ pub(crate) mod agent_loop;
 pub(crate) mod bootstrap;
 pub(crate) mod channel;
 pub(crate) mod cli;
+pub(crate) mod commands;
 pub(crate) mod config;
 pub(crate) mod config_scheme;
 pub(crate) mod consolidate;
@@ -38,6 +39,7 @@ pub use memory::{MemoryStore, SharedMemoryStore};
 pub use tool::{ToolCall, ToolDefinition, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result};
 pub use utils::{truncate_text_head_tail, write_file_atomic, build_persisted_reference, TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS};
 pub use tools::create_tool;
+pub use channel::{Channel, ChannelFactory, ChannelManager};
 
 // Re-export for binary usage.
 pub use cli::{CliArgs, Commands, run_agent_session};

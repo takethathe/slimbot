@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tokio_util::sync::CancellationToken;
 
 use crate::memory::SharedMemoryStore;
 use crate::provider::{FinishReason, Provider};
@@ -24,6 +25,7 @@ pub struct Consolidator {
     memory_store: SharedMemoryStore,
     context_window_tokens: u32,
     max_completion_tokens: u32,
+    cancel_token: CancellationToken,
 }
 
 impl Consolidator {
@@ -40,6 +42,7 @@ impl Consolidator {
             memory_store,
             context_window_tokens,
             max_completion_tokens,
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -211,12 +214,10 @@ If nothing noteworthy happened, output: (nothing)"
             tokens_to_remove,
             ratio,
         ) else {
-            info!("[Consolidator] No safe boundary for {session_id}");
             return Ok(None);
         };
 
         let Some(end_idx) = Self::cap_consolidation_boundary(&messages, start_idx, end_idx) else {
-            info!("[Consolidator] No capped boundary for {session_id}");
             return Ok(None);
         };
 
@@ -236,6 +237,12 @@ If nothing noteworthy happened, output: (nothing)"
         );
 
         let summary = self.archive(&chunk).await.ok().flatten();
+
+        // If cancelled during archive, skip all file I/O and meta updates.
+        if self.cancel_token.is_cancelled() {
+            info!("[Consolidator] Cancelled during consolidate for {session_id}, skipping file writes");
+            return Ok(None);
+        }
 
         let mut sm = self.session_manager.lock().await;
         sm.update_consolidation_cursor(session_id, end_msg_id).await;
@@ -262,14 +269,15 @@ If nothing noteworthy happened, output: (nothing)"
         let target = budget / 2;
         let tokens_to_remove = prompt_tokens.saturating_sub(target);
 
-        let result = self.consolidate_one_round(session_id, tokens_to_remove).await?;
-        if let Some((_, summary)) = result {
-            if let Some(s) = summary {
-                info!("[Consolidator] Archived summary: {} chars", s.len());
-            }
-        }
+        let _ = self.consolidate_one_round(session_id, tokens_to_remove).await?;
 
         Ok(())
+    }
+
+    /// Signal the consolidator to cancel any ongoing consolidation.
+    /// Does not wait for in-progress work — the cancellation is cooperative.
+    pub fn shutdown(&self) {
+        self.cancel_token.cancel();
     }
 }
 

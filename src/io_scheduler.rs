@@ -1,11 +1,18 @@
 use anyhow::Result;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::commands::CommandTier;
 use crate::message_bus::BusRequest;
 use crate::session::TaskHook;
 use crate::{error, info, warn_log};
+
+/// Callback invoked when a channel-tier command (e.g. /quit) is detected.
+/// The callback is responsible for triggering shutdown.
+pub type ChannelCommandCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Handle returned when a channel starts its I/O loop.
 /// Gives ChannelManager lifecycle visibility over channel I/O.
@@ -19,11 +26,30 @@ pub struct IoHandle {
 /// to the appropriate executor.
 pub struct IoScheduler {
     inbound_tx: mpsc::Sender<BusRequest>,
+    shutdown: Arc<AtomicBool>,
+    /// Optional callback invoked when a channel-tier command (e.g. /quit) is detected.
+    /// Called with (session_id, command_text) before the read loop exits.
+    channel_cmd_cb: Arc<Mutex<Option<ChannelCommandCallback>>>,
 }
 
 impl IoScheduler {
     pub fn new(inbound_tx: mpsc::Sender<BusRequest>) -> Self {
-        Self { inbound_tx }
+        Self {
+            inbound_tx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            channel_cmd_cb: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Set the callback invoked when channel-tier commands are detected in user input.
+    pub fn set_channel_command_cb(&self, cb: ChannelCommandCallback) {
+        let mut guard = self.channel_cmd_cb.lock().unwrap();
+        *guard = Some(cb);
+    }
+
+    /// Signal all I/O loops to exit on their next iteration.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 
     /// Start a blocking read loop for a CLI-style channel.
@@ -38,8 +64,14 @@ impl IoScheduler {
         prompt: String,
     ) -> JoinHandle<()> {
         let tx = self.inbound_tx.clone();
+        let shutdown = self.shutdown.clone();
+        let channel_cmd_cb = self.channel_cmd_cb.clone();
         tokio::spawn(async move {
             loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    info!("[{}] Shutdown signal received, exiting read loop", channel_name);
+                    break;
+                }
                 let prompt = prompt.clone();
                 match tokio::task::spawn_blocking(move || {
                     read_line_blocking(&prompt)
@@ -47,6 +79,19 @@ impl IoScheduler {
                 .await
                 {
                     Ok(Ok(input)) => {
+                        let cmd = crate::commands::classify_command(&input);
+                        if cmd.is_command && cmd.tier == CommandTier::Channel {
+                            info!("[{}] Channel command intercepted: {}", channel_name, input);
+                            let cb = {
+                                let guard = channel_cmd_cb.lock().unwrap();
+                                guard.clone()
+                            };
+                            if let Some(cb) = cb {
+                                cb(&session_id, &input);
+                            }
+                            break;
+                        }
+
                         let request = BusRequest {
                             session_id: session_id.clone(),
                             content: input,

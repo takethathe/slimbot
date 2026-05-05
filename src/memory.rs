@@ -93,6 +93,41 @@ impl MemoryStore {
         }
     }
 
+    // -- shutdown sync ------------------------------------------------------
+
+    /// Sync all memory files to disk (fsync). Called during shutdown.
+    pub fn sync_all(&self) -> Result<()> {
+        // Sync history file
+        if self.history_file.exists() {
+            if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&self.history_file) {
+                let _ = file.sync_all();
+            }
+        }
+        // Sync cursor file
+        if self.cursor_file.exists() {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.cursor_file) {
+                let _ = file.sync_all();
+            }
+        }
+        // Sync dream cursor file
+        if self.dream_cursor_file.exists() {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.dream_cursor_file) {
+                let _ = file.sync_all();
+            }
+        }
+        // Sync MEMORY.md
+        if self.memory_file.exists() {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.memory_file) {
+                let _ = file.sync_all();
+            }
+        }
+        // Sync the memory directory
+        if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(&self.memory_dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
     // -- history.jsonl (append-only JSONL) -----------------------------------
 
     /// Append an entry to history.jsonl and return its auto-incrementing cursor.
