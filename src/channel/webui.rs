@@ -15,7 +15,7 @@ use super::{Channel, ChannelFactory};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::{SharedSessionManager, TaskHook, TaskState};
 use crate::io_scheduler::{IoHandle, IoScheduler};
-use crate::{debug, error, info};
+use crate::{error, info};
 use crate::embed;
 
 struct WebuiState {
