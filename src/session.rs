@@ -743,6 +743,18 @@ impl SessionManager {
         }
     }
 
+    /// Truncate session messages to the given length.
+    /// Used to roll back a turn's messages on cancellation or error.
+    /// Does NOT persist — the caller decides whether to persist.
+    pub async fn truncate_messages(&mut self, session_id: &str, new_len: usize) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.messages.truncate(new_len);
+            if session.last_persisted_idx > new_len {
+                session.last_persisted_idx = new_len;
+            }
+        }
+    }
+
     /// Get the number of unconsolidated messages for a session.
     pub fn message_count(&self, session_id: &str) -> usize {
         self.sessions
@@ -872,6 +884,17 @@ pub async fn ensure_session(sm: &SharedSessionManager, session_id: &str) -> Resu
     let mut guard: tokio::sync::MutexGuard<'_, SessionManager> = sm.lock().await;
     guard.get_or_create(session_id).await?;
     Ok(())
+}
+
+/// Resolve origin channel/chat_id, falling back to parsing `session_id`.
+pub fn parse_session_origin(session_id: &str, origin: (Option<&str>, Option<&str>)) -> (String, String) {
+    match origin {
+        (Some(ch), Some(cid)) => (ch.to_string(), cid.to_string()),
+        _ => session_id
+            .split_once(':')
+            .map(|(c, i)| (c.to_string(), i.to_string()))
+            .unwrap_or_default(),
+    }
 }
 
 #[cfg(test)]
@@ -1528,5 +1551,31 @@ mod tests {
 
         let msgs = sm.get_messages("s1").await;
         assert!(msgs[1].timestamp() >= msgs[0].timestamp());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        sm.add_message("s1", user_msg("a")).await.unwrap();
+        sm.add_message("s1", assistant_msg("b")).await.unwrap();
+        sm.add_message("s1", user_msg("c")).await.unwrap();
+        assert_eq!(sm.message_count("s1"), 3);
+
+        // Truncate to 1 message
+        sm.truncate_messages("s1", 1).await;
+        assert_eq!(sm.message_count("s1"), 1);
+        let msgs = sm.get_messages("s1").await;
+        assert!(matches!(&msgs[0], Message::User { content, .. } if content == "a"));
+
+        // Truncate to 0
+        sm.truncate_messages("s1", 0).await;
+        assert_eq!(sm.message_count("s1"), 0);
+
+        // Truncate non-existent session should not panic
+        sm.truncate_messages("nonexistent", 0).await;
     }
 }

@@ -28,14 +28,6 @@ impl MessageTool {
     pub fn set_send_callback(&mut self, cb: SendCallback) {
         self.send_callback = Some(cb);
     }
-
-    pub fn start_turn(&self) {
-        self.sent_in_turn.store(false, Ordering::Relaxed);
-    }
-
-    pub fn sent_in_turn(&self) -> bool {
-        self.sent_in_turn.load(Ordering::Relaxed)
-    }
 }
 
 #[async_trait]
@@ -46,6 +38,14 @@ impl Tool for MessageTool {
 
     fn description(&self) -> &str {
         "Send a message to the user. This is the primary way to deliver results to a channel."
+    }
+
+    fn start_turn(&self) {
+        self.sent_in_turn.store(false, Ordering::Relaxed);
+    }
+
+    fn sent_in_turn(&self) -> bool {
+        self.sent_in_turn.load(Ordering::Relaxed)
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -78,6 +78,8 @@ impl Tool for MessageTool {
 
         if let Some(ref cb) = self.send_callback {
             cb(channel.clone(), chat_id.clone(), content.clone()).await;
+            // Only mark as sent when targeting the default (origin) context.
+            // Cross-channel sends should not suppress the final response.
             let default_ch = self.default_channel.lock().unwrap().clone();
             let default_chat = self.default_chat_id.lock().unwrap().clone();
             if channel == default_ch && chat_id == default_chat {

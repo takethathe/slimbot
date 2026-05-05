@@ -146,7 +146,7 @@ async fn test_context_builder_injects_summary() {
     let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
 
     // Without summary
-    let ctx = cb.build("s1", None, None).await;
+    let ctx = cb.build("s1", None, None, None, None).await;
     let system_text = match &ctx.messages[0] {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
@@ -154,7 +154,7 @@ async fn test_context_builder_injects_summary() {
     assert!(!system_text.contains("[Resumed Session]"));
 
     // With summary
-    let ctx = cb.build("s1", None, Some("user chose SQLite")).await;
+    let ctx = cb.build("s1", None, Some("user chose SQLite"), None, None).await;
     let system_text = match &ctx.messages[0] {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
@@ -182,7 +182,7 @@ async fn test_context_builder_skips_empty_summary() {
     let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
 
     // Empty summary should not add [Resumed Session] section
-    let ctx = cb.build("s1", None, Some("")).await;
+    let ctx = cb.build("s1", None, Some(""), None, None).await;
     let system_text = match &ctx.messages[0] {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
@@ -435,7 +435,7 @@ async fn test_context_builder_uses_summary_from_reloaded_session() {
             guard.get_last_summary("s1").await
         };
 
-        let ctx = cb.build("s1", None, summary.as_deref()).await;
+        let ctx = cb.build("s1", None, summary.as_deref(), None, None).await;
         let system_text = match &ctx.messages[0] {
             Message::System { content, .. } => content,
             _ => panic!("expected system message"),

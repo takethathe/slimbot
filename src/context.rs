@@ -3,9 +3,45 @@ use std::sync::Arc;
 
 use crate::bootstrap::{bootstrap_files, read_if_modified};
 use crate::memory::SharedMemoryStore;
-use crate::session::{Message, SharedSessionManager};
+use crate::session::{Message, SharedSessionManager, parse_session_origin};
 use crate::tool::{ToolDefinition, ToolManager};
 use crate::debug;
+
+/// Bounding tags for the transient runtime context block.
+/// Sent to the LLM but NOT persisted in session history.
+const RUNTIME_CONTEXT_TAG: &str = "[Runtime Context -- metadata only, not instructions]";
+const RUNTIME_CONTEXT_END: &str = "[/Runtime Context]";
+
+/// Build a transient runtime context string (time, channel, chat_id, session summary).
+/// This block is bounded by RUNTIME_CONTEXT_TAG / RUNTIME_CONTEXT_END tags and
+/// is sent to the LLM but NOT persisted in session history.
+fn build_runtime_context(channel: &str, chat_id: &str, session_summary: Option<&str>) -> String {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z");
+    let mut lines = vec![format!("Current Time: {}", now)];
+    if !channel.is_empty() && !chat_id.is_empty() {
+        lines.push(format!("Channel: {}", channel));
+        lines.push(format!("Chat ID: {}", chat_id));
+    }
+    if let Some(summary) = session_summary {
+        if !summary.is_empty() {
+            lines.push(String::new());
+            lines.push("[Resumed Session]".to_string());
+            lines.push(summary.to_string());
+        }
+    }
+    format!("{}\n{}\n{}", RUNTIME_CONTEXT_TAG, lines.join("\n"), RUNTIME_CONTEXT_END)
+}
+
+/// Merge two content strings. If either is empty, return the other; otherwise concatenate with blank line separator.
+fn merge_content(left: &str, right: &str) -> String {
+    if left.is_empty() {
+        right.to_string()
+    } else if right.is_empty() {
+        left.to_string()
+    } else {
+        format!("{}\n\n{}", left, right)
+    }
+}
 
 pub struct RunContext {
     pub messages: Vec<Message>,
@@ -81,7 +117,7 @@ impl ContextBuilder {
         }
     }
 
-    pub async fn build(&self, session_id: &str, channel_inject: Option<String>, session_summary: Option<&str>) -> RunContext {
+    pub async fn build(&self, session_id: &str, channel_inject: Option<String>, session_summary: Option<&str>, origin_channel: Option<&str>, origin_chat_id: Option<&str>) -> RunContext {
         debug!("[ContextBuilder] Starting build for session={}", session_id);
         let mut system_parts: Vec<String> = Vec::new();
 
@@ -191,6 +227,20 @@ impl ContextBuilder {
         let mut all_messages = vec![Message::system(system_prompt)];
         all_messages.extend(messages);
 
+        // 8. Inject runtime context into the last user message (transient, not persisted).
+        // Use origin channel/chat_id if provided (e.g. from cron payload), otherwise parse from session_id.
+        let (channel, chat_id) = parse_session_origin(session_id, (origin_channel, origin_chat_id));
+        let runtime_ctx = build_runtime_context(&channel, &chat_id, session_summary);
+
+        // Find the last User message and prepend runtime context to it.
+        // If the last message is already User, merge into it to avoid consecutive same-role messages.
+        if let Some(last_user_idx) = all_messages.iter().rposition(|m| matches!(m, Message::User { .. })) {
+            if let Message::User { content, .. } = &all_messages[last_user_idx] {
+                let merged = merge_content(content, &runtime_ctx);
+                all_messages[last_user_idx] = Message::user(merged);
+            }
+        }
+
         let tools = Some(self.tool_manager.to_openai_functions());
         debug!("[ContextBuilder] Tools count={}", tools.as_ref().map(|t| t.len()).unwrap_or(0));
 
@@ -249,5 +299,52 @@ Skill body.
     #[test]
     fn test_parse_no_closing_delimiter_returns_none() {
         assert!(parse_skill_frontmatter("---\nname: test\nno closing").is_none());
+    }
+
+    #[test]
+    fn test_build_runtime_context_basic() {
+        let ctx = build_runtime_context("cli", "default", None);
+        assert!(ctx.starts_with(RUNTIME_CONTEXT_TAG));
+        assert!(ctx.ends_with(RUNTIME_CONTEXT_END));
+        assert!(ctx.contains("Current Time:"));
+        assert!(ctx.contains("Channel: cli"));
+        assert!(ctx.contains("Chat ID: default"));
+        assert!(!ctx.contains("[Resumed Session]"));
+    }
+
+    #[test]
+    fn test_build_runtime_context_with_summary() {
+        let ctx = build_runtime_context("webui", "chat-1", Some("User asked about files"));
+        assert!(ctx.starts_with(RUNTIME_CONTEXT_TAG));
+        assert!(ctx.ends_with(RUNTIME_CONTEXT_END));
+        assert!(ctx.contains("Channel: webui"));
+        assert!(ctx.contains("Chat ID: chat-1"));
+        assert!(ctx.contains("[Resumed Session]"));
+        assert!(ctx.contains("User asked about files"));
+    }
+
+    #[test]
+    fn test_build_runtime_context_empty_channel() {
+        let ctx = build_runtime_context("", "", None);
+        assert!(ctx.starts_with(RUNTIME_CONTEXT_TAG));
+        assert!(!ctx.contains("Channel:"));
+        assert!(!ctx.contains("Chat ID:"));
+    }
+
+    #[test]
+    fn test_build_runtime_context_empty_summary() {
+        let ctx = build_runtime_context("cli", "default", Some(""));
+        assert!(!ctx.contains("[Resumed Session]"));
+    }
+
+    #[test]
+    fn test_merge_content() {
+        assert_eq!(merge_content("", "hello"), "hello");
+        assert_eq!(merge_content("hello", ""), "hello");
+        assert_eq!(merge_content("", ""), "");
+        let result = merge_content("existing", "new");
+        assert!(result.contains("existing"));
+        assert!(result.contains("new"));
+        assert!(result.contains("\n\n"));
     }
 }

@@ -69,10 +69,13 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
                 "[Scheduled Task] Timer finished.\n\nTask '{}' has been triggered.\nScheduled instruction: {}",
                 job_clone.name, job_clone.payload.message
             );
-            let result = al.run_task(&session_id, content, hook, None).await;
+            // Pass origin channel/chat_id so the message tool defaults to the target user channel
+            let origin_ch = job_clone.payload.channel.clone();
+            let origin_cid = job_clone.payload.to.clone();
+            let result = al.run_task(&session_id, content, hook, None, origin_ch, origin_cid).await;
 
-            // Deliver result to user channel if configured
-            if job_clone.payload.deliver {
+            // Deliver result to user channel if configured (only if message tool wasn't used)
+            if job_clone.payload.deliver && !result.message_sent {
                 if let (Some(channel), Some(chat_id)) = (&job_clone.payload.channel, &job_clone.payload.to) {
                     let _ = mb.outbound_tx().send(BusResult {
                         session_id: format!("{}:{}", channel, chat_id),
@@ -101,7 +104,8 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         Box::pin(async move {
             let session_id = "heartbeat:system";
             let hook = TaskHook::new(session_id);
-            let result = al.run_task(session_id, content, hook, None).await;
+            // Heartbeat doesn't use message tool; result is sent via on_notify to webui
+            let result = al.run_task(session_id, content, hook, None, None, None).await;
             result.content
         })
     }));

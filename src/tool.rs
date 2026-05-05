@@ -46,6 +46,10 @@ pub trait Tool: Send + Sync {
 
     /// Set the current session context. Default is no-op.
     fn set_context(&self, _ctx: &ToolContext) {}
+    /// Start a new turn (reset per-turn tracking). Default is no-op.
+    fn start_turn(&self) {}
+    /// Check if this tool sent output this turn. Default is false.
+    fn sent_in_turn(&self) -> bool { false }
 }
 
 pub struct ToolManager {
@@ -136,6 +140,18 @@ impl ToolManager {
         for tool in self.tools.values() {
             tool.set_context(ctx);
         }
+    }
+
+    /// Start a new turn for a named tool (resets per-turn tracking).
+    pub fn start_turn(&self, name: &str) {
+        if let Some(tool) = self.tools.get(name) {
+            tool.start_turn();
+        }
+    }
+
+    /// Check if a named tool sent a message this turn.
+    pub fn sent_in_turn(&self, name: &str) -> bool {
+        self.tools.get(name).map_or(false, |t| t.sent_in_turn())
     }
 }
 

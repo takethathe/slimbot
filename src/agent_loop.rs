@@ -226,9 +226,23 @@ impl AgentLoop {
         content: String,
         hook: TaskHook,
         channel_inject: Option<String>,
+        origin_channel: Option<String>,
+        origin_chat_id: Option<String>,
     ) -> AgentResult {
-        let cancel_token = self.session_manager.lock().await
-            .session_cancel_token(session_id);
+        // Ensure session exists (cron/heartbeat tasks may use new session IDs)
+        if let Err(e) = ensure_session(&self.session_manager, session_id).await {
+            error!("[AgentLoop] Failed to ensure session {}: {}", session_id, e);
+            return AgentResult {
+                success: false,
+                content: format!("Session error: {}", e),
+                ..Default::default()
+            };
+        }
+
+        let cancel_token = {
+            let guard = self.session_manager.lock().await;
+            guard.session_cancel_token(session_id)
+        };
         let runner = AgentRunner::new(
             self.tool_manager.clone(),
             self.provider.clone(),
@@ -239,8 +253,21 @@ impl AgentLoop {
             channel_inject,
             Some(self.consolidator.clone()),
             cancel_token,
+            origin_channel,
+            origin_chat_id,
         );
-        runner.run(content, hook, session_id).await
+        let result = runner.run(content, hook, session_id).await;
+
+        // Suppress final response if the message tool already delivered output this turn.
+        // This prevents duplicate messages when a cron/heartbeat task uses the message tool.
+        if result.message_sent {
+            return AgentResult {
+                content: String::new(),
+                ..result
+            };
+        }
+
+        result
     }
 
     /// Start the inbound listener task.

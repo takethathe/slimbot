@@ -6,7 +6,7 @@ use crate::consolidate::Consolidator;
 use crate::context::ContextBuilder;
 use crate::memory::SharedMemoryStore;
 use crate::provider::{Provider, Usage};
-use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState};
+use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState, parse_session_origin};
 use crate::tool::{ToolContext, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
 use crate::{debug, warn_log};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,9 @@ pub struct AgentResult {
     pub prompt_cache_hit_tokens: u32,
     pub completion_tokens: u32,
     pub iterations: u32,
+    /// True if the message tool was used to deliver output this turn.
+    /// When true, the caller should suppress the final response to avoid duplicates.
+    pub message_sent: bool,
 }
 
 impl AgentResult {
@@ -45,6 +48,10 @@ pub struct AgentRunnerBuilder {
     channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
     cancel_token: Option<CancellationToken>,
+    /// Origin channel for tool context (overrides session_id-parsed value).
+    origin_channel: Option<String>,
+    /// Origin chat_id for tool context (overrides session_id-parsed value).
+    origin_chat_id: Option<String>,
 }
 
 impl AgentRunnerBuilder {
@@ -59,6 +66,8 @@ impl AgentRunnerBuilder {
             channel_inject: None,
             consolidator: None,
             cancel_token: None,
+            origin_channel: None,
+            origin_chat_id: None,
         }
     }
 
@@ -107,6 +116,16 @@ impl AgentRunnerBuilder {
         self
     }
 
+    pub fn origin_channel(mut self, ch: Option<String>) -> Self {
+        self.origin_channel = ch;
+        self
+    }
+
+    pub fn origin_chat_id(mut self, cid: Option<String>) -> Self {
+        self.origin_chat_id = cid;
+        self
+    }
+
     pub fn build(self) -> AgentRunner {
         let session_manager = self.session_manager.expect("session_manager required");
         let tool_manager = self.tool_manager.expect("tool_manager required");
@@ -125,6 +144,8 @@ impl AgentRunnerBuilder {
             self.channel_inject,
             self.consolidator,
             self.cancel_token,
+            self.origin_channel,
+            self.origin_chat_id,
         )
     }}
 
@@ -138,6 +159,8 @@ pub struct AgentRunner {
     channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
     cancel_token: Option<CancellationToken>,
+    origin_channel: Option<String>,
+    origin_chat_id: Option<String>,
 }
 
 impl AgentRunner {
@@ -156,6 +179,8 @@ impl AgentRunner {
         channel_inject: Option<String>,
         consolidator: Option<Arc<Consolidator>>,
         cancel_token: Option<CancellationToken>,
+        origin_channel: Option<String>,
+        origin_chat_id: Option<String>,
     ) -> Self {
         Self {
             tool_manager,
@@ -167,6 +192,8 @@ impl AgentRunner {
             channel_inject,
             consolidator,
             cancel_token,
+            origin_channel,
+            origin_chat_id,
         }
     }
 
@@ -189,6 +216,12 @@ impl AgentRunner {
                 return self.cancelled_result(&hook, session_id).await;
             }
         }
+
+        // Record message count before this turn, for rollback on cancellation/error.
+        let initial_message_count = {
+            let sm = self.session_manager.lock().await;
+            sm.message_count(session_id)
+        };
 
         // 1. Write user message
         {
@@ -217,13 +250,18 @@ impl AgentRunner {
         let mut result = AgentResult::default();
 
         // Inject session context into tools (once, before the loop).
-        if let Some((channel, chat_id)) = session_id.split_once(':') {
+        // Prefer origin channel/chat_id (e.g. from cron payload) over session_id-parsed values.
+        let (tool_channel, tool_chat_id) = parse_session_origin(session_id, (self.origin_channel.as_deref(), self.origin_chat_id.as_deref()));
+        if !tool_channel.is_empty() {
             let ctx = ToolContext {
-                channel: channel.to_string(),
-                chat_id: chat_id.to_string(),
+                channel: tool_channel,
+                chat_id: tool_chat_id,
             };
             self.tool_manager.set_context(&ctx);
         }
+
+        // Reset message tool's per-turn tracking before the loop.
+        self.tool_manager.start_turn("message");
 
         loop {
 
@@ -259,7 +297,7 @@ impl AgentRunner {
                 self.memory_store.clone(),
             );
             let mut ctx = context_builder
-                .build(session_id, self.channel_inject.clone(), session_summary_ref)
+                .build(session_id, self.channel_inject.clone(), session_summary_ref, self.origin_channel.as_deref(), self.origin_chat_id.as_deref())
                 .await;
             debug!("[AgentRunner] Context built: {} messages, tools={}", ctx.messages.len(), ctx.tools.as_ref().map(|t| t.len()).unwrap_or(0));
 
@@ -272,7 +310,7 @@ impl AgentRunner {
             // Check cancellation before LLM request.
             if let Some(ref ct) = self.cancel_token {
                 if ct.is_cancelled() {
-                    return self.cancelled_result(&hook, session_id).await;
+                    return self.rollback_and_fail(&hook, session_id, initial_message_count, "Task cancelled.", iterations).await;
                 }
             }
             let response = match self
@@ -284,17 +322,7 @@ impl AgentRunner {
                 Err(e) => {
                     let err_msg = format!("LLM API request failed - {}", e);
                     warn_log!("[AgentRunner] {}", err_msg);
-                    result.success = false;
-                    result.content = err_msg.clone();
-                    result.iterations = iterations;
-                    let failed_state = TaskState::Failed { error: err_msg };
-                    {
-                        let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
-                            self.session_manager.lock().await;
-                        let _ = sm.persist(session_id).await;
-                    }
-                    hook.notify_status_change(&failed_state);
-                    return result;
+                    return self.rollback_and_fail(&hook, session_id, initial_message_count, &err_msg, iterations).await;
                 }
             };
             debug!(
@@ -349,6 +377,8 @@ impl AgentRunner {
                 if let Some(ref consolidator) = self.consolidator {
                     let _ = consolidator.maybe_consolidate(session_id, prompt_tokens).await;
                 }
+                // Mark if message tool delivered output (caller should suppress final response)
+                result.message_sent = self.tool_manager.sent_in_turn("message");
                 debug!("[AgentRunner] Run complete: success={}, iterations={}", result.success, result.iterations);
                 return result;
             }
@@ -379,7 +409,7 @@ impl AgentRunner {
                     // Check cancellation before each tool call.
                     if let Some(ref ct) = self.cancel_token {
                         if ct.is_cancelled() {
-                            return self.cancelled_result(&hook, session_id).await;
+                            return self.rollback_and_fail(&hook, session_id, initial_message_count, "Task cancelled.", iterations).await;
                         }
                     }
                     debug!("[tool_call] name={}, args={}", call.name, call.args);
@@ -470,6 +500,28 @@ impl AgentRunner {
         }
         hook.notify_status_change(&failed_state);
         result
+    }
+
+    /// Roll back messages added during this turn and return a failure result.
+    async fn rollback_and_fail(
+        &self,
+        hook: &TaskHook,
+        session_id: &str,
+        initial_message_count: usize,
+        error: &str,
+        iterations: u32,
+    ) -> AgentResult {
+        {
+            let mut sm = self.session_manager.lock().await;
+            sm.truncate_messages(session_id, initial_message_count).await;
+        }
+        hook.notify_status_change(&TaskState::Failed { error: error.to_string() });
+        AgentResult {
+            success: false,
+            content: error.to_string(),
+            iterations,
+            ..Default::default()
+        }
     }
 }
 
@@ -665,6 +717,53 @@ mod tests {
 
         async fn execute(&self, _args: serde_json::Value) -> Result<String> {
             Err(anyhow::anyhow!("Tool execution failed"))
+        }
+    }
+
+    /// Provider wrapper that cancels after the first call.
+    struct CancellingProvider {
+        inner: Arc<dyn Provider>,
+        cancel_token: CancellationToken,
+        call_count: std::sync::atomic::AtomicU32,
+    }
+
+    impl CancellingProvider {
+        fn new(inner: Arc<dyn Provider>, cancel_token: CancellationToken) -> Self {
+            Self {
+                inner,
+                cancel_token,
+                call_count: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CancellingProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            tools: Option<&[ToolDefinition]>,
+        ) -> Result<LLMResponse> {
+            let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Cancel on the first call so the next cancellation check detects it.
+            if count == 0 {
+                self.cancel_token.cancel();
+            }
+            self.inner.chat(messages, tools).await
+        }
+    }
+
+    /// Provider that always returns an error.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: Option<&[ToolDefinition]>,
+        ) -> Result<LLMResponse> {
+            Err(anyhow::anyhow!("Simulated LLM API failure"))
         }
     }
 
@@ -1339,5 +1438,127 @@ mod tests {
         let result = runner.run("hello".to_string(), TaskHook::new("test-session"), "test-session").await;
         assert!(!result.success);
         assert_eq!(result.content, "Task cancelled.");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_in_loop_rolls_back_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path();
+        let session_dir = path.join("sessions");
+        let workspace_dir = path.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let sm: SharedSessionManager =
+            Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap()));
+        let mut tm = ToolManager::new(workspace_dir.clone());
+        tm.register(Box::new(MockEchoTool::new("echo", "ok")));
+        let tm = Arc::new(tm);
+        sm.lock().await.get_or_create("test-session").await.unwrap();
+
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
+
+        // Pre-existing messages in session
+        sm.lock().await.add_message("test-session", Message::user("prev".to_string())).await.unwrap();
+        sm.lock().await.add_message("test-session", Message::assistant(Some("prev reply".to_string()), None)).await.unwrap();
+        let pre_count = sm.lock().await.message_count("test-session");
+        assert_eq!(pre_count, 2);
+
+        let ct = CancellationToken::new();
+        let ct_clone = ct.clone();
+
+        // Mock provider: returns tool_calls on first call, cancels token during that call
+        // so the second loop iteration hits cancellation.
+        let provider = Arc::new(MockProvider::new(vec![
+            LLMResponse {
+                content: Some("calling tool".to_string()),
+                tool_calls: Some(vec![tool_call("tc-1", "echo")]),
+                finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            },
+            LLMResponse {
+                content: Some("should never reach".to_string()),
+                tool_calls: None,
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder()
+            .session_manager(sm.clone())
+            .tool_manager(tm)
+            .provider(Arc::new(CancellingProvider::new(provider, ct_clone)))
+            .config(AgentConfig {
+                provider: "test".to_string(),
+                max_iterations: 40,
+                timeout_seconds: 120,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 8192,
+            })
+            .workspace_dir(workspace_dir)
+            .memory_store(ms)
+            .cancel_token(Some(ct))
+            .build();
+
+        let result = runner.run("test cancel".to_string(), TaskHook::new("test-session"), "test-session").await;
+        assert!(!result.success);
+        assert_eq!(result.content, "Task cancelled.");
+
+        // All messages added during this turn should be rolled back.
+        // Session should still have only the 2 pre-existing messages.
+        let msgs = sm.lock().await.get_messages("test-session").await;
+        assert_eq!(msgs.len(), 2, "expected pre-count messages, got {}", msgs.len());
+    }
+
+    #[tokio::test]
+    async fn test_llm_error_rolls_back_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path();
+        let session_dir = path.join("sessions");
+        let workspace_dir = path.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let sm: SharedSessionManager =
+            Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap()));
+        let mut tm = ToolManager::new(workspace_dir.clone());
+        tm.register(Box::new(MockEchoTool::new("echo", "ok")));
+        let tm = Arc::new(tm);
+        sm.lock().await.get_or_create("test-session").await.unwrap();
+
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
+
+        // Pre-existing messages
+        sm.lock().await.add_message("test-session", Message::user("prev".to_string())).await.unwrap();
+        let pre_count = sm.lock().await.message_count("test-session");
+        assert_eq!(pre_count, 1);
+
+        // Provider that always fails
+        let provider = Arc::new(FailingProvider);
+
+        let runner = AgentRunner::builder()
+            .session_manager(sm.clone())
+            .tool_manager(tm)
+            .provider(provider)
+            .config(AgentConfig {
+                provider: "test".to_string(),
+                max_iterations: 40,
+                timeout_seconds: 120,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 8192,
+            })
+            .workspace_dir(workspace_dir)
+            .memory_store(ms)
+            .build();
+
+        let result = runner.run("test error".to_string(), TaskHook::new("test-session"), "test-session").await;
+        assert!(!result.success);
+        assert!(result.content.contains("LLM API request failed"));
+
+        // User message should be rolled back.
+        let msgs = sm.lock().await.get_messages("test-session").await;
+        assert_eq!(msgs.len(), pre_count, "expected pre-count messages, got {}", msgs.len());
     }
 }

@@ -17,6 +17,11 @@ use crate::session::{SharedSessionManager, TaskState};
 use crate::{debug, error, info};
 use tokio::sync::broadcast;
 
+/// Check if a channel ID represents a system-triggered session (cron, heartbeat).
+fn is_system_channel(channel_id: &str) -> bool {
+    matches!(channel_id, "cron" | "heartbeat")
+}
+
 /// Channel trait, abstracts all I/O channels
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -211,6 +216,11 @@ impl ChannelManager {
                 .next()
                 .unwrap_or("");
 
+            // Skip system-triggered sessions (cron, heartbeat) — they have no user-facing channel
+            if is_system_channel(channel_id) {
+                continue;
+            }
+
             let mut ch_guard = channels.lock().await;
             if let Some(channel) = ch_guard.get_mut(channel_id) {
                 if let Err(e) = channel.send_output(&result).await {
@@ -242,6 +252,11 @@ impl ChannelManager {
                         .split(':')
                         .next()
                         .unwrap_or("");
+
+                    // Skip system-triggered sessions (cron, heartbeat) — they have no user-facing channel
+                    if channel_id == "cron" || channel_id == "heartbeat" {
+                        continue;
+                    }
 
                     let mut ch_guard = channels.lock().await;
                     if let Some(channel) = ch_guard.get_mut(channel_id) {

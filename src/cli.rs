@@ -106,7 +106,7 @@ pub async fn run_agent_session(
         }
         let hook = TaskHook::new(session_id);
         let result = agent_loop
-            .run_task(session_id, query.to_string(), hook, None)
+            .run_task(session_id, query.to_string(), hook, None, None, None)
             .await;
         debug!("[cli] run_task returned: success={}, content_len={}", result.success, result.content.len());
 
@@ -168,7 +168,7 @@ pub async fn run_agent_session(
 
         let hook = TaskHook::new(session_id);
         let result = agent_loop
-            .run_task(session_id, input, hook, None)
+            .run_task(session_id, input, hook, None, None, None)
             .await;
 
         if result.success {
