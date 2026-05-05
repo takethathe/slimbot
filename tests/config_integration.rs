@@ -3,7 +3,7 @@ use std::fs;
 
 use tempfile::NamedTempFile;
 
-use slimbot::{Config, AgentConfig, ProviderConfig, ToolEntry, ChannelEntry};
+use slimbot::{Config, AgentConfig, ProviderConfig, ToolEntry, ChannelConfig, GatewayConfig};
 
 // ── Config loading and validation ──
 
@@ -178,6 +178,16 @@ fn test_save_and_reload_round_trip() {
         },
     );
 
+    let mut channels = HashMap::new();
+    channels.insert("cli".to_string(), ChannelConfig {
+        enabled: true,
+        extra: {
+            let mut m = HashMap::new();
+            m.insert("chat_id".to_string(), serde_json::json!("default"));
+            m
+        },
+    });
+
     let config = Config {
         agent: AgentConfig {
             provider: "my-provider".to_string(),
@@ -192,11 +202,8 @@ fn test_save_and_reload_round_trip() {
             name: "shell".to_string(),
             enabled: true,
         }],
-        channels: vec![ChannelEntry {
-            r#type: "cli".to_string(),
-            enabled: true,
-            config: serde_json::json!({}),
-        }],
+        channels,
+        gateway: GatewayConfig::default(),
     };
 
     config.save(path).unwrap();

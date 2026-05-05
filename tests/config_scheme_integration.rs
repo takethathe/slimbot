@@ -2,7 +2,7 @@ use std::fs;
 
 use tempfile::NamedTempFile;
 
-use slimbot::{ConfigScheme, ProviderConfig, ToolEntry, ChannelEntry};
+use slimbot::{ConfigScheme, ProviderConfig, ToolEntry, ChannelConfig};
 
 // ── Default config generation ──
 
@@ -118,17 +118,17 @@ fn test_normalize_removes_empty_tools_and_channels() {
         name: "valid".to_string(),
         enabled: true,
     });
-    config.channels.push(ChannelEntry {
-        r#type: String::new(),
+    config.channels.insert("".to_string(), ChannelConfig {
         enabled: true,
-        config: serde_json::json!({}),
+        extra: std::collections::HashMap::new(),
     });
 
     scheme.normalize(&mut config);
 
     assert_eq!(config.tools.len(), 1);
     assert_eq!(config.tools[0].name, "valid");
-    assert!(config.channels.is_empty());
+    // Empty-named channels are removed during normalize
+    assert!(!config.channels.contains_key(""));
 }
 
 #[test]

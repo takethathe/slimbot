@@ -151,6 +151,33 @@ impl AgentLoop {
         let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
         tool_manager.init_from_config(&config.tools);
 
+        Self::from_parts(paths, message_bus, config, provider, tool_manager).await
+    }
+
+    /// Create an AgentLoop from a pre-configured ToolManager.
+    /// Used by gateway mode to register extra tools (message, cron) before startup.
+    pub async fn from_config_with_tools(
+        paths: &PathManager,
+        message_bus: Arc<MessageBus>,
+        config: Arc<Config>,
+        tool_manager: ToolManager,
+    ) -> Result<Self> {
+        let provider_config = config
+            .providers
+            .get(&config.agent.provider)
+            .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", config.agent.provider))?;
+        let provider = Arc::new(OpenAIProvider::new(provider_config));
+
+        Self::from_parts(paths, message_bus, config, provider, tool_manager).await
+    }
+
+    async fn from_parts(
+        paths: &PathManager,
+        message_bus: Arc<MessageBus>,
+        config: Arc<Config>,
+        provider: Arc<dyn Provider>,
+        tool_manager: ToolManager,
+    ) -> Result<Self> {
         let session_manager = SessionManager::new(paths.session_dir())?;
         let session_manager_arc = Arc::new(tokio::sync::Mutex::new(session_manager));
 
