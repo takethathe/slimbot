@@ -7,8 +7,10 @@ pub(crate) mod config;
 pub(crate) mod config_scheme;
 pub(crate) mod consolidate;
 pub(crate) mod context;
+pub(crate) mod cron;
 pub(crate) mod embed;
 pub(crate) mod gateway;
+pub(crate) mod heartbeat;
 pub(crate) mod io_scheduler;
 pub(crate) mod log;
 pub(crate) mod macros;
@@ -40,6 +42,7 @@ pub use memory::{MemoryStore, SharedMemoryStore};
 pub use tool::{ToolCall, ToolDefinition, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result};
 pub use utils::{truncate_text_head_tail, write_file_atomic, build_persisted_reference, TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS};
 pub use tools::create_tool;
+pub use cron::{CronService, CronJob, CronSchedule, CronPayload};
 pub use channel::{Channel, ChannelFactory, ChannelManager};
 
 // Re-export for binary usage.
