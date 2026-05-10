@@ -88,18 +88,18 @@
 
 ## Context Builder 对齐 nanobot
 
-- [ ] **Identity 段落**：将当前 `fixed_intro()` 替换为结构化 identity 段落，包含 runtime 信息（OS、平台、工作区路径），参考 nanobot `identity.md` 模板
-- [ ] **Platform Policy**：在 identity 中注入平台策略（POSIX/Windows），提示 file tool 优先于 shell 命令
-- [ ] **Channel Format Hint**：根据当前 channel 类型（telegram/whatsapp/cli/email）注入格式提示，指导模型适配输出格式
-- [ ] **Runtime Context 块**：在 user message 前注入 `[Runtime Context]` 元数据块（Current Time、Channel、Chat ID），而非拼入 system prompt
-- [ ] **Session Summary 注入**：AutoCompact/Consolidate 后的摘要以 `[Resumed Session]` 标记注入 runtime context，而非 system prompt
-- [ ] **Skills 加载区分 always/可选**：区分 always skills（始终加载完整内容）和可选 skills（仅显示名称列表，由 Agent 按需读取）
+- [x] **Identity 段落**：将当前 `fixed_intro()` 替换为结构化 identity 段落，包含 runtime 信息（OS、平台、工作区路径），参考 nanobot `identity.md` 模板
+- [x] **Platform Policy**：在 identity 中注入平台策略（POSIX/Windows），提示 file tool 优先于 shell 命令
+- [x] **Channel Format Hint**：根据当前 channel 类型（telegram/whatsapp/cli/email）注入格式提示，指导模型适配输出格式
+- [x] **Runtime Context 块**：在 user message 前注入 `[Runtime Context]` 元数据块（Current Time、Channel、Chat ID），而非拼入 system prompt
+- [x] **Session Summary 注入**：AutoCompact/Consolidate 后的摘要以 `[Resumed Session]` 标记注入 runtime context，而非 system prompt
+- [x] **Skills 加载区分 always/可选**：区分 always skills（始终加载完整内容）和可选 skills（仅显示名称列表，由 Agent 按需读取）
 - [x] **Recent History 注入**：system prompt 末尾追加 `# Recent History` 段落，从 `history.jsonl` 读取未处理的最近 N 条（nanobot 默认 50 条）
-- [ ] **Memory 跳过模板**：`MEMORY.md` 内容与模板一致时不注入 system prompt（对齐 `_is_template_content` 逻辑）
-- [ ] **Message 合并**：当 history 最后一条消息与当前消息 role 相同时，合并内容而非追加同 role 消息（避免 provider 拒绝连续同 role 消息）
-- [ ] **Media 支持**：`build_messages` 支持 base64 图片内联（多模态消息格式）
-- [ ] **工具结果追加**：`add_tool_result` 辅助方法确保 tool message 格式正确（tool_call_id + name）
-- [ ] **Thinking/Reasoning 支持**：assistant message 支持 `reasoning_content` / `thinking_blocks` 字段（为未来 reasoning 模型预留）
+- [x] **Memory 跳过模板**：`MEMORY.md` 内容与模板一致时不注入 system prompt（对齐 `_is_template_content` 逻辑）
+- [x] **Message 合并**：当 history 最后一条消息与当前消息 role 相同时，合并内容而非追加同 role 消息（避免 provider 拒绝连续同 role 消息）
+- [x] **Media 支持**：`build_messages` 支持 base64 图片内联（多模态消息格式）
+- [x] **工具结果追加**：`add_tool_result` 辅助方法确保 tool message 格式正确（tool_call_id + name）
+- [x] **Thinking/Reasoning 支持**：assistant message 支持 `reasoning_content` / `thinking_blocks` 字段（为未来 reasoning 模型预留）
 
 ## AutoCompact 空闲会话压缩
 

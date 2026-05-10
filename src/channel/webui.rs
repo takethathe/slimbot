@@ -495,7 +495,7 @@ mod tests {
             let mut guard = sm.lock().await;
             guard.get_or_create("webui:abc").await.unwrap();
             guard.add_message("webui:abc", crate::session::Message::user("hi".to_string())).await.unwrap();
-            guard.add_message("webui:abc", crate::session::Message::assistant(Some("hello".to_string()), None)).await.unwrap();
+            guard.add_message("webui:abc", crate::session::Message::assistant(Some("hello".to_string()), None, None, None)).await.unwrap();
             guard.persist("webui:abc").await.unwrap();
         }
 

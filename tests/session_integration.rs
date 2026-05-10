@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 use slimbot::{
-    Message, SessionManager, TaskHook, TaskState,
+    Content, Message, SessionManager, TaskHook, TaskState,
     SharedSessionManager,
 };
 
@@ -63,11 +63,11 @@ async fn test_add_and_get_messages() {
 
     sm.get_or_create("test:chat1").await.unwrap();
     sm.add_message("test:chat1", Message::user("hello".to_string())).await.unwrap();
-    sm.add_message("test:chat1", Message::assistant(Some("hi".to_string()), None)).await.unwrap();
+    sm.add_message("test:chat1", Message::assistant(Some("hi".to_string()), None, None, None)).await.unwrap();
 
     let messages = sm.get_messages("test:chat1").await;
     assert_eq!(messages.len(), 2);
-    assert!(matches!(&messages[0], Message::User { content, .. } if content == "hello"));
+    assert!(matches!(&messages[0], Message::User { content, .. } if matches!(content, Content::Plain(c) if c == "hello")));
 }
 
 #[tokio::test]
@@ -126,7 +126,7 @@ async fn test_reload_from_jsonl() {
         let mut sm = SessionManager::new(session_dir).unwrap();
         let session = sm.get_or_create("test:chat1").await.unwrap();
         assert_eq!(session.messages.len(), 1);
-        assert!(matches!(&session.messages[0], Message::User { content, .. } if content == "saved"));
+        assert!(matches!(&session.messages[0], Message::User { content, .. } if matches!(content, Content::Plain(c) if c == "saved")));
     }
 }
 
@@ -150,7 +150,7 @@ async fn test_consolidation_cursor_skips_messages() {
 
     sm.get_or_create("s1").await.unwrap();
     sm.add_message("s1", Message::user("a".to_string())).await.unwrap();    // id=1
-    sm.add_message("s1", Message::assistant(Some("b".to_string()), None)).await.unwrap(); // id=2
+    sm.add_message("s1", Message::assistant(Some("b".to_string()), None, None, None)).await.unwrap(); // id=2
     sm.add_message("s1", Message::user("c".to_string())).await.unwrap();    // id=3
 
     // Set cursor to skip first 2 messages (by id)
@@ -158,7 +158,7 @@ async fn test_consolidation_cursor_skips_messages() {
 
     let messages = sm.get_messages("s1").await;
     assert_eq!(messages.len(), 1);
-    assert!(matches!(&messages[0], Message::User { content, .. } if content == "c"));
+    assert!(matches!(&messages[0], Message::User { content, .. } if matches!(content, Content::Plain(c) if c == "c")));
 }
 
 #[tokio::test]
@@ -248,7 +248,7 @@ fn test_message_serde_round_trip() {
     let msg = Message::user("hello".to_string());
     let json = serde_json::to_string(&msg).unwrap();
     let deserialized: Message = serde_json::from_str(&json).unwrap();
-    assert!(matches!(deserialized, Message::User { content, .. } if content == "hello"));
+    assert!(matches!(deserialized, Message::User { ref content, .. } if matches!(content, Content::Plain(c) if c == "hello")));
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn test_message_assistant_with_tool_calls() {
         name: "shell".to_string(),
         args: serde_json::json!({"command": "ls"}),
     };
-    let msg = Message::assistant(Some("running ls".to_string()), Some(vec![tool_call]));
+    let msg = Message::assistant(Some("running ls".to_string()), Some(vec![tool_call]), None, None);
     let json = serde_json::to_string(&msg).unwrap();
     let deserialized: Message = serde_json::from_str(&json).unwrap();
     assert!(matches!(deserialized, Message::Assistant { tool_calls: Some(calls), .. } if calls.len() == 1));

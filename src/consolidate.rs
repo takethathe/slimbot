@@ -309,7 +309,7 @@ mod tests {
     fn test_format_messages() {
         let messages = vec![
             Message::user("hello".to_string()),
-            Message::assistant(Some("hi there".to_string()), None),
+            Message::assistant(Some("hi there".to_string()), None, None, None),
             Message::tool("result".to_string(), "tc-1".to_string(), Some("echo".to_string())),
         ];
         let formatted = Consolidator::format_messages(&messages);
@@ -322,9 +322,9 @@ mod tests {
     fn test_pick_consolidation_boundary() {
         let messages = vec![
             Message::user("a".repeat(100)),        // idx 0
-            Message::assistant(Some("b".repeat(100)), None), // idx 1
+            Message::assistant(Some("b".repeat(100)), None, None, None), // idx 1
             Message::user("c".repeat(100)),        // idx 2
-            Message::assistant(Some("d".repeat(100)), None), // idx 3
+            Message::assistant(Some("d".repeat(100)), None, None, None), // idx 3
             Message::user("e".repeat(100)),        // idx 4
         ];
 
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn test_pick_no_boundary() {
         let messages = vec![
-            Message::assistant(Some("only assistant".to_string()), None),
+            Message::assistant(Some("only assistant".to_string()), None, None, None),
         ];
         let result = Consolidator::pick_consolidation_boundary(&messages, 0, 100, 2.0);
         // No user message found after start, should return None
@@ -358,7 +358,7 @@ mod tests {
                 if i % 2 == 0 {
                     Message::user(format!("u{i}"))
                 } else {
-                    Message::assistant(Some(format!("a{i}")), None)
+                    Message::assistant(Some(format!("a{i}")), None, None, None)
                 }
             })
             .collect();
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn test_content_chars() {
         use super::message_content_chars;
-        let msg = Message::assistant(None, None);
+        let msg = Message::assistant(None, None, None, None);
         assert_eq!(message_content_chars(&msg), 0);
 
         let msg = Message::user("hello".to_string());

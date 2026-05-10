@@ -355,7 +355,7 @@ impl AgentRunner {
                     if let Err(e) = sm
                         .add_message(
                             session_id,
-                            Message::assistant(Some(text.clone()), None),
+                            Message::assistant(Some(text.clone()), None, None, None),
                         )
                         .await
                     {
@@ -396,7 +396,7 @@ impl AgentRunner {
                     if let Err(e) = sm
                         .add_message(
                             session_id,
-                            Message::assistant(response.content.clone(), Some(calls.clone())),
+                            Message::assistant(response.content.clone(), Some(calls.clone()), None, None),
                         )
                         .await
                     {
@@ -616,6 +616,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+    use crate::session::Content;
     use crate::provider::{LLMResponse, Provider, Usage, FinishReason};
     use crate::session::{Message, SessionTask, TaskHook, TaskState};
     use crate::tool::{Tool, ToolCall, ToolDefinition};
@@ -860,7 +861,7 @@ mod tests {
         let msgs = sm.lock().await.get_messages("test-session").await;
         assert_eq!(msgs.len(), 2); // user + assistant (system prompt is not stored in session)
         assert!(
-            matches!(&msgs[0], Message::User { content, .. } if content == "Say hi")
+            matches!(&msgs[0], Message::User { content, .. } if matches!(content, Content::Plain(c) if c == "Say hi"))
         );
         assert!(
             matches!(&msgs[1], Message::Assistant { content: Some(c), tool_calls: None, .. } if c == "Hello, world!")
@@ -1175,7 +1176,7 @@ mod tests {
         let msgs = sm2.lock().await.get_messages("test-session").await;
         assert_eq!(msgs.len(), 2); // user + assistant
         assert!(
-            matches!(&msgs[0], Message::User { content, .. } if content == "hello")
+            matches!(&msgs[0], Message::User { content, .. } if matches!(content, Content::Plain(c) if c == "hello"))
         );
         assert!(
             matches!(&msgs[1], Message::Assistant { content: Some(c), tool_calls: None, .. } if c == "persist me")
@@ -1254,7 +1255,7 @@ mod tests {
     fn test_drop_orphan_tool_results() {
         let mut messages = vec![
             Message::user("test".to_string()),
-            Message::assistant(Some("calling".to_string()), Some(vec![tool_call("tc-1", "echo")])),
+            Message::assistant(Some("calling".to_string()), Some(vec![tool_call("tc-1", "echo")]), None, None),
             Message::tool("orphan".to_string(), "tc-999".to_string(), Some("echo".to_string())),
             Message::tool("valid".to_string(), "tc-1".to_string(), Some("echo".to_string())),
         ];
@@ -1269,7 +1270,7 @@ mod tests {
     fn test_backfill_missing_tool_results() {
         let mut messages = vec![
             Message::user("test".to_string()),
-            Message::assistant(Some("calling".to_string()), Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")])),
+            Message::assistant(Some("calling".to_string()), Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]), None, None),
             Message::tool("result-1".to_string(), "tc-1".to_string(), Some("echo".to_string())),
             // tc-2 has no result
         ];
@@ -1292,10 +1293,10 @@ mod tests {
         // Two assistants, each with missing tool calls
         let mut messages = vec![
             Message::user("first".to_string()),
-            Message::assistant(Some("a1".to_string()), Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")])),
+            Message::assistant(Some("a1".to_string()), Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]), None, None),
             Message::tool("r1".to_string(), "tc-1".to_string(), Some("echo".to_string())),
             Message::user("second".to_string()),
-            Message::assistant(Some("a2".to_string()), Some(vec![tool_call("tc-3", "write"), tool_call("tc-4", "list")])),
+            Message::assistant(Some("a2".to_string()), Some(vec![tool_call("tc-3", "write"), tool_call("tc-4", "list")]), None, None),
             Message::tool("r4".to_string(), "tc-4".to_string(), Some("list".to_string())),
             // tc-2 and tc-3 are missing
         ];
@@ -1464,7 +1465,7 @@ mod tests {
 
         // Pre-existing messages in session
         sm.lock().await.add_message("test-session", Message::user("prev".to_string())).await.unwrap();
-        sm.lock().await.add_message("test-session", Message::assistant(Some("prev reply".to_string()), None)).await.unwrap();
+        sm.lock().await.add_message("test-session", Message::assistant(Some("prev reply".to_string()), None, None, None)).await.unwrap();
         let pre_count = sm.lock().await.message_count("test-session");
         assert_eq!(pre_count, 2);
 

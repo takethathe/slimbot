@@ -122,6 +122,82 @@ pub struct MessageMeta {
     timestamp: String,
 }
 
+impl Default for MessageMeta {
+    fn default() -> Self {
+        Self { id: 0, timestamp: String::new() }
+    }
+}
+
+/// Content block for multi-modal messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text { text: String },
+    Image { mime_type: String, base64_data: String },
+}
+
+/// User message content — plain text or multi-modal blocks.
+/// `#[serde(untagged)]` allows deserializing plain strings from existing JSONL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Plain(String),
+    Multi(Vec<ContentBlock>),
+}
+
+impl Content {
+    /// Returns true if the content is empty.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Content::Plain(s) => s.is_empty(),
+            Content::Multi(blocks) => blocks.is_empty(),
+        }
+    }
+
+    /// Get plain text representation.
+    pub fn as_text(&self) -> &str {
+        match self {
+            Content::Plain(s) => s,
+            Content::Multi(blocks) => {
+                for block in blocks {
+                    if let ContentBlock::Text { text } = block {
+                        return text;
+                    }
+                }
+                ""
+            }
+        }
+    }
+
+    /// Serialize content into a JSON value compatible with OpenAI's message format.
+    pub fn to_openai_value(&self) -> serde_json::Value {
+        match self {
+            Content::Plain(s) => serde_json::Value::String(s.clone()),
+            Content::Multi(blocks) => {
+                let arr: Vec<_> = blocks.iter().map(|b| match b {
+                    ContentBlock::Text { text } => {
+                        serde_json::json!({"type": "text", "text": text})
+                    }
+                    ContentBlock::Image { mime_type, base64_data } => {
+                        serde_json::json!({
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{};base64,{}", mime_type, base64_data)}
+                        })
+                    }
+                }).collect();
+                serde_json::Value::Array(arr)
+            }
+        }
+    }
+}
+
+/// Convenience conversion: a String becomes Content::Plain.
+impl From<String> for Content {
+    fn from(s: String) -> Self {
+        Content::Plain(s)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
@@ -133,7 +209,7 @@ pub enum Message {
     User {
         #[serde(flatten)]
         meta: MessageMeta,
-        content: String,
+        content: Content,
     },
     Assistant {
         #[serde(flatten)]
@@ -141,6 +217,10 @@ pub enum Message {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_blocks: Option<Vec<serde_json::Value>>,
     },
     Tool {
         #[serde(flatten)]
@@ -170,11 +250,25 @@ impl Message {
     }
 
     pub fn user(content: String) -> Self {
-        Message::User { meta: MessageMeta { id: 0, timestamp: String::new() }, content }
+        Message::User {
+            meta: MessageMeta { id: 0, timestamp: String::new() },
+            content: Content::Plain(content),
+        }
     }
 
-    pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
-        Message::Assistant { meta: MessageMeta { id: 0, timestamp: String::new() }, content, tool_calls }
+    pub fn assistant(
+        content: Option<String>,
+        tool_calls: Option<Vec<ToolCall>>,
+        reasoning_content: Option<String>,
+        thinking_blocks: Option<Vec<serde_json::Value>>,
+    ) -> Self {
+        Message::Assistant {
+            meta: MessageMeta { id: 0, timestamp: String::new() },
+            content,
+            tool_calls,
+            reasoning_content,
+            thinking_blocks,
+        }
     }
 
     pub fn system(content: String) -> Self {
@@ -477,7 +571,7 @@ impl Session {
 pub fn message_content_chars(msg: &Message) -> usize {
     match msg {
         Message::System { content, .. } => content.len(),
-        Message::User { content, .. } => content.len(),
+        Message::User { content, .. } => content.as_text().len(),
         Message::Assistant { content, tool_calls, .. } => {
             let text_len = content.as_deref().map(|c| c.len()).unwrap_or(0);
             let tc_len = tool_calls
@@ -499,7 +593,7 @@ pub fn message_content_chars(msg: &Message) -> usize {
 pub fn message_content_str(msg: &Message) -> &str {
     match msg {
         Message::System { content, .. } => content,
-        Message::User { content, .. } => content,
+        Message::User { content, .. } => content.as_text(),
         Message::Assistant { content, .. } => content.as_deref().unwrap_or(""),
         Message::Tool { content, .. } => content,
     }
@@ -516,7 +610,7 @@ pub enum FrontendMessage {
 impl FrontendMessage {
     pub fn from_message(msg: &Message) -> Option<Self> {
         match msg {
-            Message::User { content, .. } => Some(Self::User { content: content.clone() }),
+            Message::User { content, .. } => Some(Self::User { content: content.as_text().to_string() }),
             Message::Assistant { content, .. } => {
                 content.as_ref().map(|c| Self::Assistant { content: c.clone() })
             }
@@ -902,11 +996,11 @@ mod tests {
     use super::*;
 
     fn user_msg(content: &str) -> Message {
-        Message::User { meta: MessageMeta { id: 0, timestamp: String::new() }, content: content.to_string() }
+        Message::User { meta: MessageMeta { id: 0, timestamp: String::new() }, content: Content::Plain(content.to_string()) }
     }
 
     fn assistant_msg(content: &str) -> Message {
-        Message::Assistant { meta: MessageMeta { id: 0, timestamp: String::new() }, content: Some(content.to_string()), tool_calls: None }
+        Message::Assistant { meta: MessageMeta { id: 0, timestamp: String::new() }, content: Some(content.to_string()), tool_calls: None, reasoning_content: None, thinking_blocks: None }
     }
 
     #[tokio::test]
@@ -1452,12 +1546,12 @@ mod tests {
 
     #[test]
     fn test_frontend_message_from_message() {
-        let user = Message::User { meta: MessageMeta { id: 1, timestamp: String::new() }, content: "hello".to_string() };
+        let user = Message::User { meta: MessageMeta { id: 1, timestamp: String::new() }, content: Content::Plain("hello".to_string()) };
         let fm = FrontendMessage::from_message(&user);
         assert!(fm.is_some());
         assert!(matches!(fm.unwrap(), FrontendMessage::User { content } if content == "hello"));
 
-        let asst = Message::Assistant { meta: MessageMeta { id: 2, timestamp: String::new() }, content: Some("hi".to_string()), tool_calls: None };
+        let asst = Message::Assistant { meta: MessageMeta { id: 2, timestamp: String::new() }, content: Some("hi".to_string()), tool_calls: None, reasoning_content: None, thinking_blocks: None };
         let fm = FrontendMessage::from_message(&asst);
         assert!(matches!(fm.unwrap(), FrontendMessage::Assistant { content } if content == "hi"));
 
@@ -1569,7 +1663,7 @@ mod tests {
         sm.truncate_messages("s1", 1).await;
         assert_eq!(sm.message_count("s1"), 1);
         let msgs = sm.get_messages("s1").await;
-        assert!(matches!(&msgs[0], Message::User { content, .. } if content == "a"));
+        assert!(matches!(&msgs[0], Message::User { content, .. } if content.as_text() == "a"));
 
         // Truncate to 0
         sm.truncate_messages("s1", 0).await;
@@ -1577,5 +1671,66 @@ mod tests {
 
         // Truncate non-existent session should not panic
         sm.truncate_messages("nonexistent", 0).await;
+    }
+
+    #[test]
+    fn test_content_plain_serializes_as_string() {
+        let content = Content::Plain("hello".to_string());
+        let json = serde_json::to_string(&content).unwrap();
+        assert_eq!(json, "\"hello\"");
+    }
+
+    #[test]
+    fn test_content_multi_serializes_as_array() {
+        let content = Content::Multi(vec![
+            ContentBlock::Text { text: "look".to_string() },
+            ContentBlock::Image { mime_type: "image/png".to_string(), base64_data: "abc".to_string() },
+        ]);
+        let json = serde_json::to_string(&content).unwrap();
+        assert!(json.starts_with('['));
+        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("\"type\":\"image\""));
+    }
+
+    #[test]
+    fn test_content_to_openai_value_multi() {
+        let content = Content::Multi(vec![
+            ContentBlock::Image { mime_type: "image/png".to_string(), base64_data: "abc".to_string() },
+        ]);
+        let val = content.to_openai_value();
+        assert!(val.is_array());
+        assert!(serde_json::to_string(&val).unwrap().contains("image_url"));
+        assert!(serde_json::to_string(&val).unwrap().contains("data:image/png;base64,abc"));
+    }
+
+    #[test]
+    fn test_content_deserializes_from_string() {
+        let content: Content = serde_json::from_str("\"hello\"").unwrap();
+        assert!(matches!(content, Content::Plain(_)));
+    }
+
+    #[test]
+    fn test_content_to_openai_value_plain() {
+        let content = Content::Plain("hello".to_string());
+        assert_eq!(content.to_openai_value(), serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn test_content_is_empty() {
+        assert!(Content::Plain("".to_string()).is_empty());
+        assert!(!Content::Plain("hi".to_string()).is_empty());
+        assert!(Content::Multi(vec![]).is_empty());
+    }
+
+    #[test]
+    fn test_content_as_text() {
+        let c = Content::Plain("hello".to_string());
+        assert_eq!(c.as_text(), "hello");
+
+        let c = Content::Multi(vec![
+            ContentBlock::Image { mime_type: "image/png".to_string(), base64_data: "abc".to_string() },
+            ContentBlock::Text { text: "caption".to_string() },
+        ]);
+        assert_eq!(c.as_text(), "caption");
     }
 }

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::embed::EMBEDDED_FILES;
+use crate::embed::{EMBEDDED_FILES, get_content_by_dest};
 
 /// All embedded resources: (filename, content, dest_path).
 pub fn embedded_files() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -38,6 +38,15 @@ pub fn get_template(name: &str) -> Option<&'static str> {
         .iter()
         .find(|(n, _, _)| *n == name)
         .map(|(_, c, _)| *c)
+}
+
+/// Check if file content is identical to the embedded template.
+/// Returns true if content matches the template for the given dest_path.
+pub fn is_template_content(content: &str, dest_path: &str) -> bool {
+    match get_content_by_dest(dest_path) {
+        Some(template) => content.trim() == template.trim(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -102,5 +111,22 @@ mod tests {
         assert!(!skills.is_empty());
         assert!(skills.iter().any(|(name, _, _dest)| name.contains("SKILL.md")));
         assert!(skills.iter().all(|(_, _, dest)| dest.starts_with("skills/")));
+    }
+
+    #[test]
+    fn test_is_template_content_matches_template() {
+        let template = get_template("AGENTS.md").unwrap();
+        assert!(is_template_content(template, "AGENTS.md"));
+        assert!(is_template_content(&format!("{}\n\n  ", template), "AGENTS.md"));
+    }
+
+    #[test]
+    fn test_is_template_content_differs() {
+        assert!(!is_template_content("custom content", "AGENTS.md"));
+    }
+
+    #[test]
+    fn test_is_template_content_missing_template() {
+        assert!(!is_template_content("anything", "nonexistent.md"));
     }
 }

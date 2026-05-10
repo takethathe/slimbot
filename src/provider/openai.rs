@@ -124,11 +124,13 @@ impl crate::provider::Provider for OpenAIProvider {
                         obj
                     }
                     Message::User { content, .. } => {
-                        serde_json::json!({"role": "user", "content": content})
+                        serde_json::json!({"role": "user", "content": content.to_openai_value()})
                     }
                     Message::Assistant {
                         content,
                         tool_calls,
+                        reasoning_content,
+                        thinking_blocks,
                         ..
                     } => {
                         let mut obj = serde_json::json!({"role": "assistant"});
@@ -136,6 +138,12 @@ impl crate::provider::Provider for OpenAIProvider {
                             obj["content"] = serde_json::json!(c);
                         } else {
                             obj["content"] = serde_json::Value::Null;
+                        }
+                        if let Some(rc) = reasoning_content {
+                            obj["reasoning_content"] = serde_json::json!(rc);
+                        }
+                        if let Some(tb) = thinking_blocks {
+                            obj["thinking"] = serde_json::json!(tb);
                         }
                         if let Some(calls) = tool_calls {
                             let tc: Vec<_> = calls
@@ -282,6 +290,14 @@ impl crate::provider::Provider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Content;
+
+    #[test]
+    fn test_content_serialization_in_provider() {
+        let content = Content::Plain("hello".to_string());
+        let val = content.to_openai_value();
+        assert_eq!(val, serde_json::json!("hello"));
+    }
 
     fn make_config(api_url: &str, base_url: &str) -> ProviderConfig {
         ProviderConfig {

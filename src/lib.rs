@@ -36,7 +36,7 @@ pub use log::{LogLevel, init as log_init, log, should_log};
 pub use message_bus::{BusRequest, BusResult, MessageBus};
 pub use path::PathManager;
 pub use path::expand_home;
-pub use session::{Message, Session, SessionManager, TaskHook, TaskState, SharedSessionManager};
+pub use session::{Content, Message, Session, SessionManager, TaskHook, TaskState, SharedSessionManager};
 pub use consolidate::Consolidator;
 pub use context::ContextBuilder;
 pub use provider::{OpenAIProvider, Provider, LLMResponse, FinishReason, Usage};
