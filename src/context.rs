@@ -13,8 +13,6 @@ const RUNTIME_CONTEXT_TAG: &str = "[Runtime Context -- metadata only, not instru
 const RUNTIME_CONTEXT_END: &str = "[/Runtime Context]";
 
 /// Build a transient runtime context string (time, channel, chat_id, session summary).
-/// This block is bounded by RUNTIME_CONTEXT_TAG / RUNTIME_CONTEXT_END tags and
-/// is sent to the LLM but NOT persisted in session history.
 fn build_runtime_context(channel: &str, chat_id: &str, session_summary: Option<&str>) -> String {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z");
     let mut lines = vec![format!("Current Time: {}", now)];

@@ -339,10 +339,17 @@ impl Config {
                 .cloned()
                 .collect();
             if !matching.is_empty() {
+                // Only include values for paths that matched this subscriber
+                let matching_old: BTreeMap<_, _> = matching.iter()
+                    .filter_map(|p| change.old_values.get(p).map(|v| (p.clone(), v.clone())))
+                    .collect();
+                let matching_new: BTreeMap<_, _> = matching.iter()
+                    .filter_map(|p| change.new_values.get(p).map(|v| (p.clone(), v.clone())))
+                    .collect();
                 callback(ConfigChange {
                     paths: matching,
-                    old_values: change.old_values.clone(),
-                    new_values: change.new_values.clone(),
+                    old_values: matching_old,
+                    new_values: matching_new,
                 });
             }
         }
@@ -356,43 +363,52 @@ impl Config {
         let mut old_values = BTreeMap::new();
         let mut new_values = BTreeMap::new();
 
-        // Diff agent fields
-        let old_agent = serde_json::to_value(&old.agent).unwrap_or_default();
-        let new_agent = serde_json::to_value(&new.agent).unwrap_or_default();
-        if old_agent != new_agent {
-            if let (Some(old_obj), Some(new_obj)) = (old_agent.as_object(), new_agent.as_object()) {
-                for (key, new_val) in new_obj {
-                    if !old_obj.get(key).map(|v| v == new_val).unwrap_or(false) {
-                        let path = format!("agent.{}", key);
-                        paths.push(path.clone());
-                        old_values.insert(path.clone(), config_value_from_json(old_obj.get(key).unwrap_or(&serde_json::Value::Null)));
-                        new_values.insert(path, config_value_from_json(new_val));
-                    }
-                }
-            }
+        // Diff agent fields — cheap PartialEq check first, serialize only on difference
+        if old.agent != new.agent {
+            Self::diff_json_objects("agent", &old.agent, &new.agent, &mut paths, &mut old_values, &mut new_values);
         }
 
-        // Diff providers
+        // Diff providers — only serialize when a provider actually changed
         for (name, new_p) in &new.providers {
             if let Some(old_p) = old.providers.get(name) {
-                let old_j = serde_json::to_value(old_p).unwrap_or_default();
-                let new_j = serde_json::to_value(new_p).unwrap_or_default();
-                if old_j != new_j {
-                    if let (Some(old_obj), Some(new_obj)) = (old_j.as_object(), new_j.as_object()) {
-                        for (key, new_val) in new_obj {
-                            if !old_obj.get(key).map(|v| v == new_val).unwrap_or(false) {
-                                let path = format!("providers.{}.{}", name, key);
-                                paths.push(path.clone());
-                                old_values.insert(path.clone(), config_value_from_json(old_obj.get(key).unwrap_or(&serde_json::Value::Null)));
-                                new_values.insert(path, config_value_from_json(new_val));
-                            }
-                        }
-                    }
+                if old_p != new_p {
+                    Self::diff_json_objects(
+                        &format!("providers.{}", name),
+                        old_p, new_p, &mut paths, &mut old_values, &mut new_values,
+                    );
                 }
+            } else {
+                // New provider added
+                let path = format!("providers.{}", name);
+                paths.push(path.clone());
+                new_values.insert(path, ConfigValue::Object(serde_json::to_value(new_p).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default()));
             }
         }
 
         ConfigChange { paths, old_values, new_values }
+    }
+
+    /// Diff two serializable values field-by-field, populating paths and value maps.
+    fn diff_json_objects<T: serde::Serialize>(
+        prefix: &str,
+        old: &T,
+        new: &T,
+        paths: &mut Vec<String>,
+        old_values: &mut BTreeMap<String, ConfigValue>,
+        new_values: &mut BTreeMap<String, ConfigValue>,
+    ) {
+        let old_j = serde_json::to_value(old).unwrap_or_default();
+        let new_j = serde_json::to_value(new).unwrap_or_default();
+        if let (Some(old_obj), Some(new_obj)) = (old_j.as_object(), new_j.as_object()) {
+            for (key, new_val) in new_obj {
+                if !old_obj.get(key).map(|v| v == new_val).unwrap_or(false) {
+                    let path = format!("{}.{}", prefix, key);
+                    paths.push(path.clone());
+                    old_values.insert(path.clone(), config_value_from_json(old_obj.get(key).unwrap_or(&serde_json::Value::Null)));
+                    new_values.insert(path, config_value_from_json(new_val));
+                }
+            }
+        }
     }
 }
 

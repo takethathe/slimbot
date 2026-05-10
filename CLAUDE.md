@@ -155,7 +155,7 @@ run_gateway()
 - 使用 git 进行代码版本管理
 - **提交前必须进行 code review**，确认代码质量和变更合理性
 - **commit message 必须使用英文**
-- **禁止在 commit message 中添加 `Co-Authored-By: Claude` 或任何将 Claude 列为贡献者的内容**
+- **绝对禁止在 commit message 中添加 `Co-Authored-By: Claude` 或任何将 Claude / AI 列为贡献者的内容。这是硬性规则，无例外。**
 
 ### 代码注释
 

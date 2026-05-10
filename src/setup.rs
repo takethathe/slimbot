@@ -43,22 +43,33 @@ pub fn run_setup(
         } else {
             eprintln!("Config is already complete, no changes needed.");
         }
+
+        // Create directories and bootstrap files
+        if let Err(e) = create_directories_and_bootstrap(&paths) {
+            eprintln!("Warning: failed to create workspace directories: {}", e);
+        }
+
+        // Use already-loaded config for summary
+        print_config_summary(&config, &paths);
     } else {
         // Config doesn't exist — write full default config
         eprintln!("Writing default config to: {}", path);
         let config = default_config();
         config.save(path)?;
         eprintln!("Default config created successfully.");
+
+        // Create directories and bootstrap files
+        if let Err(e) = create_directories_and_bootstrap(&paths) {
+            eprintln!("Warning: failed to create workspace directories: {}", e);
+        }
+
+        print_config_summary(&config, &paths);
     }
 
-    // Print config summary (skip validation — api_key may be empty)
-    let config = Config::load_for_preview(path)?;
+    Ok(())
+}
 
-    // Create directories and bootstrap files
-    if let Err(e) = create_directories_and_bootstrap(&paths) {
-        eprintln!("Warning: failed to create workspace directories: {}", e);
-    }
-
+fn print_config_summary(config: &Config, paths: &PathManager) {
     eprintln!("\nConfig preview:");
     eprintln!("  data_dir: {}", paths.data_dir().display());
     eprintln!("  workspace_dir: {}", paths.workspace_dir().display());
@@ -77,9 +88,7 @@ pub fn run_setup(
     }
     eprintln!("  tools: {} entries", config.tools.len());
     eprintln!("  channels: {} entries", config.channels.len());
-    eprintln!("\nEdit {} to configure your API key and channels.", path);
-
-    Ok(())
+    eprintln!("\nEdit {} to configure your API key and channels.", paths.config_path().display());
 }
 
 fn mask_api_key(key: &str) -> String {

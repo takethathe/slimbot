@@ -1,7 +1,7 @@
 use crate::config_defs::{AgentConfig, ProviderConfig};
 use crate::config_macro::Normalizable;
 
-/// Apply normalization to all config modules. Called by `Config::normalize()`.
+/// Normalizes all config sections.
 pub fn apply_normalize(config: &mut crate::config::Config) {
     config.agent.normalize();
     for provider in config.providers.values_mut() {

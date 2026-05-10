@@ -253,8 +253,8 @@ impl ChannelManager {
                         .next()
                         .unwrap_or("");
 
-                    // Skip system-triggered sessions (cron, heartbeat) — they have no user-facing channel
-                    if channel_id == "cron" || channel_id == "heartbeat" {
+                    // Skip system-triggered sessions — they have no user-facing channel
+                    if is_system_channel(channel_id) {
                         continue;
                     }
 

@@ -52,7 +52,7 @@ macro_rules! define_config {
 macro_rules! _cfg_mixed_expand {
     (@sec $section:ident, $name:ident,
      [ $( ($field:ident, $fty:ty, $def:expr, $cname:tt $( ($($args:tt)+) )? , $desc:expr) )+ ]) => {
-        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
         #[serde(default)]
         pub struct $name {
             $( pub $field: $fty, )+
@@ -72,8 +72,10 @@ macro_rules! _cfg_mixed_expand {
                     ) ),+
                 ]))
             }
-            pub fn defaults() -> BTreeMap<&'static str, serde_json::Value> {
-                BTreeMap::from_iter([$( (stringify!($field), serde_json::json!($def)), )+])
+            pub fn defaults() -> &'static BTreeMap<&'static str, serde_json::Value> {
+                use std::sync::OnceLock;
+                static CACHE: OnceLock<BTreeMap<&'static str, serde_json::Value>> = OnceLock::new();
+                CACHE.get_or_init(|| BTreeMap::from_iter([$( (stringify!($field), serde_json::json!($def)), )+]))
             }
             pub fn clamp(&mut self) {
                 let s = &mut *self;
