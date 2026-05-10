@@ -293,6 +293,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: 4096,
             prompt_cache_enabled: true,
+            unknown: Default::default(),
         }
     }
 

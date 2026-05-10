@@ -27,10 +27,17 @@
 
 ## 增强 config 模块
 
-- [ ] 增强 `config_scheme.rs`，生成包含所有配置项的完整 config 文件
-- [ ] `setup` 命令调用 config 模块生成 `config.json`，所有配置项使用默认值作为初始值
-- [ ] 默认 config 包含完整的 `data_dir`、`workspace_dir`、`agent`、`providers`、`tools`、`channels` 配置
-- [ ] 用户只需修改必填项（如 `api_key`）即可直接使用
+- [x] 使用 `define_config!` 宏定义所有可配置项（`AgentConfig`、`ProviderConfig`），自动生成结构体、默认值、clamp 逻辑和 `FieldMeta` 元数据
+- [x] 宏支持多种约束：`range(min, max)` 数值范围、`str_max(n)` 字符串截断、`allowed([...])` 白名单、`allowed_max([...], n)` 白名单+长度、`none` 无限制
+- [x] 配置全局单例：`Config::init(path)` 初始化，`Config::get()` 返回 `Arc<Config>` 快照
+- [x] 文件监听：`notify` crate 监控 config.json 修改，自动重载
+- [x] 热重载 diff 通知：修改后计算新旧配置差异，通过 `Config::subscribe(path, callback)` 通知订阅者
+- [x] `#[serde(flatten)]` 保留未知 JSON 字段，实现向前兼容
+- [x] `Normalizable` trait 提供模块级归一化钩子，在 clamp 后调用
+- [x] `setup` 命令通过 `AgentConfig::default()` / `ProviderConfig::default()` 生成完整默认配置
+- [ ] 订阅者回调集成到运行时组件（如 gateway 热切换 provider 配置）
+- [ ] `Config::get()` 快照支持 per-provider 按需获取配置（避免全量拷贝）
+- [ ] 配置写保护：运行时通过 API 锁定关键配置，禁止热重载覆盖
 
 ## Heartbeat 机制
 
@@ -126,9 +133,8 @@
 
 ## LLM Cache 功能
 
-- [x] `ProviderConfig` 新增 `prompt_cache_enabled` 字段（默认 true），通过 serde 自动反序列化
+- [x] `ProviderConfig` 新增 `prompt_cache_enabled` 字段（默认 true），通过 `define_config!` 宏定义
 - [x] OpenAI provider 在最后一条 system message 的 content 上注入 `cache_control: {"type": "ephemeral"}`
-- [x] `setup.rs` `merge_provider` 支持 partial config 中的 `prompt_cache_enabled` 字段
 
 ## Gateway 模式
 

@@ -4,7 +4,9 @@ pub(crate) mod channel;
 pub(crate) mod cli;
 pub(crate) mod commands;
 pub(crate) mod config;
-pub(crate) mod config_scheme;
+pub(crate) mod config_defs;
+pub(crate) mod config_macro;
+pub(crate) mod config_normalize;
 pub(crate) mod consolidate;
 pub(crate) mod context;
 pub(crate) mod cron;
@@ -27,8 +29,9 @@ pub(crate) mod utils;
 pub(crate) mod worker;
 
 // Re-export key types for integration tests and binary usage.
-pub use config::{AgentConfig, ChannelConfig, Config, GatewayConfig, ProviderConfig, ToolEntry};
-pub use config_scheme::ConfigScheme;
+pub use config::{ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, GatewayConfig, HeartbeatConfig, ToolEntry};
+pub use config_defs::{AgentConfig, ProviderConfig};
+pub use config_macro::{Normalizable, FieldMeta};
 pub use log::{LogLevel, init as log_init, log, should_log};
 pub use message_bus::{BusRequest, BusResult, MessageBus};
 pub use path::PathManager;

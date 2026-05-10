@@ -1,15 +1,26 @@
+use std::collections::HashMap;
 use std::fs;
 
 use tempfile::NamedTempFile;
 
-use slimbot::{ConfigScheme, ProviderConfig, ToolEntry, ChannelConfig};
+use slimbot::{Config, AgentConfig, ProviderConfig, ToolEntry, ChannelConfig};
 
 // ── Default config generation ──
 
 #[test]
 fn test_default_config_structure() {
-    let scheme = ConfigScheme::new();
-    let config = scheme.default_config();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
+
+    // Normalize fills in default provider name
+    config.normalize();
 
     assert_eq!(config.agent.provider, "default");
     assert!(config.providers.contains_key("default"));
@@ -17,35 +28,48 @@ fn test_default_config_structure() {
     assert!(config.channels.is_empty());
 
     let provider = &config.providers["default"];
-    assert_eq!(provider.r#type, ConfigScheme::DEFAULT_PROVIDER_TYPE);
-    assert_eq!(provider.base_url, ConfigScheme::DEFAULT_BASE_URL);
-    assert!(provider.api_url.is_empty()); // derived during normalize
+    assert_eq!(provider.r#type, "openai");
+    assert_eq!(provider.base_url, "https://api.openai.com");
     assert!(provider.api_key.is_empty()); // intentional, user must set
-    assert_eq!(provider.model, ConfigScheme::DEFAULT_MODEL);
+    assert_eq!(provider.model, "gpt-4o");
 }
 
 // ── Normalization ──
 
 #[test]
 fn test_normalize_fills_empty_agent_provider() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
     config.agent.provider.clear();
 
-    scheme.normalize(&mut config);
+    config.normalize();
     assert_eq!(config.agent.provider, "default");
 }
 
 #[test]
 fn test_normalize_derives_url_from_base_url() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
 
     let provider = config.providers.get_mut("default").unwrap();
     provider.api_url.clear();
     provider.base_url = "https://api.example.com".to_string();
 
-    scheme.normalize(&mut config);
+    config.normalize();
 
     let provider = config.providers.get("default").unwrap();
     assert_eq!(
@@ -56,14 +80,21 @@ fn test_normalize_derives_url_from_base_url() {
 
 #[test]
 fn test_normalize_preserves_existing_api_url() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
 
     let provider = config.providers.get_mut("default").unwrap();
     provider.api_url = "https://custom.api.com/v1/chat".to_string();
     provider.base_url = "https://should-be-ignored.com".to_string();
 
-    scheme.normalize(&mut config);
+    config.normalize();
 
     assert_eq!(
         config.providers["default"].api_url,
@@ -73,31 +104,45 @@ fn test_normalize_preserves_existing_api_url() {
 
 #[test]
 fn test_normalize_falls_back_to_default_url_when_no_base() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
 
     let provider = config.providers.get_mut("default").unwrap();
     provider.api_url.clear();
     provider.base_url.clear();
 
-    scheme.normalize(&mut config);
+    config.normalize();
 
     assert_eq!(
         config.providers["default"].api_url,
-        ConfigScheme::DEFAULT_API_URL
+        "https://api.openai.com/v1/chat/completions"
     );
 }
 
 #[test]
 fn test_normalize_trailing_slash_stripped_from_base_url() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
 
     let provider = config.providers.get_mut("default").unwrap();
     provider.api_url.clear();
     provider.base_url = "https://api.example.com/".to_string();
 
-    scheme.normalize(&mut config);
+    config.normalize();
 
     assert_eq!(
         config.providers["default"].api_url,
@@ -107,8 +152,15 @@ fn test_normalize_trailing_slash_stripped_from_base_url() {
 
 #[test]
 fn test_normalize_removes_empty_tools_and_channels() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
 
     config.tools.push(ToolEntry {
         name: String::new(),
@@ -123,7 +175,7 @@ fn test_normalize_removes_empty_tools_and_channels() {
         extra: std::collections::HashMap::new(),
     });
 
-    scheme.normalize(&mut config);
+    config.normalize();
 
     assert_eq!(config.tools.len(), 1);
     assert_eq!(config.tools[0].name, "valid");
@@ -132,38 +184,42 @@ fn test_normalize_removes_empty_tools_and_channels() {
 }
 
 #[test]
-fn test_normalize_fixes_out_of_range_temperature() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
-
-    config.providers.get_mut("default").unwrap().temperature = 5.0;
-    scheme.normalize(&mut config);
-
-    assert_eq!(config.providers["default"].temperature, 0.7);
-}
-
-#[test]
 fn test_normalize_does_not_touch_api_key() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
 
     config.providers.get_mut("default").unwrap().api_key = "sk-secret".to_string();
-    scheme.normalize(&mut config);
+    config.normalize();
 
     assert_eq!(config.providers["default"].api_key, "sk-secret");
 }
 
 #[test]
-fn test_normalize_max_iterations_and_timeout() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
-    config.agent.max_iterations = 0;
-    config.agent.timeout_seconds = 0;
+fn test_normalize_max_iterations_and_timeout_via_clamp() {
+    // The new system uses clamp for range-based validation
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let mut config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
+    config.agent.max_iterations = 0; // below range
+    config.agent.timeout_seconds = 0; // below range
 
-    scheme.normalize(&mut config);
+    config.clamp();
 
-    assert_eq!(config.agent.max_iterations, ConfigScheme::DEFAULT_MAX_ITERATIONS);
-    assert_eq!(config.agent.timeout_seconds, ConfigScheme::DEFAULT_TIMEOUT);
+    assert_eq!(config.agent.max_iterations, 1); // clamped to min of range(1, 200)
+    assert_eq!(config.agent.timeout_seconds, 1); // clamped to min of range(1, 600)
 }
 
 // ── Write and reload ──
@@ -173,10 +229,18 @@ fn test_write_default_config_creates_file() {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
 
-    let scheme = ConfigScheme::new();
-    scheme.write_default_config(path).unwrap();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
+    config.save(path).unwrap();
 
-    assert!(scheme.config_exists(path));
+    assert!(std::path::Path::new(path).exists());
     assert!(fs::read_to_string(path).unwrap().contains("default"));
 }
 
@@ -185,8 +249,16 @@ fn test_written_config_is_valid_json() {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
 
-    let scheme = ConfigScheme::new();
-    scheme.write_default_config(path).unwrap();
+    let mut providers = HashMap::new();
+    providers.insert("default".to_string(), ProviderConfig::default());
+    let config = Config {
+        agent: AgentConfig::default(),
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
+    config.save(path).unwrap();
 
     let content = fs::read_to_string(path).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -198,10 +270,12 @@ fn test_written_config_is_valid_json() {
 
 #[test]
 fn test_normalize_multiple_providers() {
-    let scheme = ConfigScheme::new();
-    let mut config = scheme.default_config();
+    let mut providers = HashMap::new();
+    let mut default_p = ProviderConfig::default();
+    default_p.api_key = "sk-key".to_string();
+    providers.insert("default".to_string(), default_p);
 
-    config.providers.insert(
+    providers.insert(
         "siliconflow".to_string(),
         ProviderConfig {
             r#type: "custom".to_string(),
@@ -212,30 +286,50 @@ fn test_normalize_multiple_providers() {
             temperature: 0.7,
             max_tokens: 4096,
             prompt_cache_enabled: true,
+            unknown: Default::default(),
         },
     );
-    config.agent.provider = "siliconflow".to_string();
+    let mut config = Config {
+        agent: AgentConfig {
+            provider: "siliconflow".to_string(),
+            max_iterations: 40,
+            timeout_seconds: 120,
+            max_tool_result_chars: 8000,
+            persist_tool_results: true,
+            context_window_tokens: 8192,
+            unknown: Default::default(),
+        },
+        providers,
+        tools: vec![],
+        channels: HashMap::new(),
+        gateway: Default::default(),
+    };
 
-    scheme.normalize(&mut config);
+    config.normalize();
 
     let sf = config.providers.get("siliconflow").unwrap();
     assert_eq!(sf.api_url, "https://api.siliconflow.cn/v1/chat/completions");
     assert_eq!(sf.api_key, "sk-sf-key");
 }
 
-// ── Constants ──
+// ── Constants from macro defaults ──
 
 #[test]
-fn test_config_scheme_constants() {
-    assert_eq!(ConfigScheme::DEFAULT_PROVIDER_TYPE, "openai");
-    assert_eq!(ConfigScheme::DEFAULT_MODEL, "gpt-4o");
-    assert_eq!(ConfigScheme::DEFAULT_TEMPERATURE, 0.7);
-    assert_eq!(ConfigScheme::DEFAULT_MAX_TOKENS, 4096);
-    assert_eq!(ConfigScheme::DEFAULT_MAX_ITERATIONS, 40);
-    assert_eq!(ConfigScheme::DEFAULT_TIMEOUT, 120);
-    assert_eq!(
-        ConfigScheme::DEFAULT_API_URL,
-        "https://api.openai.com/v1/chat/completions"
-    );
-    assert_eq!(ConfigScheme::DEFAULT_BASE_URL, "https://api.openai.com");
+fn test_config_defaults_match_expected_values() {
+    let agent_defaults = AgentConfig::defaults();
+    let provider_defaults = ProviderConfig::defaults();
+
+    assert_eq!(agent_defaults["provider"], "");
+    assert_eq!(agent_defaults["max_iterations"], 40);
+    assert_eq!(agent_defaults["timeout_seconds"], 120);
+    assert_eq!(agent_defaults["max_tool_result_chars"], 8000);
+    assert!(agent_defaults["persist_tool_results"].as_bool().unwrap());
+    assert_eq!(agent_defaults["context_window_tokens"], 8192);
+
+    assert_eq!(provider_defaults["r#type"], "openai");
+    assert_eq!(provider_defaults["base_url"], "https://api.openai.com");
+    assert_eq!(provider_defaults["model"], "gpt-4o");
+    assert_eq!(provider_defaults["temperature"], 0.7);
+    assert_eq!(provider_defaults["max_tokens"], 4096);
+    assert!(provider_defaults["prompt_cache_enabled"].as_bool().unwrap());
 }

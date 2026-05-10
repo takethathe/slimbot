@@ -365,6 +365,7 @@ mod tests {
                 max_tool_result_chars: 10000,
                 persist_tool_results: false,
                 context_window_tokens: 8192,
+                unknown: Default::default(),
             },
             providers: {
                 let mut m = HashMap::new();
@@ -377,6 +378,7 @@ mod tests {
                     temperature: 0.7,
                     max_tokens: 4096,
                     prompt_cache_enabled: true,
+                    unknown: Default::default(),
                 });
                 m
             },

@@ -831,6 +831,7 @@ mod tests {
                 max_tool_result_chars: 8000,
                 persist_tool_results: false,
                 context_window_tokens: 8192,
+                unknown: Default::default(),
             })
             .workspace_dir(workspace_dir)
             .memory_store(ms)
@@ -1357,6 +1358,7 @@ mod tests {
                 max_tool_result_chars: 8000,
                 persist_tool_results: true,
                 context_window_tokens: 8192,
+                unknown: Default::default(),
             })
             .workspace_dir(workspace_dir.clone())
             .memory_store(ms)
@@ -1396,6 +1398,7 @@ mod tests {
                 max_tool_result_chars: 8000,
                 persist_tool_results: false,
                 context_window_tokens: 8192,
+                unknown: Default::default(),
             })
             .workspace_dir(wd)
             .memory_store(ms)
@@ -1428,6 +1431,7 @@ mod tests {
                 max_tool_result_chars: 8000,
                 persist_tool_results: false,
                 context_window_tokens: 8192,
+                unknown: Default::default(),
             })
             .workspace_dir(wd)
             .memory_store(ms)
@@ -1495,6 +1499,7 @@ mod tests {
                 max_tool_result_chars: 8000,
                 persist_tool_results: false,
                 context_window_tokens: 8192,
+                unknown: Default::default(),
             })
             .workspace_dir(workspace_dir)
             .memory_store(ms)
@@ -1548,6 +1553,7 @@ mod tests {
                 max_tool_result_chars: 8000,
                 persist_tool_results: false,
                 context_window_tokens: 8192,
+                unknown: Default::default(),
             })
             .workspace_dir(workspace_dir)
             .memory_store(ms)

@@ -40,7 +40,7 @@ fn test_load_missing_file() {
     let result = Config::load("/nonexistent/path/config.json");
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("Failed to read config.json"));
+    assert!(err.contains("Failed to read config file"));
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn test_load_invalid_json() {
     let result = Config::load(path);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("Invalid config.json"));
+    assert!(err.contains("Invalid config JSON"));
 }
 
 #[test]
@@ -132,8 +132,9 @@ fn test_provider_defaults() {
     assert_eq!(provider.r#type, "openai");
     assert!((provider.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(provider.max_tokens, 4096);
-    assert!(provider.api_url.is_empty());
-    assert!(provider.base_url.is_empty());
+    // api_url is derived from base_url during normalize
+    assert_eq!(provider.api_url, "https://api.openai.com/v1/chat/completions");
+    assert!(!provider.base_url.is_empty());
 }
 
 #[test]
@@ -175,6 +176,7 @@ fn test_save_and_reload_round_trip() {
             temperature: 0.5,
             max_tokens: 2048,
             prompt_cache_enabled: true,
+            unknown: Default::default(),
         },
     );
 
@@ -196,6 +198,7 @@ fn test_save_and_reload_round_trip() {
             max_tool_result_chars: 4000,
             persist_tool_results: false,
             context_window_tokens: 8192,
+            unknown: Default::default(),
         },
         providers,
         tools: vec![ToolEntry {
