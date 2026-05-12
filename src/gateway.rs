@@ -89,6 +89,9 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     if config.gateway.cron.enabled {
         cron_service_arc.start();
+        info!("[gateway] cron service started");
+    } else {
+        info!("[gateway] cron service disabled");
     }
 
     // Set up heartbeat service
@@ -125,6 +128,9 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     if config.gateway.heartbeat.enabled {
         heartbeat.start();
+        info!("[gateway] heartbeat service started (interval={}s)", config.gateway.heartbeat.interval_s);
+    } else {
+        info!("[gateway] heartbeat service disabled");
     }
 
     // ChannelManager: init channels from config

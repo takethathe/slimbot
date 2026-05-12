@@ -14,6 +14,24 @@ pub struct CronTool {
     in_cron_context: AtomicBool,
 }
 
+/// Parse an `at` datetime string into a UTC epoch millisecond timestamp.
+/// Returns `None` if the format is not recognized.
+fn parse_at_datetime(s: &str) -> Option<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_millis());
+    }
+    for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            let offset = *chrono::Local::now().offset();
+            return Some(
+                chrono::DateTime::<chrono::Utc>::from(ndt.and_local_timezone(offset).unwrap())
+                    .timestamp_millis(),
+            );
+        }
+    }
+    None
+}
+
 impl CronTool {
     pub fn new(cron_service: Arc<CronService>) -> Self {
         Self {
@@ -57,18 +75,10 @@ impl CronTool {
             let tz = args.get("tz").and_then(|v| v.as_str()).map(|s| s.to_string());
             CronSchedule::cron(expr.to_string(), tz)
         } else if let Some(at_str) = args.get("at").and_then(|v| v.as_str()) {
-            // Treat all datetimes as local wall-clock time.
-            let naive = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(at_str) {
-                dt.naive_local()
-            } else if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(at_str, "%Y-%m-%dT%H:%M:%S") {
-                ndt
-            } else if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(at_str, "%Y-%m-%dT%H:%M:%S%.f") {
-                ndt
-            } else {
-                return Ok("Error: invalid datetime format for 'at'. Use '2026-05-05T10:30:00' (local time)".to_string());
+            let ts = match parse_at_datetime(at_str) {
+                Some(ts) => ts,
+                None => return Ok("Error: invalid datetime format for 'at'. Use '2026-05-05T10:30:00' (local time)".to_string()),
             };
-            let offset = *chrono::Local::now().offset();
-            let ts = chrono::DateTime::<chrono::Utc>::from(naive.and_local_timezone(offset).unwrap()).timestamp_millis();
             CronSchedule::at(ts)
         } else {
             return Ok("Error: either every_seconds, cron_expr, or at is required".to_string());

@@ -34,18 +34,30 @@ pub struct GatewayConfig {
     pub heartbeat: HeartbeatConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CronConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+impl Default for CronConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HeartbeatConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_heartbeat_interval")]
     pub interval_s: u64,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self { enabled: true, interval_s: default_heartbeat_interval() }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
