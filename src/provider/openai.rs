@@ -3,11 +3,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::config::ProviderConfig;
+use crate::debug;
 use crate::session::Message;
 use crate::tool::ToolDefinition;
-use crate::debug;
 
-use super::{LLMResponse, Usage, FinishReason};
+use super::{FinishReason, LLMResponse, Usage};
 
 pub struct OpenAIProvider {
     client: reqwest::Client,
@@ -100,13 +100,20 @@ impl crate::provider::Provider for OpenAIProvider {
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<LLMResponse> {
-        debug!("[OpenAIProvider] POST {} (model={}, messages={}, tools={})",
-            self.api_url, self.config.model, messages.len(), tools.map(|t| t.len()).unwrap_or(0));
+        debug!(
+            "[OpenAIProvider] POST {} (model={}, messages={}, tools={})",
+            self.api_url,
+            self.config.model,
+            messages.len(),
+            tools.map(|t| t.len()).unwrap_or(0)
+        );
 
         // Find the index of the last system message for cache_control injection
-        let last_system_idx = messages.iter().enumerate().rev().find_map(|(i, m)| {
-            matches!(**m, Message::System { .. }).then_some(i)
-        });
+        let last_system_idx = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, m)| matches!(**m, Message::System { .. }).then_some(i));
 
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
@@ -249,31 +256,36 @@ impl crate::provider::Provider for OpenAIProvider {
             _ => FinishReason::Error,
         };
 
-        let tool_calls: Option<Vec<crate::tool::ToolCall>> = choice.message.tool_calls.as_ref().map(|calls| {
-            calls
-                .iter()
-                .map(|call| {
-                    let id = if call.id.is_empty() {
-                        uuid::Uuid::new_v4().to_string()
-                    } else {
-                        call.id.clone()
-                    };
-                    crate::tool::ToolCall {
-                        id,
-                        name: call.function.name.clone(),
-                        args: serde_json::from_str(&call.function.arguments)
-                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-                    }
-                })
-                .collect()
-        });
+        let tool_calls: Option<Vec<crate::tool::ToolCall>> =
+            choice.message.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| {
+                        let id = if call.id.is_empty() {
+                            uuid::Uuid::new_v4().to_string()
+                        } else {
+                            call.id.clone()
+                        };
+                        crate::tool::ToolCall {
+                            id,
+                            name: call.function.name.clone(),
+                            args: serde_json::from_str(&call.function.arguments)
+                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                        }
+                    })
+                    .collect()
+            });
 
-        let usage = api_resp.usage.as_ref().map(|u| Usage {
-            prompt_tokens: u.prompt_tokens.unwrap_or(0),
-            prompt_cache_hit_tokens: u.prompt_cache_hit_tokens.unwrap_or(0),
-            completion_tokens: u.completion_tokens.unwrap_or(0),
-            total_tokens: u.total_tokens.unwrap_or(0),
-        }).unwrap_or_default();
+        let usage = api_resp
+            .usage
+            .as_ref()
+            .map(|u| Usage {
+                prompt_tokens: u.prompt_tokens.unwrap_or(0),
+                prompt_cache_hit_tokens: u.prompt_cache_hit_tokens.unwrap_or(0),
+                completion_tokens: u.completion_tokens.unwrap_or(0),
+                total_tokens: u.total_tokens.unwrap_or(0),
+            })
+            .unwrap_or_default();
 
         let tool_call_count = match &tool_calls {
             Some(calls) => calls.len(),
@@ -282,7 +294,12 @@ impl crate::provider::Provider for OpenAIProvider {
         debug!(
             "[OpenAIProvider] Response: finish_reason={:?}, content_len={}, tool_calls={}, prompt_tokens={}, prompt_cache_hit={}, completion_tokens={}, total_tokens={}",
             finish_reason,
-            choice.message.content.as_ref().map(|s| s.len()).unwrap_or(0),
+            choice
+                .message
+                .content
+                .as_ref()
+                .map(|s| s.len())
+                .unwrap_or(0),
             tool_call_count,
             usage.prompt_tokens,
             usage.prompt_cache_hit_tokens,
@@ -327,31 +344,41 @@ mod tests {
 
     #[test]
     fn test_resolve_api_url_full_endpoint() {
-        let provider = OpenAIProvider::new(&make_config("https://custom.url/full/path", "https://other.url"));
+        let provider = OpenAIProvider::new(&make_config(
+            "https://custom.url/full/path",
+            "https://other.url",
+        ));
         assert_eq!(provider.api_url, "https://custom.url/full/path");
     }
 
     #[test]
     fn test_resolve_api_url_base_ends_with_v1() {
         let provider = OpenAIProvider::new(&make_config(
-            "", "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
         ));
-        assert_eq!(provider.api_url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+        assert_eq!(
+            provider.api_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
     }
 
     #[test]
     fn test_resolve_api_url_base_ends_with_v1_trailing_slash() {
         let provider = OpenAIProvider::new(&make_config(
-            "", "https://dashscope.aliyuncs.com/compatible-mode/v1/",
+            "",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/",
         ));
-        assert_eq!(provider.api_url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+        assert_eq!(
+            provider.api_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
     }
 
     #[test]
     fn test_resolve_api_url_base_already_has_chat_completions() {
-        let provider = OpenAIProvider::new(&make_config(
-            "", "https://example.com/v1/chat/completions",
-        ));
+        let provider =
+            OpenAIProvider::new(&make_config("", "https://example.com/v1/chat/completions"));
         assert_eq!(provider.api_url, "https://example.com/v1/chat/completions");
     }
 
@@ -364,7 +391,10 @@ mod tests {
     #[test]
     fn test_resolve_api_url_no_base() {
         let provider = OpenAIProvider::new(&make_config("", ""));
-        assert_eq!(provider.api_url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            provider.api_url,
+            "https://api.openai.com/v1/chat/completions"
+        );
     }
 
     #[test]

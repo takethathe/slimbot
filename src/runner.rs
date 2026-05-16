@@ -6,8 +6,13 @@ use crate::consolidate::Consolidator;
 use crate::context::ContextBuilder;
 use crate::memory::SharedMemoryStore;
 use crate::provider::{Provider, Usage};
-use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TaskState, parse_session_origin};
-use crate::tool::{ToolContext, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result, truncate_text_head_tail};
+use crate::session::{
+    Message, SessionManager, SharedSessionManager, TaskHook, TaskState, parse_session_origin,
+};
+use crate::tool::{
+    ToolContext, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result,
+    truncate_text_head_tail,
+};
 use crate::{debug, warn_log};
 use tokio_util::sync::CancellationToken;
 
@@ -147,7 +152,8 @@ impl AgentRunnerBuilder {
             self.origin_channel,
             self.origin_chat_id,
         )
-    }}
+    }
+}
 
 pub struct AgentRunner {
     tool_manager: Arc<ToolManager>,
@@ -197,12 +203,7 @@ impl AgentRunner {
         }
     }
 
-    pub async fn run(
-        &self,
-        content: String,
-        hook: TaskHook,
-        session_id: &str,
-    ) -> AgentResult {
+    pub async fn run(&self, content: String, hook: TaskHook, session_id: &str) -> AgentResult {
         debug!("[AgentRunner] Starting run for session={}", session_id);
 
         // Sentinel /stop message: all prior tasks were cancelled and drained.
@@ -227,15 +228,16 @@ impl AgentRunner {
         {
             let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                 self.session_manager.lock().await;
-            let add_result = sm
-                .add_message(
-                    session_id,
-                    Message::user(content),
-                )
-                .await;
-            if let Err(e) = add_result
-            {
-                return self.fail_result(&hook, session_id, &format!("Failed to write user message: {}", e), 0).await;
+            let add_result = sm.add_message(session_id, Message::user(content)).await;
+            if let Err(e) = add_result {
+                return self
+                    .fail_result(
+                        &hook,
+                        session_id,
+                        &format!("Failed to write user message: {}", e),
+                        0,
+                    )
+                    .await;
             }
         }
 
@@ -251,7 +253,13 @@ impl AgentRunner {
 
         // Inject session context into tools (once, before the loop).
         // Prefer origin channel/chat_id (e.g. from cron payload) over session_id-parsed values.
-        let (tool_channel, tool_chat_id) = parse_session_origin(session_id, (self.origin_channel.as_deref(), self.origin_chat_id.as_deref()));
+        let (tool_channel, tool_chat_id) = parse_session_origin(
+            session_id,
+            (
+                self.origin_channel.as_deref(),
+                self.origin_chat_id.as_deref(),
+            ),
+        );
         if !tool_channel.is_empty() {
             let ctx = ToolContext {
                 channel: tool_channel,
@@ -264,7 +272,6 @@ impl AgentRunner {
         self.tool_manager.start_turn("message");
 
         loop {
-
             // Exceeded max iterations
             if iterations >= max_iterations {
                 let err_msg = format!("Reached max iterations {}", max_iterations);
@@ -290,7 +297,13 @@ impl AgentRunner {
                 sm.get_last_summary(session_id).await
             };
             let session_summary_ref = session_summary.as_deref();
-            let (channel, chat_id) = parse_session_origin(session_id, (self.origin_channel.as_deref(), self.origin_chat_id.as_deref()));
+            let (channel, chat_id) = parse_session_origin(
+                session_id,
+                (
+                    self.origin_channel.as_deref(),
+                    self.origin_chat_id.as_deref(),
+                ),
+            );
             let context_builder = ContextBuilder::new(
                 self.session_manager.clone(),
                 self.tool_manager.clone(),
@@ -311,8 +324,10 @@ impl AgentRunner {
                 .chain(ctx.current_turn)
                 .collect();
 
-            debug!("[AgentRunner] Context built: history={}, current_turn={}, tools={}",
-                history_len, current_turn_len, tools_len);
+            debug!(
+                "[AgentRunner] Context built: history={}, current_turn={}, tools={}",
+                history_len, current_turn_len, tools_len
+            );
 
             // History governance: clean orphans and backfill missing tool results
             Self::drop_orphan_tool_results(&mut all_messages);
@@ -326,19 +341,31 @@ impl AgentRunner {
             // Check cancellation before LLM request.
             if let Some(ref ct) = self.cancel_token {
                 if ct.is_cancelled() {
-                    return self.rollback_and_fail(&hook, session_id, initial_message_count, "Task cancelled.", iterations).await;
+                    return self
+                        .rollback_and_fail(
+                            &hook,
+                            session_id,
+                            initial_message_count,
+                            "Task cancelled.",
+                            iterations,
+                        )
+                        .await;
                 }
             }
-            let response = match self
-                .provider
-                .chat(&messages, ctx.tools.as_deref())
-                .await
-            {
+            let response = match self.provider.chat(&messages, ctx.tools.as_deref()).await {
                 Ok(r) => r,
                 Err(e) => {
                     let err_msg = format!("LLM API request failed - {}", e);
                     warn_log!("[AgentRunner] {}", err_msg);
-                    return self.rollback_and_fail(&hook, session_id, initial_message_count, &err_msg, iterations).await;
+                    return self
+                        .rollback_and_fail(
+                            &hook,
+                            session_id,
+                            initial_message_count,
+                            &err_msg,
+                            iterations,
+                        )
+                        .await;
                 }
             };
             debug!(
@@ -364,7 +391,10 @@ impl AgentRunner {
                 result.success = true;
                 result.content = text.clone();
                 result.iterations = iterations;
-                debug!("[AgentRunner] No tool calls, final response (len={})", text.len());
+                debug!(
+                    "[AgentRunner] No tool calls, final response (len={})",
+                    text.len()
+                );
                 {
                     let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                         self.session_manager.lock().await;
@@ -375,7 +405,14 @@ impl AgentRunner {
                         )
                         .await
                     {
-                        return self.fail_result(&hook, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
+                        return self
+                            .fail_result(
+                                &hook,
+                                session_id,
+                                &format!("Failed to write assistant message: {}", e),
+                                iterations,
+                            )
+                            .await;
                     }
 
                     // Update token ratio so persist() saves it with the meta.
@@ -391,11 +428,16 @@ impl AgentRunner {
                 });
                 // Trigger consolidation after successful turn.
                 if let Some(ref consolidator) = self.consolidator {
-                    let _ = consolidator.maybe_consolidate(session_id, prompt_tokens).await;
+                    let _ = consolidator
+                        .maybe_consolidate(session_id, prompt_tokens)
+                        .await;
                 }
                 // Mark if message tool delivered output (caller should suppress final response)
                 result.message_sent = self.tool_manager.sent_in_turn("message");
-                debug!("[AgentRunner] Run complete: success={}, iterations={}", result.success, result.iterations);
+                debug!(
+                    "[AgentRunner] Run complete: success={}, iterations={}",
+                    result.success, result.iterations
+                );
                 return result;
             }
 
@@ -412,11 +454,23 @@ impl AgentRunner {
                     if let Err(e) = sm
                         .add_message(
                             session_id,
-                            Message::assistant(response.content.clone(), Some(calls.clone()), None, None),
+                            Message::assistant(
+                                response.content.clone(),
+                                Some(calls.clone()),
+                                None,
+                                None,
+                            ),
                         )
                         .await
                     {
-                        return self.fail_result(&hook, session_id, &format!("Failed to write assistant message: {}", e), iterations).await;
+                        return self
+                            .fail_result(
+                                &hook,
+                                session_id,
+                                &format!("Failed to write assistant message: {}", e),
+                                iterations,
+                            )
+                            .await;
                     }
                 }
 
@@ -425,7 +479,15 @@ impl AgentRunner {
                     // Check cancellation before each tool call.
                     if let Some(ref ct) = self.cancel_token {
                         if ct.is_cancelled() {
-                            return self.rollback_and_fail(&hook, session_id, initial_message_count, "Task cancelled.", iterations).await;
+                            return self
+                                .rollback_and_fail(
+                                    &hook,
+                                    session_id,
+                                    initial_message_count,
+                                    "Task cancelled.",
+                                    iterations,
+                                )
+                                .await;
                         }
                     }
                     debug!("[tool_call] name={}, args={}", call.name, call.args);
@@ -451,8 +513,10 @@ impl AgentRunner {
                         ensured
                     };
 
-                    let final_content =
-                        truncate_text_head_tail(&processed, self.config.max_tool_result_chars as usize);
+                    let final_content = truncate_text_head_tail(
+                        &processed,
+                        self.config.max_tool_result_chars as usize,
+                    );
 
                     {
                         let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
@@ -460,11 +524,22 @@ impl AgentRunner {
                         if let Err(e) = sm
                             .add_message(
                                 session_id,
-                                Message::tool(final_content, call.id.clone(), Some(call.name.clone())),
+                                Message::tool(
+                                    final_content,
+                                    call.id.clone(),
+                                    Some(call.name.clone()),
+                                ),
                             )
                             .await
                         {
-                            return self.fail_result(&hook, session_id, &format!("Failed to write tool message: {}", e), iterations).await;
+                            return self
+                                .fail_result(
+                                    &hook,
+                                    session_id,
+                                    &format!("Failed to write tool message: {}", e),
+                                    iterations,
+                                )
+                                .await;
                         }
                     }
                 }
@@ -489,7 +564,9 @@ impl AgentRunner {
         result.success = false;
         result.content = error.to_string();
         result.iterations = iterations;
-        let failed_state = TaskState::Failed { error: error.to_string() };
+        let failed_state = TaskState::Failed {
+            error: error.to_string(),
+        };
         {
             let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                 self.session_manager.lock().await;
@@ -499,11 +576,7 @@ impl AgentRunner {
         result
     }
 
-    async fn cancelled_result(
-        &self,
-        hook: &TaskHook,
-        session_id: &str,
-    ) -> AgentResult {
+    async fn cancelled_result(&self, hook: &TaskHook, session_id: &str) -> AgentResult {
         let msg = "Task cancelled.".to_string();
         let mut result = AgentResult::default();
         result.success = false;
@@ -529,9 +602,12 @@ impl AgentRunner {
     ) -> AgentResult {
         {
             let mut sm = self.session_manager.lock().await;
-            sm.truncate_messages(session_id, initial_message_count).await;
+            sm.truncate_messages(session_id, initial_message_count)
+                .await;
         }
-        hook.notify_status_change(&TaskState::Failed { error: error.to_string() });
+        hook.notify_status_change(&TaskState::Failed {
+            error: error.to_string(),
+        });
         AgentResult {
             success: false,
             content: error.to_string(),
@@ -606,17 +682,19 @@ impl AgentRunner {
         let mut by_assistant: std::collections::BTreeMap<usize, Vec<(String, String)>> =
             std::collections::BTreeMap::new();
         for (asst_idx, call_id, tool_name) in missing {
-            by_assistant.entry(asst_idx).or_default().push((call_id, tool_name));
+            by_assistant
+                .entry(asst_idx)
+                .or_default()
+                .push((call_id, tool_name));
         }
 
         for (assistant_idx, calls) in by_assistant.into_iter().rev() {
             // Insert each call in reverse so they end up in original order
             for (call_id, tool_name) in calls.into_iter().rev() {
-                messages.insert(assistant_idx + 1, Message::tool(
-                    backfill_content.to_string(),
-                    call_id,
-                    Some(tool_name),
-                ));
+                messages.insert(
+                    assistant_idx + 1,
+                    Message::tool(backfill_content.to_string(), call_id, Some(tool_name)),
+                );
             }
         }
     }
@@ -632,11 +710,11 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+    use crate::memory::MemoryStore;
+    use crate::provider::{FinishReason, LLMResponse, Provider, Usage};
     use crate::session::Content;
-    use crate::provider::{LLMResponse, Provider, Usage, FinishReason};
     use crate::session::{Message, SessionTask, TaskHook, TaskState};
     use crate::tool::{Tool, ToolCall, ToolDefinition};
-    use crate::memory::MemoryStore;
 
     /// Mock provider that returns predefined responses in order.
     struct MockProvider {
@@ -761,7 +839,9 @@ mod tests {
             messages: &[&Message],
             tools: Option<&[ToolDefinition]>,
         ) -> Result<LLMResponse> {
-            let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Cancel on the first call so the next cancellation check detects it.
             if count == 0 {
                 self.cancel_token.cancel();
@@ -797,7 +877,12 @@ mod tests {
     async fn make_test_env(
         tmp_dir: &tempfile::TempDir,
         tool_names: &[(&str, &str)],
-    ) -> (SharedSessionManager, Arc<ToolManager>, PathBuf, Arc<tokio::sync::Mutex<MemoryStore>>) {
+    ) -> (
+        SharedSessionManager,
+        Arc<ToolManager>,
+        PathBuf,
+        Arc<tokio::sync::Mutex<MemoryStore>>,
+    ) {
         let path = tmp_dir.path();
         let session_dir = path.join("sessions");
         let workspace_dir = path.join("workspace");
@@ -863,12 +948,19 @@ mod tests {
             content: Some("Hello, world!".to_string()),
             tool_calls: None,
             finish_reason: FinishReason::Stop,
-            usage: Usage { prompt_tokens: 10, prompt_cache_hit_tokens: 0, completion_tokens: 5, total_tokens: 15 },
+            usage: Usage {
+                prompt_tokens: 10,
+                prompt_cache_hit_tokens: 0,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
         }]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let task = make_task("Say hi");
 
-        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
+        let result = runner
+            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .await;
         assert_eq!(result.content, "Hello, world!");
         assert_eq!(result.success, true);
         assert_eq!(result.total_tokens, 15);
@@ -893,19 +985,31 @@ mod tests {
                 content: Some("Let me echo that for you.".to_string()),
                 tool_calls: Some(vec![tool_call("tc-1", "echo")]),
                 finish_reason: FinishReason::ToolCalls,
-                usage: Usage { prompt_tokens: 20, prompt_cache_hit_tokens: 0, completion_tokens: 10, total_tokens: 30 },
+                usage: Usage {
+                    prompt_tokens: 20,
+                    prompt_cache_hit_tokens: 0,
+                    completion_tokens: 10,
+                    total_tokens: 30,
+                },
             },
             LLMResponse {
                 content: Some("Done!".to_string()),
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
-                usage: Usage { prompt_tokens: 40, prompt_cache_hit_tokens: 0, completion_tokens: 5, total_tokens: 45 },
+                usage: Usage {
+                    prompt_tokens: 40,
+                    prompt_cache_hit_tokens: 0,
+                    completion_tokens: 5,
+                    total_tokens: 45,
+                },
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let task = make_task("Run echo");
 
-        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
+        let result = runner
+            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .await;
         assert_eq!(result.content, "Done!");
         assert_eq!(result.success, true);
         assert_eq!(result.total_tokens, 75); // 30 + 45
@@ -916,19 +1020,27 @@ mod tests {
         // user + assistant(content+tool_calls) + tool + assistant(final)
         assert_eq!(msgs.len(), 4);
         match &msgs[1] {
-            Message::Assistant { content, tool_calls, .. } => {
-                assert_eq!(
-                    content.as_deref(),
-                    Some("Let me echo that for you.")
-                );
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                assert_eq!(content.as_deref(), Some("Let me echo that for you."));
                 let calls = tool_calls.as_ref().unwrap();
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "tc-1");
             }
-            other => panic!("Expected Assistant with content and tool_calls, got {:?}", other),
+            other => panic!(
+                "Expected Assistant with content and tool_calls, got {:?}",
+                other
+            ),
         }
         match &msgs[2] {
-            Message::Tool { content, tool_call_id, .. } => {
+            Message::Tool {
+                content,
+                tool_call_id,
+                ..
+            } => {
                 assert_eq!(content, "echo-result");
                 assert_eq!(tool_call_id, "tc-1");
             }
@@ -941,10 +1053,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (sm, tm, wd, ms) = make_test_env(
             &tmp,
-            &[
-                ("list", "listing-contents"),
-                ("read", "file-contents"),
-            ],
+            &[("list", "listing-contents"), ("read", "file-contents")],
         )
         .await;
         let provider = Arc::new(MockProvider::new(vec![
@@ -955,7 +1064,12 @@ mod tests {
                     tool_call("tc-read", "read"),
                 ]),
                 finish_reason: FinishReason::ToolCalls,
-                usage: Usage { prompt_tokens: 50, prompt_cache_hit_tokens: 0, completion_tokens: 20, total_tokens: 70 },
+                usage: Usage {
+                    prompt_tokens: 50,
+                    prompt_cache_hit_tokens: 0,
+                    completion_tokens: 20,
+                    total_tokens: 70,
+                },
             },
             LLMResponse {
                 content: Some(
@@ -963,13 +1077,20 @@ mod tests {
                 ),
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
-                usage: Usage { prompt_tokens: 80, prompt_cache_hit_tokens: 0, completion_tokens: 15, total_tokens: 95 },
+                usage: Usage {
+                    prompt_tokens: 80,
+                    prompt_cache_hit_tokens: 0,
+                    completion_tokens: 15,
+                    total_tokens: 95,
+                },
             },
         ]));
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let task = make_task("List and read");
 
-        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
+        let result = runner
+            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .await;
         assert_eq!(
             result.content,
             "Here are the results: listing-contents and file-contents."
@@ -984,7 +1105,11 @@ mod tests {
 
         // Verify assistant message has both content and both tool_calls
         match &msgs[1] {
-            Message::Assistant { content, tool_calls, .. } => {
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
                 assert_eq!(
                     content.as_deref(),
                     Some("I'll check both the list and the file for you.")
@@ -994,7 +1119,10 @@ mod tests {
                 assert_eq!(calls[0].name, "list");
                 assert_eq!(calls[1].name, "read");
             }
-            other => panic!("Expected Assistant with content and 2 tool_calls, got {:?}", other),
+            other => panic!(
+                "Expected Assistant with content and 2 tool_calls, got {:?}",
+                other
+            ),
         }
 
         // Verify both tool results are recorded
@@ -1014,7 +1142,10 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![
             LLMResponse {
                 content: None,
-                tool_calls: Some(vec![tool_call("tc-a", "tool_a"), tool_call("tc-b", "tool_b")]),
+                tool_calls: Some(vec![
+                    tool_call("tc-a", "tool_a"),
+                    tool_call("tc-b", "tool_b"),
+                ]),
                 finish_reason: FinishReason::ToolCalls,
                 usage: Usage::default(),
             },
@@ -1028,13 +1159,19 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let task = make_task("Run two tools");
 
-        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
+        let result = runner
+            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .await;
         assert_eq!(result.content, "Final answer");
         assert_eq!(result.success, true);
 
         let msgs = sm.lock().await.get_messages("test-session").await;
         match &msgs[1] {
-            Message::Assistant { content, tool_calls, .. } => {
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
                 assert!(content.is_none());
                 assert_eq!(tool_calls.as_ref().unwrap().len(), 2);
             }
@@ -1059,7 +1196,9 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
         let task = make_task("Loop forever");
 
-        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
+        let result = runner
+            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .await;
         assert_eq!(result.success, false);
         assert!(result.content.contains("Reached max iterations 40"));
 
@@ -1077,8 +1216,7 @@ mod tests {
         let (sm, tm, wd, ms) = make_test_env(&tmp, &[("tool1", "r1")]).await;
 
         // Capture state changes via TaskHook
-        let (status_tx, mut status_rx) =
-            tokio::sync::mpsc::channel::<(String, TaskState)>(32);
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<(String, TaskState)>(32);
 
         let provider = Arc::new(MockProvider::new(vec![
             LLMResponse {
@@ -1113,7 +1251,10 @@ mod tests {
             matches!(&states[0], TaskState::Running { current_iteration } if *current_iteration == 0)
         );
         // Last state should be Completed
-        assert!(matches!(states.last().unwrap(), TaskState::Completed { .. }));
+        assert!(matches!(
+            states.last().unwrap(),
+            TaskState::Completed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1152,15 +1293,15 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider, workspace_dir, ms);
         let task = make_task("test");
 
-        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
+        let result = runner
+            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .await;
         assert_eq!(result.content, "Got the error, stopping.");
 
         let msgs = sm.lock().await.get_messages("test-session").await;
         // user + assistant(tool_calls) + tool(error) + assistant(final)
         assert_eq!(msgs.len(), 4);
-        assert!(
-            matches!(&msgs[2], Message::Tool { content, .. } if content.contains("Error:"))
-        );
+        assert!(matches!(&msgs[2], Message::Tool { content, .. } if content.contains("Error:")));
         assert!(
             matches!(&msgs[2], Message::Tool { content, .. } if content.contains("Analyze the error"))
         );
@@ -1180,14 +1321,20 @@ mod tests {
         let runner = make_runner(sm.clone(), tm, provider, wd, ms);
         let task = make_task("hello");
 
-        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
+        let result = runner
+            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .await;
         assert_eq!(result.content, "persist me");
 
         // Create a new SessionManager and reload from disk
         let session_dir = tmp.path().join("sessions");
         let sm2: SharedSessionManager =
             Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap()));
-        sm2.lock().await.get_or_create("test-session").await.unwrap();
+        sm2.lock()
+            .await
+            .get_or_create("test-session")
+            .await
+            .unwrap();
 
         let msgs = sm2.lock().await.get_messages("test-session").await;
         assert_eq!(msgs.len(), 2); // user + assistant
@@ -1209,10 +1356,7 @@ mod tests {
             ensure_nonempty_tool_result("shell", "   "),
             "(shell completed with no output)"
         );
-        assert_eq!(
-            ensure_nonempty_tool_result("echo", "hello"),
-            "hello"
-        );
+        assert_eq!(ensure_nonempty_tool_result("echo", "hello"), "hello");
     }
 
     #[test]
@@ -1271,9 +1415,22 @@ mod tests {
     fn test_drop_orphan_tool_results() {
         let mut messages = vec![
             Message::user("test".to_string()),
-            Message::assistant(Some("calling".to_string()), Some(vec![tool_call("tc-1", "echo")]), None, None),
-            Message::tool("orphan".to_string(), "tc-999".to_string(), Some("echo".to_string())),
-            Message::tool("valid".to_string(), "tc-1".to_string(), Some("echo".to_string())),
+            Message::assistant(
+                Some("calling".to_string()),
+                Some(vec![tool_call("tc-1", "echo")]),
+                None,
+                None,
+            ),
+            Message::tool(
+                "orphan".to_string(),
+                "tc-999".to_string(),
+                Some("echo".to_string()),
+            ),
+            Message::tool(
+                "valid".to_string(),
+                "tc-1".to_string(),
+                Some("echo".to_string()),
+            ),
         ];
 
         AgentRunner::drop_orphan_tool_results(&mut messages);
@@ -1286,8 +1443,17 @@ mod tests {
     fn test_backfill_missing_tool_results() {
         let mut messages = vec![
             Message::user("test".to_string()),
-            Message::assistant(Some("calling".to_string()), Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]), None, None),
-            Message::tool("result-1".to_string(), "tc-1".to_string(), Some("echo".to_string())),
+            Message::assistant(
+                Some("calling".to_string()),
+                Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]),
+                None,
+                None,
+            ),
+            Message::tool(
+                "result-1".to_string(),
+                "tc-1".to_string(),
+                Some("echo".to_string()),
+            ),
             // tc-2 has no result
         ];
 
@@ -1309,11 +1475,29 @@ mod tests {
         // Two assistants, each with missing tool calls
         let mut messages = vec![
             Message::user("first".to_string()),
-            Message::assistant(Some("a1".to_string()), Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]), None, None),
-            Message::tool("r1".to_string(), "tc-1".to_string(), Some("echo".to_string())),
+            Message::assistant(
+                Some("a1".to_string()),
+                Some(vec![tool_call("tc-1", "echo"), tool_call("tc-2", "read")]),
+                None,
+                None,
+            ),
+            Message::tool(
+                "r1".to_string(),
+                "tc-1".to_string(),
+                Some("echo".to_string()),
+            ),
             Message::user("second".to_string()),
-            Message::assistant(Some("a2".to_string()), Some(vec![tool_call("tc-3", "write"), tool_call("tc-4", "list")]), None, None),
-            Message::tool("r4".to_string(), "tc-4".to_string(), Some("list".to_string())),
+            Message::assistant(
+                Some("a2".to_string()),
+                Some(vec![tool_call("tc-3", "write"), tool_call("tc-4", "list")]),
+                None,
+                None,
+            ),
+            Message::tool(
+                "r4".to_string(),
+                "tc-4".to_string(),
+                Some("list".to_string()),
+            ),
             // tc-2 and tc-3 are missing
         ];
 
@@ -1382,7 +1566,9 @@ mod tests {
             .build();
         let task = make_task("test persist");
 
-        let result = runner.run(task.content.clone(), task.hook.clone(), "test-session").await;
+        let result = runner
+            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .await;
         assert_eq!(result.content, "done");
 
         let msgs = sm.lock().await.get_messages("test-session").await;
@@ -1423,7 +1609,13 @@ mod tests {
             .build();
 
         // Sentinel /stop message should be detected immediately.
-        let result = runner.run("/stop".to_string(), TaskHook::new("test-session"), "test-session").await;
+        let result = runner
+            .run(
+                "/stop".to_string(),
+                TaskHook::new("test-session"),
+                "test-session",
+            )
+            .await;
         assert!(!result.success);
         assert_eq!(result.content, "Task cancelled.");
     }
@@ -1456,7 +1648,13 @@ mod tests {
             .build();
 
         // Should return cancelled before making any LLM call.
-        let result = runner.run("hello".to_string(), TaskHook::new("test-session"), "test-session").await;
+        let result = runner
+            .run(
+                "hello".to_string(),
+                TaskHook::new("test-session"),
+                "test-session",
+            )
+            .await;
         assert!(!result.success);
         assert_eq!(result.content, "Task cancelled.");
     }
@@ -1480,8 +1678,19 @@ mod tests {
         ms.lock().await.init().unwrap();
 
         // Pre-existing messages in session
-        sm.lock().await.add_message("test-session", Message::user("prev".to_string())).await.unwrap();
-        sm.lock().await.add_message("test-session", Message::assistant(Some("prev reply".to_string()), None, None, None)).await.unwrap();
+        sm.lock()
+            .await
+            .add_message("test-session", Message::user("prev".to_string()))
+            .await
+            .unwrap();
+        sm.lock()
+            .await
+            .add_message(
+                "test-session",
+                Message::assistant(Some("prev reply".to_string()), None, None, None),
+            )
+            .await
+            .unwrap();
         let pre_count = sm.lock().await.message_count("test-session");
         assert_eq!(pre_count, 2);
 
@@ -1523,14 +1732,25 @@ mod tests {
             .cancel_token(Some(ct))
             .build();
 
-        let result = runner.run("test cancel".to_string(), TaskHook::new("test-session"), "test-session").await;
+        let result = runner
+            .run(
+                "test cancel".to_string(),
+                TaskHook::new("test-session"),
+                "test-session",
+            )
+            .await;
         assert!(!result.success);
         assert_eq!(result.content, "Task cancelled.");
 
         // All messages added during this turn should be rolled back.
         // Session should still have only the 2 pre-existing messages.
         let msgs = sm.lock().await.get_messages("test-session").await;
-        assert_eq!(msgs.len(), 2, "expected pre-count messages, got {}", msgs.len());
+        assert_eq!(
+            msgs.len(),
+            2,
+            "expected pre-count messages, got {}",
+            msgs.len()
+        );
     }
 
     #[tokio::test]
@@ -1552,7 +1772,11 @@ mod tests {
         ms.lock().await.init().unwrap();
 
         // Pre-existing messages
-        sm.lock().await.add_message("test-session", Message::user("prev".to_string())).await.unwrap();
+        sm.lock()
+            .await
+            .add_message("test-session", Message::user("prev".to_string()))
+            .await
+            .unwrap();
         let pre_count = sm.lock().await.message_count("test-session");
         assert_eq!(pre_count, 1);
 
@@ -1576,12 +1800,23 @@ mod tests {
             .memory_store(ms)
             .build();
 
-        let result = runner.run("test error".to_string(), TaskHook::new("test-session"), "test-session").await;
+        let result = runner
+            .run(
+                "test error".to_string(),
+                TaskHook::new("test-session"),
+                "test-session",
+            )
+            .await;
         assert!(!result.success);
         assert!(result.content.contains("LLM API request failed"));
 
         // User message should be rolled back.
         let msgs = sm.lock().await.get_messages("test-session").await;
-        assert_eq!(msgs.len(), pre_count, "expected pre-count messages, got {}", msgs.len());
+        assert_eq!(
+            msgs.len(),
+            pre_count,
+            "expected pre-count messages, got {}",
+            msgs.len()
+        );
     }
 }

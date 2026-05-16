@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::bootstrap::{bootstrap_files, read_if_modified};
+use crate::debug;
 use crate::memory::SharedMemoryStore;
 use crate::session::{Content, ContentBlock, Message, MessageMeta, SharedSessionManager};
 use crate::tool::{ToolDefinition, ToolManager};
-use crate::debug;
 
 /// Bounding tags for the transient runtime context block.
 /// Sent to the LLM but NOT persisted in session history.
@@ -31,7 +31,12 @@ fn build_runtime_context(channel: &str, chat_id: &str, session_summary: Option<&
             lines.push(summary.to_string());
         }
     }
-    format!("{}\n{}\n{}", RUNTIME_CONTEXT_TAG, lines.join("\n"), RUNTIME_CONTEXT_END)
+    format!(
+        "{}\n{}\n{}",
+        RUNTIME_CONTEXT_TAG,
+        lines.join("\n"),
+        RUNTIME_CONTEXT_END
+    )
 }
 
 pub struct RunContext {
@@ -175,11 +180,14 @@ impl ContextBuilder {
                         }
                         if let Some(meta) = parse_skill_frontmatter(&content) {
                             if meta.always {
-                                always_skills.push(format!("### Skill: {}\n\n{}", meta.name, meta.content));
+                                always_skills
+                                    .push(format!("### Skill: {}\n\n{}", meta.name, meta.content));
                             } else {
                                 available_skills.push(format!(
                                     "- **{}** — {}  `{}`",
-                                    meta.name, meta.description, path.display()
+                                    meta.name,
+                                    meta.description,
+                                    path.display()
                                 ));
                             }
                         } else {
@@ -213,7 +221,10 @@ impl ContextBuilder {
         chat_id: &str,
         session_summary: Option<&str>,
     ) -> RunContext {
-        debug!("[ContextBuilder] Starting build_messages for session={}", session_id);
+        debug!(
+            "[ContextBuilder] Starting build_messages for session={}",
+            session_id
+        );
 
         // Build system prompt
         let system_prompt = self.build_system_prompt(channel).await;
@@ -222,13 +233,19 @@ impl ContextBuilder {
         // Get history Arc and current_turn Vec from SessionManager
         let (history, mut current_turn) = {
             let sm = self.session_manager.lock().await;
-            (sm.get_history_arc(session_id), sm.get_current_turn_messages(session_id))
+            (
+                sm.get_history_arc(session_id),
+                sm.get_current_turn_messages(session_id),
+            )
         };
 
         // Build runtime context and set on first user message in current_turn that doesn't have it
         let runtime_ctx = build_runtime_context(channel, chat_id, session_summary);
         for msg in &mut current_turn {
-            if let Message::User { runtime_content, .. } = msg {
+            if let Message::User {
+                runtime_content, ..
+            } = msg
+            {
                 if runtime_content.is_none() {
                     *runtime_content = Some(runtime_ctx);
                     break;
@@ -240,25 +257,47 @@ impl ContextBuilder {
         Self::merge_consecutive_user_messages(&mut current_turn);
 
         let tools = Some(self.tool_manager.to_openai_functions());
-        debug!("[ContextBuilder] Tools count={}", tools.as_ref().map(|t| t.len()).unwrap_or(0));
+        debug!(
+            "[ContextBuilder] Tools count={}",
+            tools.as_ref().map(|t| t.len()).unwrap_or(0)
+        );
 
-        RunContext { history, current_turn, system_message, tools }
+        RunContext {
+            history,
+            current_turn,
+            system_message,
+            tools,
+        }
     }
 
     /// Merge consecutive User messages at the end of the list to avoid same-role rejection.
     fn merge_consecutive_user_messages(messages: &mut Vec<Message>) {
         let len = messages.len();
         if len >= 2 {
-            if matches!(messages[len - 2], Message::User { .. }) && matches!(messages[len - 1], Message::User { .. }) {
+            if matches!(messages[len - 2], Message::User { .. })
+                && matches!(messages[len - 1], Message::User { .. })
+            {
                 let last = messages.pop().unwrap();
-                if let Message::User { content: last_content, runtime_content: last_runtime, .. } = last {
+                if let Message::User {
+                    content: last_content,
+                    runtime_content: last_runtime,
+                    ..
+                } = last
+                {
                     let prev = std::mem::replace(
                         &mut messages[len - 2],
                         Message::user("__temp__".to_string()),
                     );
-                    if let Message::User { content: prev_content, runtime_content: prev_runtime, .. } = prev {
+                    if let Message::User {
+                        content: prev_content,
+                        runtime_content: prev_runtime,
+                        ..
+                    } = prev
+                    {
                         let merged = match (prev_content, last_content) {
-                            (Content::Plain(a), Content::Plain(b)) => Content::Plain(format!("{}\n\n{}", a, b)),
+                            (Content::Plain(a), Content::Plain(b)) => {
+                                Content::Plain(format!("{}\n\n{}", a, b))
+                            }
                             (Content::Plain(a), Content::Multi(b)) => {
                                 let mut blocks = vec![ContentBlock::Text { text: a.clone() }];
                                 blocks.extend(b);
@@ -308,8 +347,8 @@ impl ContextBuilder {
         };
         let hint = Self::channel_format_hint(channel);
 
-        let template = crate::embed::get_content("identity.md")
-            .unwrap_or("You are SlimBot, an AI assistant.");
+        let template =
+            crate::embed::get_content("identity.md").unwrap_or("You are SlimBot, an AI assistant.");
 
         template
             .replace("<<runtime>>", &runtime)
@@ -462,7 +501,13 @@ Skill body.
             "file contents".to_string(),
         );
         assert_eq!(messages.len(), 2);
-        if let Message::Tool { content, tool_call_id, name, .. } = &messages[1] {
+        if let Message::Tool {
+            content,
+            tool_call_id,
+            name,
+            ..
+        } = &messages[1]
+        {
             assert_eq!(content, "file contents");
             assert_eq!(tool_call_id, "call-1");
             assert_eq!(name.as_deref(), Some("read_file"));

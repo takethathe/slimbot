@@ -40,7 +40,10 @@ impl std::fmt::Display for Usage {
         write!(
             f,
             "Usage(prompt={}, cache_hit={}, completion={}, total={})",
-            self.prompt_tokens, self.prompt_cache_hit_tokens, self.completion_tokens, self.total_tokens
+            self.prompt_tokens,
+            self.prompt_cache_hit_tokens,
+            self.completion_tokens,
+            self.total_tokens
         )
     }
 }

@@ -124,7 +124,10 @@ pub struct MessageMeta {
 
 impl Default for MessageMeta {
     fn default() -> Self {
-        Self { id: 0, timestamp: String::new() }
+        Self {
+            id: 0,
+            timestamp: String::new(),
+        }
     }
 }
 
@@ -132,8 +135,13 @@ impl Default for MessageMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    Image { mime_type: String, base64_data: String },
+    Text {
+        text: String,
+    },
+    Image {
+        mime_type: String,
+        base64_data: String,
+    },
 }
 
 /// User message content — plain text or multi-modal blocks.
@@ -246,14 +254,19 @@ impl Message {
 
     pub fn timestamp(&self) -> &str {
         match self {
-            Message::System { meta, .. } | Message::User { meta, .. }
-            | Message::Assistant { meta, .. } | Message::Tool { meta, .. } => &meta.timestamp,
+            Message::System { meta, .. }
+            | Message::User { meta, .. }
+            | Message::Assistant { meta, .. }
+            | Message::Tool { meta, .. } => &meta.timestamp,
         }
     }
 
     pub fn user(content: String) -> Self {
         Message::User {
-            meta: MessageMeta { id: 0, timestamp: String::new() },
+            meta: MessageMeta {
+                id: 0,
+                timestamp: String::new(),
+            },
             content: Content::Plain(content),
             runtime_content: None,
         }
@@ -266,7 +279,10 @@ impl Message {
         thinking_blocks: Option<Vec<serde_json::Value>>,
     ) -> Self {
         Message::Assistant {
-            meta: MessageMeta { id: 0, timestamp: String::new() },
+            meta: MessageMeta {
+                id: 0,
+                timestamp: String::new(),
+            },
             content,
             tool_calls,
             reasoning_content,
@@ -275,11 +291,25 @@ impl Message {
     }
 
     pub fn system(content: String) -> Self {
-        Message::System { meta: MessageMeta { id: 0, timestamp: String::new() }, content }
+        Message::System {
+            meta: MessageMeta {
+                id: 0,
+                timestamp: String::new(),
+            },
+            content,
+        }
     }
 
     pub fn tool(content: String, tool_call_id: String, name: Option<String>) -> Self {
-        Message::Tool { meta: MessageMeta { id: 0, timestamp: String::new() }, content, tool_call_id, name }
+        Message::Tool {
+            meta: MessageMeta {
+                id: 0,
+                timestamp: String::new(),
+            },
+            content,
+            tool_call_id,
+            name,
+        }
     }
 }
 
@@ -443,44 +473,45 @@ impl SessionTaskBuilder {
         let consolidator = self.consolidator;
         let cancel_token = self.cancel_token;
 
-        let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> =
-            Box::new(move || {
-                Box::pin(async move {
-                    let runner = AgentRunner::builder()
-                        .session_manager(session_manager)
-                        .tool_manager(tool_manager)
-                        .provider(provider)
-                        .config(config)
-                        .workspace_dir(workspace_dir)
-                        .memory_store(memory_store)
-                        .channel_inject(self.channel_inject)
-                        .consolidator(consolidator)
-                        .cancel_token(cancel_token)
-                        .build();
-                    let result = runner.run(content, hook, &sid1).await;
+        let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> = Box::new(move || {
+            Box::pin(async move {
+                let runner = AgentRunner::builder()
+                    .session_manager(session_manager)
+                    .tool_manager(tool_manager)
+                    .provider(provider)
+                    .config(config)
+                    .workspace_dir(workspace_dir)
+                    .memory_store(memory_store)
+                    .channel_inject(self.channel_inject)
+                    .consolidator(consolidator)
+                    .cancel_token(cancel_token)
+                    .build();
+                let result = runner.run(content, hook, &sid1).await;
 
-                    // Send result outbound
-                    let content = if result.success {
-                        result.content.clone()
-                    } else {
-                        format!("Error: {}", result.content)
-                    };
-                    let _ = outbound_tx
-                        .send(BusResult {
-                            session_id: sid2,
-                            task_id: String::new(),
-                            content,
-                        })
-                        .await;
-                })
-            });
+                // Send result outbound
+                let content = if result.success {
+                    result.content.clone()
+                } else {
+                    format!("Error: {}", result.content)
+                };
+                let _ = outbound_tx
+                    .send(BusResult {
+                        session_id: sid2,
+                        task_id: String::new(),
+                        content,
+                    })
+                    .await;
+            })
+        });
 
         SessionTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: sid_for_task,
             content: String::new(),
             hook: TaskHook::new(""),
-            state: TaskState::Running { current_iteration: 0 },
+            state: TaskState::Running {
+                current_iteration: 0,
+            },
             closure: Some(exec_closure),
         }
     }
@@ -490,9 +521,7 @@ impl SessionTask {
     /// Consume self and wrap the closure with auto-trigger logic.
     /// The returned closure executes the task, then calls `SessionRunner::on_task_complete`
     /// to mark idle and submit the next pending task.
-    pub fn wrap(self, runner: SessionRunner)
-        -> Box<dyn FnOnce() -> BoxFuture + Send>
-    {
+    pub fn wrap(self, runner: SessionRunner) -> Box<dyn FnOnce() -> BoxFuture + Send> {
         Box::new(move || {
             let closure = self.closure.unwrap();
             Box::pin(async move {
@@ -526,8 +555,8 @@ pub struct SessionMeta {
 #[allow(dead_code)]
 pub struct Session {
     pub id: String,
-    pub history: Arc<[Message]>,       // Persisted, clean messages (immutable, zero-clone share)
-    pub current_turn: Vec<Message>,    // Current turn buffer (may have runtime_content)
+    pub history: Arc<[Message]>, // Persisted, clean messages (immutable, zero-clone share)
+    pub current_turn: Vec<Message>, // Current turn buffer (may have runtime_content)
     meta: SessionMeta,
 }
 
@@ -558,7 +587,8 @@ impl Session {
     /// Keeps the previous ratio if there are no messages to measure against.
     pub fn update_token_ratio(&mut self, prompt_tokens: u32) {
         let total_chars: usize = self
-            .history.iter()
+            .history
+            .iter()
             .chain(self.current_turn.iter())
             .map(message_content_chars)
             .sum();
@@ -573,7 +603,11 @@ pub fn message_content_chars(msg: &Message) -> usize {
     match msg {
         Message::System { content, .. } => content.len(),
         Message::User { content, .. } => content.as_text().len(),
-        Message::Assistant { content, tool_calls, .. } => {
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
             let text_len = content.as_deref().map(|c| c.len()).unwrap_or(0);
             let tc_len = tool_calls
                 .as_ref()
@@ -611,10 +645,12 @@ pub enum FrontendMessage {
 impl FrontendMessage {
     pub fn from_message(msg: &Message) -> Option<Self> {
         match msg {
-            Message::User { content, .. } => Some(Self::User { content: content.as_text().to_string() }),
-            Message::Assistant { content, .. } => {
-                content.as_ref().map(|c| Self::Assistant { content: c.clone() })
-            }
+            Message::User { content, .. } => Some(Self::User {
+                content: content.as_text().to_string(),
+            }),
+            Message::Assistant { content, .. } => content
+                .as_ref()
+                .map(|c| Self::Assistant { content: c.clone() }),
             _ => None,
         }
     }
@@ -626,10 +662,22 @@ fn assign_message_id(msg: &mut Message, next_id: &mut usize) {
     let ts = chrono::Local::now().to_rfc3339();
     *next_id += 1;
     match msg {
-        Message::System { meta, .. } => { meta.id = id; meta.timestamp = ts; }
-        Message::User { meta, .. } => { meta.id = id; meta.timestamp = ts; }
-        Message::Assistant { meta, .. } => { meta.id = id; meta.timestamp = ts; }
-        Message::Tool { meta, .. } => { meta.id = id; meta.timestamp = ts; }
+        Message::System { meta, .. } => {
+            meta.id = id;
+            meta.timestamp = ts;
+        }
+        Message::User { meta, .. } => {
+            meta.id = id;
+            meta.timestamp = ts;
+        }
+        Message::Assistant { meta, .. } => {
+            meta.id = id;
+            meta.timestamp = ts;
+        }
+        Message::Tool { meta, .. } => {
+            meta.id = id;
+            meta.timestamp = ts;
+        }
     }
 }
 
@@ -669,7 +717,8 @@ impl SessionManager {
                     continue;
                 }
                 let msg_count = Self::count_messages_in_jsonl(&entry.path());
-                let created = entry.metadata()
+                let created = entry
+                    .metadata()
                     .ok()
                     .and_then(|m| m.created().ok())
                     .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64)
@@ -685,7 +734,10 @@ impl SessionManager {
         std::fs::File::open(path)
             .map(|f| {
                 let reader = std::io::BufReader::new(f);
-                reader.lines().filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)).count()
+                reader
+                    .lines()
+                    .filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
+                    .count()
             })
             .unwrap_or(0)
     }
@@ -694,7 +746,10 @@ impl SessionManager {
     /// Returns messages suitable for frontend display (user + assistant only).
     pub fn load_session_messages(&self, session_id: &str) -> Result<Vec<FrontendMessage>> {
         let msgs = Self::load_messages_from_jsonl(&self.session_dir, session_id, 0)?;
-        Ok(msgs.iter().filter_map(|m| FrontendMessage::from_message(m)).collect())
+        Ok(msgs
+            .iter()
+            .filter_map(|m| FrontendMessage::from_message(m))
+            .collect())
     }
 
     fn meta_path(&self, session_id: &str) -> PathBuf {
@@ -713,8 +768,7 @@ impl SessionManager {
 
     fn save_meta_file(&self, session_id: &str, meta: &SessionMeta) -> Result<()> {
         let content = serde_json::to_string(meta)?;
-        write_file_atomic(&self.meta_path(session_id), &content)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        write_file_atomic(&self.meta_path(session_id), &content).map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
 
@@ -732,12 +786,18 @@ impl SessionManager {
         // Load meta from separate file
         let meta = self.load_meta_file(session_id)?;
         let (last_consolidated_id, mut next_id, char_per_token_ratio, last_summary) = match &meta {
-            Some(m) => (m.last_consolidated_id, m.next_message_id, m.char_per_token_ratio, m.last_summary.clone()),
+            Some(m) => (
+                m.last_consolidated_id,
+                m.next_message_id,
+                m.char_per_token_ratio,
+                m.last_summary.clone(),
+            ),
             None => (0, 1, 4.0, None),
         };
 
         // Load messages from append-only JSONL, skipping consolidated ones
-        let messages = Self::load_messages_from_jsonl(&self.session_dir, session_id, last_consolidated_id)?;
+        let messages =
+            Self::load_messages_from_jsonl(&self.session_dir, session_id, last_consolidated_id)?;
         let max_loaded_id = messages.iter().map(|m| m.id()).max().unwrap_or(0);
         if max_loaded_id >= next_id {
             next_id = max_loaded_id + 1;
@@ -749,24 +809,37 @@ impl SessionManager {
                 id: session_id.to_string(),
                 history: Arc::from(messages),
                 current_turn: Vec::new(),
-                meta: meta.unwrap_or(SessionMeta { last_consolidated_id, next_message_id: next_id, char_per_token_ratio, last_summary }),
+                meta: meta.unwrap_or(SessionMeta {
+                    last_consolidated_id,
+                    next_message_id: next_id,
+                    char_per_token_ratio,
+                    last_summary,
+                }),
             },
         );
-        self.runners.insert(session_id.to_string(), SessionRunner::new());
+        self.runners
+            .insert(session_id.to_string(), SessionRunner::new());
         Ok(self.sessions.get(session_id).unwrap())
     }
 
     /// Submit a SessionTask to a session. The session guarantees sequential execution.
     /// The task's closure is consumed and executed once.
     pub async fn submit_task(&mut self, task: SessionTask) {
-        let runner = self.runners.get(&task.session_id).cloned().expect("no runner for session");
+        let runner = self
+            .runners
+            .get(&task.session_id)
+            .cloned()
+            .expect("no runner for session");
         let wrapped = task.wrap(runner.clone());
         runner.submit(wrapped);
     }
 
     pub async fn add_message(&mut self, session_id: &str, mut msg: Message) -> Result<()> {
         // Defensive: strip runtime_content (should only be set by ContextBuilder, never from external)
-        if let Message::User { runtime_content, .. } = &mut msg {
+        if let Message::User {
+            runtime_content, ..
+        } = &mut msg
+        {
             *runtime_content = None;
         }
 
@@ -782,7 +855,13 @@ impl SessionManager {
     pub async fn get_messages(&self, session_id: &str) -> Vec<Message> {
         self.sessions
             .get(session_id)
-            .map(|s| s.history.iter().chain(s.current_turn.iter()).cloned().collect())
+            .map(|s| {
+                s.history
+                    .iter()
+                    .chain(s.current_turn.iter())
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -806,7 +885,9 @@ impl SessionManager {
     pub fn get_session_data(&self, session_id: &str) -> Option<SessionData> {
         let session = self.sessions.get(session_id)?;
         Some(SessionData {
-            messages: session.history.iter()
+            messages: session
+                .history
+                .iter()
                 .chain(session.current_turn.iter())
                 .cloned()
                 .collect(),
@@ -830,10 +911,12 @@ impl SessionManager {
             session.meta.last_consolidated_id = new_cursor_id;
             // Remove consolidated messages from history
             session.history = Arc::from(
-                session.history.iter()
+                session
+                    .history
+                    .iter()
                     .filter(|m| m.id() > new_cursor_id)
                     .cloned()
-                    .collect::<Vec<Message>>()
+                    .collect::<Vec<Message>>(),
             );
         }
         self.save_session_meta(session_id);
@@ -891,7 +974,8 @@ impl SessionManager {
 
     /// Return all session IDs that match a prefix.
     pub fn list_session_ids(&self, prefix: &str) -> Vec<String> {
-        self.sessions.keys()
+        self.sessions
+            .keys()
             .filter(|k| k.starts_with(prefix))
             .map(|k| k.to_string())
             .collect()
@@ -934,7 +1018,10 @@ impl SessionManager {
         for session_id in self.sessions.keys() {
             self.save_session_meta(session_id);
         }
-        if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(&self.session_dir) {
+        if let Ok(dir) = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&self.session_dir)
+        {
             let _ = dir.sync_all();
         }
     }
@@ -955,7 +1042,10 @@ impl SessionManager {
         // Strip runtime_content from current_turn messages before persisting
         let session = self.sessions.get_mut(session_id).unwrap();
         for msg in &mut session.current_turn {
-            if let Message::User { runtime_content, .. } = msg {
+            if let Message::User {
+                runtime_content, ..
+            } = msg
+            {
                 *runtime_content = None;
             }
         }
@@ -1021,7 +1111,10 @@ pub async fn ensure_session(sm: &SharedSessionManager, session_id: &str) -> Resu
 }
 
 /// Resolve origin channel/chat_id, falling back to parsing `session_id`.
-pub fn parse_session_origin(session_id: &str, origin: (Option<&str>, Option<&str>)) -> (String, String) {
+pub fn parse_session_origin(
+    session_id: &str,
+    origin: (Option<&str>, Option<&str>),
+) -> (String, String) {
     match origin {
         (Some(ch), Some(cid)) => (ch.to_string(), cid.to_string()),
         _ => session_id
@@ -1036,11 +1129,27 @@ mod tests {
     use super::*;
 
     fn user_msg(content: &str) -> Message {
-        Message::User { meta: MessageMeta { id: 0, timestamp: String::new() }, content: Content::Plain(content.to_string()), runtime_content: None }
+        Message::User {
+            meta: MessageMeta {
+                id: 0,
+                timestamp: String::new(),
+            },
+            content: Content::Plain(content.to_string()),
+            runtime_content: None,
+        }
     }
 
     fn assistant_msg(content: &str) -> Message {
-        Message::Assistant { meta: MessageMeta { id: 0, timestamp: String::new() }, content: Some(content.to_string()), tool_calls: None, reasoning_content: None, thinking_blocks: None }
+        Message::Assistant {
+            meta: MessageMeta {
+                id: 0,
+                timestamp: String::new(),
+            },
+            content: Some(content.to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            thinking_blocks: None,
+        }
     }
 
     #[tokio::test]
@@ -1051,7 +1160,9 @@ mod tests {
         sm.get_or_create("s1").await.unwrap();
 
         sm.add_message("s1", user_msg("hello")).await.unwrap();
-        sm.add_message("s1", assistant_msg("hi back")).await.unwrap();
+        sm.add_message("s1", assistant_msg("hi back"))
+            .await
+            .unwrap();
         sm.add_message("s1", user_msg("another")).await.unwrap();
 
         let session = sm.sessions.get("s1").unwrap();
@@ -1098,10 +1209,10 @@ mod tests {
         let mut sm = SessionManager::new(session_dir.clone()).unwrap();
         sm.get_or_create("s1").await.unwrap();
 
-        sm.add_message("s1", user_msg("a")).await.unwrap();       // id=1
-        sm.add_message("s1", assistant_msg("b")).await.unwrap();   // id=2
-        sm.add_message("s1", user_msg("c")).await.unwrap();        // id=3
-        sm.add_message("s1", assistant_msg("d")).await.unwrap();   // id=4
+        sm.add_message("s1", user_msg("a")).await.unwrap(); // id=1
+        sm.add_message("s1", assistant_msg("b")).await.unwrap(); // id=2
+        sm.add_message("s1", user_msg("c")).await.unwrap(); // id=3
+        sm.add_message("s1", assistant_msg("d")).await.unwrap(); // id=4
         sm.persist("s1").await.unwrap();
 
         // Verify all 4 messages in history after persist
@@ -1171,9 +1282,13 @@ mod tests {
 
         // Write old-format JSONL without id fields
         let jsonl_path = session_dir.join("s1.jsonl");
-        std::fs::write(&jsonl_path, r#"{"role":"user","content":"old msg1"}
+        std::fs::write(
+            &jsonl_path,
+            r#"{"role":"user","content":"old msg1"}
 {"role":"assistant","content":"old reply"}
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         // Load should succeed, messages get id=0 (serde default)
         // When last_consolidated_id=0 and msg.id=0, we load them for backward compat
@@ -1345,7 +1460,11 @@ mod tests {
             ));
         }
         std::fs::write(&jsonl_path, lines.join("\n")).unwrap();
-        std::fs::write(&meta_path, r#"{"last_consolidated_id":2,"next_message_id":5}"#).unwrap();
+        std::fs::write(
+            &meta_path,
+            r#"{"last_consolidated_id":2,"next_message_id":5}"#,
+        )
+        .unwrap();
 
         let mut sm = SessionManager::new(session_dir).unwrap();
         sm.get_or_create("s1").await.unwrap();
@@ -1499,17 +1618,25 @@ mod tests {
             let mut sm = SessionManager::new(session_dir.clone()).unwrap();
             // Create and persist two sessions with prefix "webui:"
             sm.get_or_create("webui:chat1").await.unwrap();
-            sm.add_message("webui:chat1", user_msg("hello")).await.unwrap();
-            sm.add_message("webui:chat1", assistant_msg("hi")).await.unwrap();
+            sm.add_message("webui:chat1", user_msg("hello"))
+                .await
+                .unwrap();
+            sm.add_message("webui:chat1", assistant_msg("hi"))
+                .await
+                .unwrap();
             sm.persist("webui:chat1").await.unwrap();
 
             sm.get_or_create("webui:chat2").await.unwrap();
-            sm.add_message("webui:chat2", user_msg("second")).await.unwrap();
+            sm.add_message("webui:chat2", user_msg("second"))
+                .await
+                .unwrap();
             sm.persist("webui:chat2").await.unwrap();
 
             // Also create a session with different prefix (should be filtered out)
             sm.get_or_create("cli:default").await.unwrap();
-            sm.add_message("cli:default", user_msg("cli msg")).await.unwrap();
+            sm.add_message("cli:default", user_msg("cli msg"))
+                .await
+                .unwrap();
             sm.persist("cli:default").await.unwrap();
         }
 
@@ -1530,10 +1657,18 @@ mod tests {
         {
             let mut sm = SessionManager::new(session_dir.clone()).unwrap();
             sm.get_or_create("webui:chat1").await.unwrap();
-            sm.add_message("webui:chat1", user_msg("hello")).await.unwrap();
-            sm.add_message("webui:chat1", assistant_msg("hi there")).await.unwrap();
-            sm.add_message("webui:chat1", user_msg("how are you")).await.unwrap();
-            sm.add_message("webui:chat1", assistant_msg("good thanks")).await.unwrap();
+            sm.add_message("webui:chat1", user_msg("hello"))
+                .await
+                .unwrap();
+            sm.add_message("webui:chat1", assistant_msg("hi there"))
+                .await
+                .unwrap();
+            sm.add_message("webui:chat1", user_msg("how are you"))
+                .await
+                .unwrap();
+            sm.add_message("webui:chat1", assistant_msg("good thanks"))
+                .await
+                .unwrap();
             sm.persist("webui:chat1").await.unwrap();
         }
 
@@ -1546,30 +1681,64 @@ mod tests {
 
     #[test]
     fn test_frontend_message_from_message() {
-        let user = Message::User { meta: MessageMeta { id: 1, timestamp: String::new() }, content: Content::Plain("hello".to_string()), runtime_content: None };
+        let user = Message::User {
+            meta: MessageMeta {
+                id: 1,
+                timestamp: String::new(),
+            },
+            content: Content::Plain("hello".to_string()),
+            runtime_content: None,
+        };
         let fm = FrontendMessage::from_message(&user);
         assert!(fm.is_some());
         assert!(matches!(fm.unwrap(), FrontendMessage::User { content } if content == "hello"));
 
-        let asst = Message::Assistant { meta: MessageMeta { id: 2, timestamp: String::new() }, content: Some("hi".to_string()), tool_calls: None, reasoning_content: None, thinking_blocks: None };
+        let asst = Message::Assistant {
+            meta: MessageMeta {
+                id: 2,
+                timestamp: String::new(),
+            },
+            content: Some("hi".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
         let fm = FrontendMessage::from_message(&asst);
         assert!(matches!(fm.unwrap(), FrontendMessage::Assistant { content } if content == "hi"));
 
-        let system = Message::System { meta: MessageMeta { id: 0, timestamp: String::new() }, content: "sys".to_string() };
+        let system = Message::System {
+            meta: MessageMeta {
+                id: 0,
+                timestamp: String::new(),
+            },
+            content: "sys".to_string(),
+        };
         assert!(FrontendMessage::from_message(&system).is_none());
 
-        let tool = Message::Tool { meta: MessageMeta { id: 3, timestamp: String::new() }, content: "tool".to_string(), tool_call_id: "t1".to_string(), name: None };
+        let tool = Message::Tool {
+            meta: MessageMeta {
+                id: 3,
+                timestamp: String::new(),
+            },
+            content: "tool".to_string(),
+            tool_call_id: "t1".to_string(),
+            name: None,
+        };
         assert!(FrontendMessage::from_message(&tool).is_none());
     }
 
     #[test]
     fn test_frontend_message_serde() {
-        let user = FrontendMessage::User { content: "hello".to_string() };
+        let user = FrontendMessage::User {
+            content: "hello".to_string(),
+        };
         let json = serde_json::to_string(&user).unwrap();
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"content\":\"hello\""));
 
-        let asst = FrontendMessage::Assistant { content: "hi".to_string() };
+        let asst = FrontendMessage::Assistant {
+            content: "hi".to_string(),
+        };
         let json = serde_json::to_string(&asst).unwrap();
         assert!(json.contains("\"role\":\"assistant\""));
     }
@@ -1589,7 +1758,13 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         let ts = msgs[0].timestamp();
         assert!(!ts.is_empty(), "timestamp should not be empty");
-        assert!(ts >= before.as_str() && ts <= after.as_str(), "timestamp {} should be in [{}, {}]", ts, before, after);
+        assert!(
+            ts >= before.as_str() && ts <= after.as_str(),
+            "timestamp {} should be in [{}, {}]",
+            ts,
+            before,
+            after
+        );
     }
 
     #[tokio::test]
@@ -1608,8 +1783,14 @@ mod tests {
         sm2.get_or_create("s1").await.unwrap();
         let msgs = sm2.get_messages("s1").await;
         assert_eq!(msgs.len(), 2);
-        assert!(!msgs[0].timestamp().is_empty(), "user message should have timestamp");
-        assert!(!msgs[1].timestamp().is_empty(), "assistant message should have timestamp");
+        assert!(
+            !msgs[0].timestamp().is_empty(),
+            "user message should have timestamp"
+        );
+        assert!(
+            !msgs[1].timestamp().is_empty(),
+            "assistant message should have timestamp"
+        );
     }
 
     #[tokio::test]
@@ -1619,9 +1800,13 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
 
         let jsonl_path = session_dir.join("s1.jsonl");
-        std::fs::write(&jsonl_path, r#"{"role":"user","content":"old msg","id":1}
+        std::fs::write(
+            &jsonl_path,
+            r#"{"role":"user","content":"old msg","id":1}
 {"role":"assistant","content":"old reply","id":2}
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let mut sm = SessionManager::new(session_dir).unwrap();
         sm.get_or_create("s1").await.unwrap();
@@ -1685,8 +1870,13 @@ mod tests {
     #[test]
     fn test_content_multi_serializes_as_array() {
         let content = Content::Multi(vec![
-            ContentBlock::Text { text: "look".to_string() },
-            ContentBlock::Image { mime_type: "image/png".to_string(), base64_data: "abc".to_string() },
+            ContentBlock::Text {
+                text: "look".to_string(),
+            },
+            ContentBlock::Image {
+                mime_type: "image/png".to_string(),
+                base64_data: "abc".to_string(),
+            },
         ]);
         let json = serde_json::to_string(&content).unwrap();
         assert!(json.starts_with('['));
@@ -1696,13 +1886,18 @@ mod tests {
 
     #[test]
     fn test_content_to_openai_value_multi() {
-        let content = Content::Multi(vec![
-            ContentBlock::Image { mime_type: "image/png".to_string(), base64_data: "abc".to_string() },
-        ]);
+        let content = Content::Multi(vec![ContentBlock::Image {
+            mime_type: "image/png".to_string(),
+            base64_data: "abc".to_string(),
+        }]);
         let val = content.to_openai_value();
         assert!(val.is_array());
         assert!(serde_json::to_string(&val).unwrap().contains("image_url"));
-        assert!(serde_json::to_string(&val).unwrap().contains("data:image/png;base64,abc"));
+        assert!(
+            serde_json::to_string(&val)
+                .unwrap()
+                .contains("data:image/png;base64,abc")
+        );
     }
 
     #[test]
@@ -1730,8 +1925,13 @@ mod tests {
         assert_eq!(c.as_text(), "hello");
 
         let c = Content::Multi(vec![
-            ContentBlock::Image { mime_type: "image/png".to_string(), base64_data: "abc".to_string() },
-            ContentBlock::Text { text: "caption".to_string() },
+            ContentBlock::Image {
+                mime_type: "image/png".to_string(),
+                base64_data: "abc".to_string(),
+            },
+            ContentBlock::Text {
+                text: "caption".to_string(),
+            },
         ]);
         assert_eq!(c.as_text(), "caption");
     }
@@ -1756,7 +1956,10 @@ mod tests {
         sm2.get_or_create("s1").await.unwrap();
         let msgs = sm2.get_messages("s1").await;
         assert_eq!(msgs.len(), 1);
-        if let Message::User { runtime_content, .. } = &msgs[0] {
+        if let Message::User {
+            runtime_content, ..
+        } = &msgs[0]
+        {
             assert!(runtime_content.is_none());
         }
     }
@@ -1787,15 +1990,26 @@ mod tests {
 
         // Simulate ContextBuilder setting runtime_content
         if let Some(msg) = sm.sessions.get_mut("s1").unwrap().current_turn.first_mut() {
-            if let Message::User { runtime_content, .. } = msg {
+            if let Message::User {
+                runtime_content, ..
+            } = msg
+            {
                 *runtime_content = Some("runtime context here".to_string());
             }
         }
 
         // Verify it's set
         let session = sm.sessions.get("s1").unwrap();
-        if let Message::User { runtime_content, .. } = &session.current_turn[0] {
-            assert!(runtime_content.as_ref().unwrap().contains("runtime context"));
+        if let Message::User {
+            runtime_content, ..
+        } = &session.current_turn[0]
+        {
+            assert!(
+                runtime_content
+                    .as_ref()
+                    .unwrap()
+                    .contains("runtime context")
+            );
         }
 
         // Persist
@@ -1803,9 +2017,12 @@ mod tests {
 
         // After persist, runtime_content should be None in memory
         let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.current_turn.len(), 0);  // merged into history
+        assert_eq!(session.current_turn.len(), 0); // merged into history
         assert_eq!(session.history.len(), 1);
-        if let Message::User { runtime_content, .. } = &session.history[0] {
+        if let Message::User {
+            runtime_content, ..
+        } = &session.history[0]
+        {
             assert!(runtime_content.is_none());
         }
 
