@@ -526,11 +526,9 @@ pub struct SessionMeta {
 #[allow(dead_code)]
 pub struct Session {
     pub id: String,
-    pub messages: Vec<Message>,
+    pub history: Arc<[Message]>,       // Persisted, clean messages (immutable, zero-clone share)
+    pub current_turn: Vec<Message>,    // Current turn buffer (may have runtime_content)
     meta: SessionMeta,
-    /// Index into messages: messages before this index have been flushed to disk.
-    /// After consolidation, this is set to remaining message count (already on disk).
-    last_persisted_idx: usize,
 }
 
 impl Session {
@@ -560,8 +558,8 @@ impl Session {
     /// Keeps the previous ratio if there are no messages to measure against.
     pub fn update_token_ratio(&mut self, prompt_tokens: u32) {
         let total_chars: usize = self
-            .messages
-            .iter()
+            .history.iter()
+            .chain(self.current_turn.iter())
             .map(message_content_chars)
             .sum();
         if total_chars > 0 && prompt_tokens > 0 {
@@ -744,15 +742,14 @@ impl SessionManager {
         if max_loaded_id >= next_id {
             next_id = max_loaded_id + 1;
         }
-        let loaded_count = messages.len();
 
         self.sessions.insert(
             session_id.to_string(),
             Session {
                 id: session_id.to_string(),
-                messages,
+                history: Arc::from(messages),
+                current_turn: Vec::new(),
                 meta: meta.unwrap_or(SessionMeta { last_consolidated_id, next_message_id: next_id, char_per_token_ratio, last_summary }),
-                last_persisted_idx: loaded_count, // all loaded messages are already on disk
             },
         );
         self.runners.insert(session_id.to_string(), SessionRunner::new());
@@ -768,19 +765,40 @@ impl SessionManager {
     }
 
     pub async fn add_message(&mut self, session_id: &str, mut msg: Message) -> Result<()> {
+        // Defensive: strip runtime_content (should only be set by ContextBuilder, never from external)
+        if let Message::User { runtime_content, .. } = &mut msg {
+            *runtime_content = None;
+        }
+
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
         assign_message_id(&mut msg, &mut session.meta.next_message_id);
-        session.messages.push(msg);
+        session.current_turn.push(msg);
         Ok(())
     }
 
     pub async fn get_messages(&self, session_id: &str) -> Vec<Message> {
         self.sessions
             .get(session_id)
-            .map(|s| s.messages.clone())
+            .map(|s| s.history.iter().chain(s.current_turn.iter()).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Clone the history Arc — O(1) ref count increment.
+    pub fn get_history_arc(&self, session_id: &str) -> Arc<[Message]> {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.history.clone())
+            .unwrap_or_default()
+    }
+
+    /// Clone current turn messages — O(turn_size), small.
+    pub fn get_current_turn_messages(&self, session_id: &str) -> Vec<Message> {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.current_turn.clone())
             .unwrap_or_default()
     }
 
@@ -788,7 +806,10 @@ impl SessionManager {
     pub fn get_session_data(&self, session_id: &str) -> Option<SessionData> {
         let session = self.sessions.get(session_id)?;
         Some(SessionData {
-            messages: session.messages.clone(),
+            messages: session.history.iter()
+                .chain(session.current_turn.iter())
+                .cloned()
+                .collect(),
             char_per_token_ratio: session.char_per_token_ratio(),
             last_consolidated_id: session.last_consolidated_id(),
         })
@@ -799,11 +820,22 @@ impl SessionManager {
     /// and the persist offset is set to the remaining message count (already on disk).
     pub async fn update_consolidation_cursor(&mut self, session_id: &str, new_cursor_id: usize) {
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.update_consolidated_id(new_cursor_id);
-            session.messages.retain(|m| m.id() > new_cursor_id);
-            session.last_persisted_idx = session.messages.len();
+            // Merge current_turn into history before consolidation
+            if !session.current_turn.is_empty() {
+                let mut merged = session.history.to_vec();
+                merged.append(&mut session.current_turn);
+                session.history = Arc::from(merged);
+            }
+            // Update consolidated ID before filtering (we lose the old messages)
+            session.meta.last_consolidated_id = new_cursor_id;
+            // Remove consolidated messages from history
+            session.history = Arc::from(
+                session.history.iter()
+                    .filter(|m| m.id() > new_cursor_id)
+                    .cloned()
+                    .collect::<Vec<Message>>()
+            );
         }
-        // Save meta after releasing the mutable borrow
         self.save_session_meta(session_id);
     }
 
@@ -830,8 +862,8 @@ impl SessionManager {
     /// Clear all messages and reset consolidation state for a session.
     pub fn clear_session(&mut self, session_id: &str) -> bool {
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.messages.clear();
-            session.last_persisted_idx = 0;
+            session.history = Arc::from([]);
+            session.current_turn.clear();
             session.meta.last_consolidated_id = 0;
             session.meta.last_summary = None;
             true
@@ -845,10 +877,7 @@ impl SessionManager {
     /// Does NOT persist — the caller decides whether to persist.
     pub async fn truncate_messages(&mut self, session_id: &str, new_len: usize) {
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.messages.truncate(new_len);
-            if session.last_persisted_idx > new_len {
-                session.last_persisted_idx = new_len;
-            }
+            session.current_turn.truncate(new_len);
         }
     }
 
@@ -856,7 +885,7 @@ impl SessionManager {
     pub fn message_count(&self, session_id: &str) -> usize {
         self.sessions
             .get(session_id)
-            .map(|s| s.messages.len())
+            .map(|s| s.current_turn.len())
             .unwrap_or(0)
     }
 
@@ -904,43 +933,51 @@ impl SessionManager {
     pub fn sync_all_meta(&self) {
         for session_id in self.sessions.keys() {
             self.save_session_meta(session_id);
-            // Sync the session's message JSONL file.
-            let jsonl_path = self.session_dir.join(format!("{}.jsonl", session_id));
-            if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&jsonl_path) {
-                let _ = file.sync_all();
-            }
         }
-        // Sync the session directory to ensure all files are durable.
         if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(&self.session_dir) {
             let _ = dir.sync_all();
         }
     }
 
     pub async fn persist(&mut self, session_id: &str) -> Result<()> {
-        let session = self
+        // Check if there's anything to persist
+        let has_pending = self
             .sessions
             .get(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
-        let pending = &session.messages[session.last_persisted_idx..];
-        let pending_count = pending.len();
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?
+            .current_turn
+            .len();
 
-        if pending_count > 0 {
-            let path = self.session_dir.join(format!("{}.jsonl", session_id));
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            for msg in pending {
-                let line = serde_json::to_string(msg)?;
-                writeln!(file, "{}", line)?;
+        if has_pending == 0 {
+            return Ok(());
+        }
+
+        // Strip runtime_content from current_turn messages before persisting
+        let session = self.sessions.get_mut(session_id).unwrap();
+        for msg in &mut session.current_turn {
+            if let Message::User { runtime_content, .. } = msg {
+                *runtime_content = None;
             }
-            file.flush()?;
         }
 
-        // Update offset and persist meta
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session.last_persisted_idx = session.messages.len();
+        // Append current_turn to JSONL
+        let path = self.session_dir.join(format!("{}.jsonl", session_id));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        for msg in &session.current_turn {
+            let line = serde_json::to_string(msg)?;
+            writeln!(file, "{}", line)?;
         }
+        file.flush()?;
+
+        // Merge current_turn into history Arc
+        let session = self.sessions.get_mut(session_id).unwrap();
+        let mut merged = session.history.to_vec();
+        merged.append(&mut session.current_turn);
+        session.history = Arc::from(merged);
+
         self.save_session_meta(session_id);
 
         Ok(())
@@ -1018,9 +1055,9 @@ mod tests {
         sm.add_message("s1", user_msg("another")).await.unwrap();
 
         let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.messages[0].id(), 1);
-        assert_eq!(session.messages[1].id(), 2);
-        assert_eq!(session.messages[2].id(), 3);
+        assert_eq!(session.current_turn[0].id(), 1);
+        assert_eq!(session.current_turn[1].id(), 2);
+        assert_eq!(session.current_turn[2].id(), 3);
         assert_eq!(session.next_message_id(), 4);
     }
 
@@ -1067,19 +1104,19 @@ mod tests {
         sm.add_message("s1", assistant_msg("d")).await.unwrap();   // id=4
         sm.persist("s1").await.unwrap();
 
-        // Verify all 4 messages in memory
+        // Verify all 4 messages in history after persist
         let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.messages.len(), 4);
-        assert_eq!(session.last_persisted_idx, 4);
+        assert_eq!(session.history.len(), 4);
+        assert!(session.current_turn.is_empty());
 
-        // Consolidate first 2 messages (by id) — they should be physically removed
+        // Consolidate first 2 messages (by id) — they should be physically removed from history
         sm.update_consolidation_cursor("s1", 2).await;
 
         let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].id(), 3);
-        assert_eq!(session.messages[1].id(), 4);
-        assert_eq!(session.last_persisted_idx, 2); // remaining messages already on disk
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(session.history[0].id(), 3);
+        assert_eq!(session.history[1].id(), 4);
+        assert!(session.current_turn.is_empty());
 
         // Persist: nothing new to write, JSONL still has 4 lines
         sm.persist("s1").await.unwrap();
@@ -1090,9 +1127,9 @@ mod tests {
         let mut sm2 = SessionManager::new(session_dir).unwrap();
         let session = sm2.get_or_create("s1").await.unwrap();
         assert_eq!(session.last_consolidated_id(), 2);
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].id(), 3);
-        assert_eq!(session.messages[1].id(), 4);
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(session.history[0].id(), 3);
+        assert_eq!(session.history[1].id(), 4);
 
         // get_messages returns all remaining messages (no filtering needed)
         let msgs = sm2.get_messages("s1").await;
@@ -1149,45 +1186,6 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].id(), 0);
         assert_eq!(msgs[1].id(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_persisted_idx_tracks_slice_offset() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
-        sm.get_or_create("s1").await.unwrap();
-
-        // Fresh session: nothing to persist yet
-        let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.last_persisted_idx, 0);
-
-        // Add messages
-        sm.add_message("s1", user_msg("a")).await.unwrap();
-        sm.add_message("s1", user_msg("b")).await.unwrap();
-        let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.last_persisted_idx, 0); // not yet persisted
-
-        // First persist: writes 2 messages
-        sm.persist("s1").await.unwrap();
-        let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.last_persisted_idx, 2); // now points past last message
-
-        // Add one more message
-        sm.add_message("s1", user_msg("c")).await.unwrap();
-        let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.messages.len(), 3);
-        assert_eq!(session.last_persisted_idx, 2); // unchanged
-
-        // Second persist: should only append message "c" (idx 2..3)
-        sm.persist("s1").await.unwrap();
-        let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.last_persisted_idx, 3);
-
-        // JSONL should have exactly 3 lines
-        let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
-        assert_eq!(jsonl.lines().count(), 3);
     }
 
     #[tokio::test]
@@ -1271,16 +1269,16 @@ mod tests {
         sm.persist("s1").await.unwrap();
 
         let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.messages.len(), 4);
-        assert_eq!(session.last_persisted_idx, 4);
+        assert_eq!(session.history.len(), 4);
+        assert!(session.current_turn.is_empty());
 
-        // Consolidate first 2 — messages removed, persist offset set to remaining count
+        // Consolidate first 2 — messages removed from history, current_turn stays empty
         sm.update_consolidation_cursor("s1", 2).await;
         let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.last_persisted_idx, 2); // remaining messages already on disk
+        assert_eq!(session.history.len(), 2);
+        assert!(session.current_turn.is_empty());
 
-        // Persist should NOT write any new lines (nothing changed since consolidation)
+        // Persist should be a no-op (nothing in current_turn)
         sm.persist("s1").await.unwrap();
         let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
         assert_eq!(jsonl.lines().count(), 4);
@@ -1307,15 +1305,14 @@ mod tests {
 
         // Consolidate a (id=1)
         sm.update_consolidation_cursor("s1", 1).await;
-        assert_eq!(sm.sessions.get("s1").unwrap().messages.len(), 1); // only "b"
-        // last_persisted_idx set to 1 (remaining messages already on disk)
-        assert_eq!(sm.sessions.get("s1").unwrap().last_persisted_idx, 1);
+        assert_eq!(sm.sessions.get("s1").unwrap().history.len(), 1); // only "b" in history
+        assert!(sm.sessions.get("s1").unwrap().current_turn.is_empty());
 
         // Add new message
         sm.add_message("s1", user_msg("c")).await.unwrap();
-        assert_eq!(sm.sessions.get("s1").unwrap().messages.len(), 2);
+        assert_eq!(sm.sessions.get("s1").unwrap().current_turn.len(), 1);
 
-        // Persist: should only append c (index 1..2) — b is already on disk
+        // Persist: should only append c — b is already on disk
         sm.persist("s1").await.unwrap();
         let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
         assert_eq!(jsonl.lines().count(), 3); // a, b, c
@@ -1353,13 +1350,13 @@ mod tests {
         let mut sm = SessionManager::new(session_dir).unwrap();
         sm.get_or_create("s1").await.unwrap();
 
-        // Only messages with id > 2 should be loaded into memory
+        // Only messages with id > 2 should be loaded into history
         let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].id(), 3);
-        assert_eq!(session.messages[1].id(), 4);
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(session.history[0].id(), 3);
+        assert_eq!(session.history[1].id(), 4);
         assert_eq!(session.last_consolidated_id(), 2);
-        assert_eq!(session.last_persisted_idx, 2); // loaded messages already on disk, nothing new to append
+        assert!(session.current_turn.is_empty()); // loaded messages already on disk
     }
 
     #[tokio::test]
@@ -1662,15 +1659,17 @@ mod tests {
         sm.add_message("s1", user_msg("c")).await.unwrap();
         assert_eq!(sm.message_count("s1"), 3);
 
-        // Truncate to 1 message
+        // Truncate to 1 message (current_turn only)
         sm.truncate_messages("s1", 1).await;
         assert_eq!(sm.message_count("s1"), 1);
         let msgs = sm.get_messages("s1").await;
+        assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::User { content, .. } if content.as_text() == "a"));
 
         // Truncate to 0
         sm.truncate_messages("s1", 0).await;
         assert_eq!(sm.message_count("s1"), 0);
+        assert!(sm.get_messages("s1").await.is_empty());
 
         // Truncate non-existent session should not panic
         sm.truncate_messages("nonexistent", 0).await;
