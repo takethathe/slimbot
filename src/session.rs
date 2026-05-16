@@ -210,6 +210,8 @@ pub enum Message {
         #[serde(flatten)]
         meta: MessageMeta,
         content: Content,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_content: Option<String>,
     },
     Assistant {
         #[serde(flatten)]
@@ -253,6 +255,7 @@ impl Message {
         Message::User {
             meta: MessageMeta { id: 0, timestamp: String::new() },
             content: Content::Plain(content),
+            runtime_content: None,
         }
     }
 
@@ -996,7 +999,7 @@ mod tests {
     use super::*;
 
     fn user_msg(content: &str) -> Message {
-        Message::User { meta: MessageMeta { id: 0, timestamp: String::new() }, content: Content::Plain(content.to_string()) }
+        Message::User { meta: MessageMeta { id: 0, timestamp: String::new() }, content: Content::Plain(content.to_string()), runtime_content: None }
     }
 
     fn assistant_msg(content: &str) -> Message {
@@ -1546,7 +1549,7 @@ mod tests {
 
     #[test]
     fn test_frontend_message_from_message() {
-        let user = Message::User { meta: MessageMeta { id: 1, timestamp: String::new() }, content: Content::Plain("hello".to_string()) };
+        let user = Message::User { meta: MessageMeta { id: 1, timestamp: String::new() }, content: Content::Plain("hello".to_string()), runtime_content: None };
         let fm = FrontendMessage::from_message(&user);
         assert!(fm.is_some());
         assert!(matches!(fm.unwrap(), FrontendMessage::User { content } if content == "hello"));

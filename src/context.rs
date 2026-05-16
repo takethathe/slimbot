@@ -265,6 +265,7 @@ impl ContextBuilder {
         messages.push(Message::User {
             meta: MessageMeta::default(),
             content: merged_content,
+            runtime_content: None,
         });
 
         // Merge with last existing user message if same role
@@ -342,6 +343,7 @@ impl ContextBuilder {
                         messages[len - 2] = Message::User {
                             meta: MessageMeta::default(),
                             content: merged,
+                            runtime_content: None,
                         };
                     }
                 }
