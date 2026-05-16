@@ -901,23 +901,18 @@ impl SessionManager {
     /// and the persist offset is set to the remaining message count (already on disk).
     pub async fn update_consolidation_cursor(&mut self, session_id: &str, new_cursor_id: usize) {
         if let Some(session) = self.sessions.get_mut(session_id) {
-            // Merge current_turn into history before consolidation
-            if !session.current_turn.is_empty() {
-                let mut merged = session.history.to_vec();
-                merged.append(&mut session.current_turn);
-                session.history = Arc::from(merged);
-            }
-            // Update consolidated ID before filtering (we lose the old messages)
+            // Merge current_turn into history, then filter out consolidated messages in one pass.
+            let merged: Vec<Message> = session
+                .history
+                .iter()
+                .chain(session.current_turn.iter())
+                .filter(|m| m.id() > new_cursor_id)
+                .cloned()
+                .collect();
+            session.history = Arc::from(merged);
+            session.current_turn.clear();
+            // Update consolidated ID after filtering
             session.meta.last_consolidated_id = new_cursor_id;
-            // Remove consolidated messages from history
-            session.history = Arc::from(
-                session
-                    .history
-                    .iter()
-                    .filter(|m| m.id() > new_cursor_id)
-                    .cloned()
-                    .collect::<Vec<Message>>(),
-            );
         }
         self.save_session_meta(session_id);
     }

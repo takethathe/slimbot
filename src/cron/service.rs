@@ -196,6 +196,9 @@ pub fn compute_next_run(schedule: &CronSchedule, now_ms: i64) -> Option<i64> {
 fn compute_next_cron(expr: &str, _now_ms: i64) -> Option<i64> {
     use cron::Schedule;
     use std::str::FromStr;
+    // Note: timezone-aware cron expressions are accepted for backward
+    // compatibility but resolved in UTC. Implementing full tz support
+    // would require the `chrono-tz` crate.
     match Schedule::from_str(expr) {
         Ok(schedule) => schedule
             .upcoming(chrono::Utc)

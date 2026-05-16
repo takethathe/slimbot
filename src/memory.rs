@@ -95,42 +95,10 @@ impl MemoryStore {
 
     /// Sync all memory files to disk (fsync). Called during shutdown.
     pub fn sync_all(&self) -> Result<()> {
-        // Sync history file
-        if self.history_file.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&self.history_file)
-            {
-                let _ = file.sync_all();
-            }
-        }
-        // Sync cursor file
-        if self.cursor_file.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&self.cursor_file)
-            {
-                let _ = file.sync_all();
-            }
-        }
-        // Sync dream cursor file
-        if self.dream_cursor_file.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&self.dream_cursor_file)
-            {
-                let _ = file.sync_all();
-            }
-        }
-        // Sync MEMORY.md
-        if self.memory_file.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&self.memory_file)
-            {
-                let _ = file.sync_all();
-            }
-        }
+        sync_if_exists(&self.history_file, true)?;
+        sync_if_exists(&self.cursor_file, false)?;
+        sync_if_exists(&self.dream_cursor_file, false)?;
+        sync_if_exists(&self.memory_file, false)?;
         // Sync the memory directory
         if let Ok(dir) = std::fs::OpenOptions::new()
             .read(true)
@@ -276,6 +244,18 @@ impl MemoryStore {
         }
         None
     }
+}
+
+/// Open a file if it exists and call fsync.
+fn sync_if_exists(path: &Path, append: bool) -> std::io::Result<()> {
+    if path.exists() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(append)
+            .open(path)?;
+        let _ = file.sync_all();
+    }
+    Ok(())
 }
 
 fn read_file_or_empty(path: &Path) -> String {

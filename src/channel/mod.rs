@@ -178,7 +178,7 @@ impl ChannelManager {
                     .extra
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<serde_json::Map<_, _>>(),
+                    .collect(),
             );
             let channel = factory.create(&config_value)?;
             let id = channel.id().to_string();
