@@ -80,7 +80,7 @@ impl std::fmt::Display for LLMResponse {
 pub trait Provider: Send + Sync {
     async fn chat(
         &self,
-        messages: &[Message],
+        messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<LLMResponse>;
 }

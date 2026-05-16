@@ -138,8 +138,8 @@ impl Consolidator {
             .provider
             .chat(
                 &[
-                    Message::system(system_prompt),
-                    Message::user(formatted),
+                    &Message::system(system_prompt),
+                    &Message::user(formatted),
                 ],
                 None,
             )

@@ -315,7 +315,7 @@ impl AgentRunner {
             }
             let response = match self
                 .provider
-                .chat(&ctx.messages, ctx.tools.as_deref())
+                .chat(&ctx.messages.iter().collect::<Vec<_>>(), ctx.tools.as_deref())
                 .await
             {
                 Ok(r) => r,
@@ -645,7 +645,7 @@ mod tests {
     impl Provider for MockProvider {
         async fn chat(
             &self,
-            _messages: &[Message],
+            _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
         ) -> Result<LLMResponse> {
             let idx = self
@@ -742,7 +742,7 @@ mod tests {
     impl Provider for CancellingProvider {
         async fn chat(
             &self,
-            messages: &[Message],
+            messages: &[&Message],
             tools: Option<&[ToolDefinition]>,
         ) -> Result<LLMResponse> {
             let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -761,7 +761,7 @@ mod tests {
     impl Provider for FailingProvider {
         async fn chat(
             &self,
-            _messages: &[Message],
+            _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
         ) -> Result<LLMResponse> {
             Err(anyhow::anyhow!("Simulated LLM API failure"))

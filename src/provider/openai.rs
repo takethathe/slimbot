@@ -97,7 +97,7 @@ struct ApiFunction {
 impl crate::provider::Provider for OpenAIProvider {
     async fn chat(
         &self,
-        messages: &[Message],
+        messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<LLMResponse> {
         debug!("[OpenAIProvider] POST {} (model={}, messages={}, tools={})",
@@ -105,7 +105,7 @@ impl crate::provider::Provider for OpenAIProvider {
 
         // Find the index of the last system message for cache_control injection
         let last_system_idx = messages.iter().enumerate().rev().find_map(|(i, m)| {
-            matches!(m, Message::System { .. }).then_some(i)
+            matches!(**m, Message::System { .. }).then_some(i)
         });
 
         let api_messages: Vec<serde_json::Value> = messages
@@ -113,8 +113,8 @@ impl crate::provider::Provider for OpenAIProvider {
             .enumerate()
             .map(|(i, m)| {
                 let is_cache_target = self.config.prompt_cache_enabled && Some(i) == last_system_idx;
-                match m {
-                    Message::System { content, .. } => {
+                match **m {
+                    Message::System { ref content, .. } => {
                         let mut obj = serde_json::json!({"role": "system", "content": content});
                         if is_cache_target {
                             obj["content"] = serde_json::json!([
@@ -123,14 +123,26 @@ impl crate::provider::Provider for OpenAIProvider {
                         }
                         obj
                     }
-                    Message::User { content, .. } => {
-                        serde_json::json!({"role": "user", "content": content.to_openai_value()})
+                    Message::User { ref content, ref runtime_content, .. } => {
+                        let mut json_content = content.to_openai_value();
+                        if let Some(ctx) = runtime_content {
+                            match &mut json_content {
+                                serde_json::Value::String(s) => {
+                                    *s = format!("{}\n\n{}", ctx, s);
+                                }
+                                serde_json::Value::Array(arr) => {
+                                    arr.insert(0, serde_json::json!({"type": "text", "text": ctx}));
+                                }
+                                _ => {}
+                            }
+                        }
+                        serde_json::json!({"role": "user", "content": json_content})
                     }
                     Message::Assistant {
-                        content,
-                        tool_calls,
-                        reasoning_content,
-                        thinking_blocks,
+                        ref content,
+                        ref tool_calls,
+                        ref reasoning_content,
+                        ref thinking_blocks,
                         ..
                     } => {
                         let mut obj = serde_json::json!({"role": "assistant"});
@@ -164,9 +176,9 @@ impl crate::provider::Provider for OpenAIProvider {
                         obj
                     }
                     Message::Tool {
-                        content,
-                        tool_call_id,
-                        name,
+                        ref content,
+                        ref tool_call_id,
+                        ref name,
                         ..
                     } => {
                         let mut obj = serde_json::json!({
