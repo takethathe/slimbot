@@ -1,10 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crate::bootstrap::{bootstrap_files, read_if_modified};
 use crate::memory::SharedMemoryStore;
-use crate::session::{Content, ContentBlock, Message, MessageMeta, SharedSessionManager, parse_session_origin};
+use crate::session::{Content, ContentBlock, Message, MessageMeta, SharedSessionManager};
 use crate::tool::{ToolDefinition, ToolManager};
 use crate::debug;
 
@@ -16,10 +15,6 @@ const RUNTIME_CONTEXT_END: &str = "[/Runtime Context]";
 const PLATFORM_POLICY_POSIX: &str = "## Platform Policy (POSIX)\n- You are running on a POSIX system. Prefer UTF-8 and standard shell tools.\n- Use file tools when they are simpler or more reliable than shell commands.";
 
 const PLATFORM_POLICY_WINDOWS: &str = "## Platform Policy (Windows)\n- You are running on Windows. Do not assume GNU tools like `grep`, `sed`, or `awk` exist.\n- Prefer Windows-native commands or file tools when they are more reliable.\n- If terminal output is garbled, retry with UTF-8 output enabled.";
-
-fn base64_encode(data: &[u8]) -> String {
-    STANDARD.encode(data)
-}
 
 /// Build a transient runtime context string (time, channel, chat_id, session summary).
 fn build_runtime_context(channel: &str, chat_id: &str, session_summary: Option<&str>) -> String {
@@ -39,19 +34,10 @@ fn build_runtime_context(channel: &str, chat_id: &str, session_summary: Option<&
     format!("{}\n{}\n{}", RUNTIME_CONTEXT_TAG, lines.join("\n"), RUNTIME_CONTEXT_END)
 }
 
-/// Merge two content strings. If either is empty, return the other; otherwise concatenate with blank line separator.
-fn merge_content(left: &str, right: &str) -> String {
-    if left.is_empty() {
-        right.to_string()
-    } else if right.is_empty() {
-        left.to_string()
-    } else {
-        format!("{}\n\n{}", left, right)
-    }
-}
-
 pub struct RunContext {
-    pub messages: Vec<Message>,
+    pub history: Arc<[Message]>,
+    pub current_turn: Vec<Message>,
+    pub system_message: Message,
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
@@ -219,94 +205,44 @@ impl ContextBuilder {
         }
     }
 
-    /// Build the complete message list for an LLM call.
+    /// Build the complete message list for an LLM call using two-list approach.
     pub async fn build_messages(
         &self,
         session_id: &str,
-        current_message: String,
         channel: &str,
         chat_id: &str,
         session_summary: Option<&str>,
-        media: Option<&[String]>,
     ) -> RunContext {
         debug!("[ContextBuilder] Starting build_messages for session={}", session_id);
 
-        // Build system prompt and prepend it as the first message
+        // Build system prompt
         let system_prompt = self.build_system_prompt(channel).await;
-        let mut messages = vec![Message::system(system_prompt)];
+        let system_message = Message::system(system_prompt);
 
-        // Build user content with optional media
-        let user_content = Self::build_user_content(&current_message, media);
-
-        // Build runtime context
-        let runtime_ctx = build_runtime_context(channel, chat_id, session_summary);
-
-        // Merge runtime context with user content
-        let merged_content = match user_content {
-            Content::Plain(text) => {
-                let merged = merge_content(&runtime_ctx, &text);
-                Content::Plain(merged)
-            }
-            Content::Multi(mut blocks) => {
-                blocks.insert(0, ContentBlock::Text { text: runtime_ctx });
-                Content::Multi(blocks)
-            }
-        };
-
-        // Get session messages and extend
-        let session_messages = {
+        // Get history Arc and current_turn Vec from SessionManager
+        let (history, mut current_turn) = {
             let sm = self.session_manager.lock().await;
-            sm.get_messages(session_id).await
+            (sm.get_history_arc(session_id), sm.get_current_turn_messages(session_id))
         };
-        debug!("[ContextBuilder] Session messages count={}", session_messages.len());
-        messages.extend(session_messages);
 
-        // Append current user message
-        messages.push(Message::User {
-            meta: MessageMeta::default(),
-            content: merged_content,
-            runtime_content: None,
-        });
+        // Build runtime context and set on first user message in current_turn that doesn't have it
+        let runtime_ctx = build_runtime_context(channel, chat_id, session_summary);
+        for msg in &mut current_turn {
+            if let Message::User { runtime_content, .. } = msg {
+                if runtime_content.is_none() {
+                    *runtime_content = Some(runtime_ctx);
+                    break;
+                }
+            }
+        }
 
-        // Merge with last existing user message if same role
-        Self::merge_consecutive_user_messages(&mut messages);
+        // Merge consecutive user messages at the end
+        Self::merge_consecutive_user_messages(&mut current_turn);
 
         let tools = Some(self.tool_manager.to_openai_functions());
         debug!("[ContextBuilder] Tools count={}", tools.as_ref().map(|t| t.len()).unwrap_or(0));
 
-        RunContext { messages, tools }
-    }
-
-    /// Build user content with optional media attachments.
-    fn build_user_content(text: &str, media: Option<&[String]>) -> Content {
-        match media {
-            None | Some([]) => Content::Plain(text.to_string()),
-            Some(paths) => {
-                let mut blocks: Vec<ContentBlock> = Vec::new();
-                for path in paths {
-                    if let Ok(raw) = std::fs::read(path) {
-                        if let Some(mime) = Self::detect_image_mime(&raw) {
-                            blocks.push(ContentBlock::Image { mime_type: mime.to_string(), base64_data: base64_encode(&raw) });
-                        }
-                    }
-                }
-                if blocks.is_empty() {
-                    Content::Plain(text.to_string())
-                } else {
-                    blocks.push(ContentBlock::Text { text: text.to_string() });
-                    Content::Multi(blocks)
-                }
-            }
-        }
-    }
-
-    /// Detect image MIME type from magic bytes.
-    fn detect_image_mime(raw: &[u8]) -> Option<&'static str> {
-        if raw.starts_with(&[0x89, 0x50, 0x4E, 0x47]) { Some("image/png") }
-        else if raw.starts_with(&[0xFF, 0xD8, 0xFF]) { Some("image/jpeg") }
-        else if raw.starts_with(b"GIF8") { Some("image/gif") }
-        else if raw.starts_with(b"RIFF") && raw.len() > 8 && &raw[8..12] == b"WEBP" { Some("image/webp") }
-        else { None }
+        RunContext { history, current_turn, system_message, tools }
     }
 
     /// Merge consecutive User messages at the end of the list to avoid same-role rejection.
@@ -315,13 +251,12 @@ impl ContextBuilder {
         if len >= 2 {
             if matches!(messages[len - 2], Message::User { .. }) && matches!(messages[len - 1], Message::User { .. }) {
                 let last = messages.pop().unwrap();
-                if let Message::User { content: last_content, .. } = last {
-                    // Take out the second-to-last message, merge, and put it back.
+                if let Message::User { content: last_content, runtime_content: last_runtime, .. } = last {
                     let prev = std::mem::replace(
                         &mut messages[len - 2],
                         Message::user("__temp__".to_string()),
                     );
-                    if let Message::User { content: prev_content, .. } = prev {
+                    if let Message::User { content: prev_content, runtime_content: prev_runtime, .. } = prev {
                         let merged = match (prev_content, last_content) {
                             (Content::Plain(a), Content::Plain(b)) => Content::Plain(format!("{}\n\n{}", a, b)),
                             (Content::Plain(a), Content::Multi(b)) => {
@@ -340,10 +275,11 @@ impl ContextBuilder {
                                 Content::Multi(blocks)
                             }
                         };
+                        let runtime = prev_runtime.or(last_runtime);
                         messages[len - 2] = Message::User {
                             meta: MessageMeta::default(),
                             content: merged,
-                            runtime_content: None,
+                            runtime_content: runtime,
                         };
                     }
                 }
@@ -359,91 +295,6 @@ impl ContextBuilder {
         result: String,
     ) {
         messages.push(Message::tool(result, tool_call_id, Some(tool_name)));
-    }
-
-    /// Legacy compatibility wrapper.
-    pub async fn build(&self, session_id: &str, channel_inject: Option<String>, session_summary: Option<&str>, origin_channel: Option<&str>, origin_chat_id: Option<&str>) -> RunContext {
-        debug!("[ContextBuilder] Starting build for session={}", session_id);
-        let (channel, chat_id) = parse_session_origin(session_id, (origin_channel, origin_chat_id));
-        let channel_str = channel.clone();
-
-        let mut system_parts: Vec<String> = Vec::new();
-
-        // 1. Identity block
-        let workspace_path_str = self.workspace_dir.to_string_lossy().to_string();
-        system_parts.push(Self::build_identity(&workspace_path_str, channel_inject.as_deref().unwrap_or("")));
-
-        // 2. Bootstrap workspace files
-        for (filename, template) in bootstrap_files() {
-            let path = self.workspace_dir.join(filename);
-            if let Some(content) = read_if_modified(&path, template) {
-                if !content.is_empty() {
-                    system_parts.push(format!("[{}] {}", filename, content));
-                }
-            }
-        }
-
-        // 3. Skills
-        self.load_skills_into_parts(&mut system_parts);
-
-        // 4. Memory (skip if matches template)
-        let ms = self.memory_store.lock().await;
-        let memory_content = ms.get_memory_context();
-        if !memory_content.is_empty() {
-            let raw_memory = ms.read_memory();
-            if !crate::bootstrap::is_template_content(&raw_memory, "memory/MEMORY.md") {
-                system_parts.push(memory_content);
-            }
-        }
-
-        // 5. Recent history
-        let recent_entries = ms.read_recent_history(50);
-        if !recent_entries.is_empty() {
-            let history_text = recent_entries
-                .iter()
-                .map(|e| format!("- [{}] {}", e.timestamp, e.content))
-                .collect::<Vec<_>>()
-                .join("\n");
-            system_parts.push(format!("# Recent History\n\n{history_text}"));
-        }
-        drop(ms);
-
-        // 6. Channel self-injected info
-        if let Some(inject) = channel_inject {
-            if !inject.is_empty() {
-                system_parts.push(inject);
-            }
-        }
-
-        // Assemble system prompt
-        let system_prompt = system_parts.join("\n\n---\n\n");
-        debug!("[ContextBuilder] System prompt total len={}", system_prompt.len());
-        let mut all_messages = vec![Message::system(system_prompt)];
-
-        // Get session messages
-        let messages = {
-            let sm = self.session_manager.lock().await;
-            sm.get_messages(session_id).await
-        };
-        debug!("[ContextBuilder] Session messages count={}", messages.len());
-        all_messages.extend(messages);
-
-        // 7. Inject runtime context into the last user message
-        let runtime_ctx = build_runtime_context(&channel_str, &chat_id, session_summary);
-        if let Some(last_user_idx) = all_messages.iter().rposition(|m| matches!(m, Message::User { .. })) {
-            if let Message::User { content, .. } = &all_messages[last_user_idx] {
-                let merged = merge_content(content.as_text(), &runtime_ctx);
-                all_messages[last_user_idx] = Message::user(merged);
-            }
-        }
-
-        let tools = Some(self.tool_manager.to_openai_functions());
-        debug!("[ContextBuilder] Tools count={}", tools.as_ref().map(|t| t.len()).unwrap_or(0));
-
-        RunContext {
-            messages: all_messages,
-            tools,
-        }
     }
 
     // --- Static methods unchanged ---
@@ -582,17 +433,6 @@ Skill body.
     }
 
     #[test]
-    fn test_merge_content() {
-        assert_eq!(merge_content("", "hello"), "hello");
-        assert_eq!(merge_content("hello", ""), "hello");
-        assert_eq!(merge_content("", ""), "");
-        let result = merge_content("existing", "new");
-        assert!(result.contains("existing"));
-        assert!(result.contains("new"));
-        assert!(result.contains("\n\n"));
-    }
-
-    #[test]
     fn test_channel_format_hint_known() {
         assert!(ContextBuilder::channel_format_hint("telegram").contains("messaging app"));
         assert!(ContextBuilder::channel_format_hint("whatsapp").contains("plain text"));
@@ -629,37 +469,5 @@ Skill body.
         } else {
             panic!("expected Tool message");
         }
-    }
-
-    #[test]
-    fn test_build_user_content_no_media() {
-        let content = ContextBuilder::build_user_content("hello", None);
-        assert!(matches!(content, Content::Plain(_)));
-        if let Content::Plain(s) = content {
-            assert_eq!(s, "hello");
-        }
-    }
-
-    #[test]
-    fn test_build_user_content_missing_file() {
-        let content = ContextBuilder::build_user_content("hello", Some(&["/nonexistent.png".to_string()]));
-        assert!(matches!(content, Content::Plain(_)));
-    }
-
-    #[test]
-    fn test_detect_image_mime_png() {
-        let png_header = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        assert_eq!(ContextBuilder::detect_image_mime(&png_header), Some("image/png"));
-    }
-
-    #[test]
-    fn test_detect_image_mime_jpeg() {
-        let jpeg_header = vec![0xFF, 0xD8, 0xFF, 0xE0];
-        assert_eq!(ContextBuilder::detect_image_mime(&jpeg_header), Some("image/jpeg"));
-    }
-
-    #[test]
-    fn test_detect_image_mime_unknown() {
-        assert_eq!(ContextBuilder::detect_image_mime(b"hello world"), None);
     }
 }

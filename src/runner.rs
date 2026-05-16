@@ -290,20 +290,36 @@ impl AgentRunner {
                 sm.get_last_summary(session_id).await
             };
             let session_summary_ref = session_summary.as_deref();
+            let (channel, chat_id) = parse_session_origin(session_id, (self.origin_channel.as_deref(), self.origin_chat_id.as_deref()));
             let context_builder = ContextBuilder::new(
                 self.session_manager.clone(),
                 self.tool_manager.clone(),
                 self.workspace_dir.clone(),
                 self.memory_store.clone(),
             );
-            let mut ctx = context_builder
-                .build(session_id, self.channel_inject.clone(), session_summary_ref, self.origin_channel.as_deref(), self.origin_chat_id.as_deref())
+            let ctx = context_builder
+                .build_messages(session_id, &channel, &chat_id, session_summary_ref)
                 .await;
-            debug!("[AgentRunner] Context built: {} messages, tools={}", ctx.messages.len(), ctx.tools.as_ref().map(|t| t.len()).unwrap_or(0));
+
+            let history_len = ctx.history.len();
+            let current_turn_len = ctx.current_turn.len();
+            let tools_len = ctx.tools.as_ref().map(|t| t.len()).unwrap_or(0);
+
+            // Build owned Vec<Message> for governance operations (may insert backfill messages)
+            let mut all_messages: Vec<Message> = std::iter::once(ctx.system_message)
+                .chain(ctx.history.iter().cloned())
+                .chain(ctx.current_turn)
+                .collect();
+
+            debug!("[AgentRunner] Context built: history={}, current_turn={}, tools={}",
+                history_len, current_turn_len, tools_len);
 
             // History governance: clean orphans and backfill missing tool results
-            Self::drop_orphan_tool_results(&mut ctx.messages);
-            Self::backfill_missing_tool_results(&mut ctx.messages);
+            Self::drop_orphan_tool_results(&mut all_messages);
+            Self::backfill_missing_tool_results(&mut all_messages);
+
+            // Build Vec<&Message> for provider
+            let messages: Vec<&Message> = all_messages.iter().collect();
 
             // Request model
             debug!("[AgentRunner] Sending chat request to provider");
@@ -315,7 +331,7 @@ impl AgentRunner {
             }
             let response = match self
                 .provider
-                .chat(&ctx.messages.iter().collect::<Vec<_>>(), ctx.tools.as_deref())
+                .chat(&messages, ctx.tools.as_deref())
                 .await
             {
                 Ok(r) => r,
