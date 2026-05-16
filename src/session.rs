@@ -1046,8 +1046,9 @@ impl SessionManager {
             .len();
 
         if has_pending > 0 {
-            // Strip runtime_content from current_turn messages before persisting
             let session = self.sessions.get_mut(session_id).unwrap();
+
+            // Strip runtime_content from current_turn messages before persisting
             for msg in &mut session.current_turn {
                 if let Message::User {
                     runtime_content, ..
@@ -1070,7 +1071,6 @@ impl SessionManager {
             file.flush()?;
 
             // Merge current_turn into history Arc
-            let session = self.sessions.get_mut(session_id).unwrap();
             let mut merged = session.history.to_vec();
             merged.append(&mut session.current_turn);
             session.history = Arc::from(merged);
