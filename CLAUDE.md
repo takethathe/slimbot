@@ -12,6 +12,9 @@
 - **运行：** `cargo run -- setup` （初始化配置、目录和 bootstrap 文件），然后 `cargo run -- <config.json路径>` （默认 `~/.slimbot/config.json`）
 - **Gateway 模式：** `cargo run -- gateway` （启动 cron、heartbeat 和 enabled channels，包括 WebUI）
 - **快速检查：** `cargo check --message-format=json 2>/dev/null | jq -c 'select(.reason == "compiler-message") | {level: .message.level, location: (.message.spans[0] | "\(.file_name):\(.line_start)"), message: .message.message}'` （JSON 输出 + jq 压缩，仅保留诊断信息，减少 token 消耗）
+- **代码格式化：** `cargo fmt` / `cargo fmt -- --check` （提交前必须先运行）
+- **静态分析：** `cargo clippy` （lint 检查，提交前确保无新 warning）
+- **测试：** `cargo test` （提交前确保所有测试通过）
 - **Rust Edition：** 2024
 
 ## 目录结构
@@ -75,10 +78,11 @@ AgentLoop ── 初始化 Provider、ToolManager、SessionManager
    │
    ▼
 AgentRunner ── ReAct 循环
-   ├── ContextBuilder.build() → system prompt + 历史消息 + 工具定义
-   ├── Provider.chat() → LLM API 调用
+   ├── ContextBuilder.build_messages() → system prompt + 历史 Arc + 当前轮 Vec
+   │   └─ runtime_content 在 Message::User 上独立存储，仅 Provider 序列化时处理
+   ├── Provider.chat(&[&Message]) → LLM API 调用（引用传递，避免 clone）
    ├── ToolManager.execute() → 工具执行
-   └── SessionManager.persist() → JSONL 持久化
+   └─ SessionManager.persist() → append-only JSONL + meta 保存
    │
    ▼
 MessageBus ── 接收 BusRequest → 封装 SessionTask → 入队/出队 → 调用 AgentRunner
@@ -117,7 +121,8 @@ run_gateway()
     ├── cron/                       # Cron 持久化目录（gateway 模式）
     │   └── jobs.json               # 定时任务 JSON 存储
     └── sessions/
-        └── {session_id}.jsonl      # 会话消息持久化
+        ├── {session_id}.jsonl      # 会话消息持久化（append-only）
+        └── {session_id}.meta.json  # 会话元数据（cursor、ID、token ratio、summary）
 ```
 
 `data_dir` 和 `workspace_dir` 是两个独立配置项。`workspace_dir` 默认值为 `{data_dir}/workspace`。
@@ -128,9 +133,13 @@ run_gateway()
 
 - `SharedSessionManager` = `Arc<Mutex<SessionManager>>`，所有模块通过共享 Mutex 访问
 - `SessionTask` 绑定 `TaskHook`，通过 `tokio::sync::mpsc` 异步通知 Channel 状态变更
-- 消息持久化：每轮 AgentRunner 结束后全量写入 JSONL（非追加）
+- 消息持久化：append-only 写入 JSONL，meta 数据单独 `.meta.json` 文件
+- Session 双列表结构：`history: Arc<[Message]>`（已持久化，零拷贝共享）+ `current_turn: Vec<Message>`（本轮缓冲）
+- Provider 接收消息引用：`Provider::chat(&[&Message])` 避免 clone 开销
+- Consolidator：token 预算触发的会话摘要，在 user-turn 边界对齐，摘要通过 `MemoryStore` 追加到 `history.jsonl`
 - Session ID 格式：`{channel_id}:{chat_id}`
 - 循环结束条件：超出 `max_iterations` 或模型返回无 tool_calls
+- WorkerPool：全局异步线程池，用于 Session 任务并发执行
 
 ## 开发规范
 

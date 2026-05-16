@@ -266,7 +266,7 @@ If nothing noteworthy happened, output: (nothing)"
     /// Main entry: check token budget, archive old messages if prompt exceeds budget.
     /// Called after each ReAct turn completes.
     pub async fn maybe_consolidate(&self, session_id: &str, prompt_tokens: u32) -> Result<()> {
-        if self.context_window_tokens <= 0 {
+        if self.context_window_tokens == 0 {
             return Ok(());
         }
 
