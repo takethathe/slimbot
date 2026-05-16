@@ -1735,4 +1735,127 @@ mod tests {
         ]);
         assert_eq!(c.as_text(), "caption");
     }
+
+    #[tokio::test]
+    async fn test_runtime_content_not_serialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        sm.add_message("s1", user_msg("hello")).await.unwrap();
+        sm.persist("s1").await.unwrap();
+
+        // Read JSONL and verify no runtime_content field
+        let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
+        assert!(!jsonl.contains("runtime_content"));
+        assert!(jsonl.contains("hello"));
+
+        // Reload and verify
+        let mut sm2 = SessionManager::new(session_dir).unwrap();
+        sm2.get_or_create("s1").await.unwrap();
+        let msgs = sm2.get_messages("s1").await;
+        assert_eq!(msgs.len(), 1);
+        if let Message::User { runtime_content, .. } = &msgs[0] {
+            assert!(runtime_content.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_message_goes_to_current_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        sm.add_message("s1", user_msg("hello")).await.unwrap();
+
+        let session = sm.sessions.get("s1").unwrap();
+        assert_eq!(session.history.len(), 0);
+        assert_eq!(session.current_turn.len(), 1);
+        assert!(matches!(&session.current_turn[0], Message::User { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_persist_strips_runtime_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        sm.add_message("s1", user_msg("hello")).await.unwrap();
+
+        // Simulate ContextBuilder setting runtime_content
+        if let Some(msg) = sm.sessions.get_mut("s1").unwrap().current_turn.first_mut() {
+            if let Message::User { runtime_content, .. } = msg {
+                *runtime_content = Some("runtime context here".to_string());
+            }
+        }
+
+        // Verify it's set
+        let session = sm.sessions.get("s1").unwrap();
+        if let Message::User { runtime_content, .. } = &session.current_turn[0] {
+            assert!(runtime_content.as_ref().unwrap().contains("runtime context"));
+        }
+
+        // Persist
+        sm.persist("s1").await.unwrap();
+
+        // After persist, runtime_content should be None in memory
+        let session = sm.sessions.get("s1").unwrap();
+        assert_eq!(session.current_turn.len(), 0);  // merged into history
+        assert_eq!(session.history.len(), 1);
+        if let Message::User { runtime_content, .. } = &session.history[0] {
+            assert!(runtime_content.is_none());
+        }
+
+        // JSONL should not contain runtime_content
+        let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
+        assert!(!jsonl.contains("runtime context"));
+    }
+
+    #[tokio::test]
+    async fn test_get_history_arc_returns_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        sm.add_message("s1", user_msg("hello")).await.unwrap();
+        sm.persist("s1").await.unwrap();
+
+        // After persist, history should have the message
+        let arc = sm.get_history_arc("s1");
+        assert_eq!(arc.len(), 1);
+
+        // Multiple calls return independent Arc clones pointing to same data
+        let arc2 = sm.get_history_arc("s1");
+        assert_eq!(arc2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_messages_combines_both_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        // Add messages and persist (goes to history)
+        sm.add_message("s1", user_msg("old1")).await.unwrap();
+        sm.add_message("s1", assistant_msg("reply1")).await.unwrap();
+        sm.persist("s1").await.unwrap();
+
+        // Add new messages (stays in current_turn)
+        sm.add_message("s1", user_msg("new1")).await.unwrap();
+        sm.add_message("s1", assistant_msg("reply2")).await.unwrap();
+
+        // get_messages should return both lists
+        let msgs = sm.get_messages("s1").await;
+        assert_eq!(msgs.len(), 4);
+
+        // Verify split between history and current_turn
+        let session = sm.sessions.get("s1").unwrap();
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(session.current_turn.len(), 2);
+    }
 }
