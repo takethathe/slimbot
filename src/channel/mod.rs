@@ -120,11 +120,19 @@ impl ChannelManager {
         // Since we can't block here, use a best-effort approach via the config.
         for (name, entry) in &self.config.channels {
             if entry.enabled && name == "cli" {
-                let sid = format!("{}:{}", name, entry.extra.get("chat_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default"));
+                let sid = format!(
+                    "{}:{}",
+                    name,
+                    entry
+                        .extra
+                        .get("chat_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default")
+                );
                 session_id = sid;
-                prompt = entry.extra.get("prompt")
+                prompt = entry
+                    .extra
+                    .get("prompt")
                     .and_then(|v| v.as_str())
                     .unwrap_or("> ")
                     .to_string();
@@ -140,9 +148,15 @@ impl ChannelManager {
     }
 
     /// Register the webui channel factory (requires session_manager for chat listing).
-    pub fn register_webui_factory(&mut self, session_manager: SharedSessionManager, shutdown_tx: tokio::sync::broadcast::Sender<()>) {
-        let factory = WebuiChannelFactory::new(self.message_bus.clone(), session_manager, shutdown_tx);
-        self.factories.insert("webui".to_string(), Box::new(factory));
+    pub fn register_webui_factory(
+        &mut self,
+        session_manager: SharedSessionManager,
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    ) {
+        let factory =
+            WebuiChannelFactory::new(self.message_bus.clone(), session_manager, shutdown_tx);
+        self.factories
+            .insert("webui".to_string(), Box::new(factory));
     }
 
     /// Initialize channels from stored config entries.
@@ -155,8 +169,17 @@ impl ChannelManager {
             if !entry.enabled {
                 continue;
             }
-            let factory = self.factories.get(name).ok_or_else(|| anyhow::anyhow!("Unregistered channel type: {}", name))?;
-            let config_value = serde_json::Value::Object(entry.extra.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<serde_json::Map<_, _>>());
+            let factory = self
+                .factories
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Unregistered channel type: {}", name))?;
+            let config_value = serde_json::Value::Object(
+                entry
+                    .extra
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<serde_json::Map<_, _>>(),
+            );
             let channel = factory.create(&config_value)?;
             let id = channel.id().to_string();
             let session_id = channel.session_id();
@@ -177,7 +200,10 @@ impl ChannelManager {
             let handle = channel.start_with_scheduler(&self.io_scheduler);
             if handle.join_handle.is_some() {
                 let mut guard = self.io_handles.lock().await;
-                debug!("Started channel I/O: {} ({})", handle.channel_name, handle.session_id);
+                debug!(
+                    "Started channel I/O: {} ({})",
+                    handle.channel_name, handle.session_id
+                );
                 guard.insert(id.clone(), handle);
             }
         }
@@ -194,7 +220,10 @@ impl ChannelManager {
         self.shutdown_io();
         let handles = {
             let mut guard = self.io_handles.lock().await;
-            guard.drain().filter_map(|(_, mut h)| h.join_handle.take()).collect::<Vec<_>>()
+            guard
+                .drain()
+                .filter_map(|(_, mut h)| h.join_handle.take())
+                .collect::<Vec<_>>()
         };
         for handle in handles {
             let _ = handle.await;
@@ -210,11 +239,7 @@ impl ChannelManager {
 
         let mut rx_guard = outbound_rx.lock().await;
         while let Some(result) = rx_guard.recv().await {
-            let channel_id = result
-                .session_id
-                .split(':')
-                .next()
-                .unwrap_or("");
+            let channel_id = result.session_id.split(':').next().unwrap_or("");
 
             // Skip system-triggered sessions (cron, heartbeat) — they have no user-facing channel
             if is_system_channel(channel_id) {
@@ -224,7 +249,10 @@ impl ChannelManager {
             let mut ch_guard = channels.lock().await;
             if let Some(channel) = ch_guard.get_mut(channel_id) {
                 if let Err(e) = channel.send_output(&result).await {
-                    error!("[ChannelManager] Failed to send output to {}: {}", channel_id, e);
+                    error!(
+                        "[ChannelManager] Failed to send output to {}: {}",
+                        channel_id, e
+                    );
                 }
             } else {
                 error!("[ChannelManager] No channel found for id: {}", channel_id);
@@ -369,17 +397,20 @@ mod tests {
             },
             providers: {
                 let mut m = HashMap::new();
-                m.insert("default".to_string(), crate::config::ProviderConfig {
-                    r#type: "openai".to_string(),
-                    api_url: String::new(),
-                    base_url: String::new(),
-                    api_key: "sk-test".to_string(),
-                    model: "gpt-4o".to_string(),
-                    temperature: 0.7,
-                    max_tokens: 4096,
-                    prompt_cache_enabled: true,
-                    unknown: Default::default(),
-                });
+                m.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: String::new(),
+                        base_url: String::new(),
+                        api_key: "sk-test".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: true,
+                        unknown: Default::default(),
+                    },
+                );
                 m
             },
             tools: vec![],

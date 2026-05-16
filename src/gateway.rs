@@ -1,20 +1,20 @@
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::signal;
 
+use crate::WorkerPool;
 use crate::agent_loop::AgentLoop;
-use crate::config::Config;
-use crate::message_bus::{BusResult, MessageBus};
-use crate::path::PathManager;
 use crate::channel::ChannelManager;
+use crate::config::Config;
 use crate::cron::CronService;
 use crate::heartbeat::HeartbeatService;
-use crate::tools::message::MessageTool;
-use crate::tools::cron::CronTool;
-use crate::tool::ToolManager;
-use crate::session::TaskHook;
-use crate::WorkerPool;
 use crate::info;
+use crate::message_bus::{BusResult, MessageBus};
+use crate::path::PathManager;
+use crate::session::TaskHook;
+use crate::tool::ToolManager;
+use crate::tools::cron::CronTool;
+use crate::tools::message::MessageTool;
 
 pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     WorkerPool::init_global(64);
@@ -32,11 +32,13 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     message_tool.set_send_callback(Arc::new(move |channel, chat_id, content| {
         let tx = outbound_tx.clone();
         Box::pin(async move {
-            let _ = tx.send(BusResult {
-                session_id: format!("{}:{}", channel, chat_id),
-                task_id: String::new(),
-                content,
-            }).await;
+            let _ = tx
+                .send(BusResult {
+                    session_id: format!("{}:{}", channel, chat_id),
+                    task_id: String::new(),
+                    content,
+                })
+                .await;
         })
     }));
     tool_manager.register(Box::new(message_tool));
@@ -48,12 +50,10 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     tool_manager.register(Box::new(cron_tool));
 
     // Create AgentLoop with pre-configured tool manager
-    let agent_loop = Arc::new(AgentLoop::from_config_with_tools(
-        paths,
-        message_bus.clone(),
-        config.clone(),
-        tool_manager,
-    ).await?);
+    let agent_loop = Arc::new(
+        AgentLoop::from_config_with_tools(paths, message_bus.clone(), config.clone(), tool_manager)
+            .await?,
+    );
 
     // Set up cron service callback
     let agent_loop_for_cron = agent_loop.clone();
@@ -108,7 +108,9 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             let session_id = "heartbeat:system";
             let hook = TaskHook::new(session_id);
             // Heartbeat doesn't use message tool; result is sent via on_notify to webui
-            let result = al.run_task(session_id, content, hook, None, None, None).await;
+            let result = al
+                .run_task(session_id, content, hook, None, None, None)
+                .await;
             result.content
         })
     }));
@@ -118,17 +120,23 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         let mb = mb_for_notify.clone();
         let resp = response.clone();
         Box::pin(async move {
-            let _ = mb.outbound_tx().send(BusResult {
-                session_id: "webui:webui_main".to_string(),
-                task_id: String::new(),
-                content: resp,
-            }).await;
+            let _ = mb
+                .outbound_tx()
+                .send(BusResult {
+                    session_id: "webui:webui_main".to_string(),
+                    task_id: String::new(),
+                    content: resp,
+                })
+                .await;
         })
     }));
 
     if config.gateway.heartbeat.enabled {
         heartbeat.start();
-        info!("[gateway] heartbeat service started (interval={}s)", config.gateway.heartbeat.interval_s);
+        info!(
+            "[gateway] heartbeat service started (interval={}s)",
+            config.gateway.heartbeat.interval_s
+        );
     } else {
         info!("[gateway] heartbeat service disabled");
     }
@@ -141,10 +149,8 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     // Register webui factory with shutdown channel
     if config.channels.contains_key("webui") {
-        channel_manager.register_webui_factory(
-            agent_loop.session_manager(),
-            channel_shutdown_tx.clone(),
-        );
+        channel_manager
+            .register_webui_factory(agent_loop.session_manager(), channel_shutdown_tx.clone());
     }
 
     channel_manager.init().await?;

@@ -964,11 +964,21 @@ impl SessionManager {
         }
     }
 
-    /// Get the number of unconsolidated messages for a session.
+    /// Get the number of unpersisted messages (current_turn only) for a session.
+    /// Used by runner for rollback — records count before turn, truncates back on failure.
     pub fn message_count(&self, session_id: &str) -> usize {
         self.sessions
             .get(session_id)
             .map(|s| s.current_turn.len())
+            .unwrap_or(0)
+    }
+
+    /// Get the total number of messages (history + current_turn) for a session.
+    /// Used for display purposes (e.g., /status command, API responses).
+    pub fn total_message_count(&self, session_id: &str) -> usize {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.history.len() + s.current_turn.len())
             .unwrap_or(0)
     }
 
@@ -1027,7 +1037,7 @@ impl SessionManager {
     }
 
     pub async fn persist(&mut self, session_id: &str) -> Result<()> {
-        // Check if there's anything to persist
+        // Check if there are pending messages to persist
         let has_pending = self
             .sessions
             .get(session_id)
@@ -1035,39 +1045,38 @@ impl SessionManager {
             .current_turn
             .len();
 
-        if has_pending == 0 {
-            return Ok(());
-        }
-
-        // Strip runtime_content from current_turn messages before persisting
-        let session = self.sessions.get_mut(session_id).unwrap();
-        for msg in &mut session.current_turn {
-            if let Message::User {
-                runtime_content, ..
-            } = msg
-            {
-                *runtime_content = None;
+        if has_pending > 0 {
+            // Strip runtime_content from current_turn messages before persisting
+            let session = self.sessions.get_mut(session_id).unwrap();
+            for msg in &mut session.current_turn {
+                if let Message::User {
+                    runtime_content, ..
+                } = msg
+                {
+                    *runtime_content = None;
+                }
             }
+
+            // Append current_turn to JSONL
+            let path = self.session_dir.join(format!("{}.jsonl", session_id));
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            for msg in &session.current_turn {
+                let line = serde_json::to_string(msg)?;
+                writeln!(file, "{}", line)?;
+            }
+            file.flush()?;
+
+            // Merge current_turn into history Arc
+            let session = self.sessions.get_mut(session_id).unwrap();
+            let mut merged = session.history.to_vec();
+            merged.append(&mut session.current_turn);
+            session.history = Arc::from(merged);
         }
 
-        // Append current_turn to JSONL
-        let path = self.session_dir.join(format!("{}.jsonl", session_id));
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        for msg in &session.current_turn {
-            let line = serde_json::to_string(msg)?;
-            writeln!(file, "{}", line)?;
-        }
-        file.flush()?;
-
-        // Merge current_turn into history Arc
-        let session = self.sessions.get_mut(session_id).unwrap();
-        let mut merged = session.history.to_vec();
-        merged.append(&mut session.current_turn);
-        session.history = Arc::from(merged);
-
+        // Always save meta (may have changed via set_last_summary, etc.)
         self.save_session_meta(session_id);
 
         Ok(())

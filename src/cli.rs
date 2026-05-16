@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::agent_loop::AgentLoop;
-use crate::commands::{classify_command, CommandTier};
+use crate::commands::{CommandTier, classify_command};
 use crate::session::TaskHook;
 use crate::{debug, fatal, info};
 
@@ -101,14 +101,20 @@ pub async fn run_agent_session(
     if let Some(query) = query {
         debug!("[cli] Single-turn query: {}", query);
         // Ensure session exists before running
-        if let Err(e) = crate::session::ensure_session(&agent_loop.session_manager(), session_id).await {
+        if let Err(e) =
+            crate::session::ensure_session(&agent_loop.session_manager(), session_id).await
+        {
             fatal!("Failed to create session: {}", e);
         }
         let hook = TaskHook::new(session_id);
         let result = agent_loop
             .run_task(session_id, query.to_string(), hook, None, None, None)
             .await;
-        debug!("[cli] run_task returned: success={}, content_len={}", result.success, result.content.len());
+        debug!(
+            "[cli] run_task returned: success={}, content_len={}",
+            result.success,
+            result.content.len()
+        );
 
         if result.success {
             println!("{}", result.content);
@@ -120,7 +126,8 @@ pub async fn run_agent_session(
 
     // Interactive mode: existing stdin loop — all I/O on main thread.
     // Ensure session exists before the loop.
-    if let Err(e) = crate::session::ensure_session(&agent_loop.session_manager(), session_id).await {
+    if let Err(e) = crate::session::ensure_session(&agent_loop.session_manager(), session_id).await
+    {
         fatal!("Failed to create session: {}", e);
     }
 
@@ -210,7 +217,7 @@ async fn handle_cli_command(agent_loop: &AgentLoop, session_id: &str, input: &st
         "/status" => {
             let sm = agent_loop.session_manager();
             let guard = sm.lock().await;
-            let msg_count = guard.message_count(session_id);
+            let msg_count = guard.total_message_count(session_id);
             drop(guard);
             eprintln!("Session: {}\nMessages: {}", session_id, msg_count);
         }

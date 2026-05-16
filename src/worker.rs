@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 /// Type-erased async future returning ().
 pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -25,7 +25,8 @@ static WORKER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 impl Worker {
     /// Create a new Worker and spawn its internal message loop.
     pub fn new() -> Self {
-        let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<Box<dyn FnOnce() -> BoxFuture + Send>>();
+        let (queue_tx, mut queue_rx) =
+            mpsc::unbounded_channel::<Box<dyn FnOnce() -> BoxFuture + Send>>();
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
         let id = WORKER_COUNTER.fetch_add(1, Ordering::Relaxed);

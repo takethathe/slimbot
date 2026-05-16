@@ -69,15 +69,14 @@ impl IoScheduler {
         tokio::spawn(async move {
             loop {
                 if shutdown.load(Ordering::Relaxed) {
-                    info!("[{}] Shutdown signal received, exiting read loop", channel_name);
+                    info!(
+                        "[{}] Shutdown signal received, exiting read loop",
+                        channel_name
+                    );
                     break;
                 }
                 let prompt = prompt.clone();
-                match tokio::task::spawn_blocking(move || {
-                    read_line_blocking(&prompt)
-                })
-                .await
-                {
+                match tokio::task::spawn_blocking(move || read_line_blocking(&prompt)).await {
                     Ok(Ok(input)) => {
                         let cmd = crate::commands::classify_command(&input);
                         if cmd.is_command && cmd.tier == CommandTier::Channel {

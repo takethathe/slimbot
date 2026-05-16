@@ -181,7 +181,6 @@ fn test_agent_requires_config() {
     assert!(!output.status.success());
 }
 
-
 // ── Data-dir and workspace-dir flags ──
 
 #[test]

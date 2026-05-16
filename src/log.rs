@@ -61,20 +61,14 @@ static LOGGER: OnceLock<Arc<SharedLogger>> = OnceLock::new();
 /// Check whether the given level would produce output.
 /// Returns `false` if the logger is not yet initialized or the level is below threshold.
 pub fn should_log(level: LogLevel) -> bool {
-    LOGGER
-        .get()
-        .map(|l| level >= l.level)
-        .unwrap_or(false)
+    LOGGER.get().map(|l| level >= l.level).unwrap_or(false)
 }
 
 /// Initialize the global logger. Must be called once at program start.
 pub fn init(level: LogLevel, log_file: Option<&Path>) -> std::io::Result<()> {
     let file = match log_file {
         Some(path) => {
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            let f = OpenOptions::new().create(true).append(true).open(path)?;
             Some(f)
         }
         None => None,

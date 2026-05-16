@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use slimbot::{
-    truncate_text_head_tail, write_file_atomic, build_persisted_reference,
-    TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS,
+    TOOL_RESULT_PREVIEW_CHARS, TOOL_RESULTS_DIR, build_persisted_reference,
+    truncate_text_head_tail, write_file_atomic,
 };
 
 // ── Text truncation ──

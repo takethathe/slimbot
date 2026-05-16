@@ -12,7 +12,10 @@ async fn test_tool_manager_register_and_execute() {
     let shell_tool = create_tool("shell", &tmp.path().join("ws")).unwrap();
     tm.register(shell_tool);
 
-    let result = tm.execute("shell", serde_json::json!({"command": "echo hello"})).await.unwrap();
+    let result = tm
+        .execute("shell", serde_json::json!({"command": "echo hello"}))
+        .await
+        .unwrap();
     assert!(result.contains("hello"));
 }
 
@@ -51,7 +54,14 @@ fn test_create_builtin_tools() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path();
 
-    let tool_names = ["shell", "file_reader", "file_writer", "file_editor", "list_dir", "make_dir"];
+    let tool_names = [
+        "shell",
+        "file_reader",
+        "file_writer",
+        "file_editor",
+        "list_dir",
+        "make_dir",
+    ];
     for name in &tool_names {
         let tool = create_tool(name, ws);
         assert!(tool.is_some(), "tool '{}' should be creatable", name);
@@ -72,7 +82,10 @@ async fn test_shell_tool_basic() {
     assert_eq!(shell_tool.name(), "shell");
     assert!(!shell_tool.description().is_empty());
 
-    let result = shell_tool.execute(serde_json::json!({"command": "echo hello"})).await.unwrap();
+    let result = shell_tool
+        .execute(serde_json::json!({"command": "echo hello"}))
+        .await
+        .unwrap();
     assert!(result.contains("hello"));
 }
 
@@ -83,7 +96,10 @@ async fn test_shell_tool_failed_command() {
     let shell_tool = create_tool("shell", &ws).unwrap();
 
     // Shell tool returns Ok even for failed commands, with exit code appended
-    let result = shell_tool.execute(serde_json::json!({"command": "exit 1"})).await.unwrap();
+    let result = shell_tool
+        .execute(serde_json::json!({"command": "exit 1"}))
+        .await
+        .unwrap();
     assert!(result.contains("Exit code: 1"));
 }
 
@@ -100,15 +116,21 @@ async fn test_file_writer_and_reader() {
     let content = "Hello, integration test!";
 
     // Write
-    writer.execute(serde_json::json!({
-        "path": test_file,
-        "content": content
-    })).await.unwrap();
+    writer
+        .execute(serde_json::json!({
+            "path": test_file,
+            "content": content
+        }))
+        .await
+        .unwrap();
 
     // Read back
-    let read_content = reader.execute(serde_json::json!({
-        "path": test_file
-    })).await.unwrap();
+    let read_content = reader
+        .execute(serde_json::json!({
+            "path": test_file
+        }))
+        .await
+        .unwrap();
     assert!(read_content.contains(content));
 }
 
@@ -120,7 +142,10 @@ async fn test_list_dir_tool() {
     std::fs::write(ws.join("file.txt"), "x").unwrap();
 
     let list_dir = create_tool("list_dir", &ws).unwrap();
-    let result = list_dir.execute(serde_json::json!({"path": "."})).await.unwrap();
+    let result = list_dir
+        .execute(serde_json::json!({"path": "."}))
+        .await
+        .unwrap();
     assert!(result.contains("file.txt"));
     assert!(result.contains("subdir"));
 }
@@ -134,7 +159,10 @@ async fn test_make_dir_tool() {
     let make_dir = create_tool("make_dir", &ws).unwrap();
     let new_dir = "new_subdir/nested";
 
-    make_dir.execute(serde_json::json!({"path": new_dir})).await.unwrap();
+    make_dir
+        .execute(serde_json::json!({"path": new_dir}))
+        .await
+        .unwrap();
 
     let created = ws.join(new_dir);
     assert!(created.is_dir());

@@ -9,10 +9,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+use crate::info;
 use crate::memory::SharedMemoryStore;
 use crate::provider::{FinishReason, Provider};
 use crate::session::{Message, SharedSessionManager, message_content_chars, message_content_str};
-use crate::info;
 
 /// Hard cap on messages per consolidation chunk.
 const MAX_CHUNK_MESSAGES: usize = 60;
@@ -137,19 +137,21 @@ impl Consolidator {
         let response = self
             .provider
             .chat(
-                &[
-                    &Message::system(system_prompt),
-                    &Message::user(formatted),
-                ],
+                &[&Message::system(system_prompt), &Message::user(formatted)],
                 None,
             )
             .await?;
 
         if response.finish_reason == FinishReason::Error {
-            anyhow::bail!("LLM returned error: {}", response.content.as_deref().unwrap_or("(empty)"));
+            anyhow::bail!(
+                "LLM returned error: {}",
+                response.content.as_deref().unwrap_or("(empty)")
+            );
         }
 
-        let summary = response.content.unwrap_or_else(|| "(no summary)".to_string());
+        let summary = response
+            .content
+            .unwrap_or_else(|| "(no summary)".to_string());
         if summary.is_empty() || summary == "(nothing)" {
             return Ok(None);
         }
@@ -159,7 +161,11 @@ impl Consolidator {
             info!("[Consolidator] Failed to append summary to history: {e}");
         }
 
-        info!("[Consolidator] Archived {} messages, summary {} chars", messages.len(), summary.len());
+        info!(
+            "[Consolidator] Archived {} messages, summary {} chars",
+            messages.len(),
+            summary.len()
+        );
         Ok(Some(summary))
     }
 
@@ -196,7 +202,11 @@ If nothing noteworthy happened, output: (nothing)"
             if data.messages.is_empty() {
                 return Ok(None);
             }
-            (data.messages, data.char_per_token_ratio, data.last_consolidated_id)
+            (
+                data.messages,
+                data.char_per_token_ratio,
+                data.last_consolidated_id,
+            )
         };
 
         let start_idx = messages
@@ -208,12 +218,9 @@ If nothing noteworthy happened, output: (nothing)"
             return Ok(None);
         }
 
-        let Some((end_idx, _removed)) = Self::pick_consolidation_boundary(
-            &messages,
-            start_idx,
-            tokens_to_remove,
-            ratio,
-        ) else {
+        let Some((end_idx, _removed)) =
+            Self::pick_consolidation_boundary(&messages, start_idx, tokens_to_remove, ratio)
+        else {
             return Ok(None);
         };
 
@@ -240,7 +247,9 @@ If nothing noteworthy happened, output: (nothing)"
 
         // If cancelled during archive, skip all file I/O and meta updates.
         if self.cancel_token.is_cancelled() {
-            info!("[Consolidator] Cancelled during consolidate for {session_id}, skipping file writes");
+            info!(
+                "[Consolidator] Cancelled during consolidate for {session_id}, skipping file writes"
+            );
             return Ok(None);
         }
 
@@ -269,7 +278,9 @@ If nothing noteworthy happened, output: (nothing)"
         let target = budget / 2;
         let tokens_to_remove = prompt_tokens.saturating_sub(target);
 
-        let _ = self.consolidate_one_round(session_id, tokens_to_remove).await?;
+        let _ = self
+            .consolidate_one_round(session_id, tokens_to_remove)
+            .await?;
 
         Ok(())
     }
@@ -310,7 +321,11 @@ mod tests {
         let messages = vec![
             Message::user("hello".to_string()),
             Message::assistant(Some("hi there".to_string()), None, None, None),
-            Message::tool("result".to_string(), "tc-1".to_string(), Some("echo".to_string())),
+            Message::tool(
+                "result".to_string(),
+                "tc-1".to_string(),
+                Some("echo".to_string()),
+            ),
         ];
         let formatted = Consolidator::format_messages(&messages);
         assert!(formatted.contains("[USER] hello"));
@@ -321,18 +336,16 @@ mod tests {
     #[test]
     fn test_pick_consolidation_boundary() {
         let messages = vec![
-            Message::user("a".repeat(100)),        // idx 0
+            Message::user("a".repeat(100)),                              // idx 0
             Message::assistant(Some("b".repeat(100)), None, None, None), // idx 1
-            Message::user("c".repeat(100)),        // idx 2
+            Message::user("c".repeat(100)),                              // idx 2
             Message::assistant(Some("d".repeat(100)), None, None, None), // idx 3
-            Message::user("e".repeat(100)),        // idx 4
+            Message::user("e".repeat(100)),                              // idx 4
         ];
 
         // Need to remove 60 tokens, ratio = 2.0 chars/token
         // Each message ~100/2.0 = 50 tokens
-        let result = Consolidator::pick_consolidation_boundary(
-            &messages, 0, 60, 2.0,
-        );
+        let result = Consolidator::pick_consolidation_boundary(&messages, 0, 60, 2.0);
         // After idx 0 (50 tokens), idx 1 (+50) = 100. First user boundary at idx 2 with 100 tokens.
         // 100 >= 60, so boundary at idx 2.
         assert!(result.is_some());
@@ -343,9 +356,12 @@ mod tests {
 
     #[test]
     fn test_pick_no_boundary() {
-        let messages = vec![
-            Message::assistant(Some("only assistant".to_string()), None, None, None),
-        ];
+        let messages = vec![Message::assistant(
+            Some("only assistant".to_string()),
+            None,
+            None,
+            None,
+        )];
         let result = Consolidator::pick_consolidation_boundary(&messages, 0, 100, 2.0);
         // No user message found after start, should return None
         assert!(result.is_none());

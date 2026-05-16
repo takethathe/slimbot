@@ -5,7 +5,11 @@ use std::sync::{Arc, Mutex};
 use super::types::*;
 use crate::debug;
 
-pub type CronJobCallback = Arc<dyn Fn(CronJob) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+pub type CronJobCallback = Arc<
+    dyn Fn(CronJob) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub struct CronService {
     store_path: PathBuf,
@@ -45,10 +49,7 @@ impl CronService {
 
     pub fn save(&self) {
         let jobs = self.jobs.lock().unwrap().clone();
-        let store = CronStore {
-            version: 1,
-            jobs,
-        };
+        let store = CronStore { version: 1, jobs };
         if let Ok(content) = serde_json::to_string_pretty(&store) {
             let _ = std::fs::write(&self.store_path, content);
         }
@@ -110,7 +111,8 @@ impl CronService {
         // Collect due jobs outside the lock
         let due_jobs: Vec<CronJob> = {
             let guard = self.jobs.lock().unwrap();
-            guard.iter()
+            guard
+                .iter()
                 .filter(|j| j.enabled && j.state.next_run_at_ms.map_or(false, |t| now >= t))
                 .cloned()
                 .collect()
@@ -174,14 +176,20 @@ impl CronService {
 pub fn compute_next_run(schedule: &CronSchedule, now_ms: i64) -> Option<i64> {
     match schedule {
         CronSchedule::At { at_ms } => {
-            if *at_ms > now_ms { Some(*at_ms) } else { None }
+            if *at_ms > now_ms {
+                Some(*at_ms)
+            } else {
+                None
+            }
         }
         CronSchedule::Every { every_ms } => {
-            if *every_ms <= 0 { None } else { Some(now_ms + *every_ms) }
+            if *every_ms <= 0 {
+                None
+            } else {
+                Some(now_ms + *every_ms)
+            }
         }
-        CronSchedule::Cron { expr, .. } => {
-            compute_next_cron(expr, now_ms)
-        }
+        CronSchedule::Cron { expr, .. } => compute_next_cron(expr, now_ms),
     }
 }
 
@@ -189,13 +197,11 @@ fn compute_next_cron(expr: &str, _now_ms: i64) -> Option<i64> {
     use cron::Schedule;
     use std::str::FromStr;
     match Schedule::from_str(expr) {
-        Ok(schedule) => {
-            schedule
-                .upcoming(chrono::Utc)
-                .take(1)
-                .next()
-                .map(|dt| dt.timestamp_millis())
-        }
+        Ok(schedule) => schedule
+            .upcoming(chrono::Utc)
+            .take(1)
+            .next()
+            .map(|dt| dt.timestamp_millis()),
         Err(_) => None,
     }
 }
@@ -471,7 +477,10 @@ mod tests {
 
         assert_eq!(svc.list_jobs().len(), 1);
         let jobs_before = svc.list_jobs();
-        assert!(jobs_before[0].delete_after_run, "delete_after_run should be true");
+        assert!(
+            jobs_before[0].delete_after_run,
+            "delete_after_run should be true"
+        );
         svc.tick().await;
 
         // Job should have been removed
@@ -660,8 +669,10 @@ mod tests {
 
         // next_run_at_ms should be set immediately after add_job, before start()
         let jobs = svc.list_jobs();
-        assert!(jobs[0].state.next_run_at_ms.is_some(),
-            "add_job must set next_run_at_ms so tick() can select the job");
+        assert!(
+            jobs[0].state.next_run_at_ms.is_some(),
+            "add_job must set next_run_at_ms so tick() can select the job"
+        );
         assert!(jobs[0].state.next_run_at_ms.unwrap() > now_ms());
     }
 
@@ -716,11 +727,16 @@ mod tests {
 
         svc.tick().await;
 
-        assert!(executed_ref.load(std::sync::atomic::Ordering::Relaxed),
-            "tick() must execute a job that was added via add_job()");
+        assert!(
+            executed_ref.load(std::sync::atomic::Ordering::Relaxed),
+            "tick() must execute a job that was added via add_job()"
+        );
         let jobs = svc.list_jobs();
         assert_eq!(jobs.len(), 1);
-        assert!(jobs[0].state.last_run_at_ms.is_some(), "job should have been executed");
+        assert!(
+            jobs[0].state.last_run_at_ms.is_some(),
+            "job should have been executed"
+        );
         assert_eq!(jobs[0].state.last_status, Some("ok".to_string()));
     }
 }

@@ -129,7 +129,10 @@ fn test_bootstrap_file_path() {
     let data = tmp.path().join("data");
     let pm = PathManager::resolve(None, Some(data.to_str().unwrap()), None).unwrap();
     assert!(pm.bootstrap_file("SOUL.md").ends_with("workspace/SOUL.md"));
-    assert!(pm.bootstrap_file("AGENTS.md").ends_with("workspace/AGENTS.md"));
+    assert!(
+        pm.bootstrap_file("AGENTS.md")
+            .ends_with("workspace/AGENTS.md")
+    );
 }
 
 // ── Sandbox validation ──

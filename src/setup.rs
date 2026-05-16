@@ -88,7 +88,10 @@ fn print_config_summary(config: &Config, paths: &PathManager) {
     }
     eprintln!("  tools: {} entries", config.tools.len());
     eprintln!("  channels: {} entries", config.channels.len());
-    eprintln!("\nEdit {} to configure your API key and channels.", paths.config_path().display());
+    eprintln!(
+        "\nEdit {} to configure your API key and channels.",
+        paths.config_path().display()
+    );
 }
 
 fn mask_api_key(key: &str) -> String {

@@ -45,8 +45,7 @@ impl MemoryStore {
 
     /// Ensure the memory directory exists.
     pub fn init(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.memory_dir)
-            .context("Failed to create memory directory")
+        std::fs::create_dir_all(&self.memory_dir).context("Failed to create memory directory")
     }
 
     // -- MEMORY.md (long-term facts) ----------------------------------------
@@ -56,8 +55,7 @@ impl MemoryStore {
     }
 
     pub fn write_memory(&self, content: &str) -> Result<()> {
-        std::fs::write(&self.memory_file, content)
-            .context("Failed to write MEMORY.md")
+        std::fs::write(&self.memory_file, content).context("Failed to write MEMORY.md")
     }
 
     // -- SOUL.md and USER.md (workspace root) --------------------------------
@@ -99,30 +97,45 @@ impl MemoryStore {
     pub fn sync_all(&self) -> Result<()> {
         // Sync history file
         if self.history_file.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&self.history_file) {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.history_file)
+            {
                 let _ = file.sync_all();
             }
         }
         // Sync cursor file
         if self.cursor_file.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.cursor_file) {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.cursor_file)
+            {
                 let _ = file.sync_all();
             }
         }
         // Sync dream cursor file
         if self.dream_cursor_file.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.dream_cursor_file) {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.dream_cursor_file)
+            {
                 let _ = file.sync_all();
             }
         }
         // Sync MEMORY.md
         if self.memory_file.exists() {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.memory_file) {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.memory_file)
+            {
                 let _ = file.sync_all();
             }
         }
         // Sync the memory directory
-        if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(&self.memory_dir) {
+        if let Ok(dir) = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&self.memory_dir)
+        {
             let _ = dir.sync_all();
         }
         Ok(())
@@ -139,8 +152,7 @@ impl MemoryStore {
             timestamp: now.to_string(),
             content: entry.to_string(),
         };
-        let line = serde_json::to_string(&record)
-            .context("Failed to serialize history entry")?;
+        let line = serde_json::to_string(&record).context("Failed to serialize history entry")?;
         std::fs::write(&self.cursor_file, cursor.to_string())
             .context("Failed to write history cursor")?;
         self.cursor_cache = Some(cursor);

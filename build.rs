@@ -18,7 +18,11 @@ fn scan_dir_recursive(dir: &Path, dest_prefix: &str) -> Vec<(String, String, Str
             let dest = format!("{}{}", dest_prefix, name);
             entries.push((name, content, dest));
         } else if path.is_dir() {
-            let sub_prefix = format!("{}{}/", dest_prefix, path.file_name().unwrap().to_string_lossy());
+            let sub_prefix = format!(
+                "{}{}/",
+                dest_prefix,
+                path.file_name().unwrap().to_string_lossy()
+            );
             entries.extend(scan_dir_recursive(&path, &sub_prefix));
         }
     }
@@ -40,17 +44,10 @@ fn main() {
     all_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut code = String::new();
-    code.push_str(
-        "/// Auto-generated embedded resource: (filename, content, destination_path).\n",
-    );
-    code.push_str(
-        "pub const EMBEDDED_FILES: &[(&str, &str, &str)] = &[\n"
-    );
+    code.push_str("/// Auto-generated embedded resource: (filename, content, destination_path).\n");
+    code.push_str("pub const EMBEDDED_FILES: &[(&str, &str, &str)] = &[\n");
     for (name, content, dest) in &all_entries {
-        code.push_str(&format!(
-            "    ({:?}, {:?}, {:?}),\n",
-            name, content, dest
-        ));
+        code.push_str(&format!("    ({:?}, {:?}, {:?}),\n", name, content, dest));
     }
     code.push_str("];\n");
 

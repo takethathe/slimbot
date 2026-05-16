@@ -56,7 +56,10 @@ pub struct HeartbeatConfig {
 
 impl Default for HeartbeatConfig {
     fn default() -> Self {
-        Self { enabled: true, interval_s: default_heartbeat_interval() }
+        Self {
+            enabled: true,
+            interval_s: default_heartbeat_interval(),
+        }
     }
 }
 
@@ -84,12 +87,18 @@ pub struct ToolEntry {
     pub enabled: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_heartbeat_interval() -> u64 { 1800 }
+fn default_true() -> bool {
+    true
+}
+fn default_heartbeat_interval() -> u64 {
+    1800
+}
 
 // ── Backward compat: Vec<ChannelEntry> → HashMap ──
 
-fn deserialize_channels<'de, D>(deserializer: D) -> std::result::Result<HashMap<String, ChannelConfig>, D::Error>
+fn deserialize_channels<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, ChannelConfig>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -154,7 +163,10 @@ impl ChannelEntryCompat {
             _ => HashMap::new(),
         };
         extra.insert("enabled".to_string(), serde_json::json!(self.enabled));
-        ChannelConfig { enabled: self.enabled, extra }
+        ChannelConfig {
+            enabled: self.enabled,
+            extra,
+        }
     }
 }
 
@@ -277,25 +289,28 @@ impl Config {
         {
             let inner_clone = inner.clone();
             let path_clone = path.to_string();
-            let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
-                    if matches!(event.kind, notify::EventKind::Modify(_)) {
-                        if let Err(e) = Self::reload_with_inner(&inner_clone) {
-                            crate::error!("[Config] Reload failed: {}", e);
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if let Ok(event) = res {
+                        if matches!(event.kind, notify::EventKind::Modify(_)) {
+                            if let Err(e) = Self::reload_with_inner(&inner_clone) {
+                                crate::error!("[Config] Reload failed: {}", e);
+                            }
                         }
                     }
-                }
-            }).context("Failed to create config watcher")?;
+                })
+                .context("Failed to create config watcher")?;
 
-            watcher.watch(
-                Path::new(&path_clone),
-                notify::RecursiveMode::NonRecursive,
-            ).context("Failed to watch config file")?;
+            watcher
+                .watch(Path::new(&path_clone), notify::RecursiveMode::NonRecursive)
+                .context("Failed to watch config file")?;
 
             inner.write().watcher = Some(watcher);
         }
 
-        CONFIG_INSTANCE.set(inner).map_err(|_| anyhow::anyhow!("Config already initialized"))?;
+        CONFIG_INSTANCE
+            .set(inner)
+            .map_err(|_| anyhow::anyhow!("Config already initialized"))?;
         Ok(())
     }
 
@@ -310,10 +325,11 @@ impl Config {
     where
         F: Fn(ConfigChange) + Send + Sync + 'static,
     {
-        let inner = CONFIG_INSTANCE
-            .get()
-            .expect("Config not initialized");
-        inner.write().subscribers.push((path.to_string(), Arc::new(callback)));
+        let inner = CONFIG_INSTANCE.get().expect("Config not initialized");
+        inner
+            .write()
+            .subscribers
+            .push((path.to_string(), Arc::new(callback)));
     }
 
     fn reload_with_inner(inner: &Arc<RwLock<ConfigInner>>) -> Result<()> {
@@ -346,16 +362,20 @@ impl Config {
         };
 
         for (prefix, callback) in subscribers {
-            let matching: Vec<_> = change.paths.iter()
+            let matching: Vec<_> = change
+                .paths
+                .iter()
                 .filter(|p| p.starts_with(&prefix) || prefix.starts_with(p.as_str()))
                 .cloned()
                 .collect();
             if !matching.is_empty() {
                 // Only include values for paths that matched this subscriber
-                let matching_old: BTreeMap<_, _> = matching.iter()
+                let matching_old: BTreeMap<_, _> = matching
+                    .iter()
                     .filter_map(|p| change.old_values.get(p).map(|v| (p.clone(), v.clone())))
                     .collect();
-                let matching_new: BTreeMap<_, _> = matching.iter()
+                let matching_new: BTreeMap<_, _> = matching
+                    .iter()
                     .filter_map(|p| change.new_values.get(p).map(|v| (p.clone(), v.clone())))
                     .collect();
                 callback(ConfigChange {
@@ -366,7 +386,10 @@ impl Config {
             }
         }
 
-        crate::info!("[Config] Reloaded config with {} changed paths", change.paths.len());
+        crate::info!(
+            "[Config] Reloaded config with {} changed paths",
+            change.paths.len()
+        );
         Ok(())
     }
 
@@ -377,7 +400,14 @@ impl Config {
 
         // Diff agent fields — cheap PartialEq check first, serialize only on difference
         if old.agent != new.agent {
-            Self::diff_json_objects("agent", &old.agent, &new.agent, &mut paths, &mut old_values, &mut new_values);
+            Self::diff_json_objects(
+                "agent",
+                &old.agent,
+                &new.agent,
+                &mut paths,
+                &mut old_values,
+                &mut new_values,
+            );
         }
 
         // Diff providers — only serialize when a provider actually changed
@@ -386,18 +416,34 @@ impl Config {
                 if old_p != new_p {
                     Self::diff_json_objects(
                         &format!("providers.{}", name),
-                        old_p, new_p, &mut paths, &mut old_values, &mut new_values,
+                        old_p,
+                        new_p,
+                        &mut paths,
+                        &mut old_values,
+                        &mut new_values,
                     );
                 }
             } else {
                 // New provider added
                 let path = format!("providers.{}", name);
                 paths.push(path.clone());
-                new_values.insert(path, ConfigValue::Object(serde_json::to_value(new_p).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default()));
+                new_values.insert(
+                    path,
+                    ConfigValue::Object(
+                        serde_json::to_value(new_p)
+                            .ok()
+                            .and_then(|v| v.as_object().cloned())
+                            .unwrap_or_default(),
+                    ),
+                );
             }
         }
 
-        ConfigChange { paths, old_values, new_values }
+        ConfigChange {
+            paths,
+            old_values,
+            new_values,
+        }
     }
 
     /// Diff two serializable values field-by-field, populating paths and value maps.
@@ -416,7 +462,12 @@ impl Config {
                 if !old_obj.get(key).map(|v| v == new_val).unwrap_or(false) {
                     let path = format!("{}.{}", prefix, key);
                     paths.push(path.clone());
-                    old_values.insert(path.clone(), config_value_from_json(old_obj.get(key).unwrap_or(&serde_json::Value::Null)));
+                    old_values.insert(
+                        path.clone(),
+                        config_value_from_json(
+                            old_obj.get(key).unwrap_or(&serde_json::Value::Null),
+                        ),
+                    );
                     new_values.insert(path, config_value_from_json(new_val));
                 }
             }
@@ -432,17 +483,20 @@ mod tests {
 
     fn make_test_config() -> Config {
         let mut providers = HashMap::new();
-        providers.insert("default".to_string(), ProviderConfig {
-            r#type: "openai".to_string(),
-            api_url: String::new(),
-            base_url: String::new(),
-            api_key: "sk-test".to_string(),
-            model: "gpt-4o".to_string(),
-            temperature: 0.7,
-            max_tokens: 4096,
-            prompt_cache_enabled: true,
-            unknown: Default::default(),
-        });
+        providers.insert(
+            "default".to_string(),
+            ProviderConfig {
+                r#type: "openai".to_string(),
+                api_url: String::new(),
+                base_url: String::new(),
+                api_key: "sk-test".to_string(),
+                model: "gpt-4o".to_string(),
+                temperature: 0.7,
+                max_tokens: 4096,
+                prompt_cache_enabled: true,
+                unknown: Default::default(),
+            },
+        );
         Config {
             agent: AgentConfig {
                 provider: "default".to_string(),

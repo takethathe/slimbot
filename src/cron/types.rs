@@ -3,15 +3,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum CronSchedule {
-    At { at_ms: i64 },
-    Every { every_ms: i64 },
-    Cron { expr: String, #[serde(default)] tz: Option<String> },
+    At {
+        at_ms: i64,
+    },
+    Every {
+        every_ms: i64,
+    },
+    Cron {
+        expr: String,
+        #[serde(default)]
+        tz: Option<String>,
+    },
 }
 
 impl CronSchedule {
-    pub fn at(at_ms: i64) -> Self { Self::At { at_ms } }
-    pub fn every(every_ms: i64) -> Self { Self::Every { every_ms } }
-    pub fn cron(expr: String, tz: Option<String>) -> Self { Self::Cron { expr, tz } }
+    pub fn at(at_ms: i64) -> Self {
+        Self::At { at_ms }
+    }
+    pub fn every(every_ms: i64) -> Self {
+        Self::Every { every_ms }
+    }
+    pub fn cron(expr: String, tz: Option<String>) -> Self {
+        Self::Cron { expr, tz }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -89,7 +103,9 @@ impl Default for CronJob {
     }
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct CronStore {
@@ -256,19 +272,17 @@ mod tests {
     fn test_cron_store_serde_roundtrip() {
         let store = CronStore {
             version: 1,
-            jobs: vec![
-                CronJob {
-                    id: "j1".to_string(),
-                    name: "job one".to_string(),
-                    enabled: true,
-                    schedule: CronSchedule::every(60_000),
-                    payload: CronPayload::default(),
-                    state: CronJobState::default(),
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                    delete_after_run: false,
-                },
-            ],
+            jobs: vec![CronJob {
+                id: "j1".to_string(),
+                name: "job one".to_string(),
+                enabled: true,
+                schedule: CronSchedule::every(60_000),
+                payload: CronPayload::default(),
+                state: CronJobState::default(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                delete_after_run: false,
+            }],
         };
 
         let json = serde_json::to_string(&store).unwrap();

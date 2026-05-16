@@ -109,15 +109,26 @@ mod tests {
     fn test_skill_files_include_memory() {
         let skills: Vec<_> = skill_files().collect();
         assert!(!skills.is_empty());
-        assert!(skills.iter().any(|(name, _, _dest)| name.contains("SKILL.md")));
-        assert!(skills.iter().all(|(_, _, dest)| dest.starts_with("skills/")));
+        assert!(
+            skills
+                .iter()
+                .any(|(name, _, _dest)| name.contains("SKILL.md"))
+        );
+        assert!(
+            skills
+                .iter()
+                .all(|(_, _, dest)| dest.starts_with("skills/"))
+        );
     }
 
     #[test]
     fn test_is_template_content_matches_template() {
         let template = get_template("AGENTS.md").unwrap();
         assert!(is_template_content(template, "AGENTS.md"));
-        assert!(is_template_content(&format!("{}\n\n  ", template), "AGENTS.md"));
+        assert!(is_template_content(
+            &format!("{}\n\n  ", template),
+            "AGENTS.md"
+        ));
     }
 
     #[test]

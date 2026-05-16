@@ -3,7 +3,7 @@ use std::fs;
 
 use tempfile::NamedTempFile;
 
-use slimbot::{Config, AgentConfig, ProviderConfig, ToolEntry, ChannelConfig};
+use slimbot::{AgentConfig, ChannelConfig, Config, ProviderConfig, ToolEntry};
 
 // ── Default config generation ──
 
@@ -170,10 +170,13 @@ fn test_normalize_removes_empty_tools_and_channels() {
         name: "valid".to_string(),
         enabled: true,
     });
-    config.channels.insert("".to_string(), ChannelConfig {
-        enabled: true,
-        extra: std::collections::HashMap::new(),
-    });
+    config.channels.insert(
+        "".to_string(),
+        ChannelConfig {
+            enabled: true,
+            extra: std::collections::HashMap::new(),
+        },
+    );
 
     config.normalize();
 

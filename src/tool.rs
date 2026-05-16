@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ToolEntry;
 use crate::utils::{
-    TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS, build_persisted_reference,
-    write_file_atomic,
+    TOOL_RESULT_PREVIEW_CHARS, TOOL_RESULTS_DIR, build_persisted_reference, write_file_atomic,
 };
 use crate::{debug, error, warn_log};
 
@@ -49,7 +48,9 @@ pub trait Tool: Send + Sync {
     /// Start a new turn (reset per-turn tracking). Default is no-op.
     fn start_turn(&self) {}
     /// Check if this tool sent output this turn. Default is false.
-    fn sent_in_turn(&self) -> bool { false }
+    fn sent_in_turn(&self) -> bool {
+        false
+    }
 }
 
 pub struct ToolManager {

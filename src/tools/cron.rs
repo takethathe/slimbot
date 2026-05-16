@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::cron::{CronJob, CronPayload, CronSchedule, CronService};
 use crate::tool::{Tool, ToolContext};
-use crate::cron::{CronService, CronJob, CronSchedule, CronPayload};
 
 pub struct CronTool {
     cron_service: Arc<CronService>,
@@ -51,13 +51,19 @@ impl CronTool {
 
     fn add_job(&self, args: &serde_json::Value) -> Result<String> {
         if self.in_cron_context.load(Ordering::Relaxed) {
-            return Ok("Error: cannot schedule new jobs from within a cron job execution".to_string());
+            return Ok(
+                "Error: cannot schedule new jobs from within a cron job execution".to_string(),
+            );
         }
 
         let message = args.get("message").and_then(|v| v.as_str());
         let message = match message {
             Some(m) if !m.trim().is_empty() => m.to_string(),
-            _ => return Ok("Error: action='add' requires a non-empty 'message' parameter".to_string()),
+            _ => {
+                return Ok(
+                    "Error: action='add' requires a non-empty 'message' parameter".to_string(),
+                );
+            }
         };
 
         let channel = self.default_channel.lock().unwrap().clone();
@@ -66,13 +72,23 @@ impl CronTool {
             return Ok("Error: no session context (channel/chat_id)".to_string());
         }
 
-        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or_else(|| &message[..message.len().min(30)]).to_string();
-        let deliver = args.get("deliver").and_then(|v| v.as_bool()).unwrap_or(true);
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| &message[..message.len().min(30)])
+            .to_string();
+        let deliver = args
+            .get("deliver")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let schedule = if let Some(every) = args.get("every_seconds").and_then(|v| v.as_i64()) {
             CronSchedule::every(every * 1000)
         } else if let Some(expr) = args.get("cron_expr").and_then(|v| v.as_str()) {
-            let tz = args.get("tz").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let tz = args
+                .get("tz")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             CronSchedule::cron(expr.to_string(), tz)
         } else if let Some(at_str) = args.get("at").and_then(|v| v.as_str()) {
             let ts = match parse_at_datetime(at_str) {
@@ -116,7 +132,9 @@ impl CronTool {
 
         let mut lines = Vec::new();
         for j in &jobs {
-            if !j.enabled { continue; }
+            if !j.enabled {
+                continue;
+            }
             let timing = format_schedule(&j.schedule);
             let mut parts = format!("- {} (id: {}, {})", j.name, j.id, timing);
             if let Some(next) = j.state.next_run_at_ms {
@@ -199,10 +217,15 @@ fn format_schedule(schedule: &CronSchedule) -> String {
     match schedule {
         CronSchedule::Every { every_ms } => {
             let ms = *every_ms;
-            if ms % 3_600_000 == 0 { format!("every {}h", ms / 3_600_000) }
-            else if ms % 60_000 == 0 { format!("every {}m", ms / 60_000) }
-            else if ms % 1000 == 0 { format!("every {}s", ms / 1000) }
-            else { format!("every {}ms", ms) }
+            if ms % 3_600_000 == 0 {
+                format!("every {}h", ms / 3_600_000)
+            } else if ms % 60_000 == 0 {
+                format!("every {}m", ms / 60_000)
+            } else if ms % 1000 == 0 {
+                format!("every {}s", ms / 1000)
+            } else {
+                format!("every {}ms", ms)
+            }
         }
         CronSchedule::Cron { expr, tz } => {
             let tz_str = tz.as_ref().map(|t| format!(" ({})", t)).unwrap_or_default();
@@ -226,51 +249,79 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_and_list() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "name": "test job",
-            "message": "do something",
-            "every_seconds": 300
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "name": "test job",
+                "message": "do something",
+                "every_seconds": 300
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("Created job"));
 
-        let result = tool.execute(serde_json::json!({
-            "action": "list"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "list"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("test job"));
     }
 
     #[tokio::test]
     async fn test_cron_tool_add_and_remove() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let add_result = tool.execute(serde_json::json!({
-            "action": "add",
-            "name": "remove me",
-            "message": "will be removed",
-            "every_seconds": 60
-        })).await.unwrap();
-        let job_id = add_result.split("id: ").last().unwrap().trim_end_matches(')');
+        let add_result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "name": "remove me",
+                "message": "will be removed",
+                "every_seconds": 60
+            }))
+            .await
+            .unwrap();
+        let job_id = add_result
+            .split("id: ")
+            .last()
+            .unwrap()
+            .trim_end_matches(')');
 
-        let result = tool.execute(serde_json::json!({
-            "action": "remove",
-            "job_id": job_id
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "remove",
+                "job_id": job_id
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("Removed job"));
     }
 
     #[tokio::test]
     async fn test_cron_tool_add_missing_message() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "name": "no message"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "name": "no message"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("requires a non-empty"));
     }
 
@@ -278,10 +329,13 @@ mod tests {
     async fn test_cron_tool_remove_missing_job() {
         let tool = make_cron_tool();
 
-        let result = tool.execute(serde_json::json!({
-            "action": "remove",
-            "job_id": "nonexistent"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "remove",
+                "job_id": "nonexistent"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("not found"));
     }
 
@@ -290,11 +344,14 @@ mod tests {
         let tool = make_cron_tool();
         // No set_context called — channel/chat_id will be empty
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "message": "test",
-            "every_seconds": 60
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "message": "test",
+                "every_seconds": 60
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("no session context"));
     }
 
@@ -302,28 +359,40 @@ mod tests {
     async fn test_cron_tool_unknown_action() {
         let tool = make_cron_tool();
 
-        let result = tool.execute(serde_json::json!({
-            "action": "invalid"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "invalid"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("Unknown action"));
     }
 
     #[tokio::test]
     async fn test_cron_tool_add_cron_expression() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "name": "cron job",
-            "message": "run at 9am",
-            "cron_expr": "0 0 9 * * *"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "name": "cron job",
+                "message": "run at 9am",
+                "cron_expr": "0 0 9 * * *"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("Created job"));
 
-        let list = tool.execute(serde_json::json!({
-            "action": "list"
-        })).await.unwrap();
+        let list = tool
+            .execute(serde_json::json!({
+                "action": "list"
+            }))
+            .await
+            .unwrap();
         assert!(list.contains("cron job"));
         assert!(list.contains("cron:"));
     }
@@ -331,14 +400,20 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_at_schedule() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "name": "one shot",
-            "message": "once",
-            "at": "2030-01-01T00:00:00Z"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "name": "one shot",
+                "message": "once",
+                "at": "2030-01-01T00:00:00Z"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("Created job"));
 
         // At-schedule jobs have delete_after_run=true
@@ -350,26 +425,38 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_at_invalid_date() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "message": "bad date",
-            "at": "not-a-date"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "message": "bad date",
+                "at": "not-a-date"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("invalid datetime format"));
     }
 
     #[tokio::test]
     async fn test_cron_tool_add_no_schedule_type() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "message": "no timing",
-            "name": "no timing"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "message": "no timing",
+                "name": "no timing"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("either every_seconds, cron_expr, or at"));
     }
 
@@ -377,9 +464,12 @@ mod tests {
     async fn test_cron_tool_remove_missing_job_id() {
         let tool = make_cron_tool();
 
-        let result = tool.execute(serde_json::json!({
-            "action": "remove"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "remove"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("job_id is required"));
     }
 
@@ -402,29 +492,48 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_job_sets_delivery_fields() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-42".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-42".into(),
+        });
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "name": "remind me",
-            "message": "go to sleep",
-            "every_seconds": 60
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "name": "remind me",
+                "message": "go to sleep",
+                "every_seconds": 60
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("Created job"));
 
         // Verify the job payload has delivery fields set correctly
         let jobs = tool.cron_service.list_jobs();
         assert_eq!(jobs.len(), 1);
         let job = &jobs[0];
-        assert!(job.payload.deliver, "deliver must be true so results are sent to user");
-        assert_eq!(job.payload.channel, Some("webui".to_string()),
-            "channel must be set so gateway knows where to route");
-        assert_eq!(job.payload.to, Some("chat-42".to_string()),
-            "to (chat_id) must be set so gateway knows where to route");
-        assert_eq!(job.payload.message, "go to sleep",
-            "payload message must contain the original instruction");
-        assert_eq!(job.payload.kind, "agent_turn",
-            "payload kind must be agent_turn for gateway execution");
+        assert!(
+            job.payload.deliver,
+            "deliver must be true so results are sent to user"
+        );
+        assert_eq!(
+            job.payload.channel,
+            Some("webui".to_string()),
+            "channel must be set so gateway knows where to route"
+        );
+        assert_eq!(
+            job.payload.to,
+            Some("chat-42".to_string()),
+            "to (chat_id) must be set so gateway knows where to route"
+        );
+        assert_eq!(
+            job.payload.message, "go to sleep",
+            "payload message must contain the original instruction"
+        );
+        assert_eq!(
+            job.payload.kind, "agent_turn",
+            "payload kind must be agent_turn for gateway execution"
+        );
     }
 
     #[tokio::test]
@@ -433,26 +542,38 @@ mod tests {
         // (e.g. "2030-01-01T10:30:00"). This should be accepted directly as local
         // time, not rejected and force the model to retry.
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let result = tool.execute(serde_json::json!({
-            "action": "add",
-            "name": "naive test",
-            "message": "test",
-            "at": "2030-01-01T10:30:00"
-        })).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "action": "add",
+                "name": "naive test",
+                "message": "test",
+                "at": "2030-01-01T10:30:00"
+            }))
+            .await
+            .unwrap();
         assert!(result.contains("Created job"));
 
         // Also verify UTC (Z) format is accepted and treated as local time
         let tool2 = make_cron_tool();
-        tool2.set_context(&ToolContext { channel: "webui".into(), chat_id: "chat-1".into() });
+        tool2.set_context(&ToolContext {
+            channel: "webui".into(),
+            chat_id: "chat-1".into(),
+        });
 
-        let result2 = tool2.execute(serde_json::json!({
-            "action": "add",
-            "name": "utc test",
-            "message": "test",
-            "at": "2030-01-01T10:30:00Z"
-        })).await.unwrap();
+        let result2 = tool2
+            .execute(serde_json::json!({
+                "action": "add",
+                "name": "utc test",
+                "message": "test",
+                "at": "2030-01-01T10:30:00Z"
+            }))
+            .await
+            .unwrap();
         assert!(result2.contains("Created job"));
 
         // Both jobs should have been created on first call (no error-retry needed)

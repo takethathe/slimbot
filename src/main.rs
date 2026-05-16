@@ -7,26 +7,25 @@ use slimbot::AgentLoop;
 use slimbot::CliArgs;
 use slimbot::Commands;
 use slimbot::Config;
-use slimbot::expand_home;
-use slimbot::log_init;
 use slimbot::LogLevel;
 use slimbot::MessageBus;
 use slimbot::PathManager;
+use slimbot::WorkerPool;
+use slimbot::expand_home;
+use slimbot::log_init;
 use slimbot::run_agent_session;
 use slimbot::run_gateway;
 use slimbot::run_setup;
-use slimbot::WorkerPool;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CliArgs::parse();
 
-    let log_level = LogLevel::from_u8(args.log).unwrap_or_else(|| {
-        LogLevel::Info
-    });
-    let log_file_path = args.log_file.as_ref().and_then(|p| {
-        p.to_str().map(|s| expand_home(s))
-    });
+    let log_level = LogLevel::from_u8(args.log).unwrap_or_else(|| LogLevel::Info);
+    let log_file_path = args
+        .log_file
+        .as_ref()
+        .and_then(|p| p.to_str().map(|s| expand_home(s)));
     log_init(log_level, log_file_path.as_deref())?;
 
     // No subcommand: print help and exit
@@ -44,20 +43,17 @@ async fn main() -> Result<()> {
             let data_dir = args.data_dir().unwrap_or("~/.slimbot");
             return run_setup(config_path, data_dir, args.workspace_dir());
         }
-        Some(Commands::Agent { ref session_id, ref query }) => {
-            let paths = PathManager::resolve(
-                args.config_path(),
-                args.data_dir(),
-                args.workspace_dir(),
-            )?;
+        Some(Commands::Agent {
+            ref session_id,
+            ref query,
+        }) => {
+            let paths =
+                PathManager::resolve(args.config_path(), args.data_dir(), args.workspace_dir())?;
             return run_cli_agent(&paths, session_id.as_deref(), query.as_deref()).await;
         }
         Some(Commands::Gateway) => {
-            let paths = PathManager::resolve(
-                args.config_path(),
-                args.data_dir(),
-                args.workspace_dir(),
-            )?;
+            let paths =
+                PathManager::resolve(args.config_path(), args.data_dir(), args.workspace_dir())?;
             return run_gateway(&paths).await;
         }
         None => unreachable!(),

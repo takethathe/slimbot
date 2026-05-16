@@ -52,6 +52,12 @@ fn test_log_level_filtering() {
     assert!(status.success(), "setup should exit successfully");
 
     let content = fs::read_to_string(&log_path).expect("log file should exist");
-    assert!(!content.contains("[D]"), "debug entries should be suppressed at level 2");
-    assert!(!content.contains("[I]"), "info entries should be suppressed at level 2");
+    assert!(
+        !content.contains("[D]"),
+        "debug entries should be suppressed at level 2"
+    );
+    assert!(
+        !content.contains("[I]"),
+        "info entries should be suppressed at level 2"
+    );
 }

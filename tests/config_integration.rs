@@ -3,7 +3,7 @@ use std::fs;
 
 use tempfile::NamedTempFile;
 
-use slimbot::{Config, AgentConfig, ProviderConfig, ToolEntry, ChannelConfig, GatewayConfig};
+use slimbot::{AgentConfig, ChannelConfig, Config, GatewayConfig, ProviderConfig, ToolEntry};
 
 // ── Config loading and validation ──
 
@@ -133,7 +133,10 @@ fn test_provider_defaults() {
     assert!((provider.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(provider.max_tokens, 4096);
     // api_url is derived from base_url during normalize
-    assert_eq!(provider.api_url, "https://api.openai.com/v1/chat/completions");
+    assert_eq!(
+        provider.api_url,
+        "https://api.openai.com/v1/chat/completions"
+    );
     assert!(!provider.base_url.is_empty());
 }
 
@@ -181,14 +184,17 @@ fn test_save_and_reload_round_trip() {
     );
 
     let mut channels = HashMap::new();
-    channels.insert("cli".to_string(), ChannelConfig {
-        enabled: true,
-        extra: {
-            let mut m = HashMap::new();
-            m.insert("chat_id".to_string(), serde_json::json!("default"));
-            m
+    channels.insert(
+        "cli".to_string(),
+        ChannelConfig {
+            enabled: true,
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("chat_id".to_string(), serde_json::json!("default"));
+                m
+            },
         },
-    });
+    );
 
     let config = Config {
         agent: AgentConfig {

@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{Notify, broadcast, mpsc};
 
-use crate::commands::{classify_command, CommandTier};
+use crate::commands::{CommandTier, classify_command};
 use crate::config::Config;
 use crate::config_defs::ProviderConfig;
 use crate::consolidate::Consolidator;
@@ -19,7 +19,9 @@ use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::path::PathManager;
 use crate::provider::{OpenAIProvider, Provider};
 use crate::runner::{AgentResult, AgentRunner};
-use crate::session::{SessionManager, SessionTaskBuilder, SharedSessionManager, TaskHook, ensure_session};
+use crate::session::{
+    SessionManager, SessionTaskBuilder, SharedSessionManager, TaskHook, ensure_session,
+};
 use crate::tool::{Tool, ToolManager};
 use crate::{error, info, warn_log};
 
@@ -132,7 +134,9 @@ impl ShutdownHandle {
                 channel_inject: None,
                 hook,
             };
-            if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = self.inbound_tx.try_send(request) {
+            if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                self.inbound_tx.try_send(request)
+            {
                 error!("[main] Inbound channel closed");
                 break;
             }
@@ -146,7 +150,6 @@ impl AgentLoop {
         message_bus: Arc<MessageBus>,
         config: Arc<Config>,
     ) -> Result<Self> {
-
         let provider_config = config
             .providers
             .get(&config.agent.provider)
@@ -186,7 +189,9 @@ impl AgentLoop {
         let session_manager = SessionManager::new(paths.session_dir())?;
         let session_manager_arc = Arc::new(tokio::sync::Mutex::new(session_manager));
 
-        let memory_store = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(paths.workspace_dir())));
+        let memory_store = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(
+            paths.workspace_dir(),
+        )));
         memory_store.lock().await.init()?;
 
         let consolidator = Arc::new(Consolidator::new(
@@ -416,13 +421,10 @@ impl AgentLoop {
             }
             "/status" => {
                 let guard = session_manager.lock().await;
-                let msg_count = guard.message_count(session_id);
+                let msg_count = guard.total_message_count(session_id);
                 drop(guard);
 
-                let status = format!(
-                    "Session: {}\nMessages: {}",
-                    session_id, msg_count
-                );
+                let status = format!("Session: {}\nMessages: {}", session_id, msg_count);
                 (status, false)
             }
             _ => (String::new(), false),
@@ -456,22 +458,25 @@ impl AgentLoop {
 
     /// Graceful shutdown of all components. Called by the main thread after
     /// the stdin loop exits (triggered by /quit).
-    pub async fn graceful_shutdown(
-        &self,
-        channel_manager: &Arc<crate::channel::ChannelManager>,
-    ) {
+    pub async fn graceful_shutdown(&self, channel_manager: &Arc<crate::channel::ChannelManager>) {
         graceful_shutdown(
             channel_manager,
             &self.session_manager,
             &self.consolidator,
             &self.memory_store,
-        ).await;
+        )
+        .await;
     }
 
     /// Shutdown for CLI mode (no ChannelManager). Shuts down consolidator,
     /// session manager, and memory store.
     pub async fn shutdown_for_cli(&self) {
-        shutdown_session_memory(&self.session_manager, &self.consolidator, &self.memory_store).await;
+        shutdown_session_memory(
+            &self.session_manager,
+            &self.consolidator,
+            &self.memory_store,
+        )
+        .await;
         info!("[AgentLoop] CLI session shutdown complete");
     }
 }

@@ -1,6 +1,6 @@
 use std::fs;
 
-use slimbot::{LogLevel, log_init, log};
+use slimbot::{LogLevel, log, log_init};
 use tempfile::TempDir;
 
 // ── LogLevel enum ──

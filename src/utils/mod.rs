@@ -10,11 +10,13 @@ pub fn truncate_text_head_tail(text: &str, max_chars: usize) -> String {
     }
     let tail_size = HEAD_TAIL_CHUNK.min(max_chars / 2);
     let head_size = max_chars - tail_size;
-    let head_end = text.char_indices()
+    let head_end = text
+        .char_indices()
         .nth(head_size)
         .map(|(i, _)| i)
         .unwrap_or(text.len());
-    let tail_start = text.char_indices()
+    let tail_start = text
+        .char_indices()
         .nth(char_count - tail_size)
         .map(|(i, _)| i)
         .unwrap_or(text.len());
@@ -49,11 +51,7 @@ pub fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 
 /// Build a reference string for a persisted tool result.
 /// Returns a stable format: reference + preview + truncation notice.
-pub fn build_persisted_reference(
-    file_path: &Path,
-    content: &str,
-    preview_max: usize,
-) -> String {
+pub fn build_persisted_reference(file_path: &Path, content: &str, preview_max: usize) -> String {
     let preview_end = content
         .char_indices()
         .nth(preview_max)

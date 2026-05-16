@@ -29,29 +29,40 @@ pub(crate) mod utils;
 pub(crate) mod worker;
 
 // Re-export key types for integration tests and binary usage.
-pub use config::{ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, GatewayConfig, HeartbeatConfig, ToolEntry};
+pub use channel::{Channel, ChannelFactory, ChannelManager};
+pub use config::{
+    ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, GatewayConfig, HeartbeatConfig,
+    ToolEntry,
+};
 pub use config_defs::{AgentConfig, ProviderConfig};
-pub use config_macro::{Normalizable, FieldMeta};
+pub use config_macro::{FieldMeta, Normalizable};
+pub use consolidate::Consolidator;
+pub use context::ContextBuilder;
+pub use cron::{CronJob, CronPayload, CronSchedule, CronService};
 pub use log::{LogLevel, init as log_init, log, should_log};
+pub use memory::{MemoryStore, SharedMemoryStore};
 pub use message_bus::{BusRequest, BusResult, MessageBus};
 pub use path::PathManager;
 pub use path::expand_home;
-pub use session::{Content, Message, Session, SessionManager, TaskHook, TaskState, SharedSessionManager};
-pub use consolidate::Consolidator;
-pub use context::ContextBuilder;
-pub use provider::{OpenAIProvider, Provider, LLMResponse, FinishReason, Usage};
+pub use provider::{FinishReason, LLMResponse, OpenAIProvider, Provider, Usage};
 pub use runner::AgentRunner;
-pub use memory::{MemoryStore, SharedMemoryStore};
-pub use tool::{ToolCall, ToolDefinition, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result};
-pub use utils::{truncate_text_head_tail, write_file_atomic, build_persisted_reference, TOOL_RESULTS_DIR, TOOL_RESULT_PREVIEW_CHARS};
+pub use session::{
+    Content, Message, Session, SessionManager, SharedSessionManager, TaskHook, TaskState,
+};
+pub use tool::{
+    ToolCall, ToolDefinition, ToolManager, ensure_nonempty_tool_result, format_tool_error,
+    persist_tool_result,
+};
 pub use tools::create_tool;
-pub use cron::{CronService, CronJob, CronSchedule, CronPayload};
-pub use channel::{Channel, ChannelFactory, ChannelManager};
+pub use utils::{
+    TOOL_RESULT_PREVIEW_CHARS, TOOL_RESULTS_DIR, build_persisted_reference,
+    truncate_text_head_tail, write_file_atomic,
+};
 
 // Re-export for binary usage.
-pub use cli::{CliArgs, Commands, run_agent_session};
-pub use setup::run_setup;
-pub use worker::WorkerPool;
 pub use agent_loop::AgentLoop;
+pub use cli::{CliArgs, Commands, run_agent_session};
 pub use gateway::run_gateway;
 pub use log as log_module;
+pub use setup::run_setup;
+pub use worker::WorkerPool;

@@ -13,11 +13,11 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 
 use super::{Channel, ChannelFactory};
+use crate::embed;
+use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::{SharedSessionManager, TaskHook, TaskState};
-use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::{error, info};
-use crate::embed;
 
 struct AppState {
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<String>>>>>,
@@ -44,10 +44,7 @@ impl WebuiChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("0.0.0.0")
             .to_string();
-        let port = config
-            .get("port")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(8080) as u16;
+        let port = config.get("port").and_then(|v| v.as_u64()).unwrap_or(8080) as u16;
         Ok(Self {
             host,
             port,
@@ -93,8 +90,9 @@ impl WebuiChannel {
         let shutdown_rx = self.shutdown_rx.as_ref().map(|rx| rx.resubscribe());
 
         let handle = tokio::spawn(async move {
-            let index_html =
-                embed::get_content_by_dest("webui/index.html").unwrap_or("<h1>SlimBot Gateway</h1>").to_string();
+            let index_html = embed::get_content_by_dest("webui/index.html")
+                .unwrap_or("<h1>SlimBot Gateway</h1>")
+                .to_string();
 
             let state = AppState {
                 chats,
@@ -156,8 +154,14 @@ struct ChatInfo {
     created_at_ms: i64,
 }
 
-async fn index_handler(State(state): State<Arc<AppState>>) -> (StatusCode, [(&'static str, &'static str); 1], String) {
-    (StatusCode::OK, [("content-type", "text/html")], state.index_html.clone())
+async fn index_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    (
+        StatusCode::OK,
+        [("content-type", "text/html")],
+        state.index_html.clone(),
+    )
 }
 
 async fn list_chats_handler(State(state): State<Arc<AppState>>) -> axum::Json<Vec<ChatInfo>> {
@@ -166,8 +170,15 @@ async fn list_chats_handler(State(state): State<Arc<AppState>>) -> axum::Json<Ve
     if let Some(sm) = &state.session_manager {
         let guard = sm.lock().await;
         for (session_id, msg_count, created) in guard.list_persisted_sessions(&prefix) {
-            let chat_id = session_id.strip_prefix(&prefix).unwrap_or(&session_id).to_string();
-            chats.push(ChatInfo { chat_id, message_count: msg_count, created_at_ms: created });
+            let chat_id = session_id
+                .strip_prefix(&prefix)
+                .unwrap_or(&session_id)
+                .to_string();
+            chats.push(ChatInfo {
+                chat_id,
+                message_count: msg_count,
+                created_at_ms: created,
+            });
         }
     }
     axum::Json(chats)
@@ -201,9 +212,8 @@ async fn create_chat_handler(State(state): State<Arc<AppState>>) -> axum::Json<S
 async fn sse_handler(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
-) -> axum::response::sse::Sse<
-    impl futures::Stream<Item = Result<Event, std::convert::Infallible>>,
-> {
+) -> axum::response::sse::Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>
+{
     let chat_id = params.get("chat_id").cloned().unwrap_or_default();
 
     let (tx, mut rx) = mpsc::channel::<String>(32);
@@ -468,7 +478,13 @@ mod tests {
         {
             let mut guard = sm.lock().await;
             guard.get_or_create("webui:chat1").await.unwrap();
-            guard.add_message("webui:chat1", crate::session::Message::user("hello".to_string())).await.unwrap();
+            guard
+                .add_message(
+                    "webui:chat1",
+                    crate::session::Message::user("hello".to_string()),
+                )
+                .await
+                .unwrap();
             guard.persist("webui:chat1").await.unwrap();
         }
 
@@ -494,8 +510,17 @@ mod tests {
         {
             let mut guard = sm.lock().await;
             guard.get_or_create("webui:abc").await.unwrap();
-            guard.add_message("webui:abc", crate::session::Message::user("hi".to_string())).await.unwrap();
-            guard.add_message("webui:abc", crate::session::Message::assistant(Some("hello".to_string()), None, None, None)).await.unwrap();
+            guard
+                .add_message("webui:abc", crate::session::Message::user("hi".to_string()))
+                .await
+                .unwrap();
+            guard
+                .add_message(
+                    "webui:abc",
+                    crate::session::Message::assistant(Some("hello".to_string()), None, None, None),
+                )
+                .await
+                .unwrap();
             guard.persist("webui:abc").await.unwrap();
         }
 
@@ -520,9 +545,7 @@ mod tests {
             index_html: String::new(),
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            create_chat_handler(State(state)).await
-        });
+        let result = rt.block_on(async { create_chat_handler(State(state)).await });
         // Should return a non-empty chat_id
         assert!(!result.0.is_empty());
         // Should be 8 chars (uuid prefix)
@@ -537,8 +560,14 @@ mod tests {
         let html = crate::embed::get_content_by_dest("webui/index.html");
         assert!(html.is_some(), "webui/index.html should be embedded");
         let html = html.unwrap();
-        assert!(html.contains("<!DOCTYPE html>"), "should contain HTML doctype");
-        assert!(html.contains("EventSource"), "should contain SSE client code");
+        assert!(
+            html.contains("<!DOCTYPE html>"),
+            "should contain HTML doctype"
+        );
+        assert!(
+            html.contains("EventSource"),
+            "should contain SSE client code"
+        );
         assert!(html.contains("/message"), "should contain message endpoint");
     }
 
@@ -575,8 +604,12 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             handle.join_handle.unwrap(),
-        ).await;
-        assert!(result.is_ok(), "server should exit within 3s of shutdown signal");
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "server should exit within 3s of shutdown signal"
+        );
     }
 
     #[tokio::test]

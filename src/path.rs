@@ -28,7 +28,8 @@ impl PathManager {
     ) -> Result<Self> {
         let explicit_workspace = workspace_dir.is_some();
         let resolved_data_dir = Self::resolve_data_dir(data_dir);
-        let resolved_workspace = Self::resolve_workspace_dir(resolved_data_dir.clone(), workspace_dir);
+        let resolved_workspace =
+            Self::resolve_workspace_dir(resolved_data_dir.clone(), workspace_dir);
         let config_path = Self::resolve_config_path(&resolved_data_dir, config)?;
 
         let data_dir = Self::ensure_dir(&resolved_data_dir)?;
@@ -122,9 +123,10 @@ impl PathManager {
 
     /// Validate that a user-provided path stays within the workspace directory.
     pub fn validate_path_sandbox(&self, user_path: &str) -> Result<PathBuf> {
-        let workspace_abs = self.workspace_dir.canonicalize().context(
-            "Workspace directory does not exist or cannot be accessed",
-        )?;
+        let workspace_abs = self
+            .workspace_dir
+            .canonicalize()
+            .context("Workspace directory does not exist or cannot be accessed")?;
 
         let clean = user_path.trim_start_matches('/');
         let joined = workspace_abs.join(clean);
@@ -159,10 +161,7 @@ impl PathManager {
         })?;
         for comp in remaining.components() {
             if let std::path::Component::ParentDir = comp {
-                anyhow::bail!(
-                    "Path escapes workspace directory via '..': {}",
-                    user_path
-                );
+                anyhow::bail!("Path escapes workspace directory via '..': {}", user_path);
             }
         }
 
@@ -199,7 +198,10 @@ mod tests {
             assert_eq!(expand_home("~"), home);
             assert_eq!(expand_home("~/foo/bar"), home.join("foo/bar"));
         }
-        assert_eq!(expand_home("/absolute/path"), PathBuf::from("/absolute/path"));
+        assert_eq!(
+            expand_home("/absolute/path"),
+            PathBuf::from("/absolute/path")
+        );
         assert_eq!(expand_home("relative/path"), PathBuf::from("relative/path"));
     }
 
@@ -304,6 +306,9 @@ mod tests {
 
         let pm = PathManager::resolve(None, Some(data.to_str().unwrap()), None).unwrap();
         assert!(pm.bootstrap_file("SOUL.md").ends_with("workspace/SOUL.md"));
-        assert!(pm.bootstrap_file("AGENTS.md").ends_with("workspace/AGENTS.md"));
+        assert!(
+            pm.bootstrap_file("AGENTS.md")
+                .ends_with("workspace/AGENTS.md")
+        );
     }
 }

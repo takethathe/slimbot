@@ -1,4 +1,4 @@
-use slimbot::{MessageBus, BusRequest, BusResult, TaskHook};
+use slimbot::{BusRequest, BusResult, MessageBus, TaskHook};
 
 // ── MessageBus creation and endpoints ──
 
@@ -122,12 +122,15 @@ async fn test_concurrent_inbound_outbound() {
     });
 
     // Send a request
-    in_tx.send(BusRequest {
-        session_id: "test:1".to_string(),
-        content: "do something".to_string(),
-        channel_inject: None,
-        hook: TaskHook::new("test:1"),
-    }).await.unwrap();
+    in_tx
+        .send(BusRequest {
+            session_id: "test:1".to_string(),
+            content: "do something".to_string(),
+            channel_inject: None,
+            hook: TaskHook::new("test:1"),
+        })
+        .await
+        .unwrap();
 
     // Receive the result
     let mut guard = out_rx.lock().await;

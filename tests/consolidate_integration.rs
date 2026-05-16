@@ -5,10 +5,8 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 use slimbot::{
-    Consolidator, ContextBuilder, MemoryStore, Message,
-    Provider, LLMResponse, FinishReason, Usage,
-    SessionManager, SharedSessionManager, ToolManager,
-    ToolDefinition,
+    Consolidator, ContextBuilder, FinishReason, LLMResponse, MemoryStore, Message, Provider,
+    SessionManager, SharedSessionManager, ToolDefinition, ToolManager, Usage,
 };
 
 // ── SessionMeta: last_summary persistence and reload ──
@@ -20,12 +18,15 @@ async fn test_set_last_summary_in_memory() {
     let mut sm = SessionManager::new(session_dir).unwrap();
 
     sm.get_or_create("s1").await.unwrap();
-    sm.add_message("s1", Message::user("hello".to_string())).await.unwrap();
+    sm.add_message("s1", Message::user("hello".to_string()))
+        .await
+        .unwrap();
 
     // Initially no summary
     assert!(sm.get_last_summary("s1").await.is_none());
 
-    sm.set_last_summary("s1", "user prefers short replies").await;
+    sm.set_last_summary("s1", "user prefers short replies")
+        .await;
     let summary = sm.get_last_summary("s1").await;
     assert_eq!(summary.as_deref(), Some("user prefers short replies"));
 }
@@ -39,7 +40,8 @@ async fn test_last_summary_persists_and_reloads() {
     {
         let mut sm = SessionManager::new(session_dir.clone()).unwrap();
         sm.get_or_create("s1").await.unwrap();
-        sm.set_last_summary("s1", "user chose option B after comparing").await;
+        sm.set_last_summary("s1", "user chose option B after comparing")
+            .await;
         sm.persist("s1").await.unwrap();
     }
 
@@ -85,7 +87,9 @@ async fn test_char_per_token_ratio_persists_and_reloads() {
     {
         let mut sm = SessionManager::new(session_dir.clone()).unwrap();
         sm.get_or_create("s1").await.unwrap();
-        sm.add_message("s1", Message::user("hello world".to_string())).await.unwrap();
+        sm.add_message("s1", Message::user("hello world".to_string()))
+            .await
+            .unwrap();
         sm.persist("s1").await.unwrap();
     }
 
@@ -115,7 +119,9 @@ async fn test_consolidation_summary_appended_to_history() {
     assert_eq!(store.read_recent_history(0).len(), 1);
 
     // Simulate a consolidation summary being appended
-    store.append_history("- User decided to use SQLite over Postgres").unwrap();
+    store
+        .append_history("- User decided to use SQLite over Postgres")
+        .unwrap();
 
     let entries = store.read_recent_history(10);
     assert_eq!(entries.len(), 2);
@@ -134,7 +140,9 @@ async fn test_context_builder_injects_summary() {
 
     let mut sm = SessionManager::new(session_dir.clone()).unwrap();
     sm.get_or_create("s1").await.unwrap();
-    sm.add_message("s1", Message::user("current query".to_string())).await.unwrap();
+    sm.add_message("s1", Message::user("current query".to_string()))
+        .await
+        .unwrap();
 
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
@@ -146,26 +154,31 @@ async fn test_context_builder_injects_summary() {
     let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
 
     // Without summary
-    let ctx = cb.build("s1", None, None, None, None).await;
-    let system_text = match &ctx.messages[0] {
+    let ctx = cb.build_messages("s1", "cli", "test", None).await;
+    let system_text = match &ctx.system_message {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
     };
     assert!(!system_text.contains("[Resumed Session]"));
 
     // With summary — check runtime context in user message (not system prompt)
-    let ctx = cb.build("s1", None, Some("user chose SQLite"), None, None).await;
+    let ctx = cb
+        .build_messages("s1", "cli", "test", Some("user chose SQLite"))
+        .await;
     // System message should NOT contain [Resumed Session] anymore
-    let system_text = match &ctx.messages[0] {
+    let system_text = match &ctx.system_message {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
     };
     assert!(!system_text.contains("[Resumed Session]"));
-    // Runtime context is in the last user message
-    let has_resumed_in_user = ctx.messages.iter().any(|m| {
-        matches!(m, Message::User { content, .. } if content.as_text().contains("[Resumed Session]"))
+    // Runtime context is in the runtime_content field of the user message in current_turn
+    let has_resumed_in_user = ctx.current_turn.iter().any(|m| {
+        matches!(m, Message::User { runtime_content, .. } if runtime_content.as_ref().is_some_and(|rc| rc.contains("[Resumed Session]")))
     });
-    assert!(has_resumed_in_user, "[Resumed Session] should be in a user message");
+    assert!(
+        has_resumed_in_user,
+        "[Resumed Session] should be in runtime_content of a user message"
+    );
 }
 
 #[tokio::test]
@@ -187,8 +200,8 @@ async fn test_context_builder_skips_empty_summary() {
     let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
 
     // Empty summary should not add [Resumed Session] section
-    let ctx = cb.build("s1", None, Some(""), None, None).await;
-    let system_text = match &ctx.messages[0] {
+    let ctx = cb.build_messages("s1", "cli", "test", Some("")).await;
+    let system_text = match &ctx.system_message {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
     };
@@ -206,7 +219,7 @@ struct SummaryMockProvider {
 impl Provider for SummaryMockProvider {
     async fn chat(
         &self,
-        _messages: &[Message],
+        _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
     ) -> anyhow::Result<LLMResponse> {
         Ok(LLMResponse {
@@ -236,8 +249,15 @@ async fn test_consolidator_archives_summary_to_history() {
 
     // Add enough messages to trigger consolidation
     for i in 0..5 {
-        sm.add_message("s1", Message::user(format!("user msg {i}"))).await.unwrap();
-        sm.add_message("s1", Message::assistant(Some(format!("reply {i}")), None, None, None)).await.unwrap();
+        sm.add_message("s1", Message::user(format!("user msg {i}")))
+            .await
+            .unwrap();
+        sm.add_message(
+            "s1",
+            Message::assistant(Some(format!("reply {i}")), None, None, None),
+        )
+        .await
+        .unwrap();
     }
 
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
@@ -249,13 +269,7 @@ async fn test_consolidator_archives_summary_to_history() {
         summary: "- User prefers dark mode\n- Decided to use SQLite".to_string(),
     });
 
-    let consolidator = Consolidator::new(
-        provider,
-        sm.clone(),
-        ms.clone(),
-        8192,
-        4096,
-    );
+    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 8192, 4096);
 
     // Trigger consolidation with high prompt token count
     consolidator.maybe_consolidate("s1", 10000).await.unwrap();
@@ -280,8 +294,15 @@ async fn test_consolidator_updates_summary_in_session_meta() {
     sm.get_or_create("s1").await.unwrap();
 
     for i in 0..5 {
-        sm.add_message("s1", Message::user(format!("user msg {i}"))).await.unwrap();
-        sm.add_message("s1", Message::assistant(Some(format!("reply {i}")), None, None, None)).await.unwrap();
+        sm.add_message("s1", Message::user(format!("user msg {i}")))
+            .await
+            .unwrap();
+        sm.add_message(
+            "s1",
+            Message::assistant(Some(format!("reply {i}")), None, None, None),
+        )
+        .await
+        .unwrap();
     }
 
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
@@ -294,13 +315,7 @@ async fn test_consolidator_updates_summary_in_session_meta() {
         summary: summary_text.to_string(),
     });
 
-    let consolidator = Consolidator::new(
-        provider,
-        sm.clone(),
-        ms.clone(),
-        8192,
-        4096,
-    );
+    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 8192, 4096);
 
     // Initially no summary
     assert!({
@@ -331,7 +346,9 @@ async fn test_consolidator_no_consolidation_when_within_budget() {
 
     let mut sm = SessionManager::new(session_dir.clone()).unwrap();
     sm.get_or_create("s1").await.unwrap();
-    sm.add_message("s1", Message::user("short query".to_string())).await.unwrap();
+    sm.add_message("s1", Message::user("short query".to_string()))
+        .await
+        .unwrap();
 
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
@@ -343,13 +360,7 @@ async fn test_consolidator_no_consolidation_when_within_budget() {
         summary: "should not be called".to_string(),
     });
 
-    let consolidator = Consolidator::new(
-        provider,
-        sm.clone(),
-        ms.clone(),
-        8192,
-        4096,
-    );
+    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 8192, 4096);
 
     // Prompt tokens well within budget (8192 - 4096 - 512 = 3584 budget)
     consolidator.maybe_consolidate("s1", 100).await.unwrap();
@@ -375,11 +386,19 @@ async fn test_consolidation_summary_survives_session_reload() {
         sm.get_or_create("s1").await.unwrap();
 
         for i in 0..5 {
-            sm.add_message("s1", Message::user(format!("msg {i}"))).await.unwrap();
-            sm.add_message("s1", Message::assistant(Some(format!("reply {i}")), None, None, None)).await.unwrap();
+            sm.add_message("s1", Message::user(format!("msg {i}")))
+                .await
+                .unwrap();
+            sm.add_message(
+                "s1",
+                Message::assistant(Some(format!("reply {i}")), None, None, None),
+            )
+            .await
+            .unwrap();
         }
 
-        sm.set_last_summary("s1", "- User runs on macOS\n- Chose async/await pattern").await;
+        sm.set_last_summary("s1", "- User runs on macOS\n- Chose async/await pattern")
+            .await;
         sm.persist("s1").await.unwrap();
     }
 
@@ -415,8 +434,11 @@ async fn test_context_builder_uses_summary_from_reloaded_session() {
     {
         let mut sm = SessionManager::new(session_dir.clone()).unwrap();
         sm.get_or_create("s1").await.unwrap();
-        sm.add_message("s1", Message::user("original query".to_string())).await.unwrap();
-        sm.set_last_summary("s1", "- User project is a chat bot").await;
+        sm.add_message("s1", Message::user("original query".to_string()))
+            .await
+            .unwrap();
+        sm.set_last_summary("s1", "- User project is a chat bot")
+            .await;
         sm.persist("s1").await.unwrap();
     }
 
@@ -425,6 +447,10 @@ async fn test_context_builder_uses_summary_from_reloaded_session() {
         let mut sm = SessionManager::new(session_dir.clone()).unwrap();
         // Trigger reload by getting the session
         sm.get_or_create("s1").await.unwrap();
+        // Add a new user message (simulating the current turn's input)
+        sm.add_message("s1", Message::user("follow-up query".to_string()))
+            .await
+            .unwrap();
 
         let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
@@ -440,12 +466,15 @@ async fn test_context_builder_uses_summary_from_reloaded_session() {
             guard.get_last_summary("s1").await
         };
 
-        let ctx = cb.build("s1", None, summary.as_deref(), None, None).await;
-        let has_resumed_in_user = ctx.messages.iter().any(|m| {
-            matches!(m, Message::User { content, .. } if content.as_text().contains("[Resumed Session]"))
+        let ctx = cb
+            .build_messages("s1", "cli", "test", summary.as_deref())
+            .await;
+        // Check runtime context in runtime_content field of current_turn user messages
+        let has_resumed_in_user = ctx.current_turn.iter().any(|m| {
+            matches!(m, Message::User { runtime_content, .. } if runtime_content.as_ref().is_some_and(|rc| rc.contains("[Resumed Session]")))
         });
-        let has_chat_bot = ctx.messages.iter().any(|m| {
-            matches!(m, Message::User { content, .. } if content.as_text().contains("chat bot"))
+        let has_chat_bot = ctx.current_turn.iter().any(|m| {
+            matches!(m, Message::User { runtime_content, .. } if runtime_content.as_ref().is_some_and(|rc| rc.contains("chat bot")))
         });
 
         // Session summary is in runtime context (user message), not system prompt

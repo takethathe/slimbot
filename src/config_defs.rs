@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use crate::define_config;
+use std::collections::BTreeMap;
 
 define_config! {
     agent => AgentConfig {
