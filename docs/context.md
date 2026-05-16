@@ -19,7 +19,7 @@ pub struct ContextBuilder {
 
 ## System Prompt 构建流程
 
-`ContextBuilder.build(session_id, channel_inject, session_summary)` 按以下顺序组装 system prompt：
+`ContextBuilder.build_messages(session_id, channel, chat_id, session_summary)` 按以下顺序组装 system prompt：
 
 ```
 system_parts = []
@@ -97,14 +97,28 @@ RunContext { messages, tools }
 
 ## 输出
 
-`build()` 返回 `RunContext`：
+`build_messages()` 返回 `RunContext`：
 
 ```rust
 pub struct RunContext {
-    pub messages: Vec<Message>,     // system + 历史消息
-    pub tools: Option<Vec<ToolDefinition>>,  // 工具定义
+    pub history: Arc<[Message]>,            // 不可变历史消息（零拷贝共享）
+    pub current_turn: Vec<Message>,         // 本轮新增消息（含 runtime_content）
+    pub system_message: Message,            // 构建的 system prompt
+    pub tools: Option<Vec<ToolDefinition>>, // 工具定义
 }
 ```
+
+Runner 在每次 LLM 调用前从 `RunContext` 构建消息引用列表：
+```rust
+let messages: Vec<&Message> = ctx.history.iter()
+    .chain(ctx.current_turn.iter())
+    .collect();
+provider.chat(&messages, ctx.tools.as_deref()).await;
+```
+
+### Runtime content 生命周期
+
+`build_messages()` 在 `current_turn` 的第一个 `Message::User` 上设置 `runtime_content = Some(ctx)`。Provider 序列化时将其 prepend 到 content 字符串。`persist()` 时 strip 掉，**不会写入 JSONL**。
 
 ## 注意事项
 

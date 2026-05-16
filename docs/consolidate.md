@@ -107,7 +107,7 @@ ReAct turn 完成
 
 ## 上下文注入
 
-`ContextBuilder.build()` 在 system prompt 中注入 `[Resumed Session]` 段落（在 memory 之后、recent history 之前），代替已驱逐的消息：
+`ContextBuilder.build_messages()` 在 `current_turn` 的第一个 `Message::User` 上设置 `runtime_content` 字段（包含 `[Resumed Session]` 摘要），仅在 Provider 序列化时处理，不污染持久化消息：
 
 ```
 [Resumed Session] - User prefers dark mode

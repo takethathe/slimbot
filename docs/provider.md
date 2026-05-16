@@ -13,7 +13,7 @@
 pub trait Provider: Send + Sync {
     async fn chat(
         &self,
-        messages: &[Message],
+        messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<ChatResponse>;
 }
@@ -23,8 +23,24 @@ pub trait Provider: Send + Sync {
 
 | 参数 | 说明 |
 |------|------|
-| `messages` | 消息列表（system + 历史 + 用户消息） |
+| `messages` | 消息引用列表（system + 历史 + 用户消息），避免 clone 开销 |
 | `tools` | 可选的工具定义列表，用于 OpenAI function calling |
+
+### `runtime_content` 处理
+
+`Message::User` 可能携带 `runtime_content: Option<String>` 字段（由 `ContextBuilder.build_messages()` 设置）。Provider 序列化时将其 prepend 到 content 字符串前：
+
+```rust
+Message::User { content, runtime_content, .. } => {
+    let mut json_content = content.to_openai_value();
+    if let Some(ctx) = runtime_content {
+        // prepend ctx to content
+    }
+    // ...
+}
+```
+
+`runtime_content` 通过 `skip_serializing_if` 保证**永远不会写入 JSONL**。
 
 ### 返回值
 
@@ -121,7 +137,7 @@ pub struct MyProvider { ... }
 
 #[async_trait]
 impl Provider for MyProvider {
-    async fn chat(&self, messages: &[Message], tools: Option<&[ToolDefinition]>) -> Result<ChatResponse> {
+    async fn chat(&self, messages: &[&Message], tools: Option<&[ToolDefinition]>) -> Result<ChatResponse> {
         // 调用你自己的 LLM API
         // 将响应转换为 ChatResponse 格式返回
     }
