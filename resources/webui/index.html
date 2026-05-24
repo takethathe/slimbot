@@ -702,6 +702,12 @@ let evtSource = null;
 let isProcessing = false;
 let activeUserDot = null;
 
+// SSE message accumulation state (per-request, reset on each new message)
+let currentMsgEl = null;
+let accumulated = '';
+let responseReceived = false;
+let streamClosed = false;
+
 function formatTimestamp(ms) {
   const d = new Date(ms);
   const now = new Date();
@@ -837,25 +843,16 @@ async function loadHistory(chatId) {
   }
 }
 
-function enterChat(chatId) {
-  currentChat = chatId;
-  isProcessing = false;
-  activeUserDot = null;
-
-  document.getElementById('chat-select').style.display = 'none';
-  const view = document.getElementById('view');
-  view.style.display = 'flex';
-  view.classList.add('active');
-  document.getElementById('chat-title').innerHTML = '<span class="dot"></span>' + chatId;
+function setupSSE(chatId) {
+  // Reset per-request state
+  currentMsgEl = null;
+  accumulated = '';
+  responseReceived = false;
+  streamClosed = false;
 
   if (evtSource) evtSource.close();
 
-  let accumulated = '';
-  let currentMsgEl = null;
-
   evtSource = new EventSource('/sse?chat_id=' + encodeURIComponent(chatId));
-  let responseReceived = false;
-  let streamClosed = false;
 
   function onStreamDone() {
     if (streamClosed) return;
@@ -883,9 +880,9 @@ function enterChat(chatId) {
     accumulated += data;
     currentMsgEl.el.innerHTML = renderMarkdown(accumulated);
     scrollToBottom();
+  };
 
-    // Server closes the SSE stream after sending the result, so close the
-    // client EventSource to prevent auto-reconnect and mark completion.
+  evtSource.onerror = () => {
     onStreamDone();
   };
 
@@ -897,138 +894,135 @@ function enterChat(chatId) {
       console.warn('Failed to parse agent_event:', err);
     }
   });
+}
 
-  function handleAgentEvent(event) {
-    switch (event.type) {
-      case 'task_started':
-        setUserDotState('running');
-        break;
+function enterChat(chatId) {
+  currentChat = chatId;
+  isProcessing = false;
+  activeUserDot = null;
 
-      case 'task_completed':
-        setUserDotState('done');
-        hideTyping();
-        isProcessing = false;
-        updateSendButton();
-        activeUserDot = null;
-        break;
+  document.getElementById('chat-select').style.display = 'none';
+  const view = document.getElementById('view');
+  view.style.display = 'flex';
+  view.classList.add('active');
+  document.getElementById('chat-title').innerHTML = '<span class="dot"></span>' + chatId;
 
-      case 'task_failed':
-        setUserDotState('failed');
-        hideTyping();
-        isProcessing = false;
-        updateSendButton();
-        activeUserDot = null;
-        appendEventCard('task-failed', 'Task failed', event.error || '');
-        break;
+  setupSSE(chatId);
+  loadHistory(chatId);
+  document.getElementById('input').focus();
+}
 
-      case 'pre_iteration':
-        appendEventCard('iteration', 'Iteration ' + event.iteration);
-        break;
+function handleAgentEvent(event) {
+  switch (event.type) {
+    case 'task_started':
+      setUserDotState('running');
+      break;
 
-      case 'assistant_message':
-        hideTyping();
-        if (!currentMsgEl) {
-          currentMsgEl = appendMessage('assistant', '', false);
-          accumulated = '';
-        }
-        accumulated += event.content;
-        currentMsgEl.el.innerHTML = renderMarkdown(accumulated);
-        scrollToBottom();
-        break;
-
-      case 'tool_call': {
-        const card = appendEventCard('tool-call', event.name, formatArgs(event.args));
-        card.dataset.toolName = event.name;
-        break;
-      }
-
-      case 'tool_result': {
-        // Find the most recent tool_call card with matching name and update it
-        updateToolResult(event.name, event.output);
-        break;
-      }
-    }
-  }
-
-  function formatArgs(args) {
-    try {
-      const parsed = JSON.parse(args);
-      return JSON.stringify(parsed, null, 2);
-    } catch {
-      return args;
-    }
-  }
-
-  function appendEventCard(type, name, detail) {
-    const container = document.getElementById('messages');
-    const div = document.createElement('div');
-    div.className = 'event-card ' + type;
-
-    const header = document.createElement('div');
-    header.className = 'event-header';
-
-    const icon = document.createElement('span');
-    icon.className = 'event-icon';
-    icon.textContent = type === 'tool-call' ? '▶' : type === 'tool-result' ? '✓' : '○';
-
-    const nameEl = document.createElement('span');
-    nameEl.className = 'event-name';
-    nameEl.textContent = name;
-
-    header.appendChild(icon);
-    header.appendChild(nameEl);
-    div.appendChild(header);
-
-    if (detail) {
-      const detailEl = document.createElement('div');
-      detailEl.className = type === 'tool-call' ? 'event-args' :
-                           type === 'tool-result' ? 'event-output' :
-                           'event-content';
-      detailEl.textContent = detail;
-      div.appendChild(detailEl);
-    }
-
-    container.appendChild(div);
-    scrollToBottom();
-    return div;
-  }
-
-  function updateToolResult(toolName, output) {
-    // Find the most recent tool_call card without a result
-    const container = document.getElementById('messages');
-    const cards = container.querySelectorAll('.event-card.tool-call');
-    for (let i = cards.length - 1; i >= 0; i--) {
-      if (cards[i].dataset.toolName === toolName && !cards[i].querySelector('.event-output')) {
-        // Convert to tool-result style
-        cards[i].className = 'event-card tool-result';
-        const icon = cards[i].querySelector('.event-icon');
-        if (icon) icon.textContent = '✓';
-
-        const outputEl = document.createElement('div');
-        outputEl.className = 'event-output';
-        outputEl.textContent = output.length > 500 ? output.slice(0, 500) + '\n... (truncated)' : output;
-        cards[i].appendChild(outputEl);
-        scrollToBottom();
-        break;
-      }
-    }
-  }
-
-  evtSource.onerror = () => {
-    // Fires on network errors or server restarts — not on normal close
-    // since the server drops the sender and the stream ends cleanly.
-    // Only reset state if we haven't already completed normally.
-    if (!streamClosed) {
+    case 'task_completed':
+      setUserDotState('done');
       hideTyping();
       isProcessing = false;
       updateSendButton();
-      setUserDotState('failed');
       activeUserDot = null;
-    }
-  };
+      break;
 
-  loadHistory(chatId);
-  document.getElementById('input').focus();
+    case 'task_failed':
+      setUserDotState('failed');
+      hideTyping();
+      isProcessing = false;
+      updateSendButton();
+      activeUserDot = null;
+      appendEventCard('task-failed', 'Task failed', event.error || '');
+      break;
+
+    case 'pre_iteration':
+      appendEventCard('iteration', 'Iteration ' + event.iteration);
+      break;
+
+    case 'assistant_message':
+      hideTyping();
+      if (!currentMsgEl) {
+        currentMsgEl = appendMessage('assistant', '', false);
+        accumulated = '';
+      }
+      accumulated += event.content;
+      currentMsgEl.el.innerHTML = renderMarkdown(accumulated);
+      scrollToBottom();
+      break;
+
+    case 'tool_call': {
+      const card = appendEventCard('tool-call', event.name, formatArgs(event.args));
+      card.dataset.toolName = event.name;
+      break;
+    }
+
+    case 'tool_result': {
+      updateToolResult(event.name, event.output);
+      break;
+    }
+  }
+}
+
+function formatArgs(args) {
+  try {
+    const parsed = JSON.parse(args);
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return args;
+  }
+}
+
+function appendEventCard(type, name, detail) {
+  const container = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'event-card ' + type;
+
+  const header = document.createElement('div');
+  header.className = 'event-header';
+
+  const icon = document.createElement('span');
+  icon.className = 'event-icon';
+  icon.textContent = type === 'tool-call' ? '▶' : type === 'tool-result' ? '✓' : '○';
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'event-name';
+  nameEl.textContent = name;
+
+  header.appendChild(icon);
+  header.appendChild(nameEl);
+  div.appendChild(header);
+
+  if (detail) {
+    const detailEl = document.createElement('div');
+    detailEl.className = type === 'tool-call' ? 'event-args' :
+                         type === 'tool-result' ? 'event-output' :
+                         'event-content';
+    detailEl.textContent = detail;
+    div.appendChild(detailEl);
+  }
+
+  container.appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
+function updateToolResult(toolName, output) {
+  const container = document.getElementById('messages');
+  const cards = container.querySelectorAll('.event-card.tool-call');
+  for (let i = cards.length - 1; i >= 0; i--) {
+    if (cards[i].dataset.toolName === toolName && !cards[i].querySelector('.event-output')) {
+      cards[i].className = 'event-card tool-result';
+      const icon = cards[i].querySelector('.event-icon');
+      if (icon) icon.textContent = '✓';
+
+      const outputEl = document.createElement('div');
+      outputEl.className = 'event-output';
+      outputEl.textContent = output.length > 500 ? output.slice(0, 500) + '\n... (truncated)' : output;
+      cards[i].appendChild(outputEl);
+      scrollToBottom();
+      break;
+    }
+  }
 }
 
 function updateSendButton() {
@@ -1065,6 +1059,9 @@ document.getElementById('input-form').onsubmit = async (e) => {
   activeUserDot = userMsg;
   setUserDotState('running');
   showTyping();
+
+  // Create a fresh SSE connection for this request so messages are received.
+  setupSSE(currentChat);
 
   try {
     const res = await fetch('/message?chat_id=' + encodeURIComponent(currentChat), {
