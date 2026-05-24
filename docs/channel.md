@@ -29,6 +29,9 @@ pub trait Channel: Send + Sync {
     /// 输出中间状态（如工具执行进度）
     async fn write_status(&mut self, session_id: &str, state: &TaskState) -> Result<()>;
 
+    /// 输出 Agent 运行时事件（tool_call、assistant_message 等）
+    async fn write_event(&mut self, event: &AgentEvent) -> Result<()> { Ok(()) }
+
     /// 准备注入到上下文的额外信息（可选）
     async fn prepare_inject(&self) -> Result<String>;
 
@@ -67,6 +70,7 @@ pub struct ChannelManager {
     channels: Arc<Mutex<HashMap<String, Box<dyn Channel>>>>,
     factories: HashMap<String, Box<dyn ChannelFactory>>,
     message_bus: Arc<MessageBus>,
+    event_tx: Option<broadcast::Sender<AgentEvent>>,  // AgentEvent 广播发送端
 }
 ```
 

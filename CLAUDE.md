@@ -77,9 +77,9 @@ slimbot/
 AgentLoop ── 初始化 Provider、ToolManager、SessionManager
    │
    ▼
-AgentRunner ── ReAct 循环
+AgentRunner ── ReAct 循环 ── 通过 TaskHook.fire_event() 发送 AgentEvent
    ├── ContextBuilder.build_messages() → system prompt + 历史 Arc + 当前轮 Vec
-   │   └─ runtime_content 在 Message::User 上独立存储，仅 Provider 序列化时处理
+   │   ─ runtime_content 在 Message::User 上独立存储，仅 Provider 序列化时处理
    ├── Provider.chat(&[&Message]) → LLM API 调用（引用传递，避免 clone）
    ├── ToolManager.execute() → 工具执行
    └─ SessionManager.persist() → append-only JSONL + meta 保存
@@ -89,12 +89,17 @@ MessageBus ── 接收 BusRequest → 封装 SessionTask → 入队/出队 →
    │
    ▼
 ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 → 与 MessageBus 交互
+    通过 broadcast::Sender<AgentEvent> 将事件路由到各通道
 ```
 
 ### Gateway 模式
 
 ```
 run_gateway()
+   ├── broadcast::channel(256) ─ AgentEvent 广播总线
+   │   ├── 发送给 ChannelManager.event_tx
+   │   └── 传递给 WebuiChannelFactory 注册到每个 WebuiChannel
+   │
    ├── CronService ── 定时任务调度，JSON 持久化，tick 驱动
    │   └── on_job → AgentLoop.run_task()
    ├── HeartbeatService ── 定期读取 HEARTBEAT.md，LLM 判断执行
@@ -105,6 +110,10 @@ run_gateway()
    └── ChannelManager ── 启动 enabled channels (CLI + WebUI)
        ├── CLI channel ── stdin/stdout
        └── WebUI channel ── axum HTTP server (SSE + REST API)
+           ├── SSE 消息: BusResult → write_output → 正常文本气泡
+           ├── SSE 事件: AgentEvent → write_event → 前端 event listener
+           └── 事件类型: task_started/completed/failed, tool_call/result,
+               assistant_message, pre_iteration
 ```
 
 ## 数据目录
@@ -132,7 +141,7 @@ run_gateway()
 ## 关键设计决策
 
 - `SharedSessionManager` = `Arc<Mutex<SessionManager>>`，所有模块通过共享 Mutex 访问
-- `SessionTask` 绑定 `TaskHook`，通过 `tokio::sync::mpsc` 异步通知 Channel 状态变更
+- `SessionTask` 绑定 `TaskHook`，通过 `broadcast::Sender<AgentEvent>` 广播运行时事件（tool_call、assistant_message 等），各 Channel 订阅后自行处理
 - 消息持久化：append-only 写入 JSONL，meta 数据单独 `.meta.json` 文件
 - Session 双列表结构：`history: Arc<[Message]>`（已持久化，零拷贝共享）+ `current_turn: Vec<Message>`（本轮缓冲）
 - Provider 接收消息引用：`Provider::chat(&[&Message])` 避免 clone 开销

@@ -80,7 +80,7 @@ pub async fn run(
 
 ### 步骤 2：更新任务状态为 Running
 
-设置 `TaskState::Running { current_iteration: 0 }`，通过 `TaskHook.notify_status_change()` 通知通道。
+设置 `TaskState::Running { current_iteration: 0 }`，通过 `TaskHook.notify_status_change()` 通知通道。同时通过 `TaskHook.fire_event()` 发出 `AgentEvent::TaskStarted`。
 
 ### 步骤 3：进入 ReAct 循环
 
@@ -168,3 +168,20 @@ pub async fn run(
 当 `consolidator` 字段为 `Some(Arc<Consolidator>)` 时，ReAct 循环完成后（最终回复阶段）会调用 `consolidator.maybe_consolidate(session_id, prompt_tokens)`。若 prompt_tokens 超过安全预算，Consolidator 会自动选取旧消息进行摘要，摘要追加到 `history.jsonl` 并更新会话的 consolidation 游标。
 
 传入 `None` 时跳过摘要检查。
+
+## AgentEvent 事件流
+
+ReAct 循环在关键节点通过 `TaskHook.fire_event()` 发出 `AgentEvent`，供前端实时展示：
+
+| 事件 | 触发时机 | 数据 |
+|------|---------|------|
+| `TaskStarted` | 循环开始前 | session_id |
+| `PreIteration` | 每轮迭代开始 | session_id, iteration |
+| `AssistantMessage` | LLM 返回后 | session_id, content |
+| `ToolCall` | 工具执行前 | session_id, name, args |
+| `ToolResult` | 工具执行后 | session_id, name, output |
+| `PostIteration` | 工具循环结束后 | session_id, iteration |
+| `TaskCompleted` | 循环成功完成 | session_id, result |
+| `TaskFailed` | 循环失败（超时/错误） | session_id, error |
+
+事件通过 `broadcast::Sender<AgentEvent>` 广播到 `ChannelManager`，各 Channel 的 `write_event()` 方法负责将其送达客户端（WebUI 中通过 SSE 的 `agent_event` 事件类型）。

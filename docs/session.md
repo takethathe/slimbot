@@ -86,6 +86,7 @@ pub enum TaskState {
 ```rust
 pub struct TaskHook {
     status_tx: Option<tokio::sync::mpsc::Sender<(String, TaskState)>>,  // 状态通道
+    event_tx: Option<tokio::sync::broadcast::Sender<AgentEvent>>,       // AgentEvent 广播通道
     session_id: String,                                       // 所属 Session ID
 }
 ```
@@ -94,7 +95,27 @@ pub struct TaskHook {
 ```rust
 TaskHook::new(&session_id)
     .with_status_channel(status_tx)   // 绑定状态通知通道
+    .with_events(event_tx)            // 绑定 AgentEvent 广播通道
 ```
+
+### AgentEvent
+
+Agent 运行过程中通过 `TaskHook.fire_event()` 发出的实时事件，使用 `#[serde(tag = "type")]` 序列化供前端消费：
+
+```rust
+pub enum AgentEvent {
+    TaskStarted { session_id: String },
+    TaskCompleted { session_id: String, result: String },
+    TaskFailed { session_id: String, error: String },
+    PreIteration { session_id: String, iteration: u32 },
+    PostIteration { session_id: String, iteration: u32 },
+    AssistantMessage { session_id: String, content: String },
+    ToolCall { session_id: String, name: String, args: String },
+    ToolResult { session_id: String, name: String, output: String },
+}
+```
+
+每个 variant 提供 `session_id()` 方法用于事件路由。
 
 ### Session
 
