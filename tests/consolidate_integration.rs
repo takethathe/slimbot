@@ -269,10 +269,10 @@ async fn test_consolidator_archives_summary_to_history() {
         summary: "- User prefers dark mode\n- Decided to use SQLite".to_string(),
     });
 
-    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 8192, 4096);
+    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 32768);
 
     // Trigger consolidation with high prompt token count
-    consolidator.maybe_consolidate("s1", 10000).await.unwrap();
+    consolidator.maybe_consolidate("s1", 30000).await.unwrap();
 
     // Verify summary was appended to history
     let entries = ms.lock().await.read_recent_history(10);
@@ -315,7 +315,7 @@ async fn test_consolidator_updates_summary_in_session_meta() {
         summary: summary_text.to_string(),
     });
 
-    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 8192, 4096);
+    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 32768);
 
     // Initially no summary
     assert!({
@@ -323,7 +323,7 @@ async fn test_consolidator_updates_summary_in_session_meta() {
         guard.get_last_summary("s1").await.is_none()
     });
 
-    consolidator.maybe_consolidate("s1", 10000).await.unwrap();
+    consolidator.maybe_consolidate("s1", 30000).await.unwrap();
 
     // After consolidation, summary should be in session meta
     let summary = {
@@ -360,7 +360,7 @@ async fn test_consolidator_no_consolidation_when_within_budget() {
         summary: "should not be called".to_string(),
     });
 
-    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 8192, 4096);
+    let consolidator = Consolidator::new(provider, sm.clone(), ms.clone(), 32768);
 
     // Prompt tokens well within budget (8192 - 4096 - 512 = 3584 budget)
     consolidator.maybe_consolidate("s1", 100).await.unwrap();

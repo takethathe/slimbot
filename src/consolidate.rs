@@ -24,7 +24,6 @@ pub struct Consolidator {
     session_manager: SharedSessionManager,
     memory_store: SharedMemoryStore,
     context_window_tokens: u32,
-    max_completion_tokens: u32,
     cancel_token: CancellationToken,
 }
 
@@ -34,14 +33,12 @@ impl Consolidator {
         session_manager: SharedSessionManager,
         memory_store: SharedMemoryStore,
         context_window_tokens: u32,
-        max_completion_tokens: u32,
     ) -> Self {
         Self {
             provider,
             session_manager,
             memory_store,
             context_window_tokens,
-            max_completion_tokens,
             cancel_token: CancellationToken::new(),
         }
     }
@@ -270,12 +267,17 @@ If nothing noteworthy happened, output: (nothing)"
             return Ok(());
         }
 
-        let budget = self.context_window_tokens - self.max_completion_tokens - SAFETY_BUFFER;
+        // Budget: allow prompt to use up to 85% of context window, minus safety buffer.
+        // We don't reserve max_completion_tokens here — that's the model's own limit
+        // enforced by the API. We only care about the prompt fitting in context.
+        let budget = ((self.context_window_tokens as f64 * 0.85) as u32) - SAFETY_BUFFER;
         if prompt_tokens <= budget {
             return Ok(());
         }
 
-        let target = budget / 2;
+        // Target: reduce prompt to 60% of budget to leave room for the next turn's
+        // system prompt and tool definitions.
+        let target = (budget as f64 * 0.6) as u32;
         let tokens_to_remove = prompt_tokens.saturating_sub(target);
 
         let _ = self

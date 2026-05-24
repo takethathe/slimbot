@@ -7,13 +7,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::commands::{CommandTier, classify_command};
 use crate::config::Config;
-use crate::config_defs::ProviderConfig;
 use crate::consolidate::Consolidator;
-
-/// Default max tokens for consolidator, sourced from ProviderConfig macro default.
-fn default_max_tokens() -> u32 {
-    ProviderConfig::default().max_tokens
-}
 use crate::memory::{MemoryStore, SharedMemoryStore};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::path::PathManager;
@@ -195,7 +189,6 @@ impl AgentLoop {
             session_manager_arc.clone(),
             memory_store.clone(),
             config.agent.context_window_tokens,
-            default_max_tokens(),
         ));
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);

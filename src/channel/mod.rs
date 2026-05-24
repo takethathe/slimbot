@@ -448,7 +448,7 @@ mod tests {
                 timeout_seconds: 120,
                 max_tool_result_chars: 10000,
                 persist_tool_results: false,
-                context_window_tokens: 8192,
+                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {

@@ -327,7 +327,7 @@ fn test_config_defaults_match_expected_values() {
     assert_eq!(agent_defaults["timeout_seconds"], 120);
     assert_eq!(agent_defaults["max_tool_result_chars"], 8000);
     assert!(agent_defaults["persist_tool_results"].as_bool().unwrap());
-    assert_eq!(agent_defaults["context_window_tokens"], 8192);
+    assert_eq!(agent_defaults["context_window_tokens"], 32768);
 
     assert_eq!(provider_defaults["r#type"], "openai");
     assert_eq!(provider_defaults["base_url"], "https://api.openai.com");

@@ -8,7 +8,7 @@ define_config! {
         timeout_seconds: u64 = 120, range(1, 600), desc: "Per-request timeout in seconds",
         max_tool_result_chars: u32 = 8000, range(100, 100_000), desc: "Max characters for tool result before truncation",
         persist_tool_results: bool = true, none, desc: "Whether to persist oversized tool results to disk",
-        context_window_tokens: u32 = 8192, range(1024, 200_000), desc: "LLM context window size in tokens",
+        context_window_tokens: u32 = 32768, range(1024, 200_000), desc: "LLM context window size in tokens",
     }
 }
 
