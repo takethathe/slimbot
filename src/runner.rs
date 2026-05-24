@@ -326,7 +326,7 @@ impl AgentRunner {
                 }
             };
             debug!(
-                "[AgentRunner] Got response: content_len={}, tool_calls={}, prompt_tokens={}, prompt_cache_hit={}, completion_tokens={}, total_tokens={}",
+                "[AgentRunner] Got response: content_len={}, tool_calls={}, prompt_tokens={}, cached_tokens={}, completion_tokens={}, total_tokens={}",
                 response.content.as_ref().map(|s| s.len()).unwrap_or(0),
                 response.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0),
                 response.usage.prompt_tokens,

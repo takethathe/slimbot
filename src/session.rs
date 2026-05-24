@@ -181,20 +181,33 @@ impl Content {
     pub fn to_openai_value(&self) -> serde_json::Value {
         match self {
             Content::Plain(s) => serde_json::Value::String(s.clone()),
-            Content::Multi(blocks) => {
-                let arr: Vec<_> = blocks.iter().map(|b| match b {
-                    ContentBlock::Text { text } => {
-                        serde_json::json!({"type": "text", "text": text})
-                    }
-                    ContentBlock::Image { mime_type, base64_data } => {
-                        serde_json::json!({
-                            "type": "image_url",
-                            "image_url": {"url": format!("data:{};base64,{}", mime_type, base64_data)}
-                        })
-                    }
-                }).collect();
-                serde_json::Value::Array(arr)
+            Content::Multi(_) => serde_json::Value::Array(self.to_openai_blocks()),
+        }
+    }
+
+    /// Convert to a list of structured OpenAI-compatible content blocks.
+    pub fn to_openai_blocks(&self) -> Vec<serde_json::Value> {
+        let block_to_json = |b: &ContentBlock| -> serde_json::Value {
+            match b {
+                ContentBlock::Text { text } => {
+                    serde_json::json!({"type": "text", "text": text})
+                }
+                ContentBlock::Image {
+                    mime_type,
+                    base64_data,
+                } => {
+                    serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{};base64,{}", mime_type, base64_data)}
+                    })
+                }
             }
+        };
+        match self {
+            Content::Plain(s) => {
+                vec![serde_json::json!({"type": "text", "text": s})]
+            }
+            Content::Multi(blocks) => blocks.iter().map(&block_to_json).collect(),
         }
     }
 }
@@ -650,11 +663,17 @@ pub enum FrontendMessage {
 impl FrontendMessage {
     pub fn from_message(msg: &Message) -> Option<Self> {
         match msg {
-            Message::User { content, .. } => Some(Self::User {
-                content: content.as_text().to_string(),
-            }),
+            Message::User { content, .. } => {
+                let text = content.as_text().to_string();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(Self::User { content: text })
+                }
+            }
             Message::Assistant { content, .. } => content
                 .as_ref()
+                .filter(|c| !c.is_empty())
                 .map(|c| Self::Assistant { content: c.clone() }),
             _ => None,
         }
@@ -1741,6 +1760,42 @@ mod tests {
             name: None,
         };
         assert!(FrontendMessage::from_message(&tool).is_none());
+
+        // Empty content should be filtered out — prevents blank messages in history.
+        let empty_user = Message::User {
+            meta: MessageMeta {
+                id: 4,
+                timestamp: String::new(),
+            },
+            content: Content::Plain("".to_string()),
+            runtime_content: None,
+        };
+        assert!(FrontendMessage::from_message(&empty_user).is_none());
+
+        let empty_asst = Message::Assistant {
+            meta: MessageMeta {
+                id: 5,
+                timestamp: String::new(),
+            },
+            content: Some("".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
+        assert!(FrontendMessage::from_message(&empty_asst).is_none());
+
+        // Assistant with None content (tool_calls only) should be filtered.
+        let tool_only_asst = Message::Assistant {
+            meta: MessageMeta {
+                id: 6,
+                timestamp: String::new(),
+            },
+            content: None,
+            tool_calls: Some(vec![]),
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
+        assert!(FrontendMessage::from_message(&tool_only_asst).is_none());
     }
 
     #[test]

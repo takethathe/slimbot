@@ -39,7 +39,7 @@ impl std::fmt::Display for Usage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Usage(prompt={}, cache_hit={}, completion={}, total={})",
+            "Usage(prompt={}, cached_tokens={}, completion={}, total={})",
             self.prompt_tokens,
             self.prompt_cache_hit_tokens,
             self.completion_tokens,

@@ -53,9 +53,14 @@ struct ApiResponse {
 #[derive(Deserialize)]
 struct ApiUsage {
     prompt_tokens: Option<u32>,
-    prompt_cache_hit_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
+    input_tokens_details: Option<ApiInputTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct ApiInputTokensDetails {
+    cached_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -108,42 +113,53 @@ impl crate::provider::Provider for OpenAIProvider {
             tools.map(|t| t.len()).unwrap_or(0)
         );
 
-        // Find the index of the last system message for cache_control injection
+        // Find indices of the last system and user messages for cache_control injection.
         let last_system_idx = messages
             .iter()
             .enumerate()
             .rev()
             .find_map(|(i, m)| matches!(**m, Message::System { .. }).then_some(i));
+        let last_user_idx = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, m)| matches!(**m, Message::User { .. }).then_some(i));
 
         let api_messages: Vec<serde_json::Value> = messages
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let is_cache_target = self.config.prompt_cache_enabled && Some(i) == last_system_idx;
+                let is_cache_target = self.config.prompt_cache_enabled
+                    && (Some(i) == last_system_idx || Some(i) == last_user_idx);
                 match **m {
                     Message::System { ref content, .. } => {
-                        let mut obj = serde_json::json!({"role": "system", "content": content});
+                        let content_blocks = serde_json::json!([
+                            {"type": "text", "text": content}
+                        ]);
+                        let mut obj =
+                            serde_json::json!({"role": "system", "content": content_blocks});
                         if is_cache_target {
-                            obj["content"] = serde_json::json!([
-                                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
-                            ]);
+                            obj["content"][0]["cache_control"] =
+                                serde_json::json!({"type": "ephemeral"});
                         }
                         obj
                     }
-                    Message::User { ref content, ref runtime_content, .. } => {
-                        let mut json_content = content.to_openai_value();
+                    Message::User {
+                        ref content,
+                        ref runtime_content,
+                        ..
+                    } => {
+                        let mut content_blocks = content.to_openai_blocks();
                         if let Some(ctx) = runtime_content {
-                            match &mut json_content {
-                                serde_json::Value::String(s) => {
-                                    *s = format!("{}\n\n{}", ctx, s);
-                                }
-                                serde_json::Value::Array(arr) => {
-                                    arr.insert(0, serde_json::json!({"type": "text", "text": ctx}));
-                                }
-                                _ => {}
-                            }
+                            content_blocks
+                                .insert(0, serde_json::json!({"type": "text", "text": ctx}));
                         }
-                        serde_json::json!({"role": "user", "content": json_content})
+                        if is_cache_target {
+                            let last = content_blocks.len().saturating_sub(1);
+                            content_blocks[last]["cache_control"] =
+                                serde_json::json!({"type": "ephemeral"});
+                        }
+                        serde_json::json!({"role": "user", "content": content_blocks})
                     }
                     Message::Assistant {
                         ref content,
@@ -281,7 +297,11 @@ impl crate::provider::Provider for OpenAIProvider {
             .as_ref()
             .map(|u| Usage {
                 prompt_tokens: u.prompt_tokens.unwrap_or(0),
-                prompt_cache_hit_tokens: u.prompt_cache_hit_tokens.unwrap_or(0),
+                prompt_cache_hit_tokens: u
+                    .input_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens)
+                    .unwrap_or(0),
                 completion_tokens: u.completion_tokens.unwrap_or(0),
                 total_tokens: u.total_tokens.unwrap_or(0),
             })
@@ -292,7 +312,7 @@ impl crate::provider::Provider for OpenAIProvider {
             None => 0,
         };
         debug!(
-            "[OpenAIProvider] Response: finish_reason={:?}, content_len={}, tool_calls={}, prompt_tokens={}, prompt_cache_hit={}, completion_tokens={}, total_tokens={}",
+            "[OpenAIProvider] Response: finish_reason={:?}, content_len={}, tool_calls={}, prompt_tokens={}, cached_tokens={}, completion_tokens={}, total_tokens={}",
             finish_reason,
             choice
                 .message
