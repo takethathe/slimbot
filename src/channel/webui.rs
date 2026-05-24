@@ -16,7 +16,7 @@ use super::{Channel, ChannelFactory};
 use crate::embed;
 use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
-use crate::session::{SharedSessionManager, TaskHook, TaskState};
+use crate::session::{SharedSessionManager, TaskHook, TaskState, AgentEvent};
 use crate::{error, info};
 
 struct AppState {
@@ -318,6 +318,7 @@ pub struct WebuiChannelFactory {
     message_bus: Arc<MessageBus>,
     session_manager: SharedSessionManager,
     shutdown_tx: broadcast::Sender<()>,
+    event_tx: broadcast::Sender<AgentEvent>,
 }
 
 impl WebuiChannelFactory {
@@ -325,11 +326,13 @@ impl WebuiChannelFactory {
         message_bus: Arc<MessageBus>,
         session_manager: SharedSessionManager,
         shutdown_tx: broadcast::Sender<()>,
+        event_tx: broadcast::Sender<AgentEvent>,
     ) -> Self {
         Self {
             message_bus,
             session_manager,
             shutdown_tx,
+            event_tx,
         }
     }
 }
@@ -408,8 +411,9 @@ mod tests {
             crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
         ));
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let (event_tx, _) = broadcast::channel::<AgentEvent>(32);
 
-        let factory = WebuiChannelFactory::new(mb, sm, shutdown_tx);
+        let factory = WebuiChannelFactory::new(mb, sm, shutdown_tx, event_tx);
         assert_eq!(factory.channel_type(), "webui");
 
         let config = json!({"host": "127.0.0.1", "port": 9999});

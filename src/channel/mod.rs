@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::io_scheduler::{ChannelCommandCallback, IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
-use crate::session::{SharedSessionManager, TaskState};
+use crate::session::{SharedSessionManager, TaskState, AgentEvent};
 use crate::{debug, error, info};
 use tokio::sync::broadcast;
 
@@ -59,6 +59,10 @@ pub trait Channel: Send + Sync {
     async fn send_output(&mut self, result: &BusResult) -> Result<()> {
         self.write_output(result).await
     }
+    /// Send an AgentEvent to the client. Default: no-op (CLI channels don't need this).
+    async fn write_event(&mut self, _event: &AgentEvent) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Channel factory trait, creates channels by type from config
@@ -78,10 +82,15 @@ pub struct ChannelManager {
     config: Arc<Config>,
     io_handles: Arc<Mutex<HashMap<String, IoHandle>>>,
     io_scheduler: IoScheduler,
+    event_tx: Option<broadcast::Sender<AgentEvent>>,
 }
 
 impl ChannelManager {
-    pub fn new(message_bus: Arc<MessageBus>, config: Arc<Config>) -> Self {
+    pub fn new(
+        message_bus: Arc<MessageBus>,
+        config: Arc<Config>,
+        event_tx: Option<broadcast::Sender<AgentEvent>>,
+    ) -> Self {
         let io_scheduler = IoScheduler::new(message_bus.inbound_tx());
         let cm = Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
@@ -90,9 +99,15 @@ impl ChannelManager {
             config,
             io_handles: Arc::new(Mutex::new(HashMap::new())),
             io_scheduler,
+            event_tx,
         };
         // Auto-register all built-in channel factories
         cm
+    }
+
+    /// Return the event broadcast sender for channels to subscribe to agent events.
+    pub fn event_tx(&self) -> Option<broadcast::Sender<AgentEvent>> {
+        self.event_tx.clone()
     }
 
     /// Set the shutdown broadcast callback that fires when a channel-tier command
@@ -152,9 +167,14 @@ impl ChannelManager {
         &mut self,
         session_manager: SharedSessionManager,
         shutdown_tx: tokio::sync::broadcast::Sender<()>,
+        event_tx: Option<broadcast::Sender<AgentEvent>>,
     ) {
+        let Some(event_tx) = event_tx else {
+            error!("[ChannelManager] No event_tx provided for webui factory");
+            return;
+        };
         let factory =
-            WebuiChannelFactory::new(self.message_bus.clone(), session_manager, shutdown_tx);
+            WebuiChannelFactory::new(self.message_bus.clone(), session_manager, shutdown_tx, event_tx);
         self.factories
             .insert("webui".to_string(), Box::new(factory));
     }
@@ -265,6 +285,43 @@ impl ChannelManager {
     /// The outbound message branch is checked first (no biased) so that pending
     /// messages (like a /quit goodbye) are processed before the shutdown signal.
     pub async fn run_with_shutdown(&self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+        // Spawn event listener if event channel is configured
+        if let Some(event_tx) = &self.event_tx {
+            let event_rx = event_tx.subscribe();
+            let channels = self.channels.clone();
+            tokio::spawn(async move {
+                let mut rx = event_rx;
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let session_id = event.session_id();
+                            let channel_id = session_id.split(':').next().unwrap_or("");
+
+                            // Skip system-triggered sessions
+                            if is_system_channel(channel_id) {
+                                continue;
+                            }
+
+                            let mut ch_guard = channels.lock().await;
+                            if let Some(channel) = ch_guard.get_mut(channel_id) {
+                                if let Err(e) = channel.write_event(&event).await {
+                                    error!(
+                                        "[ChannelManager] Failed to write event to {}: {}",
+                                        channel_id, e
+                                    );
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            error!("[ChannelManager] Event listener lagged by {} messages", n);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Existing outbound router
         let channels = self.channels.clone();
         let outbound_rx = self.message_bus.outbound_rx();
 
@@ -281,7 +338,6 @@ impl ChannelManager {
                         .next()
                         .unwrap_or("");
 
-                    // Skip system-triggered sessions — they have no user-facing channel
                     if is_system_channel(channel_id) {
                         continue;
                     }
@@ -423,7 +479,7 @@ mod tests {
     fn test_channel_manager_register_factory() {
         let mb = Arc::new(MessageBus::new());
         let config = Arc::new(make_test_config());
-        let mut cm = ChannelManager::new(mb, config);
+        let mut cm = ChannelManager::new(mb, config, None);
 
         cm.register_factory("test", Box::new(TestChannelFactory));
         assert!(cm.factories.contains_key("test"));
@@ -442,7 +498,7 @@ mod tests {
         );
         let mb = Arc::new(MessageBus::new());
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config);
+        let mut cm = ChannelManager::new(mb, config, None);
         cm.register_factory("test", Box::new(TestChannelFactory));
 
         cm.init().await.unwrap();
@@ -461,7 +517,7 @@ mod tests {
         );
         let mb = Arc::new(MessageBus::new());
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config);
+        let mut cm = ChannelManager::new(mb, config, None);
         cm.register_factory("test", Box::new(TestChannelFactory));
 
         cm.init().await.unwrap();
@@ -480,7 +536,7 @@ mod tests {
         );
         let mb = Arc::new(MessageBus::new());
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config);
+        let mut cm = ChannelManager::new(mb, config, None);
         // No factory registered for "unknown"
 
         let result = cm.init().await;
@@ -491,7 +547,7 @@ mod tests {
     fn test_channel_manager_shutdown_io() {
         let mb = Arc::new(MessageBus::new());
         let config = Arc::new(make_test_config());
-        let cm = ChannelManager::new(mb, config);
+        let cm = ChannelManager::new(mb, config, None);
         // Should not panic even with no handles
         cm.shutdown_io();
     }
@@ -500,7 +556,7 @@ mod tests {
     fn test_channel_manager_channel_info_default() {
         let mb = Arc::new(MessageBus::new());
         let config = Arc::new(make_test_config());
-        let cm = ChannelManager::new(mb, config);
+        let cm = ChannelManager::new(mb, config, None);
         let (sid, prompt) = cm.channel_info();
         assert_eq!(sid, "cli:default");
         assert_eq!(prompt, "> ");
@@ -520,7 +576,7 @@ mod tests {
         );
         let mb = Arc::new(MessageBus::new());
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config);
+        let mut cm = ChannelManager::new(mb, config, None);
         cm.register_factory("test", Box::new(TestChannelFactory));
         cm.init().await.unwrap();
         cm.start_channels().await;

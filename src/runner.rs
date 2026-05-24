@@ -7,7 +7,7 @@ use crate::context::ContextBuilder;
 use crate::memory::SharedMemoryStore;
 use crate::provider::{Provider, Usage};
 use crate::session::{
-    Message, SessionManager, SharedSessionManager, TaskHook, TaskState, parse_session_origin,
+    AgentEvent, Message, SessionManager, SharedSessionManager, TaskHook, TaskState, parse_session_origin,
 };
 use crate::tool::{
     ToolContext, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result,
@@ -209,6 +209,9 @@ impl AgentRunner {
             current_iteration: 0,
         };
         hook.notify_status_change(&running_state);
+        hook.fire_event(AgentEvent::TaskStarted {
+            session_id: session_id.to_string(),
+        });
 
         let max_iterations = self.config.max_iterations;
         let mut iterations: u32 = 0;
@@ -248,8 +251,18 @@ impl AgentRunner {
                     let _ = sm.persist(session_id).await;
                 }
                 hook.notify_status_change(&failed_state);
+                hook.fire_event(AgentEvent::TaskFailed {
+                    session_id: session_id.to_string(),
+                    error: err_msg,
+                });
                 return result;
             }
+
+            // Pre-iteration event
+            hook.fire_event(AgentEvent::PreIteration {
+                session_id: session_id.to_string(),
+                iteration: iterations,
+            });
 
             // Build context (with session summary from last consolidation)
             let session_summary = {
@@ -335,6 +348,16 @@ impl AgentRunner {
                 response.usage.total_tokens,
             );
 
+            // Emit assistant message content if present
+            if let Some(ref content) = response.content {
+                if !content.is_empty() {
+                    hook.fire_event(AgentEvent::AssistantMessage {
+                        session_id: session_id.to_string(),
+                        content: content.clone(),
+                    });
+                }
+            }
+
             // No tool calls → done
             let has_tool_calls = response
                 .tool_calls
@@ -380,7 +403,12 @@ impl AgentRunner {
                     };
                     let _ = sm.persist(session_id).await;
                 }
-                hook.notify_status_change(&TaskState::Completed {
+                let completed_state = TaskState::Completed {
+                    result: text.clone(),
+                };
+                hook.notify_status_change(&completed_state);
+                hook.fire_event(AgentEvent::TaskCompleted {
+                    session_id: session_id.to_string(),
                     result: text.clone(),
                 });
                 // Trigger consolidation after successful turn.
@@ -448,6 +476,12 @@ impl AgentRunner {
                         }
                     }
                     debug!("[tool_call] name={}, args={}", call.name, call.args);
+                    // Fire ToolCall event before execution
+                    hook.fire_event(AgentEvent::ToolCall {
+                        session_id: session_id.to_string(),
+                        name: call.name.clone(),
+                        args: call.args.to_string(),
+                    });
                     let raw_result = match self
                         .tool_manager
                         .execute(&call.name, call.args.clone())
@@ -456,6 +490,13 @@ impl AgentRunner {
                         Ok(r) => r,
                         Err(e) => format_tool_error(&e.to_string()),
                     };
+
+                    // Fire ToolResult event after execution
+                    hook.fire_event(AgentEvent::ToolResult {
+                        session_id: session_id.to_string(),
+                        name: call.name.clone(),
+                        output: raw_result.clone(),
+                    });
 
                     let ensured = ensure_nonempty_tool_result(&call.name, &raw_result);
 
@@ -506,6 +547,10 @@ impl AgentRunner {
                     current_iteration: iterations,
                 };
                 hook.notify_status_change(&running_state);
+                hook.fire_event(AgentEvent::PostIteration {
+                    session_id: session_id.to_string(),
+                    iteration: iterations,
+                });
             }
         }
     }
@@ -530,6 +575,10 @@ impl AgentRunner {
             let _ = sm.persist(session_id).await;
         }
         hook.notify_status_change(&failed_state);
+        hook.fire_event(AgentEvent::TaskFailed {
+            session_id: session_id.to_string(),
+            error: error.to_string(),
+        });
         result
     }
 
@@ -538,13 +587,17 @@ impl AgentRunner {
         let mut result = AgentResult::default();
         result.success = false;
         result.content = msg.clone();
-        let failed_state = TaskState::Failed { error: msg };
+        let failed_state = TaskState::Failed { error: msg.clone() };
         {
             let mut sm: tokio::sync::MutexGuard<'_, SessionManager> =
                 self.session_manager.lock().await;
             let _ = sm.persist(session_id).await;
         }
         hook.notify_status_change(&failed_state);
+        hook.fire_event(AgentEvent::TaskFailed {
+            session_id: session_id.to_string(),
+            error: msg.clone(),
+        });
         result
     }
 
@@ -563,6 +616,10 @@ impl AgentRunner {
                 .await;
         }
         hook.notify_status_change(&TaskState::Failed {
+            error: error.to_string(),
+        });
+        hook.fire_event(AgentEvent::TaskFailed {
+            session_id: session_id.to_string(),
             error: error.to_string(),
         });
         AgentResult {
@@ -667,6 +724,8 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+    use tokio::sync::mpsc;
+    use crate::session::AgentEvent;
     use crate::memory::MemoryStore;
     use crate::provider::{FinishReason, LLMResponse, Provider, Usage};
     use crate::session::Content;
@@ -1255,6 +1314,65 @@ mod tests {
             states.last().unwrap(),
             TaskState::Completed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_agent_event_sequence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[("tool1", "r1")]).await;
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            LLMResponse {
+                content: Some("running tool".to_string()),
+                tool_calls: Some(vec![tool_call("tc-1", "tool1")]),
+                finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            },
+            LLMResponse {
+                content: Some("done".to_string()),
+                tool_calls: None,
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ]));
+        let runner = make_runner(sm.clone(), tm, provider, wd, ms);
+        let task = make_task("test");
+        let hook = TaskHook::new("test-session").with_events(event_tx);
+        let content = task.content.clone();
+
+        let result = runner
+            .run(content, hook, "test-session", None, None, None, None)
+            .await;
+
+        assert!(result.success);
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Ok(evt) = event_rx.try_recv() {
+            events.push(evt);
+        }
+
+        assert!(!events.is_empty(), "should have emitted events");
+        assert!(
+            matches!(events[0], AgentEvent::TaskStarted { .. }),
+            "first event should be TaskStarted, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(events.last().unwrap(), AgentEvent::TaskCompleted { .. }),
+            "last event should be TaskCompleted, got {:?}",
+            events.last().unwrap()
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "tool1")),
+            "should contain ToolCall for tool1"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::ToolResult { name, .. } if name == "tool1")),
+            "should contain ToolResult for tool1"
+        );
     }
 
     #[tokio::test]
