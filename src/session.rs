@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
@@ -341,6 +341,61 @@ pub enum TaskState {
     Failed { error: String },
 }
 
+/// Fine-grained agent execution event for real-time UI updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    TaskStarted {
+        session_id: String,
+    },
+    TaskCompleted {
+        session_id: String,
+        result: String,
+    },
+    TaskFailed {
+        session_id: String,
+        error: String,
+    },
+    PreIteration {
+        session_id: String,
+        iteration: u32,
+    },
+    PostIteration {
+        session_id: String,
+        iteration: u32,
+    },
+    AssistantMessage {
+        session_id: String,
+        content: String,
+    },
+    ToolCall {
+        session_id: String,
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        session_id: String,
+        name: String,
+        output: String,
+    },
+}
+
+impl AgentEvent {
+    /// Extract session_id from any event variant.
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::TaskStarted { session_id, .. }
+            | Self::TaskCompleted { session_id, .. }
+            | Self::TaskFailed { session_id, .. }
+            | Self::PreIteration { session_id, .. }
+            | Self::PostIteration { session_id, .. }
+            | Self::AssistantMessage { session_id, .. }
+            | Self::ToolCall { session_id, .. }
+            | Self::ToolResult { session_id, .. } => session_id,
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub struct SessionTask {
     pub id: String,
@@ -357,6 +412,7 @@ pub struct SessionTask {
 pub struct TaskHook {
     status_tx: Option<tokio::sync::mpsc::Sender<(String, TaskState)>>,
     session_id: String,
+    event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
 }
 
 impl TaskHook {
@@ -364,6 +420,7 @@ impl TaskHook {
         Self {
             status_tx: None,
             session_id: session_id.to_string(),
+            event_tx: None,
         }
     }
 
@@ -371,12 +428,30 @@ impl TaskHook {
         Self {
             status_tx: Some(tx),
             session_id: self.session_id,
+            event_tx: self.event_tx,
         }
     }
 
     pub fn notify_status_change(&self, state: &TaskState) {
         if let Some(ref tx) = self.status_tx {
             let _ = tx.try_send((self.session_id.clone(), state.clone()));
+        }
+    }
+
+    /// Attach an event broadcast sender for fine-grained AgentEvent notifications.
+    pub fn with_events(self, tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        Self {
+            event_tx: Some(tx),
+            session_id: self.session_id,
+            status_tx: self.status_tx,
+        }
+    }
+
+    /// Fire an AgentEvent to all registered event subscribers.
+    /// Silently drops if no event channel is attached.
+    pub fn fire_event(&self, event: AgentEvent) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(event);
         }
     }
 }
@@ -527,9 +602,9 @@ impl SessionTaskBuilder {
 
         SessionTask {
             id: uuid::Uuid::new_v4().to_string(),
-            session_id: sid_for_task,
+            session_id: sid_for_task.clone(),
             content: String::new(),
-            hook: TaskHook::new(""),
+            hook: TaskHook::new(&sid_for_task),
             state: TaskState::Running {
                 current_iteration: 0,
             },
@@ -2145,5 +2220,71 @@ mod tests {
         let session = sm.sessions.get("s1").unwrap();
         assert_eq!(session.history.len(), 2);
         assert_eq!(session.current_turn.len(), 2);
+    }
+
+    #[test]
+    fn test_agent_event_serialization() {
+        let event = AgentEvent::ToolCall {
+            session_id: "webui:abc".to_string(),
+            name: "shell".to_string(),
+            args: "ls -la".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"tool_call\""));
+        assert!(json.contains("\"name\":\"shell\""));
+        assert!(json.contains("\"args\":\"ls -la\""));
+    }
+
+    #[test]
+    fn test_agent_event_deserialization() {
+        let json = r#"{"type":"task_completed","session_id":"webui:abc","result":"done"}"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        match event {
+            AgentEvent::TaskCompleted { session_id, result } => {
+                assert_eq!(session_id, "webui:abc");
+                assert_eq!(result, "done");
+            }
+            _ => panic!("expected TaskCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_agent_event_session_id() {
+        let event = AgentEvent::PreIteration {
+            session_id: "cli:default".to_string(),
+            iteration: 2,
+        };
+        assert_eq!(event.session_id(), "cli:default");
+    }
+
+    #[test]
+    fn test_task_hook_fire_event_without_channel() {
+        let hook = TaskHook::new("test-session");
+        // Should not panic when event_tx is None
+        hook.fire_event(AgentEvent::TaskStarted {
+            session_id: "test-session".to_string(),
+        });
+    }
+
+    #[tokio::test]
+    async fn test_task_hook_fire_event_with_channel() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let hook = TaskHook::new("test-session").with_events(tx);
+
+        hook.fire_event(AgentEvent::TaskStarted {
+            session_id: "test-session".to_string(),
+        });
+        hook.fire_event(AgentEvent::PreIteration {
+            session_id: "test-session".to_string(),
+            iteration: 1,
+        });
+
+        let evt1 = rx.try_recv().unwrap();
+        assert!(matches!(evt1, AgentEvent::TaskStarted { .. }));
+        let evt2 = rx.try_recv().unwrap();
+        assert!(matches!(
+            evt2,
+            AgentEvent::PreIteration { iteration: 1, .. }
+        ));
     }
 }
