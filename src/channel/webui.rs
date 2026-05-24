@@ -86,7 +86,6 @@ impl WebuiChannel {
 
     /// Prune disconnected SSE subscribers for a chat and send payload to remaining.
     async fn prune_and_send(&mut self, chat_id: &str, payload: SsePayload) -> Result<()> {
-        // Step 1: Extract senders under lock, then release
         let senders = {
             let mut guard = self.chats.lock().await;
             guard.remove(chat_id)
@@ -95,7 +94,6 @@ impl WebuiChannel {
             return Ok(());
         };
 
-        // Step 2: Send outside the lock to avoid serializing async writes
         let mut alive = Vec::new();
         for tx in senders {
             if tx.send(payload.clone()).await.is_ok() {
@@ -103,11 +101,17 @@ impl WebuiChannel {
             }
         }
 
-        // Step 3: Re-insert alive senders under lock
         if !alive.is_empty() {
             self.chats.lock().await.insert(chat_id.to_string(), alive);
         }
         Ok(())
+    }
+
+    fn chat_id_from(&self, session_id: &str) -> String {
+        session_id
+            .strip_prefix(&self.session_prefix)
+            .unwrap_or("")
+            .to_string()
     }
 
     pub fn start_server(&self) -> IoHandle {
@@ -326,11 +330,7 @@ impl Channel for WebuiChannel {
     }
 
     async fn write_output(&mut self, result: &BusResult) -> Result<()> {
-        let chat_id = result
-            .session_id
-            .strip_prefix(&self.session_prefix)
-            .unwrap_or("")
-            .to_string();
+        let chat_id = self.chat_id_from(&result.session_id);
         self.prune_and_send(&chat_id, SsePayload::Message(result.content.clone()))
             .await
     }
@@ -340,11 +340,7 @@ impl Channel for WebuiChannel {
     }
 
     async fn write_event(&mut self, event: &AgentEvent) -> Result<()> {
-        let session_id = event.session_id();
-        let chat_id = session_id
-            .strip_prefix(&self.session_prefix)
-            .unwrap_or("")
-            .to_string();
+        let chat_id = self.chat_id_from(event.session_id());
         let json = serde_json::to_string(event)?;
         self.prune_and_send(&chat_id, SsePayload::AgentEvent(json))
             .await

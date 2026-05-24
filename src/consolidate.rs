@@ -18,6 +18,10 @@ use crate::session::{Message, SharedSessionManager, message_content_chars, messa
 const MAX_CHUNK_MESSAGES: usize = 60;
 /// Extra headroom for tokenizer estimation drift.
 const SAFETY_BUFFER: u32 = 512;
+/// Prompt can use up to 85% of context window.
+const CONTEXT_BUDGET_FRACTION: f64 = 0.85;
+/// Consolidation reduces prompt to 60% of budget, leaving room for next turn.
+const CONSOLIDATION_TARGET_FRACTION: f64 = 0.6;
 
 pub struct Consolidator {
     provider: Arc<dyn Provider>,
@@ -270,14 +274,13 @@ If nothing noteworthy happened, output: (nothing)"
         // Budget: allow prompt to use up to 85% of context window, minus safety buffer.
         // We don't reserve max_completion_tokens here — that's the model's own limit
         // enforced by the API. We only care about the prompt fitting in context.
-        let budget = ((self.context_window_tokens as f64 * 0.85) as u32) - SAFETY_BUFFER;
+        let budget =
+            ((self.context_window_tokens as f64 * CONTEXT_BUDGET_FRACTION) as u32) - SAFETY_BUFFER;
         if prompt_tokens <= budget {
             return Ok(());
         }
 
-        // Target: reduce prompt to 60% of budget to leave room for the next turn's
-        // system prompt and tool definitions.
-        let target = (budget as f64 * 0.6) as u32;
+        let target = (budget as f64 * CONSOLIDATION_TARGET_FRACTION) as u32;
         let tokens_to_remove = prompt_tokens.saturating_sub(target);
 
         let _ = self

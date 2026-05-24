@@ -22,6 +22,10 @@ fn is_system_channel(channel_id: &str) -> bool {
     matches!(channel_id, "cron" | "heartbeat")
 }
 
+fn extract_channel_id(session_id: &str) -> &str {
+    session_id.split(':').next().unwrap_or("")
+}
+
 /// Channel trait, abstracts all I/O channels
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -259,7 +263,7 @@ impl ChannelManager {
 
         let mut rx_guard = outbound_rx.lock().await;
         while let Some(result) = rx_guard.recv().await {
-            let channel_id = result.session_id.split(':').next().unwrap_or("");
+            let channel_id = extract_channel_id(&result.session_id);
 
             // Skip system-triggered sessions (cron, heartbeat) — they have no user-facing channel
             if is_system_channel(channel_id) {
@@ -295,7 +299,7 @@ impl ChannelManager {
                     match rx.recv().await {
                         Ok(event) => {
                             let session_id = event.session_id();
-                            let channel_id = session_id.split(':').next().unwrap_or("");
+                            let channel_id = extract_channel_id(session_id);
 
                             // Skip system-triggered sessions
                             if is_system_channel(channel_id) {

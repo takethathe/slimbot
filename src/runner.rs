@@ -399,9 +399,6 @@ impl AgentRunner {
                     // Update token ratio so persist() saves it with the meta.
                     sm.update_token_ratio(session_id, prompt_tokens);
 
-                    let _completed_state = TaskState::Completed {
-                        result: text.clone(),
-                    };
                     let _ = sm.persist(session_id).await;
                 }
                 let completed_state = TaskState::Completed {
