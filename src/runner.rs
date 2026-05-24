@@ -50,13 +50,7 @@ pub struct AgentRunnerBuilder {
     config: Option<AgentConfig>,
     workspace_dir: Option<PathBuf>,
     memory_store: Option<SharedMemoryStore>,
-    channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
-    cancel_token: Option<CancellationToken>,
-    /// Origin channel for tool context (overrides session_id-parsed value).
-    origin_channel: Option<String>,
-    /// Origin chat_id for tool context (overrides session_id-parsed value).
-    origin_chat_id: Option<String>,
 }
 
 impl AgentRunnerBuilder {
@@ -68,11 +62,7 @@ impl AgentRunnerBuilder {
             config: None,
             workspace_dir: None,
             memory_store: None,
-            channel_inject: None,
             consolidator: None,
-            cancel_token: None,
-            origin_channel: None,
-            origin_chat_id: None,
         }
     }
 
@@ -106,28 +96,8 @@ impl AgentRunnerBuilder {
         self
     }
 
-    pub fn channel_inject(mut self, ci: Option<String>) -> Self {
-        self.channel_inject = ci;
-        self
-    }
-
     pub fn consolidator(mut self, c: Option<Arc<Consolidator>>) -> Self {
         self.consolidator = c;
-        self
-    }
-
-    pub fn cancel_token(mut self, ct: Option<CancellationToken>) -> Self {
-        self.cancel_token = ct;
-        self
-    }
-
-    pub fn origin_channel(mut self, ch: Option<String>) -> Self {
-        self.origin_channel = ch;
-        self
-    }
-
-    pub fn origin_chat_id(mut self, cid: Option<String>) -> Self {
-        self.origin_chat_id = cid;
         self
     }
 
@@ -146,11 +116,7 @@ impl AgentRunnerBuilder {
             config,
             workspace_dir,
             memory_store,
-            self.channel_inject,
             self.consolidator,
-            self.cancel_token,
-            self.origin_channel,
-            self.origin_chat_id,
         )
     }
 }
@@ -162,11 +128,7 @@ pub struct AgentRunner {
     config: AgentConfig,
     workspace_dir: PathBuf,
     memory_store: SharedMemoryStore,
-    channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
-    cancel_token: Option<CancellationToken>,
-    origin_channel: Option<String>,
-    origin_chat_id: Option<String>,
 }
 
 impl AgentRunner {
@@ -182,11 +144,7 @@ impl AgentRunner {
         config: AgentConfig,
         workspace_dir: PathBuf,
         memory_store: SharedMemoryStore,
-        channel_inject: Option<String>,
         consolidator: Option<Arc<Consolidator>>,
-        cancel_token: Option<CancellationToken>,
-        origin_channel: Option<String>,
-        origin_chat_id: Option<String>,
     ) -> Self {
         Self {
             tool_manager,
@@ -195,24 +153,29 @@ impl AgentRunner {
             config,
             workspace_dir,
             memory_store,
-            channel_inject,
             consolidator,
-            cancel_token,
-            origin_channel,
-            origin_chat_id,
         }
     }
 
-    pub async fn run(&self, content: String, hook: TaskHook, session_id: &str) -> AgentResult {
+    pub async fn run(
+        &self,
+        content: String,
+        hook: TaskHook,
+        session_id: &str,
+        _channel_inject: Option<String>,
+        cancel_token: Option<CancellationToken>,
+        origin_channel: Option<String>,
+        origin_chat_id: Option<String>,
+    ) -> AgentResult {
         debug!("[AgentRunner] Starting run for session={}", session_id);
 
         // Sentinel /stop message: all prior tasks were cancelled and drained.
-        if self.cancel_token.is_some() && content == "/stop" {
+        if cancel_token.is_some() && content == "/stop" {
             return self.cancelled_result(&hook, session_id).await;
         }
 
         // Check cancellation before starting.
-        if let Some(ref ct) = self.cancel_token {
+        if let Some(ref ct) = cancel_token {
             if ct.is_cancelled() {
                 return self.cancelled_result(&hook, session_id).await;
             }
@@ -255,10 +218,7 @@ impl AgentRunner {
         // Prefer origin channel/chat_id (e.g. from cron payload) over session_id-parsed values.
         let (tool_channel, tool_chat_id) = parse_session_origin(
             session_id,
-            (
-                self.origin_channel.as_deref(),
-                self.origin_chat_id.as_deref(),
-            ),
+            (origin_channel.as_deref(), origin_chat_id.as_deref()),
         );
         if !tool_channel.is_empty() {
             let ctx = ToolContext {
@@ -299,10 +259,7 @@ impl AgentRunner {
             let session_summary_ref = session_summary.as_deref();
             let (channel, chat_id) = parse_session_origin(
                 session_id,
-                (
-                    self.origin_channel.as_deref(),
-                    self.origin_chat_id.as_deref(),
-                ),
+                (origin_channel.as_deref(), origin_chat_id.as_deref()),
             );
             let context_builder = ContextBuilder::new(
                 self.session_manager.clone(),
@@ -339,7 +296,7 @@ impl AgentRunner {
             // Request model
             debug!("[AgentRunner] Sending chat request to provider");
             // Check cancellation before LLM request.
-            if let Some(ref ct) = self.cancel_token {
+            if let Some(ref ct) = cancel_token {
                 if ct.is_cancelled() {
                     return self
                         .rollback_and_fail(
@@ -477,7 +434,7 @@ impl AgentRunner {
                 // 2. Execute tools and write Tool messages
                 for call in calls {
                     // Check cancellation before each tool call.
-                    if let Some(ref ct) = self.cancel_token {
+                    if let Some(ref ct) = cancel_token {
                         if ct.is_cancelled() {
                             return self
                                 .rollback_and_fail(
@@ -922,11 +879,11 @@ mod tests {
         workspace_dir: PathBuf,
         ms: Arc<tokio::sync::Mutex<MemoryStore>>,
     ) -> AgentRunner {
-        AgentRunner::builder()
-            .session_manager(sm)
-            .tool_manager(tm)
-            .provider(provider)
-            .config(AgentConfig {
+        AgentRunner::new(
+            tm,
+            provider,
+            sm,
+            AgentConfig {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
@@ -934,10 +891,11 @@ mod tests {
                 persist_tool_results: false,
                 context_window_tokens: 8192,
                 unknown: Default::default(),
-            })
-            .workspace_dir(workspace_dir)
-            .memory_store(ms)
-            .build()
+            },
+            workspace_dir,
+            ms,
+            None,
+        )
     }
 
     #[tokio::test]
@@ -959,7 +917,15 @@ mod tests {
         let task = make_task("Say hi");
 
         let result = runner
-            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .run(
+                task.content.clone(),
+                task.hook.clone(),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         assert_eq!(result.content, "Hello, world!");
         assert_eq!(result.success, true);
@@ -1008,7 +974,15 @@ mod tests {
         let task = make_task("Run echo");
 
         let result = runner
-            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .run(
+                task.content.clone(),
+                task.hook.clone(),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         assert_eq!(result.content, "Done!");
         assert_eq!(result.success, true);
@@ -1089,7 +1063,15 @@ mod tests {
         let task = make_task("List and read");
 
         let result = runner
-            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .run(
+                task.content.clone(),
+                task.hook.clone(),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         assert_eq!(
             result.content,
@@ -1160,7 +1142,15 @@ mod tests {
         let task = make_task("Run two tools");
 
         let result = runner
-            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .run(
+                task.content.clone(),
+                task.hook.clone(),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         assert_eq!(result.content, "Final answer");
         assert_eq!(result.success, true);
@@ -1197,7 +1187,15 @@ mod tests {
         let task = make_task("Loop forever");
 
         let result = runner
-            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .run(
+                task.content.clone(),
+                task.hook.clone(),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         assert_eq!(result.success, false);
         assert!(result.content.contains("Reached max iterations 40"));
@@ -1237,7 +1235,9 @@ mod tests {
         let hook = TaskHook::new("test-session").with_status_channel(status_tx);
         let content = task.content.clone();
 
-        let _ = runner.run(content, hook, "test-session").await;
+        let _ = runner
+            .run(content, hook, "test-session", None, None, None, None)
+            .await;
 
         // Collect all status events
         let mut states = Vec::new();
@@ -1294,7 +1294,15 @@ mod tests {
         let task = make_task("test");
 
         let result = runner
-            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .run(
+                task.content.clone(),
+                task.hook.clone(),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         assert_eq!(result.content, "Got the error, stopping.");
 
@@ -1322,7 +1330,15 @@ mod tests {
         let task = make_task("hello");
 
         let result = runner
-            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .run(
+                task.content.clone(),
+                task.hook.clone(),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         assert_eq!(result.content, "persist me");
 
@@ -1548,11 +1564,11 @@ mod tests {
                 usage: Usage::default(),
             },
         ]));
-        let runner = AgentRunner::builder()
-            .session_manager(sm.clone())
-            .tool_manager(tm)
-            .provider(provider)
-            .config(AgentConfig {
+        let runner = AgentRunner::new(
+            tm,
+            provider,
+            sm.clone(),
+            AgentConfig {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
@@ -1560,14 +1576,23 @@ mod tests {
                 persist_tool_results: true,
                 context_window_tokens: 8192,
                 unknown: Default::default(),
-            })
-            .workspace_dir(workspace_dir.clone())
-            .memory_store(ms)
-            .build();
+            },
+            workspace_dir.clone(),
+            ms,
+            None,
+        );
         let task = make_task("test persist");
 
         let result = runner
-            .run(task.content.clone(), task.hook.clone(), "test-session")
+            .run(
+                task.content.clone(),
+                task.hook.clone(),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         assert_eq!(result.content, "done");
 
@@ -1590,11 +1615,11 @@ mod tests {
         let ct = CancellationToken::new();
         ct.cancel();
 
-        let runner = AgentRunner::builder()
-            .session_manager(sm.clone())
-            .tool_manager(tm)
-            .provider(Arc::new(MockProvider::new(vec![]))) // no responses needed
-            .config(AgentConfig {
+        let runner = AgentRunner::new(
+            tm,
+            Arc::new(MockProvider::new(vec![])),
+            sm.clone(),
+            AgentConfig {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
@@ -1602,11 +1627,11 @@ mod tests {
                 persist_tool_results: false,
                 context_window_tokens: 8192,
                 unknown: Default::default(),
-            })
-            .workspace_dir(wd)
-            .memory_store(ms)
-            .cancel_token(Some(ct))
-            .build();
+            },
+            wd,
+            ms,
+            None,
+        );
 
         // Sentinel /stop message should be detected immediately.
         let result = runner
@@ -1614,6 +1639,10 @@ mod tests {
                 "/stop".to_string(),
                 TaskHook::new("test-session"),
                 "test-session",
+                None,
+                Some(ct),
+                None,
+                None,
             )
             .await;
         assert!(!result.success);
@@ -1629,11 +1658,11 @@ mod tests {
         let ct = CancellationToken::new();
         ct.cancel();
 
-        let runner = AgentRunner::builder()
-            .session_manager(sm.clone())
-            .tool_manager(tm)
-            .provider(Arc::new(MockProvider::new(vec![])))
-            .config(AgentConfig {
+        let runner = AgentRunner::new(
+            tm,
+            Arc::new(MockProvider::new(vec![])),
+            sm.clone(),
+            AgentConfig {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
@@ -1641,11 +1670,11 @@ mod tests {
                 persist_tool_results: false,
                 context_window_tokens: 8192,
                 unknown: Default::default(),
-            })
-            .workspace_dir(wd)
-            .memory_store(ms)
-            .cancel_token(Some(ct))
-            .build();
+            },
+            wd,
+            ms,
+            None,
+        );
 
         // Should return cancelled before making any LLM call.
         let result = runner
@@ -1653,6 +1682,10 @@ mod tests {
                 "hello".to_string(),
                 TaskHook::new("test-session"),
                 "test-session",
+                None,
+                Some(ct),
+                None,
+                None,
             )
             .await;
         assert!(!result.success);
@@ -1714,11 +1747,11 @@ mod tests {
             },
         ]));
 
-        let runner = AgentRunner::builder()
-            .session_manager(sm.clone())
-            .tool_manager(tm)
-            .provider(Arc::new(CancellingProvider::new(provider, ct_clone)))
-            .config(AgentConfig {
+        let runner = AgentRunner::new(
+            tm,
+            Arc::new(CancellingProvider::new(provider, ct_clone)),
+            sm.clone(),
+            AgentConfig {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
@@ -1726,17 +1759,21 @@ mod tests {
                 persist_tool_results: false,
                 context_window_tokens: 8192,
                 unknown: Default::default(),
-            })
-            .workspace_dir(workspace_dir)
-            .memory_store(ms)
-            .cancel_token(Some(ct))
-            .build();
+            },
+            workspace_dir,
+            ms,
+            None,
+        );
 
         let result = runner
             .run(
                 "test cancel".to_string(),
                 TaskHook::new("test-session"),
                 "test-session",
+                None,
+                Some(ct),
+                None,
+                None,
             )
             .await;
         assert!(!result.success);
@@ -1783,11 +1820,11 @@ mod tests {
         // Provider that always fails
         let provider = Arc::new(FailingProvider);
 
-        let runner = AgentRunner::builder()
-            .session_manager(sm.clone())
-            .tool_manager(tm)
-            .provider(provider)
-            .config(AgentConfig {
+        let runner = AgentRunner::new(
+            tm,
+            provider,
+            sm.clone(),
+            AgentConfig {
                 provider: "test".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
@@ -1795,16 +1832,21 @@ mod tests {
                 persist_tool_results: false,
                 context_window_tokens: 8192,
                 unknown: Default::default(),
-            })
-            .workspace_dir(workspace_dir)
-            .memory_store(ms)
-            .build();
+            },
+            workspace_dir,
+            ms,
+            None,
+        );
 
         let result = runner
             .run(
                 "test error".to_string(),
                 TaskHook::new("test-session"),
                 "test-session",
+                None,
+                None,
+                None,
+                None,
             )
             .await;
         assert!(!result.success);

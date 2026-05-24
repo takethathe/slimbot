@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -29,7 +30,7 @@ pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
 pub struct SessionRunner {
     running: Arc<AtomicBool>,
     task_queue: Arc<std::sync::Mutex<VecDeque<Box<dyn FnOnce() -> BoxFuture + Send>>>>,
-    cancel_token: Arc<std::sync::Mutex<CancellationToken>>,
+    cancel_token: Arc<ParkingMutex<CancellationToken>>,
     /// Notified by on_task_complete so shutdown can wait for the running task.
     task_done: Arc<tokio::sync::Notify>,
 }
@@ -39,7 +40,7 @@ impl SessionRunner {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             task_queue: Arc::new(std::sync::Mutex::new(VecDeque::new())),
-            cancel_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
+            cancel_token: Arc::new(ParkingMutex::new(CancellationToken::new())),
             task_done: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -73,17 +74,16 @@ impl SessionRunner {
     /// Returns a clone of the new (non-cancelled) token for the sentinel task.
     /// Tasks already queued hold a clone of the old token and will observe cancellation.
     fn cancel_and_reset(&self) -> CancellationToken {
-        let mut guard = self.cancel_token.lock().unwrap();
+        let mut guard = self.cancel_token.lock();
         guard.cancel();
         let new_token = CancellationToken::new();
-        let old = std::mem::replace(&mut *guard, new_token.clone());
-        drop(old);
+        *guard = new_token.clone();
         new_token
     }
 
     /// Return a clone of the session's current cancellation token.
     pub fn cancel_token(&self) -> CancellationToken {
-        self.cancel_token.lock().unwrap().clone()
+        self.cancel_token.lock().clone()
     }
 
     /// Whether the runner is currently idle.
@@ -94,7 +94,7 @@ impl SessionRunner {
     /// Shutdown: clear pending queue and cancel running tasks.
     /// Does NOT wait for the running task — callers use `wait_idle()` for that.
     fn shutdown(&self) {
-        self.cancel_token.lock().unwrap().cancel();
+        self.cancel_token.lock().cancel();
         self.task_queue.lock().unwrap().clear();
     }
 
@@ -475,18 +475,26 @@ impl SessionTaskBuilder {
 
         let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> = Box::new(move || {
             Box::pin(async move {
-                let runner = AgentRunner::builder()
-                    .session_manager(session_manager)
-                    .tool_manager(tool_manager)
-                    .provider(provider)
-                    .config(config)
-                    .workspace_dir(workspace_dir)
-                    .memory_store(memory_store)
-                    .channel_inject(self.channel_inject)
-                    .consolidator(consolidator)
-                    .cancel_token(cancel_token)
-                    .build();
-                let result = runner.run(content, hook, &sid1).await;
+                let runner = AgentRunner::new(
+                    tool_manager,
+                    provider,
+                    session_manager,
+                    config,
+                    workspace_dir,
+                    memory_store,
+                    consolidator,
+                );
+                let result = runner
+                    .run(
+                        content,
+                        hook,
+                        &sid1,
+                        self.channel_inject,
+                        cancel_token,
+                        None,
+                        None,
+                    )
+                    .await;
 
                 // Send result outbound
                 let content = if result.success {
@@ -1029,6 +1037,13 @@ impl SessionManager {
         {
             let _ = dir.sync_all();
         }
+    }
+
+    /// Full graceful shutdown: cancels runners, waits for running tasks, then syncs meta.
+    pub async fn graceful_shutdown(&self) {
+        self.shutdown_all();
+        self.wait_all_idle().await;
+        self.sync_all_meta();
     }
 
     pub async fn persist(&mut self, session_id: &str) -> Result<()> {

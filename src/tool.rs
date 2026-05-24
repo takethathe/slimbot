@@ -56,6 +56,8 @@ pub trait Tool: Send + Sync {
 pub struct ToolManager {
     tools: HashMap<String, Box<dyn Tool>>,
     workspace_dir: PathBuf,
+    /// Cached OpenAI tool definitions, rebuilt on register.
+    openai_tools: Vec<ToolDefinition>,
 }
 
 impl ToolManager {
@@ -63,12 +65,18 @@ impl ToolManager {
         Self {
             tools: HashMap::new(),
             workspace_dir,
+            openai_tools: Vec::new(),
         }
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.name().to_string();
         debug!("Registered tool: {}", name);
+        self.openai_tools.push(ToolDefinition {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            parameters: tool.parameters(),
+        });
         self.tools.insert(name, tool);
     }
 
@@ -118,14 +126,7 @@ impl ToolManager {
     }
 
     pub fn to_openai_functions(&self) -> Vec<ToolDefinition> {
-        self.tools
-            .values()
-            .map(|tool| ToolDefinition {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                parameters: tool.parameters(),
-            })
-            .collect()
+        self.openai_tools.clone()
     }
 
     pub async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {

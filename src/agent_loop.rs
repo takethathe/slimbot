@@ -46,13 +46,7 @@ async fn shutdown_session_memory(
     memory_store: &SharedMemoryStore,
 ) {
     consolidator.shutdown();
-    {
-        let guard = session_manager.lock().await;
-        guard.shutdown_all();
-        drop(guard);
-    }
-    session_manager.lock().await.wait_all_idle().await;
-    session_manager.lock().await.sync_all_meta();
+    session_manager.lock().await.graceful_shutdown().await;
     {
         let guard = memory_store.lock().await;
         let _ = guard.sync_all();
@@ -71,6 +65,8 @@ pub struct AgentLoop {
     consolidator: Arc<Consolidator>,
     /// Broadcast sender: triggers shutdown of inbound loop and I/O schedulers.
     shutdown_tx: broadcast::Sender<()>,
+    /// Pre-built runner with stable components, reused across tasks.
+    runner: AgentRunner,
 }
 
 /// Returned by `AgentLoop::run()` so the caller can publish input and
@@ -204,16 +200,29 @@ impl AgentLoop {
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
+        let tool_manager_arc = Arc::new(tool_manager);
+
+        let runner = AgentRunner::new(
+            tool_manager_arc.clone(),
+            provider.clone(),
+            session_manager_arc.clone(),
+            config.agent.clone(),
+            paths.workspace_dir().to_path_buf(),
+            memory_store.clone(),
+            Some(consolidator.clone()),
+        );
+
         Ok(Self {
             config,
             workspace_dir: paths.workspace_dir().to_path_buf(),
             provider,
-            tool_manager: Arc::new(tool_manager),
+            tool_manager: tool_manager_arc,
             session_manager: session_manager_arc,
             memory_store,
             message_bus,
             consolidator,
             shutdown_tx,
+            runner,
         })
     }
 
@@ -253,20 +262,18 @@ impl AgentLoop {
             let guard = self.session_manager.lock().await;
             guard.session_cancel_token(session_id)
         };
-        let runner = AgentRunner::new(
-            self.tool_manager.clone(),
-            self.provider.clone(),
-            self.session_manager.clone(),
-            self.config.agent.clone(),
-            self.workspace_dir.clone(),
-            self.memory_store.clone(),
-            channel_inject,
-            Some(self.consolidator.clone()),
-            cancel_token,
-            origin_channel,
-            origin_chat_id,
-        );
-        let result = runner.run(content, hook, session_id).await;
+        let result = self
+            .runner
+            .run(
+                content,
+                hook,
+                session_id,
+                channel_inject,
+                cancel_token,
+                origin_channel,
+                origin_chat_id,
+            )
+            .await;
 
         // Suppress final response if the message tool already delivered output this turn.
         // This prevents duplicate messages when a cron/heartbeat task uses the message tool.

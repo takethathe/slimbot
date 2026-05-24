@@ -145,3 +145,25 @@
 - [x] Gateway 主线程为 ChannelManager 监听 output message
 - [x] Cron 与 Heartbeat 集成到 AgentLoop 通过 callback 触发任务
 - [x] 完整的单元测试覆盖：cron service (38 tests), heartbeat service (12 tests), webui channel (11 tests), channel manager (9 tests), message tool (6 tests), cron tool (13 tests)
+
+## 代码优化（2026-05-24 审计）
+
+### 高优先级（性能 / 正确性）
+
+- [ ] **复用 AgentRunner 实例** — `AgentLoop::run_task` 每次调用都新建 `AgentRunner`，clone 11 个字段。将 `AgentRunner` 提前构建并复用，避免 `PathBuf` 等堆分配（`agent_loop.rs:256-268`, `runner.rs:306-315`）
+- [ ] **合并 shutdown_session_memory 三次锁为一次** — `shutdown_all()`, `wait_all_idle()`, `sync_all_meta()` 分别获取同一把锁。封装为 `SessionManager` 上的单一方法（`agent_loop.rs:50-55`）
+- [ ] **移除 MessageBus 中 `Arc<Mutex<Receiver>>` 包装** — 每个 receiver 只有单一消费者，`Arc<tokio::sync::Mutex>` 是多余开销。直接传递 `Receiver` 所有权（`message_bus.rs:32-34`）
+- [ ] **缓存 ToolManager 的 `to_openai_functions` 结果** — 工具定义是静态的，但每次 LLM 调用都重新分配 `Vec` 并 clone 所有字符串。改为内部缓存，注册时重建（`tool.rs:120-129`）
+- [ ] **移除 CancellationToken 的 Mutex 包装** — `CancellationToken` 本身已线程安全，`Arc<std::sync::Mutex<CancellationToken>>` 是多余序列化。直接 clone 使用（`session.rs:32`）
+
+### 中优先级（代码质量）
+
+- [ ] **消除 AgentRunnerBuilder 和 SessionTaskBuilder 重复** — 两个 builder 携带几乎相同字段和 build 逻辑。提取共享 `AgentComponents` 结构（`runner.rs:46-156`, `session.rs:373-518`）
+- [ ] **统一使用 parking_lot::Mutex 替换 std::sync::Mutex** — 项目已依赖 `parking_lot`，但 cron/service.rs、tools/message.rs、session.rs 仍使用 `std::sync::Mutex`
+- [ ] **拆分 AgentLoop God Object** — 持有 8 个组件引用，职责过重。引入 `Runtime` / `App` 结构负责生命周期管理（`agent_loop.rs:63-74`）
+
+### 低优先级（改进空间）
+
+- [ ] **升级 reqwest 到 0.12** — 当前使用 0.11，0.12 支持 HTTP/3 和改进的 TLS 处理（`Cargo.toml:18`）
+- [ ] **补充测试覆盖** — FileReader 缺少成功读取/截断测试、路径安全缺少 symlink 越界测试、Cron 缺少并发 tick 测试、Session 缺少并发提交竞态测试
+- [ ] **优化 Message 序列化避免中间 Value 分配** — `serde_json::json!()` 每次 LLM 调用为每条消息分配中间 JSON Value。实现自定义 `Serialize` 直接写 OpenAI 格式（`provider/openai.rs:118-203`）
