@@ -280,10 +280,18 @@ impl Channel for WebuiChannel {
             .strip_prefix("webui:")
             .unwrap_or("")
             .to_string();
-        let guard = self.chats.lock().await;
-        if let Some(senders) = guard.get(&chat_id) {
+        let mut guard = self.chats.lock().await;
+        if let Some(senders) = guard.remove(&chat_id) {
+            // Keep only senders that successfully received the message;
+            // disconnected clients are silently pruned.
+            let mut alive = Vec::new();
             for tx in senders {
-                let _ = tx.send(result.content.clone()).await;
+                if tx.send(result.content.clone()).await.is_ok() {
+                    alive.push(tx);
+                }
+            }
+            if !alive.is_empty() {
+                guard.insert(chat_id, alive);
             }
         }
         Ok(())
