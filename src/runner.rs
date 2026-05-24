@@ -540,15 +540,16 @@ impl AgentRunner {
                     }
                 }
 
+                // Fire PostIteration with the same iteration number that PreIteration used.
+                hook.fire_event(AgentEvent::PostIteration {
+                    session_id: session_id.to_string(),
+                    iteration: iterations,
+                });
                 iterations += 1;
                 let running_state = TaskState::Running {
                     current_iteration: iterations,
                 };
                 hook.notify_status_change(&running_state);
-                hook.fire_event(AgentEvent::PostIteration {
-                    session_id: session_id.to_string(),
-                    iteration: iterations,
-                });
             }
         }
     }

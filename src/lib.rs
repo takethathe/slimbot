@@ -47,10 +47,11 @@ pub use path::expand_home;
 pub use provider::{FinishReason, LLMResponse, OpenAIProvider, Provider, Usage};
 pub use runner::AgentRunner;
 pub use session::{
-    Content, Message, Session, SessionManager, SharedSessionManager, TaskHook, TaskState,
+    AgentEvent, Content, Message, Session, SessionManager, SharedSessionManager, TaskHook,
+    TaskState,
 };
 pub use tool::{
-    ToolCall, ToolDefinition, ToolManager, ensure_nonempty_tool_result, format_tool_error,
+    Tool, ToolCall, ToolDefinition, ToolManager, ensure_nonempty_tool_result, format_tool_error,
     persist_tool_result,
 };
 pub use tools::create_tool;
