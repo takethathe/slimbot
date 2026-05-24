@@ -2,11 +2,6 @@ use std::path::Path;
 
 use crate::embed::{EMBEDDED_FILES, get_content_by_dest};
 
-/// All embedded resources: (filename, content, dest_path).
-pub fn embedded_files() -> &'static [(&'static str, &'static str, &'static str)] {
-    EMBEDDED_FILES
-}
-
 /// Returns the file content if it exists and differs from the embedded template,
 /// or `None` if the file is missing, unreadable, or matches the template.
 pub fn read_if_modified(path: &Path, template: &str) -> Option<String> {
@@ -33,6 +28,7 @@ pub fn skill_files() -> impl Iterator<Item = (&'static str, &'static str, &'stat
 }
 
 /// Get embedded content by filename.
+#[cfg(test)]
 pub fn get_template(name: &str) -> Option<&'static str> {
     EMBEDDED_FILES
         .iter()
