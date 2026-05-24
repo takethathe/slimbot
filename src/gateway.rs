@@ -11,7 +11,7 @@ use crate::heartbeat::HeartbeatService;
 use crate::info;
 use crate::message_bus::{BusResult, MessageBus};
 use crate::path::PathManager;
-use crate::session::TaskHook;
+use crate::session::{AgentEvent, TaskHook};
 use crate::tool::ToolManager;
 use crate::tools::cron::CronTool;
 use crate::tools::message::MessageTool;
@@ -142,7 +142,9 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     }
 
     // ChannelManager: init channels from config
-    let mut channel_manager = ChannelManager::new(message_bus.clone(), config.clone(), None);
+    let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
+    let mut channel_manager =
+        ChannelManager::new(message_bus.clone(), config.clone(), Some(event_tx.clone()));
 
     // Create shutdown broadcast for channel servers (webui etc.)
     let (channel_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -152,7 +154,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         channel_manager.register_webui_factory(
             agent_loop.session_manager(),
             channel_shutdown_tx.clone(),
-            None,
+            event_tx.clone(),
         );
     }
 

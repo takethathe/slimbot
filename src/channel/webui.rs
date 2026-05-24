@@ -20,7 +20,7 @@ use crate::session::{AgentEvent, SharedSessionManager, TaskHook, TaskState};
 use crate::{error, info};
 
 struct AppState {
-    chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<String>>>>>,
+    chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<SsePayload>>>>>,
     inbound_tx: mpsc::Sender<BusRequest>,
     channel_id: String,
     session_manager: Option<SharedSessionManager>,
@@ -28,13 +28,21 @@ struct AppState {
     event_tx: Option<broadcast::Sender<AgentEvent>>,
 }
 
+/// SSE payload with event type discrimination.
+#[derive(Clone)]
+enum SsePayload {
+    Message(String),
+    AgentEvent(String),
+}
+
 pub struct WebuiChannel {
     host: String,
     port: u16,
     channel_id: String,
+    session_prefix: String, // "{channel_id}:" for fast session_id stripping
     message_bus: Option<Arc<MessageBus>>,
     session_manager: Option<SharedSessionManager>,
-    chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<String>>>>>,
+    chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<SsePayload>>>>>,
     shutdown_rx: Option<broadcast::Receiver<()>>,
     event_tx: Option<broadcast::Sender<AgentEvent>>,
 }
@@ -51,6 +59,7 @@ impl WebuiChannel {
             host,
             port,
             channel_id: "webui".to_string(),
+            session_prefix: "webui:".to_string(),
             message_bus: None,
             session_manager: None,
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -73,6 +82,32 @@ impl WebuiChannel {
 
     pub fn set_event_tx(&mut self, tx: broadcast::Sender<AgentEvent>) {
         self.event_tx = Some(tx);
+    }
+
+    /// Prune disconnected SSE subscribers for a chat and send payload to remaining.
+    async fn prune_and_send(&mut self, chat_id: &str, payload: SsePayload) -> Result<()> {
+        // Step 1: Extract senders under lock, then release
+        let senders = {
+            let mut guard = self.chats.lock().await;
+            guard.remove(chat_id)
+        };
+        let Some(senders) = senders else {
+            return Ok(());
+        };
+
+        // Step 2: Send outside the lock to avoid serializing async writes
+        let mut alive = Vec::new();
+        for tx in senders {
+            if tx.send(payload.clone()).await.is_ok() {
+                alive.push(tx);
+            }
+        }
+
+        // Step 3: Re-insert alive senders under lock
+        if !alive.is_empty() {
+            self.chats.lock().await.insert(chat_id.to_string(), alive);
+        }
+        Ok(())
     }
 
     pub fn start_server(&self) -> IoHandle {
@@ -225,15 +260,19 @@ async fn sse_handler(
 {
     let chat_id = params.get("chat_id").cloned().unwrap_or_default();
 
-    let (tx, mut rx) = mpsc::channel::<String>(32);
+    let (tx, mut rx) = mpsc::channel::<SsePayload>(32);
     {
         let mut guard = state.chats.lock().await;
         guard.entry(chat_id).or_default().push(tx);
     }
 
     let stream = async_stream::stream! {
-        while let Some(content) = rx.recv().await {
-            yield Ok(Event::default().data(content));
+        while let Some(payload) = rx.recv().await {
+            let event = match payload {
+                SsePayload::Message(content) => Event::default().data(content),
+                SsePayload::AgentEvent(json) => Event::default().event("agent_event").data(json),
+            };
+            yield Ok(event);
         }
     };
 
@@ -289,24 +328,11 @@ impl Channel for WebuiChannel {
     async fn write_output(&mut self, result: &BusResult) -> Result<()> {
         let chat_id = result
             .session_id
-            .strip_prefix("webui:")
+            .strip_prefix(&self.session_prefix)
             .unwrap_or("")
             .to_string();
-        let mut guard = self.chats.lock().await;
-        if let Some(senders) = guard.remove(&chat_id) {
-            // Keep only senders that successfully received the message;
-            // disconnected clients are silently pruned.
-            let mut alive = Vec::new();
-            for tx in senders {
-                if tx.send(result.content.clone()).await.is_ok() {
-                    alive.push(tx);
-                }
-            }
-            if !alive.is_empty() {
-                guard.insert(chat_id, alive);
-            }
-        }
-        Ok(())
+        self.prune_and_send(&chat_id, SsePayload::Message(result.content.clone()))
+            .await
     }
 
     async fn write_status(&mut self, _session_id: &str, _state: &TaskState) -> Result<()> {
@@ -314,34 +340,14 @@ impl Channel for WebuiChannel {
     }
 
     async fn write_event(&mut self, event: &AgentEvent) -> Result<()> {
-        let json = serde_json::to_string(event)?;
-        let session_id = match event {
-            AgentEvent::TaskStarted { session_id } => session_id,
-            AgentEvent::TaskCompleted { session_id, .. } => session_id,
-            AgentEvent::TaskFailed { session_id, .. } => session_id,
-            AgentEvent::PreIteration { session_id, .. } => session_id,
-            AgentEvent::PostIteration { session_id, .. } => session_id,
-            AgentEvent::AssistantMessage { session_id, .. } => session_id,
-            AgentEvent::ToolCall { session_id, .. } => session_id,
-            AgentEvent::ToolResult { session_id, .. } => session_id,
-        };
+        let session_id = event.session_id();
         let chat_id = session_id
-            .strip_prefix(&format!("{}:", self.channel_id))
-            .unwrap_or(session_id)
+            .strip_prefix(&self.session_prefix)
+            .unwrap_or("")
             .to_string();
-        let mut guard = self.chats.lock().await;
-        if let Some(senders) = guard.get_mut(&chat_id) {
-            let mut alive = Vec::new();
-            for tx in senders.drain(..) {
-                if tx.send(json.clone()).await.is_ok() {
-                    alive.push(tx);
-                }
-            }
-            if !alive.is_empty() {
-                guard.insert(chat_id, alive);
-            }
-        }
-        Ok(())
+        let json = serde_json::to_string(event)?;
+        self.prune_and_send(&chat_id, SsePayload::AgentEvent(json))
+            .await
     }
 
     async fn prepare_inject(&self) -> Result<String> {
@@ -474,7 +480,7 @@ mod tests {
         // Register an SSE subscriber for chat "abc123"
         {
             let mut guard = ch.chats.lock().await;
-            let (tx, _rx) = mpsc::channel::<String>(32);
+            let (tx, _rx) = mpsc::channel::<SsePayload>(32);
             guard.entry("abc123".to_string()).or_default().push(tx);
         }
 

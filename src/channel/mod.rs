@@ -167,12 +167,8 @@ impl ChannelManager {
         &mut self,
         session_manager: SharedSessionManager,
         shutdown_tx: tokio::sync::broadcast::Sender<()>,
-        event_tx: Option<broadcast::Sender<AgentEvent>>,
+        event_tx: broadcast::Sender<AgentEvent>,
     ) {
-        let Some(event_tx) = event_tx else {
-            error!("[ChannelManager] No event_tx provided for webui factory");
-            return;
-        };
         let factory = WebuiChannelFactory::new(
             self.message_bus.clone(),
             session_manager,

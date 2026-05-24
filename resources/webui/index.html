@@ -539,6 +539,98 @@ body::after {
 .typing-indicator span:nth-child(2) { animation-delay: 0.15s; }
 .typing-indicator span:nth-child(3) { animation-delay: 0.3s; }
 
+/* ── Agent event cards ── */
+.event-card {
+  align-self: flex-start;
+  max-width: 82%;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: rgba(17, 19, 24, 0.6);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  padding: 0.6rem 0.9rem;
+  font-size: 0.8rem;
+  animation: msgIn 0.3s ease both;
+}
+
+.event-card.tool-call {
+  border-left: 2px solid var(--accent);
+}
+
+.event-card.tool-result {
+  border-left: 2px solid var(--status-done);
+}
+
+.event-card .event-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.3rem;
+}
+
+.event-card .event-icon {
+  font-size: 0.75rem;
+  color: var(--accent);
+}
+
+.event-card .event-name {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--text-primary);
+  font-size: 0.82rem;
+}
+
+.event-card .event-args,
+.event-card .event-output {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0.3rem 0.5rem;
+  border-radius: 4px;
+  margin-top: 0.25rem;
+  word-break: break-all;
+}
+
+.event-card .event-args {
+  color: var(--text-secondary);
+}
+
+.event-card .event-output {
+  color: var(--text-muted);
+  max-height: 120px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
+.event-card.assistant-message {
+  border-left: 2px solid rgba(200, 164, 94, 0.4);
+}
+
+.event-card.assistant-message .event-content {
+  font-size: 0.84rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+.event-card.iteration {
+  border-left: 2px solid var(--border-subtle);
+  opacity: 0.6;
+}
+
+.event-card.iteration .event-name {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.event-card.task-completed {
+  border-left: 2px solid var(--status-done);
+  opacity: 0.7;
+}
+
+.event-card.task-failed {
+  border-left: 2px solid var(--status-failed);
+}
+
 /* ─ Animations ── */
 @keyframes fadeUp {
   from { opacity: 0; transform: translateY(12px); }
@@ -796,6 +888,131 @@ function enterChat(chatId) {
     // client EventSource to prevent auto-reconnect and mark completion.
     onStreamDone();
   };
+
+  evtSource.addEventListener('agent_event', (e) => {
+    try {
+      const event = JSON.parse(e.data);
+      handleAgentEvent(event);
+    } catch (err) {
+      console.warn('Failed to parse agent_event:', err);
+    }
+  });
+
+  function handleAgentEvent(event) {
+    switch (event.type) {
+      case 'task_started':
+        setUserDotState('running');
+        break;
+
+      case 'task_completed':
+        setUserDotState('done');
+        hideTyping();
+        isProcessing = false;
+        updateSendButton();
+        activeUserDot = null;
+        break;
+
+      case 'task_failed':
+        setUserDotState('failed');
+        hideTyping();
+        isProcessing = false;
+        updateSendButton();
+        activeUserDot = null;
+        appendEventCard('task-failed', 'Task failed', event.error || '');
+        break;
+
+      case 'pre_iteration':
+        appendEventCard('iteration', 'Iteration ' + event.iteration);
+        break;
+
+      case 'assistant_message':
+        hideTyping();
+        if (!currentMsgEl) {
+          currentMsgEl = appendMessage('assistant', '', false);
+          accumulated = '';
+        }
+        accumulated += event.content;
+        currentMsgEl.el.innerHTML = renderMarkdown(accumulated);
+        scrollToBottom();
+        break;
+
+      case 'tool_call': {
+        const card = appendEventCard('tool-call', event.name, formatArgs(event.args));
+        card.dataset.toolName = event.name;
+        break;
+      }
+
+      case 'tool_result': {
+        // Find the most recent tool_call card with matching name and update it
+        updateToolResult(event.name, event.output);
+        break;
+      }
+    }
+  }
+
+  function formatArgs(args) {
+    try {
+      const parsed = JSON.parse(args);
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return args;
+    }
+  }
+
+  function appendEventCard(type, name, detail) {
+    const container = document.getElementById('messages');
+    const div = document.createElement('div');
+    div.className = 'event-card ' + type;
+
+    const header = document.createElement('div');
+    header.className = 'event-header';
+
+    const icon = document.createElement('span');
+    icon.className = 'event-icon';
+    icon.textContent = type === 'tool-call' ? '▶' : type === 'tool-result' ? '✓' : '○';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'event-name';
+    nameEl.textContent = name;
+
+    header.appendChild(icon);
+    header.appendChild(nameEl);
+    div.appendChild(header);
+
+    if (detail) {
+      const detailEl = document.createElement('div');
+      detailEl.className = type === 'tool-call' ? 'event-args' :
+                           type === 'tool-result' ? 'event-output' :
+                           'event-content';
+      detailEl.textContent = detail;
+      div.appendChild(detailEl);
+    }
+
+    container.appendChild(div);
+    scrollToBottom();
+    return div;
+  }
+
+  function updateToolResult(toolName, output) {
+    // Find the most recent tool_call card without a result
+    const container = document.getElementById('messages');
+    const cards = container.querySelectorAll('.event-card.tool-call');
+    for (let i = cards.length - 1; i >= 0; i--) {
+      if (cards[i].dataset.toolName === toolName && !cards[i].querySelector('.event-output')) {
+        // Convert to tool-result style
+        cards[i].className = 'event-card tool-result';
+        const icon = cards[i].querySelector('.event-icon');
+        if (icon) icon.textContent = '✓';
+
+        const outputEl = document.createElement('div');
+        outputEl.className = 'event-output';
+        outputEl.textContent = output.length > 500 ? output.slice(0, 500) + '\n... (truncated)' : output;
+        cards[i].appendChild(outputEl);
+        scrollToBottom();
+        break;
+      }
+    }
+  }
 
   evtSource.onerror = () => {
     // Fires on network errors or server restarts — not on normal close

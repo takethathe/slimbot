@@ -447,7 +447,6 @@ impl TaskHook {
         }
     }
 
-    /// Fire an AgentEvent to the broadcast channel.
     /// Silently drops if no event channel is attached.
     pub fn fire_event(&self, event: AgentEvent) {
         if let Some(ref tx) = self.event_tx {
