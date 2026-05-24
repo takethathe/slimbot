@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::io_scheduler::{ChannelCommandCallback, IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
-use crate::session::{SharedSessionManager, TaskState, AgentEvent};
+use crate::session::{AgentEvent, SharedSessionManager, TaskState};
 use crate::{debug, error, info};
 use tokio::sync::broadcast;
 
@@ -173,8 +173,12 @@ impl ChannelManager {
             error!("[ChannelManager] No event_tx provided for webui factory");
             return;
         };
-        let factory =
-            WebuiChannelFactory::new(self.message_bus.clone(), session_manager, shutdown_tx, event_tx);
+        let factory = WebuiChannelFactory::new(
+            self.message_bus.clone(),
+            session_manager,
+            shutdown_tx,
+            event_tx,
+        );
         self.factories
             .insert("webui".to_string(), Box::new(factory));
     }

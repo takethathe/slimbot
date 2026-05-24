@@ -16,7 +16,7 @@ use super::{Channel, ChannelFactory};
 use crate::embed;
 use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
-use crate::session::{SharedSessionManager, TaskHook, TaskState, AgentEvent};
+use crate::session::{AgentEvent, SharedSessionManager, TaskHook, TaskState};
 use crate::{error, info};
 
 struct AppState {
@@ -25,6 +25,7 @@ struct AppState {
     channel_id: String,
     session_manager: Option<SharedSessionManager>,
     index_html: String,
+    event_tx: Option<broadcast::Sender<AgentEvent>>,
 }
 
 pub struct WebuiChannel {
@@ -35,6 +36,7 @@ pub struct WebuiChannel {
     session_manager: Option<SharedSessionManager>,
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<String>>>>>,
     shutdown_rx: Option<broadcast::Receiver<()>>,
+    event_tx: Option<broadcast::Sender<AgentEvent>>,
 }
 
 impl WebuiChannel {
@@ -53,6 +55,7 @@ impl WebuiChannel {
             session_manager: None,
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             shutdown_rx: None,
+            event_tx: None,
         })
     }
 
@@ -66,6 +69,10 @@ impl WebuiChannel {
 
     pub fn set_shutdown_rx(&mut self, rx: broadcast::Receiver<()>) {
         self.shutdown_rx = Some(rx);
+    }
+
+    pub fn set_event_tx(&mut self, tx: broadcast::Sender<AgentEvent>) {
+        self.event_tx = Some(tx);
     }
 
     pub fn start_server(&self) -> IoHandle {
@@ -88,6 +95,7 @@ impl WebuiChannel {
         let channel_id = self.channel_id.clone();
         let session_manager = self.session_manager.clone();
         let shutdown_rx = self.shutdown_rx.as_ref().map(|rx| rx.resubscribe());
+        let event_tx = self.event_tx.clone();
 
         let handle = tokio::spawn(async move {
             let index_html = embed::get_content_by_dest("webui/index.html")
@@ -100,6 +108,7 @@ impl WebuiChannel {
                 channel_id,
                 session_manager,
                 index_html,
+                event_tx,
             };
 
             let app = axum::Router::new()
@@ -242,7 +251,10 @@ async fn message_handler(
     };
 
     let session_id = format!("{}:{}", state.channel_id, chat_id);
-    let hook = TaskHook::new(&session_id);
+    let mut hook = TaskHook::new(&session_id);
+    if let Some(ref tx) = state.event_tx {
+        hook = hook.with_events(tx.clone());
+    }
     let request = BusRequest {
         session_id,
         content: body,
@@ -301,6 +313,37 @@ impl Channel for WebuiChannel {
         Ok(())
     }
 
+    async fn write_event(&mut self, event: &AgentEvent) -> Result<()> {
+        let json = serde_json::to_string(event)?;
+        let session_id = match event {
+            AgentEvent::TaskStarted { session_id } => session_id,
+            AgentEvent::TaskCompleted { session_id, .. } => session_id,
+            AgentEvent::TaskFailed { session_id, .. } => session_id,
+            AgentEvent::PreIteration { session_id, .. } => session_id,
+            AgentEvent::PostIteration { session_id, .. } => session_id,
+            AgentEvent::AssistantMessage { session_id, .. } => session_id,
+            AgentEvent::ToolCall { session_id, .. } => session_id,
+            AgentEvent::ToolResult { session_id, .. } => session_id,
+        };
+        let chat_id = session_id
+            .strip_prefix(&format!("{}:", self.channel_id))
+            .unwrap_or(session_id)
+            .to_string();
+        let mut guard = self.chats.lock().await;
+        if let Some(senders) = guard.get_mut(&chat_id) {
+            let mut alive = Vec::new();
+            for tx in senders.drain(..) {
+                if tx.send(json.clone()).await.is_ok() {
+                    alive.push(tx);
+                }
+            }
+            if !alive.is_empty() {
+                guard.insert(chat_id, alive);
+            }
+        }
+        Ok(())
+    }
+
     async fn prepare_inject(&self) -> Result<String> {
         Ok(String::new())
     }
@@ -347,6 +390,7 @@ impl ChannelFactory for WebuiChannelFactory {
         ch.set_message_bus(self.message_bus.clone());
         ch.set_session_manager(self.session_manager.clone());
         ch.set_shutdown_rx(self.shutdown_tx.subscribe());
+        ch.set_event_tx(self.event_tx.clone());
         Ok(Box::new(ch))
     }
 }
@@ -476,6 +520,7 @@ mod tests {
             channel_id: "webui".to_string(),
             session_manager: None,
             index_html: String::new(),
+            event_tx: None,
         });
         let result = list_chats_handler(State(state)).await;
         assert!(result.0.is_empty());
@@ -506,6 +551,7 @@ mod tests {
             channel_id: "webui".to_string(),
             session_manager: Some(sm),
             index_html: String::new(),
+            event_tx: None,
         });
         let result = list_chats_handler(State(state)).await;
         assert_eq!(result.0.len(), 1);
@@ -542,6 +588,7 @@ mod tests {
             channel_id: "webui".to_string(),
             session_manager: Some(sm),
             index_html: String::new(),
+            event_tx: None,
         });
         let result = session_history_handler(State(state), Path("abc".to_string())).await;
         assert_eq!(result.0.len(), 2);
@@ -555,6 +602,7 @@ mod tests {
             channel_id: "webui".to_string(),
             session_manager: None,
             index_html: String::new(),
+            event_tx: None,
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { create_chat_handler(State(state)).await });

@@ -7,7 +7,8 @@ use crate::context::ContextBuilder;
 use crate::memory::SharedMemoryStore;
 use crate::provider::{Provider, Usage};
 use crate::session::{
-    AgentEvent, Message, SessionManager, SharedSessionManager, TaskHook, TaskState, parse_session_origin,
+    AgentEvent, Message, SessionManager, SharedSessionManager, TaskHook, TaskState,
+    parse_session_origin,
 };
 use crate::tool::{
     ToolContext, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result,
@@ -724,13 +725,13 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use tokio::sync::mpsc;
-    use crate::session::AgentEvent;
     use crate::memory::MemoryStore;
     use crate::provider::{FinishReason, LLMResponse, Provider, Usage};
+    use crate::session::AgentEvent;
     use crate::session::Content;
     use crate::session::{Message, SessionTask, TaskHook, TaskState};
     use crate::tool::{Tool, ToolCall, ToolDefinition};
+    use tokio::sync::broadcast;
 
     /// Mock provider that returns predefined responses in order.
     struct MockProvider {
@@ -1321,7 +1322,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (sm, tm, wd, ms) = make_test_env(&tmp, &[("tool1", "r1")]).await;
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (event_tx, mut event_rx) = broadcast::channel::<AgentEvent>(32);
 
         let provider = Arc::new(MockProvider::new(vec![
             LLMResponse {
@@ -1366,11 +1367,15 @@ mod tests {
             events.last().unwrap()
         );
         assert!(
-            events.iter().any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "tool1")),
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "tool1")),
             "should contain ToolCall for tool1"
         );
         assert!(
-            events.iter().any(|e| matches!(e, AgentEvent::ToolResult { name, .. } if name == "tool1")),
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { name, .. } if name == "tool1")),
             "should contain ToolResult for tool1"
         );
     }

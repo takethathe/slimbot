@@ -149,8 +149,11 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     // Register webui factory with shutdown channel
     if config.channels.contains_key("webui") {
-        channel_manager
-            .register_webui_factory(agent_loop.session_manager(), channel_shutdown_tx.clone(), None);
+        channel_manager.register_webui_factory(
+            agent_loop.session_manager(),
+            channel_shutdown_tx.clone(),
+            None,
+        );
     }
 
     channel_manager.init().await?;

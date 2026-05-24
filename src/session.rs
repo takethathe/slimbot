@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
@@ -412,7 +412,7 @@ pub struct SessionTask {
 pub struct TaskHook {
     status_tx: Option<tokio::sync::mpsc::Sender<(String, TaskState)>>,
     session_id: String,
-    event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    event_tx: Option<broadcast::Sender<AgentEvent>>,
 }
 
 impl TaskHook {
@@ -439,7 +439,7 @@ impl TaskHook {
     }
 
     /// Attach an event broadcast sender for fine-grained AgentEvent notifications.
-    pub fn with_events(self, tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+    pub fn with_events(self, tx: broadcast::Sender<AgentEvent>) -> Self {
         Self {
             event_tx: Some(tx),
             session_id: self.session_id,
@@ -447,7 +447,7 @@ impl TaskHook {
         }
     }
 
-    /// Fire an AgentEvent to all registered event subscribers.
+    /// Fire an AgentEvent to the broadcast channel.
     /// Silently drops if no event channel is attached.
     pub fn fire_event(&self, event: AgentEvent) {
         if let Some(ref tx) = self.event_tx {
@@ -2268,7 +2268,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_hook_fire_event_with_channel() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (tx, mut rx) = broadcast::channel::<AgentEvent>(16);
         let hook = TaskHook::new("test-session").with_events(tx);
 
         hook.fire_event(AgentEvent::TaskStarted {
