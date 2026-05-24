@@ -588,9 +588,6 @@ impl Session {
             Some(summary.to_string())
         };
     }
-    fn update_consolidated_id(&mut self, id: usize) {
-        self.meta.last_consolidated_id = id;
-    }
     /// Update the chars-per-token ratio based on the last LLM prompt tokens.
     /// Keeps the previous ratio if there are no messages to measure against.
     pub fn update_token_ratio(&mut self, prompt_tokens: u32) {
