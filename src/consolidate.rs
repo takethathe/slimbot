@@ -91,6 +91,12 @@ impl Consolidator {
         let mut removed_tokens: u32 = 0;
         let mut last_boundary: Option<(usize, u32)> = None;
 
+        // Accumulate tokens from start_idx, checking for user-turn boundaries
+        // after the start. The boundary check happens before adding that message's
+        // tokens to `removed_tokens`, so `removed_tokens` reflects tokens strictly
+        // before the boundary.
+        #[allow(clippy::collapsible_if)]
+        #[allow(clippy::needless_range_loop)]
         for idx in start_idx..messages.len() {
             if idx > start_idx {
                 if let Message::User { .. } = messages[idx] {
@@ -187,14 +193,14 @@ If nothing noteworthy happened, output: (nothing)"
             .to_string()
     }
 
-    /// Internal: perform one round of consolidation. Returns the end message ID
-    /// that was consolidated (for cursor update).
+    /// Internal: perform one round of consolidation. Returns the number of
+    /// messages consolidated and an optional summary.
     async fn consolidate_one_round(
         &self,
         session_id: &str,
         tokens_to_remove: u32,
     ) -> Result<Option<(usize, Option<String>)>> {
-        let (messages, ratio, last_consolidated_id) = {
+        let (messages, ratio) = {
             let sm = self.session_manager.lock().await;
             let data = match sm.get_session_data(session_id) {
                 Some(d) => d,
@@ -203,17 +209,11 @@ If nothing noteworthy happened, output: (nothing)"
             if data.messages.is_empty() {
                 return Ok(None);
             }
-            (
-                data.messages,
-                data.char_per_token_ratio,
-                data.last_consolidated_id,
-            )
+            (data.messages, data.char_per_token_ratio)
         };
 
-        let start_idx = messages
-            .iter()
-            .position(|m| m.id() > last_consolidated_id)
-            .unwrap_or(0);
+        // All loaded messages start after consolidated_lines, so start_idx = 0
+        let start_idx = 0;
 
         if start_idx >= messages.len() {
             return Ok(None);
@@ -234,7 +234,7 @@ If nothing noteworthy happened, output: (nothing)"
             return Ok(None);
         }
 
-        let end_msg_id = messages[end_idx - 1].id();
+        let chunk_count = end_idx - start_idx;
 
         info!(
             "[Consolidator] Consolidating {} messages ({}..{}) for session {}",
@@ -255,13 +255,13 @@ If nothing noteworthy happened, output: (nothing)"
         }
 
         let mut sm = self.session_manager.lock().await;
-        sm.update_consolidation_cursor(session_id, end_msg_id).await;
+        sm.update_consolidated_lines(session_id, chunk_count).await;
         if let Some(ref s) = summary {
             sm.set_last_summary(session_id, s).await;
         }
         sm.save_session_meta(session_id);
 
-        Ok(Some((end_msg_id, summary)))
+        Ok(Some((chunk_count, summary)))
     }
 
     /// Main entry: check token budget, archive old messages if prompt exceeds budget.
@@ -272,8 +272,6 @@ If nothing noteworthy happened, output: (nothing)"
         }
 
         // Budget: allow prompt to use up to 85% of context window, minus safety buffer.
-        // We don't reserve max_completion_tokens here — that's the model's own limit
-        // enforced by the API. We only care about the prompt fitting in context.
         let budget =
             ((self.context_window_tokens as f64 * CONTEXT_BUDGET_FRACTION) as u32) - SAFETY_BUFFER;
         if prompt_tokens <= budget {

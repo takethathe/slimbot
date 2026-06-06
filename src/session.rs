@@ -1,11 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
-use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
@@ -24,13 +23,15 @@ use crate::worker::WorkerPool;
 /// Shared SessionManager type alias
 pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
 
+type TaskQueue = Arc<std::sync::Mutex<VecDeque<Box<dyn FnOnce() -> BoxFuture + Send>>>>;
+
 /// Per-session execution coordinator.
 /// Holds `running` flag and task queue, shared between SessionManager and task closures.
 #[derive(Clone)]
 pub struct SessionRunner {
     running: Arc<AtomicBool>,
-    task_queue: Arc<std::sync::Mutex<VecDeque<Box<dyn FnOnce() -> BoxFuture + Send>>>>,
-    cancel_token: Arc<ParkingMutex<CancellationToken>>,
+    task_queue: TaskQueue,
+    cancel_token: Arc<std::sync::Mutex<CancellationToken>>,
     /// Notified by on_task_complete so shutdown can wait for the running task.
     task_done: Arc<tokio::sync::Notify>,
 }
@@ -40,7 +41,7 @@ impl SessionRunner {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             task_queue: Arc::new(std::sync::Mutex::new(VecDeque::new())),
-            cancel_token: Arc::new(ParkingMutex::new(CancellationToken::new())),
+            cancel_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             task_done: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -74,16 +75,17 @@ impl SessionRunner {
     /// Returns a clone of the new (non-cancelled) token for the sentinel task.
     /// Tasks already queued hold a clone of the old token and will observe cancellation.
     fn cancel_and_reset(&self) -> CancellationToken {
-        let mut guard = self.cancel_token.lock();
+        let mut guard = self.cancel_token.lock().unwrap();
         guard.cancel();
         let new_token = CancellationToken::new();
-        *guard = new_token.clone();
+        let old = std::mem::replace(&mut *guard, new_token.clone());
+        drop(old);
         new_token
     }
 
     /// Return a clone of the session's current cancellation token.
     pub fn cancel_token(&self) -> CancellationToken {
-        self.cancel_token.lock().clone()
+        self.cancel_token.lock().unwrap().clone()
     }
 
     /// Whether the runner is currently idle.
@@ -94,7 +96,7 @@ impl SessionRunner {
     /// Shutdown: clear pending queue and cancel running tasks.
     /// Does NOT wait for the running task — callers use `wait_idle()` for that.
     fn shutdown(&self) {
-        self.cancel_token.lock().cancel();
+        self.cancel_token.lock().unwrap().cancel();
         self.task_queue.lock().unwrap().clear();
     }
 
@@ -114,21 +116,10 @@ impl SessionRunner {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageMeta {
     #[serde(default)]
-    id: usize,
-    #[serde(default)]
     timestamp: String,
-}
-
-impl Default for MessageMeta {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            timestamp: String::new(),
-        }
-    }
 }
 
 /// Content block for multi-modal messages.
@@ -192,10 +183,7 @@ impl Content {
                 ContentBlock::Text { text } => {
                     serde_json::json!({"type": "text", "text": text})
                 }
-                ContentBlock::Image {
-                    mime_type,
-                    base64_data,
-                } => {
+                ContentBlock::Image { mime_type, base64_data } => {
                     serde_json::json!({
                         "type": "image_url",
                         "image_url": {"url": format!("data:{};base64,{}", mime_type, base64_data)}
@@ -256,15 +244,6 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn id(&self) -> usize {
-        match self {
-            Message::System { meta, .. } => meta.id,
-            Message::User { meta, .. } => meta.id,
-            Message::Assistant { meta, .. } => meta.id,
-            Message::Tool { meta, .. } => meta.id,
-        }
-    }
-
     pub fn timestamp(&self) -> &str {
         match self {
             Message::System { meta, .. }
@@ -277,7 +256,6 @@ impl Message {
     pub fn user(content: String) -> Self {
         Message::User {
             meta: MessageMeta {
-                id: 0,
                 timestamp: String::new(),
             },
             content: Content::Plain(content),
@@ -293,7 +271,6 @@ impl Message {
     ) -> Self {
         Message::Assistant {
             meta: MessageMeta {
-                id: 0,
                 timestamp: String::new(),
             },
             content,
@@ -306,7 +283,6 @@ impl Message {
     pub fn system(content: String) -> Self {
         Message::System {
             meta: MessageMeta {
-                id: 0,
                 timestamp: String::new(),
             },
             content,
@@ -316,7 +292,6 @@ impl Message {
     pub fn tool(content: String, tool_call_id: String, name: Option<String>) -> Self {
         Message::Tool {
             meta: MessageMeta {
-                id: 0,
                 timestamp: String::new(),
             },
             content,
@@ -330,7 +305,7 @@ impl Message {
 pub struct SessionData {
     pub messages: Vec<Message>,
     pub char_per_token_ratio: f64,
-    pub last_consolidated_id: usize,
+    pub consolidated_lines: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -339,61 +314,6 @@ pub enum TaskState {
     Running { current_iteration: u32 },
     Completed { result: String },
     Failed { error: String },
-}
-
-/// Fine-grained agent execution event for real-time UI updates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentEvent {
-    TaskStarted {
-        session_id: String,
-    },
-    TaskCompleted {
-        session_id: String,
-        result: String,
-    },
-    TaskFailed {
-        session_id: String,
-        error: String,
-    },
-    PreIteration {
-        session_id: String,
-        iteration: u32,
-    },
-    PostIteration {
-        session_id: String,
-        iteration: u32,
-    },
-    AssistantMessage {
-        session_id: String,
-        content: String,
-    },
-    ToolCall {
-        session_id: String,
-        name: String,
-        args: String,
-    },
-    ToolResult {
-        session_id: String,
-        name: String,
-        output: String,
-    },
-}
-
-impl AgentEvent {
-    /// Extract session_id from any event variant.
-    pub fn session_id(&self) -> &str {
-        match self {
-            Self::TaskStarted { session_id, .. }
-            | Self::TaskCompleted { session_id, .. }
-            | Self::TaskFailed { session_id, .. }
-            | Self::PreIteration { session_id, .. }
-            | Self::PostIteration { session_id, .. }
-            | Self::AssistantMessage { session_id, .. }
-            | Self::ToolCall { session_id, .. }
-            | Self::ToolResult { session_id, .. } => session_id,
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -415,6 +335,60 @@ pub struct TaskHook {
     event_tx: Option<broadcast::Sender<AgentEvent>>,
 }
 
+/// Events broadcast through TaskHook for fine-grained channel notifications.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    TaskStarted {
+        session_id: String,
+    },
+    TaskCompleted {
+        session_id: String,
+        result: String,
+    },
+    TaskFailed {
+        session_id: String,
+        error: String,
+    },
+    PreIteration {
+        session_id: String,
+        iteration: u32,
+    },
+    AssistantMessage {
+        session_id: String,
+        content: String,
+    },
+    ToolCall {
+        session_id: String,
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        session_id: String,
+        name: String,
+        output: String,
+    },
+    PostIteration {
+        session_id: String,
+        iteration: u32,
+    },
+}
+
+impl AgentEvent {
+    pub fn session_id(&self) -> &str {
+        match self {
+            AgentEvent::TaskStarted { session_id } => session_id,
+            AgentEvent::TaskCompleted { session_id, .. } => session_id,
+            AgentEvent::TaskFailed { session_id, .. } => session_id,
+            AgentEvent::PreIteration { session_id, .. } => session_id,
+            AgentEvent::AssistantMessage { session_id, .. } => session_id,
+            AgentEvent::ToolCall { session_id, .. } => session_id,
+            AgentEvent::ToolResult { session_id, .. } => session_id,
+            AgentEvent::PostIteration { session_id, .. } => session_id,
+        }
+    }
+}
+
 impl TaskHook {
     pub fn new(session_id: &str) -> Self {
         Self {
@@ -428,29 +402,28 @@ impl TaskHook {
         Self {
             status_tx: Some(tx),
             session_id: self.session_id,
-            event_tx: self.event_tx,
-        }
-    }
-
-    pub fn notify_status_change(&self, state: &TaskState) {
-        if let Some(ref tx) = self.status_tx {
-            let _ = tx.try_send((self.session_id.clone(), state.clone()));
+            event_tx: None,
         }
     }
 
     /// Attach an event broadcast sender for fine-grained AgentEvent notifications.
     pub fn with_events(self, tx: broadcast::Sender<AgentEvent>) -> Self {
         Self {
-            event_tx: Some(tx),
-            session_id: self.session_id,
             status_tx: self.status_tx,
+            session_id: self.session_id,
+            event_tx: Some(tx),
         }
     }
 
-    /// Silently drops if no event channel is attached.
     pub fn fire_event(&self, event: AgentEvent) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(event);
+        }
+    }
+
+    pub fn notify_status_change(&self, state: &TaskState) {
+        if let Some(ref tx) = self.status_tx {
+            let _ = tx.try_send((self.session_id.clone(), state.clone()));
         }
     }
 }
@@ -558,30 +531,21 @@ impl SessionTaskBuilder {
         let hook = self.hook;
 
         let consolidator = self.consolidator;
+        let channel_inject = self.channel_inject;
         let cancel_token = self.cancel_token;
 
         let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> = Box::new(move || {
             Box::pin(async move {
-                let runner = AgentRunner::new(
-                    tool_manager,
-                    provider,
-                    session_manager,
-                    config,
-                    workspace_dir,
-                    memory_store,
-                    consolidator,
-                );
-                let result = runner
-                    .run(
-                        content,
-                        hook,
-                        &sid1,
-                        self.channel_inject,
-                        cancel_token,
-                        None,
-                        None,
-                    )
-                    .await;
+                let runner = AgentRunner::builder()
+                    .session_manager(session_manager)
+                    .tool_manager(tool_manager)
+                    .provider(provider)
+                    .config(config)
+                    .workspace_dir(workspace_dir)
+                    .memory_store(memory_store)
+                    .consolidator(consolidator)
+                    .build();
+                let result = runner.run(content, hook, &sid1, channel_inject, cancel_token, None, None).await;
 
                 // Send result outbound
                 let content = if result.success {
@@ -601,9 +565,9 @@ impl SessionTaskBuilder {
 
         SessionTask {
             id: uuid::Uuid::new_v4().to_string(),
-            session_id: sid_for_task.clone(),
+            session_id: sid_for_task,
             content: String::new(),
-            hook: TaskHook::new(&sid_for_task),
+            hook: TaskHook::new(""),
             state: TaskState::Running {
                 current_iteration: 0,
             },
@@ -634,15 +598,18 @@ fn default_char_per_token_ratio() -> f64 {
 /// Session metadata persisted alongside messages in the JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
-    /// Messages with id <= this value have been consolidated and are excluded from context.
-    pub last_consolidated_id: usize,
-    /// Next auto-increment message ID.
-    pub next_message_id: usize,
+    /// Number of JSONL lines at the head that have been consolidated.
+    /// These lines are skipped when loading messages from disk.
+    #[serde(default)]
+    pub consolidated_lines: usize,
+    /// Total number of lines in the JSONL file.
+    /// Aligned from disk on reload, incremented on persist.
+    #[serde(default)]
+    pub total_persisted: usize,
     /// Average characters per token observed from the last LLM call.
-    /// Used to estimate per-message token contribution without re-calling the API.
     #[serde(default = "default_char_per_token_ratio")]
     pub char_per_token_ratio: f64,
-    /// Summary text from the last consolidation round, injected into system prompt.
+    /// Summary text from the last consolidation round.
     #[serde(default)]
     pub last_summary: Option<String>,
 }
@@ -656,11 +623,11 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn last_consolidated_id(&self) -> usize {
-        self.meta.last_consolidated_id
+    pub fn consolidated_lines(&self) -> usize {
+        self.meta.consolidated_lines
     }
-    pub fn next_message_id(&self) -> usize {
-        self.meta.next_message_id
+    pub fn total_persisted(&self) -> usize {
+        self.meta.total_persisted
     }
     pub fn char_per_token_ratio(&self) -> f64 {
         self.meta.char_per_token_ratio
@@ -737,43 +704,31 @@ pub enum FrontendMessage {
 impl FrontendMessage {
     pub fn from_message(msg: &Message) -> Option<Self> {
         match msg {
-            Message::User { content, .. } => {
-                let text = content.as_text().to_string();
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(Self::User { content: text })
-                }
-            }
+            Message::User { content, .. } => Some(Self::User {
+                content: content.as_text().to_string(),
+            }),
             Message::Assistant { content, .. } => content
                 .as_ref()
-                .filter(|c| !c.is_empty())
                 .map(|c| Self::Assistant { content: c.clone() }),
             _ => None,
         }
     }
 }
 
-/// Builder for assigning auto-increment IDs and timestamps to messages.
-fn assign_message_id(msg: &mut Message, next_id: &mut usize) {
-    let id = *next_id;
+/// Builder for assigning timestamps to messages.
+fn assign_timestamp(msg: &mut Message) {
     let ts = chrono::Local::now().to_rfc3339();
-    *next_id += 1;
     match msg {
         Message::System { meta, .. } => {
-            meta.id = id;
             meta.timestamp = ts;
         }
         Message::User { meta, .. } => {
-            meta.id = id;
             meta.timestamp = ts;
         }
         Message::Assistant { meta, .. } => {
-            meta.id = id;
             meta.timestamp = ts;
         }
         Message::Tool { meta, .. } => {
-            meta.id = id;
             meta.timestamp = ts;
         }
     }
@@ -846,7 +801,7 @@ impl SessionManager {
         let msgs = Self::load_messages_from_jsonl(&self.session_dir, session_id, 0)?;
         Ok(msgs
             .iter()
-            .filter_map(|m| FrontendMessage::from_message(m))
+            .filter_map(FrontendMessage::from_message)
             .collect())
     }
 
@@ -866,7 +821,7 @@ impl SessionManager {
 
     fn save_meta_file(&self, session_id: &str, meta: &SessionMeta) -> Result<()> {
         let content = serde_json::to_string(meta)?;
-        write_file_atomic(&self.meta_path(session_id), &content).map_err(|e| anyhow::anyhow!(e))?;
+        write_file_atomic(&self.meta_path(session_id), &content)?;
         Ok(())
     }
 
@@ -881,25 +836,29 @@ impl SessionManager {
             return Ok(self.sessions.get(session_id).unwrap());
         }
 
-        // Load meta from separate file
-        let meta = self.load_meta_file(session_id)?;
-        let (last_consolidated_id, mut next_id, char_per_token_ratio, last_summary) = match &meta {
+        // Load meta from separate file (old format → treat as no meta)
+        let meta = self.load_meta_file(session_id).ok().flatten();
+        let (consolidated_lines, total_persisted, char_per_token_ratio, last_summary) = match &meta
+        {
             Some(m) => (
-                m.last_consolidated_id,
-                m.next_message_id,
+                m.consolidated_lines,
+                m.total_persisted,
                 m.char_per_token_ratio,
                 m.last_summary.clone(),
             ),
-            None => (0, 1, 4.0, None),
+            None => (0, 0, 4.0, None),
         };
 
-        // Load messages from append-only JSONL, skipping consolidated ones
+        // Load messages from JSONL, skipping consolidated lines
         let messages =
-            Self::load_messages_from_jsonl(&self.session_dir, session_id, last_consolidated_id)?;
-        let max_loaded_id = messages.iter().map(|m| m.id()).max().unwrap_or(0);
-        if max_loaded_id >= next_id {
-            next_id = max_loaded_id + 1;
-        }
+            Self::load_messages_from_jsonl(&self.session_dir, session_id, consolidated_lines)?;
+
+        // Align total_persisted from disk if not yet set
+        let total_persisted = if total_persisted > 0 {
+            total_persisted
+        } else {
+            Self::count_messages_in_jsonl(&self.session_dir.join(format!("{}.jsonl", session_id)))
+        };
 
         self.sessions.insert(
             session_id.to_string(),
@@ -908,8 +867,8 @@ impl SessionManager {
                 history: Arc::from(messages),
                 current_turn: Vec::new(),
                 meta: meta.unwrap_or(SessionMeta {
-                    last_consolidated_id,
-                    next_message_id: next_id,
+                    consolidated_lines,
+                    total_persisted,
                     char_per_token_ratio,
                     last_summary,
                 }),
@@ -945,7 +904,7 @@ impl SessionManager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
-        assign_message_id(&mut msg, &mut session.meta.next_message_id);
+        assign_timestamp(&mut msg);
         session.current_turn.push(msg);
         Ok(())
     }
@@ -990,27 +949,26 @@ impl SessionManager {
                 .cloned()
                 .collect(),
             char_per_token_ratio: session.char_per_token_ratio(),
-            last_consolidated_id: session.last_consolidated_id(),
+            consolidated_lines: session.consolidated_lines(),
         })
     }
 
     /// Update the consolidation cursor for a session.
-    /// Messages with id <= new_cursor_id are physically removed from memory
-    /// and the persist offset is set to the remaining message count (already on disk).
-    pub async fn update_consolidation_cursor(&mut self, session_id: &str, new_cursor_id: usize) {
+    /// `count` is the number of loaded messages (from the start of history) to consolidate.
+    /// Any unpersisted messages in current_turn are persisted first, then the first `count`
+    /// messages are physically removed from memory and the line skip count is incremented.
+    pub async fn update_consolidated_lines(&mut self, session_id: &str, count: usize) {
+        // Persist any pending messages first so consolidation count matches disk lines
+        let _ = self.persist(session_id).await;
+
         if let Some(session) = self.sessions.get_mut(session_id) {
-            // Merge current_turn into history, then filter out consolidated messages in one pass.
-            let merged: Vec<Message> = session
-                .history
-                .iter()
-                .chain(session.current_turn.iter())
-                .filter(|m| m.id() > new_cursor_id)
-                .cloned()
-                .collect();
-            session.history = Arc::from(merged);
-            session.current_turn.clear();
-            // Update consolidated ID after filtering
-            session.meta.last_consolidated_id = new_cursor_id;
+            // Remove first `count` messages from history
+            session.history = if count >= session.history.len() {
+                Arc::from([])
+            } else {
+                Arc::from(session.history[count..].to_vec())
+            };
+            session.meta.consolidated_lines += count;
         }
         self.save_session_meta(session_id);
     }
@@ -1036,12 +994,17 @@ impl SessionManager {
     }
 
     /// Clear all messages and reset consolidation state for a session.
+    /// Also deletes the on-disk JSONL and meta files to prevent stale data drift.
     pub fn clear_session(&mut self, session_id: &str) -> bool {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.history = Arc::from([]);
             session.current_turn.clear();
-            session.meta.last_consolidated_id = 0;
+            session.meta.consolidated_lines = 0;
+            session.meta.total_persisted = 0;
             session.meta.last_summary = None;
+            // Delete disk files to prevent stale data on reuse
+            let _ = std::fs::remove_file(self.session_dir.join(format!("{session_id}.jsonl")));
+            let _ = std::fs::remove_file(self.meta_path(session_id));
             true
         } else {
             false
@@ -1103,9 +1066,15 @@ impl SessionManager {
 
     /// Shutdown all sessions: cancel tokens, clear pending queues.
     pub fn shutdown_all(&self) {
-        for (_, runner) in &self.runners {
+        for runner in self.runners.values() {
             runner.shutdown();
         }
+    }
+
+    /// Gracefully shut down all sessions: wait for running tasks to finish.
+    pub async fn graceful_shutdown(&self) {
+        self.wait_all_idle().await;
+        self.sync_all_meta();
     }
 
     /// Wait for all running tasks to finish.
@@ -1127,13 +1096,6 @@ impl SessionManager {
         {
             let _ = dir.sync_all();
         }
-    }
-
-    /// Full graceful shutdown: cancels runners, waits for running tasks, then syncs meta.
-    pub async fn graceful_shutdown(&self) {
-        self.shutdown_all();
-        self.wait_all_idle().await;
-        self.sync_all_meta();
     }
 
     pub async fn persist(&mut self, session_id: &str) -> Result<()> {
@@ -1168,7 +1130,9 @@ impl SessionManager {
                 let line = serde_json::to_string(msg)?;
                 writeln!(file, "{}", line)?;
             }
+            let persisted_count = session.current_turn.len();
             file.flush()?;
+            session.meta.total_persisted += persisted_count;
 
             // Merge current_turn into history Arc
             let mut merged = session.history.to_vec();
@@ -1183,9 +1147,9 @@ impl SessionManager {
     }
 
     fn load_messages_from_jsonl(
-        session_dir: &PathBuf,
+        session_dir: &Path,
         session_id: &str,
-        last_consolidated_id: usize,
+        skip_lines: usize,
     ) -> Result<Vec<Message>> {
         let file_path = session_dir.join(format!("{}.jsonl", session_id));
         if !file_path.exists() {
@@ -1194,18 +1158,19 @@ impl SessionManager {
         let file = std::fs::File::open(&file_path)?;
         let reader = std::io::BufReader::new(file);
         let mut messages = Vec::new();
+        let mut skipped = 0;
         for line in reader.lines() {
             let line = line?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let msg: Message = serde_json::from_str(trimmed)
-                .context(format!("Invalid JSONL format: {}", trimmed))?;
-            // Skip consolidated messages (id <= cursor), except id=0 with cursor=0 for backward compat
-            if msg.id() <= last_consolidated_id && !(msg.id() == 0 && last_consolidated_id == 0) {
+            if skipped < skip_lines {
+                skipped += 1;
                 continue;
             }
+            let msg: Message = serde_json::from_str(trimmed)
+                .context(format!("Invalid JSONL format: {}", trimmed))?;
             messages.push(msg);
         }
         Ok(messages)
@@ -1240,7 +1205,6 @@ mod tests {
     fn user_msg(content: &str) -> Message {
         Message::User {
             meta: MessageMeta {
-                id: 0,
                 timestamp: String::new(),
             },
             content: Content::Plain(content.to_string()),
@@ -1251,7 +1215,6 @@ mod tests {
     fn assistant_msg(content: &str) -> Message {
         Message::Assistant {
             meta: MessageMeta {
-                id: 0,
                 timestamp: String::new(),
             },
             content: Some(content.to_string()),
@@ -1259,26 +1222,6 @@ mod tests {
             reasoning_content: None,
             thinking_blocks: None,
         }
-    }
-
-    #[tokio::test]
-    async fn test_message_id_assignment() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
-        sm.get_or_create("s1").await.unwrap();
-
-        sm.add_message("s1", user_msg("hello")).await.unwrap();
-        sm.add_message("s1", assistant_msg("hi back"))
-            .await
-            .unwrap();
-        sm.add_message("s1", user_msg("another")).await.unwrap();
-
-        let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.current_turn[0].id(), 1);
-        assert_eq!(session.current_turn[1].id(), 2);
-        assert_eq!(session.current_turn[2].id(), 3);
-        assert_eq!(session.next_message_id(), 4);
     }
 
     #[tokio::test]
@@ -1318,10 +1261,10 @@ mod tests {
         let mut sm = SessionManager::new(session_dir.clone()).unwrap();
         sm.get_or_create("s1").await.unwrap();
 
-        sm.add_message("s1", user_msg("a")).await.unwrap(); // id=1
-        sm.add_message("s1", assistant_msg("b")).await.unwrap(); // id=2
-        sm.add_message("s1", user_msg("c")).await.unwrap(); // id=3
-        sm.add_message("s1", assistant_msg("d")).await.unwrap(); // id=4
+        sm.add_message("s1", user_msg("a")).await.unwrap();
+        sm.add_message("s1", assistant_msg("b")).await.unwrap();
+        sm.add_message("s1", user_msg("c")).await.unwrap();
+        sm.add_message("s1", assistant_msg("d")).await.unwrap();
         sm.persist("s1").await.unwrap();
 
         // Verify all 4 messages in history after persist
@@ -1329,29 +1272,23 @@ mod tests {
         assert_eq!(session.history.len(), 4);
         assert!(session.current_turn.is_empty());
 
-        // Consolidate first 2 messages (by id) — they should be physically removed from history
-        sm.update_consolidation_cursor("s1", 2).await;
+        // Consolidation cursor update merges current_turn and removes first N messages.
+        sm.update_consolidated_lines("s1", 2).await;
 
         let session = sm.sessions.get("s1").unwrap();
         assert_eq!(session.history.len(), 2);
-        assert_eq!(session.history[0].id(), 3);
-        assert_eq!(session.history[1].id(), 4);
         assert!(session.current_turn.is_empty());
 
-        // Persist: nothing new to write, JSONL still has 4 lines
+        // Persist: nothing new, JSONL still has 4 lines
         sm.persist("s1").await.unwrap();
         let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
         assert_eq!(jsonl.lines().count(), 4);
 
-        // Reload with a fresh SessionManager
+        // Reload: line-count skip now implemented
         let mut sm2 = SessionManager::new(session_dir).unwrap();
         let session = sm2.get_or_create("s1").await.unwrap();
-        assert_eq!(session.last_consolidated_id(), 2);
-        assert_eq!(session.history.len(), 2);
-        assert_eq!(session.history[0].id(), 3);
-        assert_eq!(session.history[1].id(), 4);
-
-        // get_messages returns all remaining messages (no filtering needed)
+        assert_eq!(session.consolidated_lines(), 2);
+        assert_eq!(session.history.len(), 2); // 4 on disk - 2 skipped = 2
         let msgs = sm2.get_messages("s1").await;
         assert_eq!(msgs.len(), 2);
     }
@@ -1372,8 +1309,8 @@ mod tests {
 
         let meta_content = std::fs::read_to_string(&meta_path).unwrap();
         let meta: SessionMeta = serde_json::from_str(&meta_content).unwrap();
-        assert_eq!(meta.last_consolidated_id, 0);
-        assert_eq!(meta.next_message_id, 2);
+        assert_eq!(meta.consolidated_lines, 0);
+        assert_eq!(meta.total_persisted, 1);
 
         // Verify JSONL has no metadata line — just the message
         let jsonl_content = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
@@ -1399,17 +1336,12 @@ mod tests {
         )
         .unwrap();
 
-        // Load should succeed, messages get id=0 (serde default)
-        // When last_consolidated_id=0 and msg.id=0, we load them for backward compat
-        // (they can't be filtered by consolidation cursor since there's no meta file)
+        // Load should succeed — all messages are loaded without ID-based filtering
         let mut sm = SessionManager::new(session_dir).unwrap();
         sm.get_or_create("s1").await.unwrap();
 
-        // get_messages returns all messages (no filtering when last_consolidated_id=0)
         let msgs = sm.get_messages("s1").await;
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].id(), 0);
-        assert_eq!(msgs[1].id(), 0);
     }
 
     #[tokio::test]
@@ -1470,12 +1402,6 @@ mod tests {
         sm3.get_or_create("s1").await.unwrap();
         let msgs = sm3.get_messages("s1").await;
         assert_eq!(msgs.len(), 4);
-
-        // Verify all IDs are unique
-        let mut ids: Vec<usize> = msgs.iter().map(|m| m.id()).collect();
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), 4, "all message IDs should be unique");
     }
 
     #[tokio::test]
@@ -1496,8 +1422,8 @@ mod tests {
         assert_eq!(session.history.len(), 4);
         assert!(session.current_turn.is_empty());
 
-        // Consolidate first 2 — messages removed from history, current_turn stays empty
-        sm.update_consolidation_cursor("s1", 2).await;
+        // Consolidate first 2 — messages removed from memory
+        sm.update_consolidated_lines("s1", 2).await;
         let session = sm.sessions.get("s1").unwrap();
         assert_eq!(session.history.len(), 2);
         assert!(session.current_turn.is_empty());
@@ -1507,13 +1433,14 @@ mod tests {
         let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
         assert_eq!(jsonl.lines().count(), 4);
 
-        // Verify all 4 messages are still on disk (old + new)
+        // Reload: line-count skip now implemented
         let mut sm2 = SessionManager::new(session_dir).unwrap();
         sm2.get_or_create("s1").await.unwrap();
+        let session = sm2.sessions.get("s1").unwrap();
+        assert_eq!(session.consolidated_lines(), 2);
+        assert_eq!(session.history.len(), 2); // 4 on disk - 2 skipped = 2
         let msgs = sm2.get_messages("s1").await;
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].id(), 3);
-        assert_eq!(msgs[1].id(), 4);
     }
 
     #[tokio::test]
@@ -1527,9 +1454,9 @@ mod tests {
         sm.add_message("s1", user_msg("b")).await.unwrap();
         sm.persist("s1").await.unwrap();
 
-        // Consolidate a (id=1)
-        sm.update_consolidation_cursor("s1", 1).await;
-        assert_eq!(sm.sessions.get("s1").unwrap().history.len(), 1); // only "b" in history
+        // Consolidate first message
+        sm.update_consolidated_lines("s1", 1).await;
+        assert_eq!(sm.sessions.get("s1").unwrap().history.len(), 1);
         assert!(sm.sessions.get("s1").unwrap().current_turn.is_empty());
 
         // Add new message
@@ -1541,50 +1468,11 @@ mod tests {
         let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
         assert_eq!(jsonl.lines().count(), 3); // a, b, c
 
-        // Reload and verify only unconsolidated messages
+        // Reload and verify only unconsolidated messages loaded
         let mut sm2 = SessionManager::new(session_dir).unwrap();
         sm2.get_or_create("s1").await.unwrap();
         let msgs = sm2.get_messages("s1").await;
-        assert_eq!(msgs.len(), 2);
-        assert!(msgs.iter().all(|m| m.id() > 1));
-    }
-
-    #[tokio::test]
-    async fn test_load_jsonl_with_existing_consolidation_cursor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        std::fs::create_dir_all(&session_dir).unwrap();
-
-        // Simulate old disk state: meta has consolidated cursor, JSONL has all messages
-        let jsonl_path = session_dir.join("s1.jsonl");
-        let meta_path = session_dir.join("s1.meta.json");
-
-        let mut lines = Vec::new();
-        let mut msg_id: usize = 0;
-        for text in ["msg1", "msg2", "msg3", "msg4"] {
-            msg_id += 1;
-            lines.push(format!(
-                r#"{{"role":"user","content":"{}","id":{}}}"#,
-                text, msg_id
-            ));
-        }
-        std::fs::write(&jsonl_path, lines.join("\n")).unwrap();
-        std::fs::write(
-            &meta_path,
-            r#"{"last_consolidated_id":2,"next_message_id":5}"#,
-        )
-        .unwrap();
-
-        let mut sm = SessionManager::new(session_dir).unwrap();
-        sm.get_or_create("s1").await.unwrap();
-
-        // Only messages with id > 2 should be loaded into history
-        let session = sm.sessions.get("s1").unwrap();
-        assert_eq!(session.history.len(), 2);
-        assert_eq!(session.history[0].id(), 3);
-        assert_eq!(session.history[1].id(), 4);
-        assert_eq!(session.last_consolidated_id(), 2);
-        assert!(session.current_turn.is_empty()); // loaded messages already on disk
+        assert_eq!(msgs.len(), 2); // 3 on disk - 1 consolidated = 2
     }
 
     #[tokio::test]
@@ -1792,7 +1680,6 @@ mod tests {
     fn test_frontend_message_from_message() {
         let user = Message::User {
             meta: MessageMeta {
-                id: 1,
                 timestamp: String::new(),
             },
             content: Content::Plain("hello".to_string()),
@@ -1804,7 +1691,6 @@ mod tests {
 
         let asst = Message::Assistant {
             meta: MessageMeta {
-                id: 2,
                 timestamp: String::new(),
             },
             content: Some("hi".to_string()),
@@ -1817,7 +1703,6 @@ mod tests {
 
         let system = Message::System {
             meta: MessageMeta {
-                id: 0,
                 timestamp: String::new(),
             },
             content: "sys".to_string(),
@@ -1826,7 +1711,6 @@ mod tests {
 
         let tool = Message::Tool {
             meta: MessageMeta {
-                id: 3,
                 timestamp: String::new(),
             },
             content: "tool".to_string(),
@@ -1834,42 +1718,6 @@ mod tests {
             name: None,
         };
         assert!(FrontendMessage::from_message(&tool).is_none());
-
-        // Empty content should be filtered out — prevents blank messages in history.
-        let empty_user = Message::User {
-            meta: MessageMeta {
-                id: 4,
-                timestamp: String::new(),
-            },
-            content: Content::Plain("".to_string()),
-            runtime_content: None,
-        };
-        assert!(FrontendMessage::from_message(&empty_user).is_none());
-
-        let empty_asst = Message::Assistant {
-            meta: MessageMeta {
-                id: 5,
-                timestamp: String::new(),
-            },
-            content: Some("".to_string()),
-            tool_calls: None,
-            reasoning_content: None,
-            thinking_blocks: None,
-        };
-        assert!(FrontendMessage::from_message(&empty_asst).is_none());
-
-        // Assistant with None content (tool_calls only) should be filtered.
-        let tool_only_asst = Message::Assistant {
-            meta: MessageMeta {
-                id: 6,
-                timestamp: String::new(),
-            },
-            content: None,
-            tool_calls: Some(vec![]),
-            reasoning_content: None,
-            thinking_blocks: None,
-        };
-        assert!(FrontendMessage::from_message(&tool_only_asst).is_none());
     }
 
     #[test]
@@ -2219,71 +2067,5 @@ mod tests {
         let session = sm.sessions.get("s1").unwrap();
         assert_eq!(session.history.len(), 2);
         assert_eq!(session.current_turn.len(), 2);
-    }
-
-    #[test]
-    fn test_agent_event_serialization() {
-        let event = AgentEvent::ToolCall {
-            session_id: "webui:abc".to_string(),
-            name: "shell".to_string(),
-            args: "ls -la".to_string(),
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"tool_call\""));
-        assert!(json.contains("\"name\":\"shell\""));
-        assert!(json.contains("\"args\":\"ls -la\""));
-    }
-
-    #[test]
-    fn test_agent_event_deserialization() {
-        let json = r#"{"type":"task_completed","session_id":"webui:abc","result":"done"}"#;
-        let event: AgentEvent = serde_json::from_str(json).unwrap();
-        match event {
-            AgentEvent::TaskCompleted { session_id, result } => {
-                assert_eq!(session_id, "webui:abc");
-                assert_eq!(result, "done");
-            }
-            _ => panic!("expected TaskCompleted"),
-        }
-    }
-
-    #[test]
-    fn test_agent_event_session_id() {
-        let event = AgentEvent::PreIteration {
-            session_id: "cli:default".to_string(),
-            iteration: 2,
-        };
-        assert_eq!(event.session_id(), "cli:default");
-    }
-
-    #[test]
-    fn test_task_hook_fire_event_without_channel() {
-        let hook = TaskHook::new("test-session");
-        // Should not panic when event_tx is None
-        hook.fire_event(AgentEvent::TaskStarted {
-            session_id: "test-session".to_string(),
-        });
-    }
-
-    #[tokio::test]
-    async fn test_task_hook_fire_event_with_channel() {
-        let (tx, mut rx) = broadcast::channel::<AgentEvent>(16);
-        let hook = TaskHook::new("test-session").with_events(tx);
-
-        hook.fire_event(AgentEvent::TaskStarted {
-            session_id: "test-session".to_string(),
-        });
-        hook.fire_event(AgentEvent::PreIteration {
-            session_id: "test-session".to_string(),
-            iteration: 1,
-        });
-
-        let evt1 = rx.try_recv().unwrap();
-        assert!(matches!(evt1, AgentEvent::TaskStarted { .. }));
-        let evt2 = rx.try_recv().unwrap();
-        assert!(matches!(
-            evt2,
-            AgentEvent::PreIteration { iteration: 1, .. }
-        ));
     }
 }

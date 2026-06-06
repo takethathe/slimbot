@@ -176,9 +176,10 @@ async fn test_consolidation_cursor_skips_messages() {
     sm.add_message("s1", Message::user("c".to_string()))
         .await
         .unwrap(); // id=3
+    sm.persist("s1").await.unwrap();
 
-    // Set cursor to skip first 2 messages (by id)
-    sm.update_consolidation_cursor("s1", 2).await;
+    // Set consolidated lines to skip first 2 messages
+    sm.update_consolidated_lines("s1", 2).await;
 
     let messages = sm.get_messages("s1").await;
     assert_eq!(messages.len(), 1);
@@ -203,14 +204,14 @@ async fn test_consolidation_persists_and_reloads_cursor() {
             .unwrap(); // id=2
         sm.persist("s1").await.unwrap();
 
-        // Consolidate first message (by id) — physically removed from memory
-        sm.update_consolidation_cursor("s1", 1).await;
+        // Consolidate first message — physically removed from memory
+        sm.update_consolidated_lines("s1", 1).await;
     }
 
     {
         let mut sm = SessionManager::new(session_dir).unwrap();
         let session = sm.get_or_create("s1").await.unwrap();
-        assert_eq!(session.last_consolidated_id(), 1);
+        assert_eq!(session.consolidated_lines(), 1);
         // get_messages should skip consolidated ones
         let msgs = sm.get_messages("s1").await;
         assert_eq!(msgs.len(), 1);
@@ -373,8 +374,8 @@ async fn test_meta_file_separate_from_messages() {
     // Meta file should exist
     assert!(session_dir.join("s1.meta.json").exists());
     let meta_content = fs::read_to_string(session_dir.join("s1.meta.json")).unwrap();
-    assert!(meta_content.contains("last_consolidated_id"));
-    assert!(meta_content.contains("next_message_id"));
+    assert!(meta_content.contains("consolidated_lines"));
+    assert!(meta_content.contains("total_persisted"));
 
     // JSONL should have no metadata lines — just the message
     let jsonl = fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
