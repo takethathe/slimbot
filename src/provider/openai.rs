@@ -48,6 +48,146 @@ impl OpenAIProvider {
     }
 }
 
+/// Build API messages array with cache_control markers for prompt caching.
+///
+/// Markers are placed at:
+/// - `messages[0]` if it is a System message (stable prefix start)
+/// - `messages[len-2]` (history boundary — everything before current input)
+fn build_api_messages(messages: &[&Message], prompt_cache_enabled: bool) -> Vec<serde_json::Value> {
+    let has_system_at_zero = messages
+        .first()
+        .is_some_and(|m| matches!(**m, Message::System { .. }));
+    let boundary_idx = if messages.len() >= 3 {
+        Some(messages.len() - 2)
+    } else {
+        None
+    };
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let is_cache_target =
+                prompt_cache_enabled && (has_system_at_zero && i == 0 || Some(i) == boundary_idx);
+            match **m {
+                Message::System { ref content, .. } => {
+                    let content_blocks = serde_json::json!([{"type": "text", "text": content}]);
+                    let mut obj = serde_json::json!({"role": "system", "content": content_blocks});
+                    if is_cache_target {
+                        obj["content"][0]["cache_control"] =
+                            serde_json::json!({"type": "ephemeral"});
+                    }
+                    obj
+                }
+                Message::User {
+                    ref content,
+                    ref runtime_content,
+                    ..
+                } => {
+                    let mut content_blocks = content.to_openai_blocks();
+                    if let Some(ctx) = runtime_content {
+                        content_blocks.insert(0, serde_json::json!({"type": "text", "text": ctx}));
+                    }
+                    if is_cache_target {
+                        let last = content_blocks.len().saturating_sub(1);
+                        content_blocks[last]["cache_control"] =
+                            serde_json::json!({"type": "ephemeral"});
+                    }
+                    serde_json::json!({"role": "user", "content": content_blocks})
+                }
+                Message::Assistant {
+                    ref content,
+                    ref tool_calls,
+                    ref reasoning_content,
+                    ref thinking_blocks,
+                    ..
+                } => {
+                    let mut obj = serde_json::json!({"role": "assistant"});
+                    if let Some(c) = content {
+                        obj["content"] = serde_json::json!(c);
+                    } else {
+                        obj["content"] = serde_json::Value::Null;
+                    }
+                    if let Some(rc) = reasoning_content {
+                        obj["reasoning_content"] = serde_json::json!(rc);
+                    }
+                    if let Some(tb) = thinking_blocks {
+                        obj["thinking"] = serde_json::json!(tb);
+                    }
+                    if let Some(calls) = tool_calls {
+                        let tc: Vec<_> = calls
+                            .iter()
+                            .map(|call| {
+                                serde_json::json!({
+                                    "id": call.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": call.name,
+                                        "arguments": call.args.to_string(),
+                                    }
+                                })
+                            })
+                            .collect();
+                        obj["tool_calls"] = serde_json::json!(tc);
+                    }
+                    if is_cache_target {
+                        if let Some(calls) = tool_calls {
+                            let last = calls.len().saturating_sub(1);
+                            obj["tool_calls"][last]["cache_control"] =
+                                serde_json::json!({"type": "ephemeral"});
+                        } else if obj["content"].is_string() || obj["content"].is_null() {
+                            obj["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                        }
+                    }
+                    obj
+                }
+                Message::Tool {
+                    ref content,
+                    ref tool_call_id,
+                    ref name,
+                    ..
+                } => {
+                    let mut obj = serde_json::json!({
+                        "role": "tool",
+                        "content": content,
+                        "tool_call_id": tool_call_id,
+                    });
+                    if let Some(n) = name {
+                        obj["name"] = serde_json::json!(n);
+                    }
+                    if is_cache_target {
+                        obj["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                    }
+                    obj
+                }
+            }
+        })
+        .collect()
+}
+
+/// Build tool definitions with cache_control on the last tool.
+fn build_tool_defs(tools: &[ToolDefinition], prompt_cache_enabled: bool) -> Vec<serde_json::Value> {
+    let last_idx = tools.len().saturating_sub(1);
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut def = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            });
+            if prompt_cache_enabled && i == last_idx {
+                def["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+            def
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct ApiResponse {
     choices: Vec<ApiChoice>,
@@ -117,110 +257,7 @@ impl crate::provider::Provider for OpenAIProvider {
             tools.map(|t| t.len()).unwrap_or(0)
         );
 
-        // Find indices of the last system and user messages for cache_control injection.
-        let last_system_idx = messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, m)| matches!(**m, Message::System { .. }).then_some(i));
-        let last_user_idx = messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, m)| matches!(**m, Message::User { .. }).then_some(i));
-
-        let api_messages: Vec<serde_json::Value> = messages
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let is_cache_target = self.config.prompt_cache_enabled
-                    && (Some(i) == last_system_idx || Some(i) == last_user_idx);
-                match **m {
-                    Message::System { ref content, .. } => {
-                        let content_blocks = serde_json::json!([
-                            {"type": "text", "text": content}
-                        ]);
-                        let mut obj =
-                            serde_json::json!({"role": "system", "content": content_blocks});
-                        if is_cache_target {
-                            obj["content"][0]["cache_control"] =
-                                serde_json::json!({"type": "ephemeral"});
-                        }
-                        obj
-                    }
-                    Message::User {
-                        ref content,
-                        ref runtime_content,
-                        ..
-                    } => {
-                        let mut content_blocks = content.to_openai_blocks();
-                        if let Some(ctx) = runtime_content {
-                            content_blocks
-                                .insert(0, serde_json::json!({"type": "text", "text": ctx}));
-                        }
-                        if is_cache_target {
-                            let last = content_blocks.len().saturating_sub(1);
-                            content_blocks[last]["cache_control"] =
-                                serde_json::json!({"type": "ephemeral"});
-                        }
-                        serde_json::json!({"role": "user", "content": content_blocks})
-                    }
-                    Message::Assistant {
-                        ref content,
-                        ref tool_calls,
-                        ref reasoning_content,
-                        ref thinking_blocks,
-                        ..
-                    } => {
-                        let mut obj = serde_json::json!({"role": "assistant"});
-                        if let Some(c) = content {
-                            obj["content"] = serde_json::json!(c);
-                        } else {
-                            obj["content"] = serde_json::Value::Null;
-                        }
-                        if let Some(rc) = reasoning_content {
-                            obj["reasoning_content"] = serde_json::json!(rc);
-                        }
-                        if let Some(tb) = thinking_blocks {
-                            obj["thinking"] = serde_json::json!(tb);
-                        }
-                        if let Some(calls) = tool_calls {
-                            let tc: Vec<_> = calls
-                                .iter()
-                                .map(|call| {
-                                    serde_json::json!({
-                                        "id": call.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": call.name,
-                                            "arguments": call.args.to_string(),
-                                        }
-                                    })
-                                })
-                                .collect();
-                            obj["tool_calls"] = serde_json::json!(tc);
-                        }
-                        obj
-                    }
-                    Message::Tool {
-                        ref content,
-                        ref tool_call_id,
-                        ref name,
-                        ..
-                    } => {
-                        let mut obj = serde_json::json!({
-                            "role": "tool",
-                            "content": content,
-                            "tool_call_id": tool_call_id,
-                        });
-                        if let Some(n) = name {
-                            obj["name"] = serde_json::json!(n);
-                        }
-                        obj
-                    }
-                }
-            })
-            .collect();
+        let api_messages = build_api_messages(messages, self.config.prompt_cache_enabled);
 
         let mut body = serde_json::json!({
             "model": self.config.model,
@@ -230,19 +267,7 @@ impl crate::provider::Provider for OpenAIProvider {
         });
 
         if let Some(tools) = tools {
-            let tool_defs: Vec<serde_json::Value> = tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
-                        }
-                    })
-                })
-                .collect();
+            let tool_defs = build_tool_defs(tools, self.config.prompt_cache_enabled);
             body["tools"] = serde_json::json!(tool_defs);
         }
 
@@ -1514,5 +1539,205 @@ mod tests {
 
         // input_tokens_details should be ignored (no longer a recognized field)
         assert!(api_usage.prompt_tokens_details.is_none());
+    }
+
+    // ── Prompt cache marker tests ──
+
+    fn make_tool(name: &str) -> crate::tool::ToolDefinition {
+        crate::tool::ToolDefinition {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn has_cache_control(val: &serde_json::Value) -> bool {
+        if val.is_object() {
+            if val.get("cache_control").is_some() {
+                return true;
+            }
+            for v in val.as_object().unwrap().values() {
+                if has_cache_control(v) {
+                    return true;
+                }
+            }
+        }
+        if val.is_array() {
+            for v in val.as_array().unwrap() {
+                if has_cache_control(v) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn cache_control_count(val: &serde_json::Value) -> usize {
+        let mut count = 0;
+        if val.is_object() {
+            if val.get("cache_control").is_some() {
+                count += 1;
+            }
+            for v in val.as_object().unwrap().values() {
+                count += cache_control_count(v);
+            }
+        }
+        if val.is_array() {
+            for v in val.as_array().unwrap() {
+                count += cache_control_count(v);
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn test_build_api_messages_cache_on_system_first() {
+        let sys = Message::system("You are a helper".to_string());
+        let user = Message::user("hello".to_string());
+        let msgs: Vec<&Message> = vec![&sys, &user];
+        let result = super::build_api_messages(&msgs, true);
+        assert!(
+            has_cache_control(&result[0]),
+            "messages[0] (system) should have cache_control"
+        );
+    }
+
+    #[test]
+    fn test_build_api_messages_cache_on_history_boundary() {
+        let sys = Message::system("system".to_string());
+        let u1 = Message::user("first".to_string());
+        let a1 = Message::assistant(Some("reply".to_string()), None, None, None);
+        let u2 = Message::user("current".to_string());
+        let msgs: Vec<&Message> = vec![&sys, &u1, &a1, &u2];
+        let result = super::build_api_messages(&msgs, true);
+        assert!(
+            has_cache_control(&result[2]),
+            "messages[-2] should have cache_control"
+        );
+        assert!(
+            !has_cache_control(&result[3]),
+            "messages[-1] should NOT have cache_control"
+        );
+    }
+
+    #[test]
+    fn test_build_api_messages_no_cache_when_disabled() {
+        let sys = Message::system("system".to_string());
+        let u1 = Message::user("first".to_string());
+        let a1 = Message::assistant(Some("reply".to_string()), None, None, None);
+        let msgs: Vec<&Message> = vec![&sys, &u1, &a1];
+        let result = super::build_api_messages(&msgs, false);
+        for msg in &result {
+            assert!(
+                !has_cache_control(msg),
+                "no cache_control when prompt_cache_enabled=false"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_api_messages_short_list_no_boundary_marker() {
+        let sys = Message::system("system".to_string());
+        let user = Message::user("hello".to_string());
+        let msgs: Vec<&Message> = vec![&sys, &user];
+        let result = super::build_api_messages(&msgs, true);
+        assert_eq!(cache_control_count(&result[0]), 1);
+        assert!(!has_cache_control(&result[1]));
+    }
+
+    #[test]
+    fn test_build_api_messages_system_not_at_zero_no_system_marker() {
+        let user = Message::user("hello".to_string());
+        let assistant = Message::assistant(Some("hi".to_string()), None, None, None);
+        let user2 = Message::user("follow up".to_string());
+        let msgs: Vec<&Message> = vec![&user, &assistant, &user2];
+        let result = super::build_api_messages(&msgs, true);
+        assert!(!has_cache_control(&result[0]));
+        assert!(has_cache_control(&result[1]));
+        assert!(!has_cache_control(&result[2]));
+    }
+
+    #[test]
+    fn test_build_tool_defs_cache_on_last_tool() {
+        let tools = vec![
+            make_tool("read_file"),
+            make_tool("write_file"),
+            make_tool("shell"),
+        ];
+        let result = super::build_tool_defs(&tools, true);
+        assert!(
+            has_cache_control(&result[2]),
+            "last tool should have cache_control"
+        );
+        assert!(!has_cache_control(&result[0]));
+        assert!(!has_cache_control(&result[1]));
+    }
+
+    #[test]
+    fn test_build_tool_defs_single_tool() {
+        let tools = vec![make_tool("read_file")];
+        let result = super::build_tool_defs(&tools, true);
+        assert!(
+            has_cache_control(&result[0]),
+            "single tool should have cache_control"
+        );
+    }
+
+    #[test]
+    fn test_build_tool_defs_no_cache_when_disabled() {
+        let tools = vec![make_tool("read_file"), make_tool("shell")];
+        let result = super::build_tool_defs(&tools, false);
+        for tool in &result {
+            assert!(
+                !has_cache_control(tool),
+                "no cache_control when prompt_cache_enabled=false"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_api_messages_total_marker_count() {
+        let sys = Message::system("system prompt".to_string());
+        let u1 = Message::user("first question".to_string());
+        let a1 = Message::assistant(Some("answer".to_string()), None, None, None);
+        let t1 = Message::tool(
+            "result".to_string(),
+            "call-1".to_string(),
+            Some("read_file".to_string()),
+        );
+        let u2 = Message::user("follow up".to_string());
+        let msgs: Vec<&Message> = vec![&sys, &u1, &a1, &t1, &u2];
+        let result = super::build_api_messages(&msgs, true);
+        let total: usize = result.iter().map(|m| cache_control_count(m)).sum();
+        assert_eq!(total, 2, "expected 2 message markers (system + boundary)");
+    }
+
+    #[test]
+    fn test_build_tool_defs_empty_slice() {
+        let tools: Vec<crate::tool::ToolDefinition> = vec![];
+        let result = super::build_tool_defs(&tools, true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_api_messages_tool_at_boundary_gets_marker() {
+        // When messages[-2] is a Tool message, it should get cache_control
+        let sys = Message::system("system".to_string());
+        let u1 = Message::user("question".to_string());
+        let a1 = Message::assistant(Some("let me check".to_string()), None, None, None);
+        let t1 = Message::tool(
+            "result".to_string(),
+            "call-1".to_string(),
+            Some("read_file".to_string()),
+        );
+        let u2 = Message::user("thanks".to_string());
+        let msgs: Vec<&Message> = vec![&sys, &u1, &a1, &t1, &u2];
+        let result = super::build_api_messages(&msgs, true);
+
+        // messages[-2] = t1 (index 3) is a Tool message → should have cache_control
+        assert!(
+            has_cache_control(&result[3]),
+            "Tool message at boundary should have cache_control"
+        );
     }
 }
