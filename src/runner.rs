@@ -211,7 +211,7 @@ impl AgentRunner {
         };
         hook.notify_status_change(&running_state);
         hook.fire_event(AgentEvent::TaskStarted {
-            session_id: session_id.to_string(),
+            session_id: hook.session_id().to_string(),
         });
 
         let max_iterations = self.config.max_iterations;
@@ -253,7 +253,7 @@ impl AgentRunner {
                 }
                 hook.notify_status_change(&failed_state);
                 hook.fire_event(AgentEvent::TaskFailed {
-                    session_id: session_id.to_string(),
+                    session_id: hook.session_id().to_string(),
                     error: err_msg,
                 });
                 return result;
@@ -261,7 +261,7 @@ impl AgentRunner {
 
             // Pre-iteration event
             hook.fire_event(AgentEvent::PreIteration {
-                session_id: session_id.to_string(),
+                session_id: hook.session_id().to_string(),
                 iteration: iterations,
             });
 
@@ -353,7 +353,7 @@ impl AgentRunner {
             if let Some(ref content) = response.content {
                 if !content.is_empty() {
                     hook.fire_event(AgentEvent::AssistantMessage {
-                        session_id: session_id.to_string(),
+                        session_id: hook.session_id().to_string(),
                         content: content.clone(),
                     });
                 }
@@ -406,7 +406,7 @@ impl AgentRunner {
                 };
                 hook.notify_status_change(&completed_state);
                 hook.fire_event(AgentEvent::TaskCompleted {
-                    session_id: session_id.to_string(),
+                    session_id: hook.session_id().to_string(),
                     result: text.clone(),
                 });
                 // Trigger consolidation after successful turn.
@@ -476,7 +476,7 @@ impl AgentRunner {
                     debug!("[tool_call] name={}, args={}", call.name, call.args);
                     // Fire ToolCall event before execution
                     hook.fire_event(AgentEvent::ToolCall {
-                        session_id: session_id.to_string(),
+                        session_id: hook.session_id().to_string(),
                         name: call.name.clone(),
                         args: call.args.to_string(),
                     });
@@ -491,7 +491,7 @@ impl AgentRunner {
 
                     // Fire ToolResult event after execution
                     hook.fire_event(AgentEvent::ToolResult {
-                        session_id: session_id.to_string(),
+                        session_id: hook.session_id().to_string(),
                         name: call.name.clone(),
                         output: raw_result.clone(),
                     });
@@ -542,7 +542,7 @@ impl AgentRunner {
 
                 // Fire PostIteration with the same iteration number that PreIteration used.
                 hook.fire_event(AgentEvent::PostIteration {
-                    session_id: session_id.to_string(),
+                    session_id: hook.session_id().to_string(),
                     iteration: iterations,
                 });
                 iterations += 1;
@@ -575,7 +575,7 @@ impl AgentRunner {
         }
         hook.notify_status_change(&failed_state);
         hook.fire_event(AgentEvent::TaskFailed {
-            session_id: session_id.to_string(),
+            session_id: hook.session_id().to_string(),
             error: error.to_string(),
         });
         result
@@ -594,7 +594,7 @@ impl AgentRunner {
         }
         hook.notify_status_change(&failed_state);
         hook.fire_event(AgentEvent::TaskFailed {
-            session_id: session_id.to_string(),
+            session_id: hook.session_id().to_string(),
             error: msg.clone(),
         });
         result
@@ -618,7 +618,7 @@ impl AgentRunner {
             error: error.to_string(),
         });
         hook.fire_event(AgentEvent::TaskFailed {
-            session_id: session_id.to_string(),
+            session_id: hook.session_id().to_string(),
             error: error.to_string(),
         });
         AgentResult {

@@ -63,16 +63,37 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         .await?,
     );
 
+    // ChannelManager: init channels from config
+    let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
+    let mut channel_manager = ChannelManager::new(
+        message_bus.clone(),
+        outbound_rx,
+        config.clone(),
+        Some(event_tx.clone()),
+    );
+
     // Set up cron service callback
     let agent_loop_for_cron = agent_loop.clone();
     let mb_for_cron = message_bus.clone();
+    let event_tx_for_cron = event_tx.clone();
     cron_service_arc.set_on_job(Arc::new(move |job| {
         let al = agent_loop_for_cron.clone();
         let mb = mb_for_cron.clone();
         let job_clone = job.clone();
+        let event_tx = event_tx_for_cron.clone();
         Box::pin(async move {
             let session_id = format!("cron:{}", job_clone.id);
-            let hook = TaskHook::new(&session_id);
+            // Use origin session_id for event routing so cron execution
+            // events (task_started, tool_call, etc.) appear in the user's
+            // WebUI chat instead of being filtered as system-channel events.
+            // TaskHook.session_id is only used for event broadcasting and
+            // status notifications — session persistence uses the session_id
+            // parameter passed separately to run_task().
+            let origin_session_id = job_clone.payload.channel.as_deref()
+                .zip(job_clone.payload.to.as_deref())
+                .map(|(ch, cid)| format!("{}:{}", ch, cid));
+            let hook = TaskHook::new(origin_session_id.as_deref().unwrap_or(&session_id))
+                .with_events(event_tx);
             let content = format!(
                 "[Scheduled Task] Timer finished.\n\nTask '{}' has been triggered.\nScheduled instruction: {}",
                 job_clone.name, job_clone.payload.message
@@ -85,7 +106,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             // Deliver result to user channel if configured (only if message tool wasn't used)
             if job_clone.payload.deliver && !result.message_sent {
                 if let (Some(channel), Some(chat_id)) = (&job_clone.payload.channel, &job_clone.payload.to) {
-                    let _ = mb.publish_outbound(BusResult {
+                    mb.publish_outbound(BusResult {
                         session_id: format!("{}:{}", channel, chat_id),
                         task_id: String::new(),
                         content: result.content,
@@ -146,15 +167,6 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     } else {
         info!("[gateway] heartbeat service disabled");
     }
-
-    // ChannelManager: init channels from config
-    let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-    let mut channel_manager = ChannelManager::new(
-        message_bus.clone(),
-        outbound_rx,
-        config.clone(),
-        Some(event_tx.clone()),
-    );
 
     // Create shutdown broadcast for channel servers (webui etc.)
     let (channel_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);

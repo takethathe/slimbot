@@ -872,9 +872,12 @@ function setupSSE(chatId) {
 
     responseReceived = true;
 
-    if (!currentMsgEl) {
+    // Always create a new message bubble for each SSE message
+    // This ensures cron job messages appear as separate bubbles
+    if (!currentMsgEl || streamClosed) {
       currentMsgEl = appendMessage('assistant', '', false);
       accumulated = '';
+      streamClosed = false;
     }
 
     accumulated += data;
@@ -916,6 +919,11 @@ function handleAgentEvent(event) {
   switch (event.type) {
     case 'task_started':
       setUserDotState('running');
+      // Reset message state for new task (so cron job messages create new bubbles)
+      currentMsgEl = null;
+      accumulated = '';
+      responseReceived = false;
+      streamClosed = false;
       break;
 
     case 'task_completed':
@@ -924,6 +932,8 @@ function handleAgentEvent(event) {
       isProcessing = false;
       updateSendButton();
       activeUserDot = null;
+      // Mark stream as done so next onmessage creates new bubble
+      streamClosed = true;
       break;
 
     case 'task_failed':
@@ -932,6 +942,8 @@ function handleAgentEvent(event) {
       isProcessing = false;
       updateSendButton();
       activeUserDot = null;
+      // Mark stream as done so next onmessage creates new bubble
+      streamClosed = true;
       appendEventCard('task-failed', 'Task failed', event.error || '');
       break;
 
@@ -940,14 +952,9 @@ function handleAgentEvent(event) {
       break;
 
     case 'assistant_message':
+      // Content is already displayed via SSE onmessage (BusResult).
+      // Only hide typing indicator to avoid visual flicker.
       hideTyping();
-      if (!currentMsgEl) {
-        currentMsgEl = appendMessage('assistant', '', false);
-        accumulated = '';
-      }
-      accumulated += event.content;
-      currentMsgEl.el.innerHTML = renderMarkdown(accumulated);
-      scrollToBottom();
       break;
 
     case 'tool_call': {

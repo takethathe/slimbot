@@ -429,6 +429,11 @@ impl TaskHook {
             let _ = tx.try_send((self.session_id.clone(), state.clone()));
         }
     }
+
+    /// Returns the session_id associated with this hook.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 /// Builder for constructing a `SessionTask` with its execution closure attached.
