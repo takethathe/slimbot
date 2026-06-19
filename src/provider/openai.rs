@@ -59,11 +59,11 @@ struct ApiUsage {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
-    input_tokens_details: Option<ApiInputTokensDetails>,
+    prompt_tokens_details: Option<ApiPromptTokensDetails>,
 }
 
 #[derive(Deserialize)]
-struct ApiInputTokensDetails {
+struct ApiPromptTokensDetails {
     cached_tokens: Option<u32>,
 }
 
@@ -302,7 +302,7 @@ impl crate::provider::Provider for OpenAIProvider {
             .map(|u| Usage {
                 prompt_tokens: u.prompt_tokens.unwrap_or(0),
                 prompt_cache_hit_tokens: u
-                    .input_tokens_details
+                    .prompt_tokens_details
                     .as_ref()
                     .and_then(|d| d.cached_tokens)
                     .unwrap_or(0),
@@ -701,7 +701,7 @@ mod tests {
             }],
             "usage": {
                 "prompt_tokens": 100,
-                "input_tokens_details": {
+                "prompt_tokens_details": {
                     "cached_tokens": 50
                 }
             }
@@ -709,7 +709,7 @@ mod tests {
         let resp: ApiResponse = serde_json::from_str(json).unwrap();
         let usage = resp.usage.unwrap();
         assert_eq!(
-            usage.input_tokens_details.as_ref().unwrap().cached_tokens,
+            usage.prompt_tokens_details.as_ref().unwrap().cached_tokens,
             Some(50)
         );
     }
@@ -928,6 +928,10 @@ mod tests {
         assert_eq!(usage.prompt_tokens, Some(100));
         assert_eq!(usage.completion_tokens, Some(20));
         assert_eq!(usage.total_tokens, Some(120));
+        assert_eq!(
+            usage.prompt_tokens_details.as_ref().unwrap().cached_tokens,
+            Some(50)
+        );
     }
 
     #[test]
@@ -1000,6 +1004,10 @@ mod tests {
         assert_eq!(usage.prompt_tokens, Some(100));
         assert_eq!(usage.completion_tokens, Some(50));
         assert_eq!(usage.total_tokens, Some(150));
+        assert_eq!(
+            usage.prompt_tokens_details.as_ref().unwrap().cached_tokens,
+            Some(30)
+        );
     }
 
     #[test]
@@ -1396,7 +1404,7 @@ mod tests {
                 "prompt_tokens": 100,
                 "completion_tokens": 50,
                 "total_tokens": 150,
-                "input_tokens_details": {
+                "prompt_tokens_details": {
                     "cached_tokens": 40
                 }
             }
@@ -1407,8 +1415,104 @@ mod tests {
         assert_eq!(usage.completion_tokens, Some(50));
         assert_eq!(usage.total_tokens, Some(150));
         assert_eq!(
-            usage.input_tokens_details.as_ref().unwrap().cached_tokens,
+            usage.prompt_tokens_details.as_ref().unwrap().cached_tokens,
             Some(40)
         );
+    }
+
+    #[test]
+    fn test_api_usage_to_usage_mapping_with_cached_tokens() {
+        // Verify the full mapping from ApiUsage to Usage, specifically that
+        // prompt_tokens_details.cached_tokens maps to Usage.prompt_cache_hit_tokens.
+        let json = r#"{
+            "choices": [{
+                "message": {"content": "cached response", "tool_calls": null},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 200,
+                "completion_tokens": 30,
+                "total_tokens": 230,
+                "prompt_tokens_details": {
+                    "cached_tokens": 150
+                }
+            }
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let api_usage = resp.usage.as_ref().unwrap();
+
+        // Simulate the mapping logic from chat()
+        let usage = Usage {
+            prompt_tokens: api_usage.prompt_tokens.unwrap_or(0),
+            prompt_cache_hit_tokens: api_usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
+            completion_tokens: api_usage.completion_tokens.unwrap_or(0),
+            total_tokens: api_usage.total_tokens.unwrap_or(0),
+        };
+
+        assert_eq!(usage.prompt_tokens, 200);
+        assert_eq!(usage.prompt_cache_hit_tokens, 150);
+        assert_eq!(usage.completion_tokens, 30);
+        assert_eq!(usage.total_tokens, 230);
+    }
+
+    #[test]
+    fn test_api_usage_to_usage_mapping_without_cached_tokens() {
+        // When prompt_tokens_details is absent, prompt_cache_hit_tokens should be 0.
+        let json = r#"{
+            "choices": [{
+                "message": {"content": "no cache", "tool_calls": null},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120
+            }
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let api_usage = resp.usage.as_ref().unwrap();
+
+        let usage = Usage {
+            prompt_tokens: api_usage.prompt_tokens.unwrap_or(0),
+            prompt_cache_hit_tokens: api_usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
+            completion_tokens: api_usage.completion_tokens.unwrap_or(0),
+            total_tokens: api_usage.total_tokens.unwrap_or(0),
+        };
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.prompt_cache_hit_tokens, 0);
+    }
+
+    #[test]
+    fn test_prompt_tokens_details_ignores_input_tokens_details() {
+        // Ensure the old (wrong) field name "input_tokens_details" is ignored
+        // and only "prompt_tokens_details" is used for cached tokens.
+        let json = r#"{
+            "choices": [{
+                "message": {"content": "hi", "tool_calls": null},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "input_tokens_details": {
+                    "cached_tokens": 80
+                }
+            }
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let api_usage = resp.usage.unwrap();
+
+        // input_tokens_details should be ignored (no longer a recognized field)
+        assert!(api_usage.prompt_tokens_details.is_none());
     }
 }
