@@ -1,6 +1,6 @@
+use slimbot::{Content, Message, SessionManager};
 use std::fs;
 use tempfile::TempDir;
-use slimbot::{Content, Message, SessionManager};
 
 // ── total_persisted alignment from disk ──
 
@@ -91,7 +91,10 @@ async fn test_persisted_jsonl_does_not_contain_id_field() {
 
     let jsonl = fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
     // The serialized message should NOT have an "id" field
-    assert!(!jsonl.contains("\"id\":"), "JSONL should not contain id field, got: {jsonl}");
+    assert!(
+        !jsonl.contains("\"id\":"),
+        "JSONL should not contain id field, got: {jsonl}"
+    );
     assert!(jsonl.contains("hello"));
 }
 

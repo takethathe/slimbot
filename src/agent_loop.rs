@@ -480,3 +480,625 @@ impl AgentLoop {
         info!("[AgentLoop] CLI session shutdown complete");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Message;
+
+    fn make_test_paths(tmp: &tempfile::TempDir) -> PathManager {
+        let data_dir = tmp.path().join("data");
+        let workspace_dir = data_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        // Create a minimal config file
+        let config_path = data_dir.join("config.json");
+        let config = crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        };
+        let config_json = serde_json::to_string_pretty(&config).unwrap();
+        std::fs::write(&config_path, config_json).unwrap();
+
+        PathManager::resolve(
+            Some(config_path.to_str().unwrap()),
+            Some(data_dir.to_str().unwrap()),
+            Some(workspace_dir.to_str().unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let message_bus = Arc::new(MessageBus::new());
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        });
+
+        let result = AgentLoop::from_config(&paths, message_bus, config).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_from_config_with_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let message_bus = Arc::new(MessageBus::new());
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        });
+
+        let tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
+        let result =
+            AgentLoop::from_config_with_tools(&paths, message_bus, config, tool_manager).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_session_manager() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let message_bus = Arc::new(MessageBus::new());
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        });
+
+        let agent_loop = AgentLoop::from_config(&paths, message_bus, config)
+            .await
+            .unwrap();
+        let sm = agent_loop.session_manager();
+        assert!(sm.lock().await.list_persisted_sessions("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let message_bus = Arc::new(MessageBus::new());
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        });
+
+        let agent_loop = AgentLoop::from_config(&paths, message_bus, config.clone())
+            .await
+            .unwrap();
+        assert_eq!(agent_loop.config().agent.provider, "default");
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_register_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let message_bus = Arc::new(MessageBus::new());
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        });
+
+        let mut agent_loop = AgentLoop::from_config(&paths, message_bus, config)
+            .await
+            .unwrap();
+        // register_tool is a no-op but should not panic
+        agent_loop.register_tool(Box::new(crate::tools::shell::ShellTool::default()));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_handle_creation() {
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let (inbound_tx, _) = mpsc::channel(10);
+
+        let handle = ShutdownHandle {
+            shutdown_tx,
+            inbound_tx,
+        };
+
+        // Verify handle was created
+        assert_eq!(handle.shutdown_tx.receiver_count(), 0);
+    }
+
+    async fn make_agent_loop(tmp: &tempfile::TempDir) -> AgentLoop {
+        let paths = make_test_paths(tmp);
+        let message_bus = Arc::new(MessageBus::new());
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        });
+        AgentLoop::from_config(&paths, message_bus, config)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_shutdown_for_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_loop = make_agent_loop(&tmp).await;
+        // shutdown_for_cli should not panic
+        agent_loop.shutdown_for_cli().await;
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_start_inbound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_loop = make_agent_loop(&tmp).await;
+        // start_inbound spawns a task; should not panic
+        agent_loop.start_inbound(None);
+        // Give the task time to spawn
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Trigger shutdown to clean up the spawned task
+        agent_loop.shutdown_for_cli().await;
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_run_task_nonexistent_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_loop = make_agent_loop(&tmp).await;
+        let hook = TaskHook::new("new-session");
+        // run_task should create the session and run
+        let result = agent_loop
+            .run_task("new-session", "test".to_string(), hook, None, None, None)
+            .await;
+        // Result should be returned (success depends on provider, but session should be created)
+        let sm = agent_loop.session_manager();
+        assert!(sm.lock().await.has_session("new-session"));
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_run_returns_shutdown_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_loop = Arc::new(make_agent_loop(&tmp).await);
+
+        let message_bus = Arc::new(MessageBus::new());
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: std::collections::HashMap::new(),
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        });
+        let (event_tx, _) = broadcast::channel::<crate::session::AgentEvent>(256);
+        let channel_manager = Arc::new(crate::channel::ChannelManager::new(
+            message_bus,
+            config,
+            Some(event_tx),
+        ));
+
+        let handle = agent_loop.run(&channel_manager);
+        // Handle should have a valid shutdown_tx
+        assert!(handle.shutdown_tx.receiver_count() >= 1);
+
+        // Trigger shutdown to clean up
+        let _ = handle.shutdown_tx.send(());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_session_manager_accessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_loop = make_agent_loop(&tmp).await;
+        let sm = agent_loop.session_manager();
+        // Should be usable
+        sm.lock().await.get_or_create("test").await.unwrap();
+        assert!(sm.lock().await.has_session("test"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_config_accessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_loop = make_agent_loop(&tmp).await;
+        let config = agent_loop.config();
+        assert_eq!(config.agent.provider, "default");
+        assert_eq!(config.agent.max_iterations, 10);
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_from_config_missing_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let message_bus = Arc::new(MessageBus::new());
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "nonexistent".to_string(), // Provider doesn't exist
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "openai".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "https://api.openai.com".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "gpt-4o".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+            },
+        });
+
+        let result = AgentLoop::from_config(&paths, message_bus, config).await;
+        assert!(result.is_err());
+        let err_str = format!("{}", result.err().unwrap());
+        assert!(err_str.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_agent_loop_command_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let sm: SharedSessionManager = Arc::new(tokio::sync::Mutex::new(
+            SessionManager::new(session_dir).unwrap(),
+        ));
+        let (outbound_tx, _) = mpsc::channel(10);
+
+        // Create a session
+        {
+            let mut guard = sm.lock().await;
+            guard.get_or_create("test-session").await.unwrap();
+            guard
+                .add_message("test-session", Message::user("hello".to_string()))
+                .await
+                .unwrap();
+        }
+
+        // Test /status command
+        let (response, should_shutdown) =
+            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "test-session", "/status")
+                .await;
+        assert!(!should_shutdown);
+        assert!(response.contains("Session: test-session"));
+        assert!(response.contains("Messages: 1"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_agent_loop_command_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let sm: SharedSessionManager = Arc::new(tokio::sync::Mutex::new(
+            SessionManager::new(session_dir.clone()).unwrap(),
+        ));
+        let (outbound_tx, _) = mpsc::channel(10);
+
+        // Create a session with messages
+        {
+            let mut guard = sm.lock().await;
+            guard.get_or_create("test-session").await.unwrap();
+            guard
+                .add_message("test-session", Message::user("hello".to_string()))
+                .await
+                .unwrap();
+            guard.persist("test-session").await.unwrap();
+        }
+
+        // Verify session has messages
+        assert!(session_dir.join("test-session.jsonl").exists());
+
+        // Test /clear command
+        let (response, should_shutdown) =
+            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "test-session", "/clear").await;
+        assert!(!should_shutdown);
+        assert!(response.contains("cleared"));
+
+        // Verify files were deleted
+        assert!(!session_dir.join("test-session.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn test_handle_agent_loop_command_stop_no_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let sm: SharedSessionManager = Arc::new(tokio::sync::Mutex::new(
+            SessionManager::new(session_dir).unwrap(),
+        ));
+        let (outbound_tx, _) = mpsc::channel(10);
+
+        // Test /stop command with no session
+        let (response, should_shutdown) =
+            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "nonexistent-session", "/stop")
+                .await;
+        assert!(!should_shutdown);
+        assert!(response.contains("No session to stop"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_agent_loop_command_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let sm: SharedSessionManager = Arc::new(tokio::sync::Mutex::new(
+            SessionManager::new(session_dir).unwrap(),
+        ));
+        let (outbound_tx, _) = mpsc::channel(10);
+
+        // Test unknown command
+        let (response, should_shutdown) =
+            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "test-session", "/unknown")
+                .await;
+        assert!(!should_shutdown);
+        assert!(response.is_empty());
+    }
+}

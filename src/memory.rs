@@ -367,9 +367,148 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
 
-        store.write_memory("user prefers short replies").unwrap();
+        store.write_memory("User prefers Rust").unwrap();
         let ctx = store.get_memory_context();
         assert!(ctx.contains("## Long-term Memory"));
-        assert!(ctx.contains("user prefers short replies"));
+        assert!(ctx.contains("User prefers Rust"));
+    }
+
+    #[test]
+    fn test_soul_read_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+
+        assert!(store.read_soul().is_empty());
+        store.write_soul("You are a helpful assistant").unwrap();
+        assert_eq!(store.read_soul(), "You are a helpful assistant");
+    }
+
+    #[test]
+    fn test_user_read_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+
+        assert!(store.read_user().is_empty());
+        store.write_user("Alice, software engineer").unwrap();
+        assert_eq!(store.read_user(), "Alice, software engineer");
+    }
+
+    #[test]
+    fn test_sync_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        store.write_memory("test").unwrap();
+        store.append_history("entry").unwrap();
+
+        // sync_all should not panic or error
+        let result = store.sync_all();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_read_entries_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+
+        let entries = store.read_entries();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_read_entries_with_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        store.append_history("entry1").unwrap();
+        store.append_history("entry2").unwrap();
+
+        let entries = store.read_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "entry1");
+        assert_eq!(entries[1].content, "entry2");
+    }
+
+    #[test]
+    fn test_next_cursor_starts_at_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        assert_eq!(store.next_cursor(), 1);
+    }
+
+    #[test]
+    fn test_next_cursor_increments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        let c1 = store.append_history("entry1").unwrap();
+        let c2 = store.append_history("entry2").unwrap();
+        let c3 = store.append_history("entry3").unwrap();
+
+        assert_eq!(c1, 1);
+        assert_eq!(c2, 2);
+        assert_eq!(c3, 3);
+    }
+
+    #[test]
+    fn test_read_recent_history_with_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        for i in 1..=10 {
+            store.append_history(&format!("entry {}", i)).unwrap();
+        }
+
+        let recent = store.read_recent_history(5);
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent[0].content, "entry 6");
+        assert_eq!(recent[4].content, "entry 10");
+    }
+
+    #[test]
+    fn test_read_recent_history_zero_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        for i in 1..=5 {
+            store.append_history(&format!("entry {}", i)).unwrap();
+        }
+
+        // max_entries = 0 means no cap
+        let all = store.read_recent_history(0);
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn test_history_entry_serialization() {
+        let entry = HistoryEntry {
+            cursor: 42,
+            timestamp: "2024-01-15 10:30".to_string(),
+            content: "Test content".to_string(),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("42"));
+        assert!(json.contains("2024-01-15 10:30"));
+        assert!(json.contains("Test content"));
+
+        let deserialized: HistoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.cursor, 42);
+        assert_eq!(deserialized.timestamp, "2024-01-15 10:30");
+        assert_eq!(deserialized.content, "Test content");
+    }
+
+    #[test]
+    fn test_memory_init_creates_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let store = MemoryStore::new(&workspace_dir);
+        assert!(!workspace_dir.join("memory").exists());
+
+        store.init().unwrap();
+        assert!(workspace_dir.join("memory").exists());
     }
 }

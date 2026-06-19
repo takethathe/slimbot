@@ -183,7 +183,10 @@ impl Content {
                 ContentBlock::Text { text } => {
                     serde_json::json!({"type": "text", "text": text})
                 }
-                ContentBlock::Image { mime_type, base64_data } => {
+                ContentBlock::Image {
+                    mime_type,
+                    base64_data,
+                } => {
                     serde_json::json!({
                         "type": "image_url",
                         "image_url": {"url": format!("data:{};base64,{}", mime_type, base64_data)}
@@ -545,7 +548,17 @@ impl SessionTaskBuilder {
                     .memory_store(memory_store)
                     .consolidator(consolidator)
                     .build();
-                let result = runner.run(content, hook, &sid1, channel_inject, cancel_token, None, None).await;
+                let result = runner
+                    .run(
+                        content,
+                        hook,
+                        &sid1,
+                        channel_inject,
+                        cancel_token,
+                        None,
+                        None,
+                    )
+                    .await;
 
                 // Send result outbound
                 let content = if result.success {
@@ -2067,5 +2080,143 @@ mod tests {
         let session = sm.sessions.get("s1").unwrap();
         assert_eq!(session.history.len(), 2);
         assert_eq!(session.current_turn.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_clear_session_removes_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+        sm.add_message("s1", user_msg("hello")).await.unwrap();
+        sm.persist("s1").await.unwrap();
+
+        // Verify files exist
+        assert!(session_dir.join("s1.jsonl").exists());
+        assert!(session_dir.join("s1.meta.json").exists());
+
+        // Clear session
+        sm.clear_session("s1");
+
+        // Files should be deleted
+        assert!(!session_dir.join("s1.jsonl").exists());
+        assert!(!session_dir.join("s1.meta.json").exists());
+
+        // Session should be removed from memory
+        assert!(sm.get_or_create("s1").await.is_ok()); // creates fresh
+        let msgs = sm.get_messages("s1").await;
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_clear_session_nonexistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.clear_session("nonexistent"); // should be a no-op
+    }
+
+    #[test]
+    fn test_content_multi_with_image_block() {
+        let content = Content::Multi(vec![
+            ContentBlock::Text {
+                text: "Look at this:".to_string(),
+            },
+            ContentBlock::Image {
+                mime_type: "image/png".to_string(),
+                base64_data: "iVBORw0KGgoAAAANSUhEUg==".to_string(),
+            },
+        ]);
+        assert!(!content.is_empty());
+        assert_eq!(content.as_text(), "Look at this:"); // as_text returns first text block
+
+        let blocks = content.to_openai_blocks();
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_content_multi_serialization() {
+        let content = Content::Multi(vec![ContentBlock::Text {
+            text: "multi text".to_string(),
+        }]);
+        let json = serde_json::to_string(&content).unwrap();
+        // Multi should serialize as an array
+        assert!(json.starts_with('['));
+        let deserialized: Content = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Content::Multi(blocks) => assert_eq!(blocks.len(), 1),
+            _ => panic!("expected Multi"),
+        }
+    }
+
+    #[test]
+    fn test_message_assistant_with_tool_calls() {
+        let msg = Message::Assistant {
+            meta: MessageMeta {
+                timestamp: String::new(),
+            },
+            content: Some("Let me check".to_string()),
+            tool_calls: Some(vec![crate::tool::ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                args: serde_json::json!({"path": "test.txt"}),
+            }]),
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
+        // Verify structure
+        if let Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } = &msg
+        {
+            assert_eq!(content, &Some("Let me check".to_string()));
+            let tc = tool_calls.as_ref().unwrap();
+            assert_eq!(tc.len(), 1);
+            assert_eq!(tc[0].name, "read_file");
+        } else {
+            panic!("expected assistant message");
+        }
+    }
+
+    #[test]
+    fn test_session_runner_new() {
+        let runner = SessionRunner::new();
+        // Verify initial state
+        assert!(!runner.running.load(Ordering::Relaxed));
+        assert!(runner.task_queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_session_runner_maybe_start_next() {
+        let runner = SessionRunner::new();
+        // Calling maybe_start_next with empty queue should not panic
+        runner.maybe_start_next();
+        assert!(!runner.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_session_runner_on_task_complete() {
+        let runner = SessionRunner::new();
+        runner.running.store(true, Ordering::Relaxed);
+        runner.on_task_complete();
+        assert!(!runner.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_session_runner_shutdown() {
+        let runner = SessionRunner::new();
+        runner.shutdown();
+        // After shutdown, running should be false
+        assert!(!runner.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_session_runner_wait_idle() {
+        let runner = SessionRunner::new();
+        // wait_idle should return immediately if not running
+        runner.wait_idle();
+        assert!(!runner.running.load(Ordering::Relaxed));
     }
 }

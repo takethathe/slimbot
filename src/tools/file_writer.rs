@@ -93,4 +93,109 @@ mod tests {
             .unwrap();
         assert_eq!(content, "hello world");
     }
+
+    #[tokio::test]
+    async fn test_write_creates_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let result = writer
+            .execute(serde_json::json!({
+                "path": "sub/dir/test.txt",
+                "content": "nested"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("bytes"));
+        assert!(result.contains("sub/dir/test.txt"));
+        assert!(tmp.path().join("sub/dir/test.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_write_overwrites_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("old.txt"), "old content")
+            .await
+            .unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let _ = writer
+            .execute(serde_json::json!({
+                "path": "old.txt",
+                "content": "new content"
+            }))
+            .await
+            .unwrap();
+        let content = tokio::fs::read_to_string(tmp.path().join("old.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "new content");
+    }
+
+    #[tokio::test]
+    async fn test_write_empty_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let result = writer
+            .execute(serde_json::json!({
+                "path": "empty.txt",
+                "content": ""
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("0 bytes"));
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("empty.txt"))
+                .await
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_missing_path_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let result = writer.execute(serde_json::json!({"content": "test"})).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing required argument: path")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_missing_content_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let result = writer
+            .execute(serde_json::json!({"path": "test.txt"}))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing required argument: content")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_path_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let result = writer
+            .execute(serde_json::json!({
+                "path": "../../outside.txt",
+                "content": "escape attempt"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Path escapes workspace")
+        );
+    }
 }

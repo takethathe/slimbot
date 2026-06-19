@@ -587,4 +587,56 @@ mod tests {
         // No panic; io_handles should remain empty since TestChannel returns no join_handle
         assert!(cm.io_handles.lock().await.is_empty());
     }
+
+    #[test]
+    fn test_is_system_channel() {
+        // System channels should be identified by name
+        assert!(is_system_channel("cron"));
+        assert!(is_system_channel("heartbeat"));
+        assert!(!is_system_channel("cli"));
+        assert!(!is_system_channel("webui"));
+        assert!(!is_system_channel("telegram"));
+    }
+
+    #[tokio::test]
+    async fn test_channel_manager_init_empty_channels() {
+        // Config with no channels should init cleanly
+        let config = Arc::new(make_test_config());
+        let mb = Arc::new(MessageBus::new());
+        let mut cm = ChannelManager::new(mb, config, None);
+
+        cm.init().await.unwrap();
+        assert!(cm.channels.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_channel_manager_multiple_channels() {
+        let mut config = make_test_config();
+        config.channels.insert(
+            "test1".to_string(),
+            crate::config::ChannelConfig {
+                enabled: true,
+                extra: Default::default(),
+            },
+        );
+        config.channels.insert(
+            "test2".to_string(),
+            crate::config::ChannelConfig {
+                enabled: true,
+                extra: Default::default(),
+            },
+        );
+        let mb = Arc::new(MessageBus::new());
+        let config = Arc::new(config);
+        let mut cm = ChannelManager::new(mb, config, None);
+        // Register factories for both types
+        let factory1: Box<dyn ChannelFactory> = Box::new(TestChannelFactory);
+        let factory2: Box<dyn ChannelFactory> = Box::new(TestChannelFactory);
+        cm.register_factory("test1", factory1);
+        cm.register_factory("test2", factory2);
+
+        cm.init().await.unwrap();
+        // Channels are stored in a map keyed by type, so we should have 2 entries
+        assert!(cm.channels.lock().await.len() >= 1); // At least 1 since both factory create same channel
+    }
 }

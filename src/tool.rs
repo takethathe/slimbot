@@ -205,3 +205,172 @@ pub fn persist_tool_result(
 
     build_persisted_reference(&file_path, content, TOOL_RESULT_PREVIEW_CHARS)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ToolEntry;
+
+    #[test]
+    fn test_tool_manager_new_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = ToolManager::new(tmp.path().to_path_buf());
+        assert!(tm.to_openai_functions().is_empty());
+    }
+
+    #[test]
+    fn test_tool_manager_register_and_execute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = ToolManager::new(tmp.path().to_path_buf());
+        tm.register(Box::new(crate::tools::shell::ShellTool::default()));
+
+        let funcs = tm.to_openai_functions();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "shell");
+        assert!(!funcs[0].description.is_empty());
+    }
+
+    #[test]
+    fn test_tool_manager_execute_unknown_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = ToolManager::new(tmp.path().to_path_buf());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(tm.execute("nonexistent", serde_json::json!({})));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Tool not found"));
+    }
+
+    #[test]
+    fn test_tool_manager_init_from_config_all_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = ToolManager::new(tmp.path().to_path_buf());
+        tm.init_from_config(&[]); // empty config → all defaults
+
+        let funcs = tm.to_openai_functions();
+        assert!(!funcs.is_empty());
+        // All 6 built-in tools should be registered
+        let names: Vec<_> = funcs.iter().map(|f| &f.name).collect();
+        assert!(names.contains(&&"shell".to_string()));
+        assert!(names.contains(&&"file_reader".to_string()));
+        assert!(names.contains(&&"file_writer".to_string()));
+        assert!(names.contains(&&"file_editor".to_string()));
+        assert!(names.contains(&&"list_dir".to_string()));
+        assert!(names.contains(&&"make_dir".to_string()));
+    }
+
+    #[test]
+    fn test_tool_manager_init_from_config_selective() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = ToolManager::new(tmp.path().to_path_buf());
+        tm.init_from_config(&[
+            ToolEntry {
+                name: "shell".into(),
+                enabled: true,
+            },
+            ToolEntry {
+                name: "file_reader".into(),
+                enabled: false,
+            },
+        ]);
+
+        let funcs = tm.to_openai_functions();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "shell");
+    }
+
+    #[test]
+    fn test_tool_manager_init_from_config_unknown_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = ToolManager::new(tmp.path().to_path_buf());
+        tm.init_from_config(&[ToolEntry {
+            name: "nonexistent_tool".into(),
+            enabled: true,
+        }]);
+
+        // Should be empty since unknown tool is skipped
+        assert!(tm.to_openai_functions().is_empty());
+    }
+
+    #[test]
+    fn test_tool_manager_set_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = ToolManager::new(tmp.path().to_path_buf());
+        tm.register(Box::new(crate::tools::shell::ShellTool::default()));
+
+        let ctx = ToolContext {
+            channel: "cli".into(),
+            chat_id: "test".into(),
+        };
+        tm.set_context(&ctx);
+        // ShellTool doesn't override set_context, so this should be a no-op
+    }
+
+    #[test]
+    fn test_tool_manager_start_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = ToolManager::new(tmp.path().to_path_buf());
+        tm.register(Box::new(crate::tools::shell::ShellTool::default()));
+
+        tm.start_turn("shell");
+        tm.start_turn("nonexistent"); // no-op for nonexistent tools
+    }
+
+    #[test]
+    fn test_tool_manager_sent_in_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = ToolManager::new(tmp.path().to_path_buf());
+        tm.register(Box::new(crate::tools::shell::ShellTool::default()));
+
+        assert!(!tm.sent_in_turn("shell"));
+        assert!(!tm.sent_in_turn("nonexistent"));
+    }
+
+    #[test]
+    fn test_ensure_nonempty_tool_result() {
+        assert_eq!(
+            ensure_nonempty_tool_result("test_tool", ""),
+            "(test_tool completed with no output)"
+        );
+        assert_eq!(
+            ensure_nonempty_tool_result("test_tool", "   "),
+            "(test_tool completed with no output)"
+        );
+        assert_eq!(ensure_nonempty_tool_result("test_tool", "hello"), "hello");
+    }
+
+    #[test]
+    fn test_format_tool_error() {
+        let formatted = format_tool_error("file not found");
+        assert!(formatted.contains("file not found"));
+        assert!(formatted.contains("Analyze the error"));
+    }
+
+    #[test]
+    fn test_persist_tool_result_under_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = persist_tool_result(tmp.path(), "call-1", "short result", 100);
+        assert_eq!(result, "short result");
+    }
+
+    #[test]
+    fn test_persist_tool_result_over_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "x".repeat(2000); // well over the 1200 preview limit
+        let result = persist_tool_result(tmp.path(), "call-2", &content, 100);
+        assert!(result.contains("persisted"));
+        assert!(result.contains("call-2"));
+        assert!(result.contains("Original size"));
+    }
+
+    #[test]
+    fn test_create_builtin_tool_known_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(create_builtin_tool("shell", tmp.path()).is_some());
+        assert!(create_builtin_tool("file_reader", tmp.path()).is_some());
+        assert!(create_builtin_tool("file_writer", tmp.path()).is_some());
+        assert!(create_builtin_tool("file_editor", tmp.path()).is_some());
+        assert!(create_builtin_tool("list_dir", tmp.path()).is_some());
+        assert!(create_builtin_tool("make_dir", tmp.path()).is_some());
+        assert!(create_builtin_tool("unknown_tool", tmp.path()).is_none());
+    }
+}

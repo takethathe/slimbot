@@ -1982,4 +1982,43 @@ mod tests {
             msgs.len()
         );
     }
+
+    #[tokio::test]
+    async fn test_agent_result_accumulate() {
+        // Test that AgentResult.accumulate correctly combines Usage stats
+        let mut total = AgentResult {
+            success: false,
+            content: String::new(),
+            total_tokens: 0,
+            prompt_tokens: 0,
+            prompt_cache_hit_tokens: 0,
+            completion_tokens: 0,
+            iterations: 0,
+            message_sent: false,
+        };
+
+        let usage1 = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_cache_hit_tokens: 20,
+        };
+        total.accumulate(&usage1);
+        assert_eq!(total.total_tokens, 150);
+        assert_eq!(total.prompt_tokens, 100);
+        assert_eq!(total.prompt_cache_hit_tokens, 20);
+        assert_eq!(total.completion_tokens, 50);
+
+        let usage2 = Usage {
+            prompt_tokens: 200,
+            completion_tokens: 80,
+            total_tokens: 280,
+            prompt_cache_hit_tokens: 40,
+        };
+        total.accumulate(&usage2);
+        assert_eq!(total.total_tokens, 430);
+        assert_eq!(total.prompt_tokens, 300);
+        assert_eq!(total.prompt_cache_hit_tokens, 60);
+        assert_eq!(total.completion_tokens, 130);
+    }
 }

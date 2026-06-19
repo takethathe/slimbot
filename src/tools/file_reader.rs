@@ -85,4 +85,76 @@ mod tests {
             .await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_read_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("test.txt"), "hello world")
+            .await
+            .unwrap();
+        let tool = FileReaderTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_read_truncates_large_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let large_content = "x".repeat(60_000);
+        tokio::fs::write(tmp.path().join("large.txt"), &large_content)
+            .await
+            .unwrap();
+        let tool = FileReaderTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({"path": "large.txt"}))
+            .await
+            .unwrap();
+        assert!(result.starts_with("(truncated to 50000 chars)"));
+        assert!(result.len() < 51_000); // truncated content + header
+    }
+
+    #[tokio::test]
+    async fn test_read_not_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(tmp.path().join("adir"))
+            .await
+            .unwrap();
+        let tool = FileReaderTool::new(tmp.path().to_path_buf());
+        let result = tool.execute(serde_json::json!({"path": "adir"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a file"));
+    }
+
+    #[tokio::test]
+    async fn test_read_missing_path_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = FileReaderTool::new(tmp.path().to_path_buf());
+        let result = tool.execute(serde_json::json!({})).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing required argument")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_rejects_path_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = FileReaderTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({"path": "../../etc/passwd"}))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Path escapes workspace")
+        );
+    }
 }

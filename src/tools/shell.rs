@@ -122,4 +122,60 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }
+
+    #[tokio::test]
+    async fn test_shell_stdout_and_stderr() {
+        let tool = ShellTool::default();
+        let result = tool
+            .execute(serde_json::json!({"command": "echo out; echo err >&2"}))
+            .await
+            .unwrap();
+        assert!(result.contains("stdout:"));
+        assert!(result.contains("out"));
+        assert!(result.contains("stderr:"));
+        assert!(result.contains("err"));
+        assert!(result.contains("---")); // separator between stdout and stderr
+    }
+
+    #[tokio::test]
+    async fn test_shell_failed_exit_code() {
+        let tool = ShellTool::default();
+        let result = tool
+            .execute(serde_json::json!({"command": "exit 42"}))
+            .await
+            .unwrap();
+        assert!(result.contains("Exit code: 42"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_no_output() {
+        let tool = ShellTool::default();
+        let result = tool
+            .execute(serde_json::json!({"command": "true"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "(no output)");
+    }
+
+    #[tokio::test]
+    async fn test_shell_stderr_only() {
+        let tool = ShellTool::default();
+        let result = tool
+            .execute(serde_json::json!({"command": "echo err-only >&2"}))
+            .await
+            .unwrap();
+        assert!(result.contains("stderr:"));
+        assert!(result.contains("err-only"));
+        assert!(!result.contains("stdout:"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_custom_timeout() {
+        let tool = ShellTool::new(2);
+        let result = tool
+            .execute(serde_json::json!({"command": "sleep 1"}))
+            .await;
+        // Should succeed since sleep 1 < timeout 2
+        assert!(result.is_ok());
+    }
 }

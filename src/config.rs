@@ -576,4 +576,678 @@ mod tests {
         let diff = Config::compute_diff(&cfg, &cfg);
         assert!(diff.paths.is_empty());
     }
+
+    #[test]
+    fn test_config_clamp_zero_values() {
+        let mut cfg = make_test_config();
+        cfg.agent.max_iterations = 0;
+        cfg.agent.timeout_seconds = 0;
+        cfg.clamp();
+        assert_eq!(cfg.agent.max_iterations, 1); // clamped to minimum
+        assert_eq!(cfg.agent.timeout_seconds, 1); // clamped to minimum (range(1, 600))
+    }
+
+    #[test]
+    fn test_config_clamp_extreme_values() {
+        let mut cfg = make_test_config();
+        cfg.agent.max_iterations = u32::MAX;
+        cfg.agent.timeout_seconds = u64::MAX;
+        cfg.agent.context_window_tokens = u32::MAX;
+        cfg.clamp();
+        assert_eq!(cfg.agent.max_iterations, 200); // max clamp
+        assert_eq!(cfg.agent.timeout_seconds, 600); // max clamp
+        assert_eq!(cfg.agent.context_window_tokens, 200_000); // max clamp from range(1024, 200_000)
+    }
+
+    #[test]
+    fn test_config_load_with_negative_values_in_json() {
+        // Negative numeric values in JSON are deserialized as the underlying integer type's
+        // two's complement representation for unsigned types (serde_json behavior).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        // -1 as u32 in JSON would be rejected by serde_json as out of range
+        std::fs::write(
+            &path,
+            r#"{"agent":{"provider":"default","max_iterations":-1},"providers":{"default":{"type":"openai","api_key":"test","model":"gpt-4"}}}"#,
+        )
+        .unwrap();
+        let result = Config::load_for_preview(path.to_str().unwrap());
+        // Serde_json should reject negative for unsigned
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_load_invalid_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let result = Config::load_for_preview(path.to_str().unwrap());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_load_empty_providers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, r#"{"agent":{"provider":"default"},"providers":{}}"#).unwrap();
+        let cfg = Config::load_for_preview(path.to_str().unwrap()).unwrap();
+        assert!(cfg.providers.is_empty());
+    }
+
+    #[test]
+    fn test_config_unknown_fields_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"provider":"default","unknown_field":42},"providers":{"default":{"type":"openai","api_key":"test","model":"gpt-4","unknown":"ignored"}}}"#,
+        )
+        .unwrap();
+        let result = Config::load_for_preview(path.to_str().unwrap());
+        // Should succeed — unknown fields are ignored
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_save_and_reload_with_zero_values() {
+        // load_for_preview applies clamp, so zero values should be clamped to minimum.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"provider":"default","max_iterations":0,"timeout_seconds":0},"providers":{"default":{"type":"openai","api_key":"test","model":"gpt-4"}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_for_preview(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.agent.max_iterations, 1); // clamp(0) -> 1
+        assert_eq!(cfg.agent.timeout_seconds, 1); // clamp(0) -> 1
+    }
+
+    #[test]
+    fn test_config_null_values() {
+        // Null values for optional/required fields should be handled gracefully
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"provider":"default"},"providers":{"default":{"type":"openai","api_key":"test","model":"gpt-4","api_url":null}}}"#,
+        )
+        .unwrap();
+        let result = Config::load_for_preview(path.to_str().unwrap());
+        // Should either succeed with null ignored or fail gracefully
+        assert!(result.is_err() || result.unwrap().providers.contains_key("default"));
+    }
+
+    #[test]
+    fn test_config_diff_multiple_changes() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.agent.max_iterations = 50;
+        new.agent.timeout_seconds = 200;
+        new.providers.get_mut("default").unwrap().model = "gpt-4-turbo".to_string();
+
+        let diff = Config::compute_diff(&old, &new);
+        assert_eq!(diff.paths.len(), 3);
+    }
+
+    #[test]
+    fn test_config_compute_diff_no_changes() {
+        let cfg = make_test_config();
+        let diff = Config::compute_diff(&cfg, &cfg);
+        assert!(diff.paths.is_empty());
+    }
+
+    #[test]
+    fn test_config_compute_diff_provider_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.get_mut("default").unwrap().temperature = 0.5;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("temperature")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_multiple_providers() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.insert(
+            "secondary".to_string(),
+            crate::config::ProviderConfig {
+                r#type: "openai".to_string(),
+                api_url: "".to_string(),
+                base_url: "https://api.openai.com".to_string(),
+                api_key: "sk-secondary".to_string(),
+                model: "gpt-3.5-turbo".to_string(),
+                temperature: 0.5,
+                max_tokens: 2048,
+                prompt_cache_enabled: false,
+                unknown: Default::default(),
+            },
+        );
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+    }
+
+    #[test]
+    fn test_config_tools_serialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"provider":"default"},"providers":{"default":{"type":"openai","api_key":"test","model":"gpt-4"}},"tools":[{"name":"shell","enabled":true},{"name":"file_reader","enabled":false}]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_for_preview(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.tools.len(), 2);
+        assert_eq!(cfg.tools[0].name, "shell");
+        assert!(cfg.tools[0].enabled);
+        assert_eq!(cfg.tools[1].name, "file_reader");
+        assert!(!cfg.tools[1].enabled);
+    }
+
+    #[test]
+    fn test_config_channels_serialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"provider":"default"},"providers":{"default":{"type":"openai","api_key":"test","model":"gpt-4"}},"channels":{"cli":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_for_preview(path.to_str().unwrap()).unwrap();
+        assert!(cfg.channels.contains_key("cli"));
+        assert!(cfg.channels["cli"].enabled);
+    }
+
+    #[test]
+    fn test_config_gateway_serialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"provider":"default"},"providers":{"default":{"type":"openai","api_key":"test","model":"gpt-4"}},"gateway":{"cron":{"enabled":false},"heartbeat":{"enabled":true,"interval_s":30}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_for_preview(path.to_str().unwrap()).unwrap();
+        assert!(!cfg.gateway.cron.enabled);
+        assert!(cfg.gateway.heartbeat.enabled);
+        assert_eq!(cfg.gateway.heartbeat.interval_s, 30);
+    }
+
+    #[test]
+    fn test_config_load_for_preview_normalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        // Missing provider field - should be filled by normalization
+        std::fs::write(
+            &path,
+            r#"{"agent":{},"providers":{"default":{"type":"openai","api_key":"test","model":"gpt-4"}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_for_preview(path.to_str().unwrap()).unwrap();
+        // After normalization, provider should be set to "default"
+        assert_eq!(cfg.agent.provider, "default");
+    }
+
+    #[test]
+    fn test_config_tool_entry_serialization() {
+        let entry = crate::config::ToolEntry {
+            name: "shell".to_string(),
+            enabled: true,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("shell"));
+        assert!(json.contains("true"));
+
+        let deserialized: crate::config::ToolEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "shell");
+        assert!(deserialized.enabled);
+    }
+
+    #[test]
+    fn test_config_channel_config_serialization() {
+        let entry = crate::config::ChannelConfig {
+            enabled: true,
+            extra: Default::default(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("true"));
+
+        let deserialized: crate::config::ChannelConfig = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.enabled);
+    }
+
+    #[test]
+    fn test_config_cron_config_defaults() {
+        let cron_config = crate::config::CronConfig::default();
+        assert!(cron_config.enabled);
+    }
+
+    #[test]
+    fn test_config_heartbeat_config_defaults() {
+        let heartbeat_config = crate::config::HeartbeatConfig::default();
+        assert!(heartbeat_config.enabled);
+        assert_eq!(heartbeat_config.interval_s, 1800);
+    }
+
+    #[test]
+    fn test_config_gateway_config_defaults() {
+        let gateway_config = crate::config::GatewayConfig::default();
+        assert!(gateway_config.cron.enabled);
+        assert!(gateway_config.heartbeat.enabled);
+    }
+
+    #[test]
+    fn test_config_provider_config_serialization() {
+        let provider = crate::config::ProviderConfig {
+            r#type: "openai".to_string(),
+            api_url: "https://api.openai.com".to_string(),
+            base_url: "".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-4".to_string(),
+            temperature: 0.7,
+            max_tokens: 4096,
+            prompt_cache_enabled: true,
+            unknown: Default::default(),
+        };
+        let json = serde_json::to_string(&provider).unwrap();
+        assert!(json.contains("openai"));
+        assert!(json.contains("gpt-4"));
+    }
+
+    #[test]
+    fn test_config_agent_config_serialization() {
+        let agent = crate::config::AgentConfig {
+            provider: "default".to_string(),
+            max_iterations: 40,
+            timeout_seconds: 120,
+            max_tool_result_chars: 8000,
+            persist_tool_results: false,
+            context_window_tokens: 32768,
+            unknown: Default::default(),
+        };
+        let json = serde_json::to_string(&agent).unwrap();
+        assert!(json.contains("default"));
+        assert!(json.contains("40"));
+    }
+
+    #[test]
+    fn test_config_save_creates_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/dir/config.json");
+        let cfg = make_test_config();
+        let result = cfg.save(path.to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_config_load_nonexistent_file() {
+        let result = Config::load_for_preview("/nonexistent/config.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_provider_defaults() {
+        let provider = crate::config::ProviderConfig::default();
+        assert_eq!(provider.r#type, "openai");
+        assert_eq!(provider.model, "gpt-4o");
+        assert_eq!(provider.temperature, 0.7);
+        assert_eq!(provider.max_tokens, 4096);
+        assert!(provider.prompt_cache_enabled);
+    }
+
+    #[test]
+    fn test_config_agent_defaults() {
+        let agent = crate::config::AgentConfig::default();
+        assert_eq!(agent.provider, "");
+        assert_eq!(agent.max_iterations, 40);
+        assert_eq!(agent.timeout_seconds, 120);
+        assert_eq!(agent.max_tool_result_chars, 8000);
+        assert!(agent.persist_tool_results);
+        assert_eq!(agent.context_window_tokens, 32768);
+    }
+
+    #[test]
+    fn test_config_provider_config_with_all_fields() {
+        let provider = crate::config::ProviderConfig {
+            r#type: "openai".to_string(),
+            api_url: "https://api.openai.com/v1/chat/completions".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            api_key: "sk-test-key-12345".to_string(),
+            model: "gpt-4-turbo".to_string(),
+            temperature: 0.3,
+            max_tokens: 8192,
+            prompt_cache_enabled: true,
+            unknown: Default::default(),
+        };
+        assert_eq!(provider.r#type, "openai");
+        assert_eq!(
+            provider.api_url,
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(provider.base_url, "https://api.openai.com");
+        assert_eq!(provider.api_key, "sk-test-key-12345");
+        assert_eq!(provider.model, "gpt-4-turbo");
+        assert_eq!(provider.temperature, 0.3);
+        assert_eq!(provider.max_tokens, 8192);
+        assert!(provider.prompt_cache_enabled);
+    }
+
+    #[test]
+    fn test_config_agent_config_with_all_fields() {
+        let agent = crate::config::AgentConfig {
+            provider: "custom-provider".to_string(),
+            max_iterations: 100,
+            timeout_seconds: 300,
+            max_tool_result_chars: 16000,
+            persist_tool_results: true,
+            context_window_tokens: 64000,
+            unknown: Default::default(),
+        };
+        assert_eq!(agent.provider, "custom-provider");
+        assert_eq!(agent.max_iterations, 100);
+        assert_eq!(agent.timeout_seconds, 300);
+        assert_eq!(agent.max_tool_result_chars, 16000);
+        assert!(agent.persist_tool_results);
+        assert_eq!(agent.context_window_tokens, 64000);
+    }
+
+    #[test]
+    fn test_config_compute_diff_with_added_provider() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.insert(
+            "new-provider".to_string(),
+            crate::config::ProviderConfig {
+                r#type: "openai".to_string(),
+                api_url: "".to_string(),
+                base_url: "https://api.openai.com".to_string(),
+                api_key: "sk-new".to_string(),
+                model: "gpt-3.5-turbo".to_string(),
+                temperature: 0.9,
+                max_tokens: 2048,
+                prompt_cache_enabled: false,
+                unknown: Default::default(),
+            },
+        );
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+    }
+
+    #[test]
+    fn test_config_compute_diff_agent_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.agent.max_iterations = 100;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("max_iterations")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_timeout_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.agent.timeout_seconds = 240;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("timeout_seconds")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_context_window_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.agent.context_window_tokens = 128000;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(
+            diff.paths
+                .iter()
+                .any(|p| p.contains("context_window_tokens"))
+        );
+    }
+
+    #[test]
+    fn test_config_compute_diff_model_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.get_mut("default").unwrap().model = "gpt-4-turbo".to_string();
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("model")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_api_key_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.get_mut("default").unwrap().api_key = "sk-new-key".to_string();
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("api_key")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_temperature_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.get_mut("default").unwrap().temperature = 0.9;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("temperature")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_max_tokens_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.get_mut("default").unwrap().max_tokens = 8192;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("max_tokens")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_base_url_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.get_mut("default").unwrap().base_url = "https://custom.api.com".to_string();
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("base_url")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_prompt_cache_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers
+            .get_mut("default")
+            .unwrap()
+            .prompt_cache_enabled = false;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(
+            diff.paths
+                .iter()
+                .any(|p| p.contains("prompt_cache_enabled"))
+        );
+    }
+
+    #[test]
+    fn test_config_compute_diff_provider_type_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.providers.get_mut("default").unwrap().r#type = "anthropic".to_string();
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("type")));
+    }
+
+    #[test]
+    fn test_config_compute_diff_persist_tool_results_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.agent.persist_tool_results = !old.agent.persist_tool_results;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(
+            diff.paths
+                .iter()
+                .any(|p| p.contains("persist_tool_results"))
+        );
+    }
+
+    #[test]
+    fn test_config_compute_diff_max_tool_result_chars_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.agent.max_tool_result_chars = 16000;
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(
+            diff.paths
+                .iter()
+                .any(|p| p.contains("max_tool_result_chars"))
+        );
+    }
+
+    #[test]
+    fn test_config_compute_diff_agent_provider_change() {
+        let old = make_test_config();
+        let mut new = make_test_config();
+        new.agent.provider = "secondary".to_string();
+
+        let diff = Config::compute_diff(&old, &new);
+        assert!(!diff.paths.is_empty());
+        assert!(diff.paths.iter().any(|p| p.contains("provider")));
+    }
+
+    #[test]
+    fn test_config_save_creates_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-config.json");
+        let cfg = make_test_config();
+        let result = cfg.save(path.to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(path.exists());
+
+        // Verify the file contains valid JSON
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.is_object());
+    }
+
+    #[test]
+    fn test_config_load_and_validate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        let cfg = make_test_config();
+        cfg.save(path.to_str().unwrap()).unwrap();
+
+        let loaded = Config::load(path.to_str().unwrap());
+        assert!(loaded.is_ok());
+        let loaded = loaded.unwrap();
+        let validation = loaded.validate();
+        assert!(validation.is_ok());
+    }
+
+    #[test]
+    fn test_config_provider_config_unknown_fields() {
+        let provider = crate::config::ProviderConfig {
+            r#type: "openai".to_string(),
+            api_url: "".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-4".to_string(),
+            temperature: 0.7,
+            max_tokens: 4096,
+            prompt_cache_enabled: true,
+            unknown: Default::default(),
+        };
+        // Verify unknown fields are empty by default
+        assert!(provider.unknown.is_empty());
+    }
+
+    #[test]
+    fn test_config_agent_config_unknown_fields() {
+        let agent = crate::config::AgentConfig {
+            provider: "default".to_string(),
+            max_iterations: 40,
+            timeout_seconds: 120,
+            max_tool_result_chars: 8000,
+            persist_tool_results: false,
+            context_window_tokens: 32768,
+            unknown: Default::default(),
+        };
+        // Verify unknown fields are empty by default
+        assert!(agent.unknown.is_empty());
+    }
+
+    #[test]
+    fn test_config_tool_entry_disabled() {
+        let entry = crate::config::ToolEntry {
+            name: "shell".to_string(),
+            enabled: false,
+        };
+        assert_eq!(entry.name, "shell");
+        assert!(!entry.enabled);
+    }
+
+    #[test]
+    fn test_config_channel_config_disabled() {
+        let entry = crate::config::ChannelConfig {
+            enabled: false,
+            extra: Default::default(),
+        };
+        assert!(!entry.enabled);
+    }
+
+    #[test]
+    fn test_config_cron_config_disabled() {
+        let cron_config = crate::config::CronConfig { enabled: false };
+        assert!(!cron_config.enabled);
+    }
+
+    #[test]
+    fn test_config_heartbeat_config_custom_interval() {
+        let heartbeat_config = crate::config::HeartbeatConfig {
+            enabled: true,
+            interval_s: 300,
+        };
+        assert!(heartbeat_config.enabled);
+        assert_eq!(heartbeat_config.interval_s, 300);
+    }
+
+    #[test]
+    fn test_config_gateway_config_custom() {
+        let gateway_config = crate::config::GatewayConfig {
+            cron: crate::config::CronConfig { enabled: true },
+            heartbeat: crate::config::HeartbeatConfig {
+                enabled: true,
+                interval_s: 120,
+            },
+        };
+        assert!(gateway_config.cron.enabled);
+        assert!(gateway_config.heartbeat.enabled);
+        assert_eq!(gateway_config.heartbeat.interval_s, 120);
+    }
 }

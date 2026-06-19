@@ -226,3 +226,220 @@ async fn handle_cli_command(agent_loop: &AgentLoop, session_id: &str, input: &st
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_args_config_path_from_flag() {
+        let args = CliArgs {
+            config_positional: None,
+            config: Some(PathBuf::from("/path/to/config.json")),
+            data_dir: None,
+            workspace_dir: None,
+            log: 1,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.config_path(), Some("/path/to/config.json"));
+    }
+
+    #[test]
+    fn test_cli_args_config_path_from_positional() {
+        let args = CliArgs {
+            config_positional: Some(PathBuf::from("/path/to/positional.json")),
+            config: None,
+            data_dir: None,
+            workspace_dir: None,
+            log: 1,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.config_path(), Some("/path/to/positional.json"));
+    }
+
+    #[test]
+    fn test_cli_args_config_path_flag_takes_precedence() {
+        let args = CliArgs {
+            config_positional: Some(PathBuf::from("/positional.json")),
+            config: Some(PathBuf::from("/flag.json")),
+            data_dir: None,
+            workspace_dir: None,
+            log: 1,
+            log_file: None,
+            command: None,
+        };
+        // --config should take precedence over positional
+        assert_eq!(args.config_path(), Some("/flag.json"));
+    }
+
+    #[test]
+    fn test_cli_args_config_path_none() {
+        let args = CliArgs {
+            config_positional: None,
+            config: None,
+            data_dir: None,
+            workspace_dir: None,
+            log: 1,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.config_path(), None);
+    }
+
+    #[test]
+    fn test_cli_args_data_dir() {
+        let args = CliArgs {
+            config_positional: None,
+            config: None,
+            data_dir: Some(PathBuf::from("/data/dir")),
+            workspace_dir: None,
+            log: 1,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.data_dir(), Some("/data/dir"));
+    }
+
+    #[test]
+    fn test_cli_args_data_dir_none() {
+        let args = CliArgs {
+            config_positional: None,
+            config: None,
+            data_dir: None,
+            workspace_dir: None,
+            log: 1,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.data_dir(), None);
+    }
+
+    #[test]
+    fn test_cli_args_workspace_dir() {
+        let args = CliArgs {
+            config_positional: None,
+            config: None,
+            data_dir: None,
+            workspace_dir: Some(PathBuf::from("/workspace/dir")),
+            log: 1,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.workspace_dir(), Some("/workspace/dir"));
+    }
+
+    #[test]
+    fn test_cli_args_workspace_dir_none() {
+        let args = CliArgs {
+            config_positional: None,
+            config: None,
+            data_dir: None,
+            workspace_dir: None,
+            log: 1,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.workspace_dir(), None);
+    }
+
+    #[test]
+    fn test_cli_args_log_levels() {
+        let args = CliArgs {
+            config_positional: None,
+            config: None,
+            data_dir: None,
+            workspace_dir: None,
+            log: 0,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.log, 0);
+
+        let args = CliArgs {
+            config_positional: None,
+            config: None,
+            data_dir: None,
+            workspace_dir: None,
+            log: 4,
+            log_file: None,
+            command: None,
+        };
+        assert_eq!(args.log, 4);
+    }
+
+    #[test]
+    fn test_cli_args_log_file() {
+        let args = CliArgs {
+            config_positional: None,
+            config: None,
+            data_dir: None,
+            workspace_dir: None,
+            log: 1,
+            log_file: Some(PathBuf::from("/var/log/slimbot.log")),
+            command: None,
+        };
+        assert_eq!(args.log_file, Some(PathBuf::from("/var/log/slimbot.log")));
+    }
+
+    #[test]
+    fn test_commands_setup_variant() {
+        let cmd = Commands::Setup {
+            config: Some(PathBuf::from("/custom/config.json")),
+        };
+        if let Commands::Setup { config } = cmd {
+            assert_eq!(config, Some(PathBuf::from("/custom/config.json")));
+        } else {
+            panic!("Expected Setup variant");
+        }
+    }
+
+    #[test]
+    fn test_commands_agent_variant() {
+        let cmd = Commands::Agent {
+            query: Some("test query".to_string()),
+            session_id: Some("test-session".to_string()),
+        };
+        if let Commands::Agent { query, session_id } = cmd {
+            assert_eq!(query, Some("test query".to_string()));
+            assert_eq!(session_id, Some("test-session".to_string()));
+        } else {
+            panic!("Expected Agent variant");
+        }
+    }
+
+    #[test]
+    fn test_commands_gateway_variant() {
+        let cmd = Commands::Gateway;
+        if let Commands::Gateway = cmd {
+            // Success
+        } else {
+            panic!("Expected Gateway variant");
+        }
+    }
+
+    #[test]
+    fn test_commands_setup_no_config() {
+        let cmd = Commands::Setup { config: None };
+        if let Commands::Setup { config } = cmd {
+            assert_eq!(config, None);
+        } else {
+            panic!("Expected Setup variant");
+        }
+    }
+
+    #[test]
+    fn test_commands_agent_no_query() {
+        let cmd = Commands::Agent {
+            query: None,
+            session_id: None,
+        };
+        if let Commands::Agent { query, session_id } = cmd {
+            assert_eq!(query, None);
+            assert_eq!(session_id, None);
+        } else {
+            panic!("Expected Agent variant");
+        }
+    }
+}

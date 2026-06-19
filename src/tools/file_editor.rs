@@ -156,4 +156,133 @@ mod tests {
             .await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_edit_missing_path_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({"old_string": "a", "new_string": "b"}))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing required argument: path")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_missing_old_string_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({"path": "edit.txt", "new_string": "b"}))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing required argument: old_string")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_missing_new_string_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("edit.txt"), "hello")
+            .await
+            .unwrap();
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({"path": "edit.txt", "old_string": "hello"}))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing required argument: new_string")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_not_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(tmp.path().join("adir"))
+            .await
+            .unwrap();
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "adir",
+                "old_string": "a",
+                "new_string": "b"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a file"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_path_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "../../outside.txt",
+                "old_string": "a",
+                "new_string": "b"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Path escapes workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_empty_old_string_matches_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("edit.txt"), "hello")
+            .await
+            .unwrap();
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "edit.txt",
+                "old_string": "",
+                "new_string": "x"
+            }))
+            .await;
+        // Empty string matches at every position (len+1 times), so should error
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_edit_unicode_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("edit.txt"), "你好世界")
+            .await
+            .unwrap();
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "edit.txt",
+                "old_string": "世界",
+                "new_string": "Rust"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("1 replacement"));
+        let content = tokio::fs::read_to_string(tmp.path().join("edit.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "你好Rust");
+    }
 }

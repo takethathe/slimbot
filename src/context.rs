@@ -515,4 +515,351 @@ Skill body.
             panic!("expected Tool message");
         }
     }
+
+    #[test]
+    fn test_merge_consecutive_user_plain_plain() {
+        let mut msgs = vec![
+            Message::user("first".to_string()),
+            Message::user("second".to_string()),
+        ];
+        ContextBuilder::merge_consecutive_user_messages(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        if let Message::User { content, .. } = &msgs[0] {
+            match content {
+                Content::Plain(s) => assert_eq!(s, "first\n\nsecond"),
+                _ => panic!("expected Plain content"),
+            }
+        } else {
+            panic!("expected user message");
+        }
+    }
+
+    #[test]
+    fn test_merge_consecutive_user_plain_multi() {
+        let multi = Content::Multi(vec![ContentBlock::Text {
+            text: "multi".to_string(),
+        }]);
+        let mut msgs = vec![
+            Message::user("plain".to_string()),
+            Message::User {
+                meta: MessageMeta::default(),
+                content: multi,
+                runtime_content: None,
+            },
+        ];
+        ContextBuilder::merge_consecutive_user_messages(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        if let Message::User { content, .. } = &msgs[0] {
+            match content {
+                Content::Multi(blocks) => {
+                    assert!(
+                        blocks.len() >= 2,
+                        "expected at least 2 blocks, got {}",
+                        blocks.len()
+                    );
+                }
+                _ => panic!("expected Multi content"),
+            }
+        } else {
+            panic!("expected user message");
+        }
+    }
+
+    #[test]
+    fn test_merge_consecutive_user_multi_plain() {
+        let multi = Content::Multi(vec![ContentBlock::Text {
+            text: "multi".to_string(),
+        }]);
+        let mut msgs = vec![
+            Message::User {
+                meta: MessageMeta::default(),
+                content: multi,
+                runtime_content: None,
+            },
+            Message::user("plain".to_string()),
+        ];
+        ContextBuilder::merge_consecutive_user_messages(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        if let Message::User { content, .. } = &msgs[0] {
+            match content {
+                Content::Multi(blocks) => {
+                    assert!(
+                        blocks.len() >= 2,
+                        "expected at least 2 blocks, got {}",
+                        blocks.len()
+                    );
+                }
+                _ => panic!("expected Multi content"),
+            }
+        } else {
+            panic!("expected user message");
+        }
+    }
+
+    #[test]
+    fn test_merge_consecutive_user_multi_multi() {
+        let multi1 = Content::Multi(vec![ContentBlock::Text {
+            text: "first".to_string(),
+        }]);
+        let multi2 = Content::Multi(vec![ContentBlock::Text {
+            text: "second".to_string(),
+        }]);
+        let mut msgs = vec![
+            Message::User {
+                meta: MessageMeta::default(),
+                content: multi1,
+                runtime_content: None,
+            },
+            Message::User {
+                meta: MessageMeta::default(),
+                content: multi2,
+                runtime_content: None,
+            },
+        ];
+        ContextBuilder::merge_consecutive_user_messages(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        if let Message::User { content, .. } = &msgs[0] {
+            match content {
+                Content::Multi(blocks) => {
+                    assert!(
+                        blocks.len() >= 2,
+                        "expected at least 2 blocks, got {}",
+                        blocks.len()
+                    );
+                }
+                _ => panic!("expected Multi content"),
+            }
+        } else {
+            panic!("expected user message");
+        }
+    }
+
+    #[test]
+    fn test_merge_consecutive_non_user_no_change() {
+        let mut msgs = vec![
+            Message::assistant(Some("ok".to_string()), None, None, None),
+            Message::user("hello".to_string()),
+        ];
+        let before_len = msgs.len();
+        ContextBuilder::merge_consecutive_user_messages(&mut msgs);
+        assert_eq!(msgs.len(), before_len); // no merge for non-consecutive user
+    }
+
+    #[test]
+    fn test_merge_consecutive_single_user_no_change() {
+        let mut msgs = vec![Message::user("hello".to_string())];
+        let before_len = msgs.len();
+        ContextBuilder::merge_consecutive_user_messages(&mut msgs);
+        assert_eq!(msgs.len(), before_len);
+    }
+
+    #[test]
+    fn test_merge_consecutive_preserves_runtime_content() {
+        let mut msgs = vec![
+            Message::User {
+                meta: MessageMeta::default(),
+                content: Content::Plain("first".to_string()),
+                runtime_content: Some("runtime1".to_string()),
+            },
+            Message::User {
+                meta: MessageMeta::default(),
+                content: Content::Plain("second".to_string()),
+                runtime_content: Some("runtime2".to_string()),
+            },
+        ];
+        ContextBuilder::merge_consecutive_user_messages(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        if let Message::User {
+            runtime_content, ..
+        } = &msgs[0]
+        {
+            // First user's runtime_content takes precedence (it was already set)
+            assert_eq!(runtime_content, &Some("runtime1".to_string()));
+        } else {
+            panic!("expected user message");
+        }
+    }
+
+    #[test]
+    fn test_merge_consecutive_runtime_content_or() {
+        let mut msgs = vec![
+            Message::User {
+                meta: MessageMeta::default(),
+                content: Content::Plain("first".to_string()),
+                runtime_content: None,
+            },
+            Message::User {
+                meta: MessageMeta::default(),
+                content: Content::Plain("second".to_string()),
+                runtime_content: Some("runtime".to_string()),
+            },
+        ];
+        ContextBuilder::merge_consecutive_user_messages(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        if let Message::User {
+            runtime_content, ..
+        } = &msgs[0]
+        {
+            // Second user's runtime_content fills in
+            assert_eq!(runtime_content, &Some("runtime".to_string()));
+        } else {
+            panic!("expected user message");
+        }
+    }
+
+    #[test]
+    fn test_parse_skill_frontmatter_empty_name_falls_back() {
+        let input = r#"---
+name:
+description: A skill.
+---
+
+Body
+"#;
+        let meta = parse_skill_frontmatter(input).unwrap();
+        assert_eq!(meta.name, "unknown");
+    }
+
+    #[test]
+    fn test_parse_skill_frontmatter_empty_content_skipped() {
+        let input = "---\nname: test\ndescription: desc\n---\n";
+        let meta = parse_skill_frontmatter(input).unwrap();
+        assert_eq!(meta.content, "");
+    }
+
+    #[test]
+    fn test_parse_skill_frontmatter_with_always_false() {
+        let input = r#"---
+name: optional-skill
+description: An optional skill.
+always: false
+---
+
+Skill content here.
+"#;
+        let meta = parse_skill_frontmatter(input).unwrap();
+        assert_eq!(meta.name, "optional-skill");
+        assert!(!meta.always);
+        assert_eq!(meta.content, "Skill content here.");
+    }
+
+    #[test]
+    fn test_parse_skill_frontmatter_with_always_true() {
+        let input = r#"---
+name: required-skill
+description: A required skill.
+always: true
+---
+
+Required skill content.
+"#;
+        let meta = parse_skill_frontmatter(input).unwrap();
+        assert_eq!(meta.name, "required-skill");
+        assert!(meta.always);
+        assert_eq!(meta.content, "Required skill content.");
+    }
+
+    #[test]
+    fn test_parse_skill_frontmatter_multiline_content() {
+        let input = r#"---
+name: multi
+description: Multi-line content.
+---
+
+# Heading
+
+Paragraph 1.
+
+Paragraph 2.
+
+```rust
+let x = 42;
+```
+"#;
+        let meta = parse_skill_frontmatter(input).unwrap();
+        assert!(meta.content.contains("# Heading"));
+        assert!(meta.content.contains("Paragraph 1."));
+        assert!(meta.content.contains("Paragraph 2."));
+        assert!(meta.content.contains("```rust"));
+    }
+
+    #[test]
+    fn test_build_runtime_context_with_empty_summary() {
+        let ctx = build_runtime_context("webui", "chat-123", Some(""));
+        assert!(!ctx.contains("[Resumed Session]"));
+    }
+
+    #[test]
+    fn test_build_runtime_context_with_summary_variant() {
+        let ctx = build_runtime_context("cli", "default", Some("User prefers Rust"));
+        assert!(ctx.contains("[Resumed Session]"));
+        assert!(ctx.contains("User prefers Rust"));
+    }
+
+    #[test]
+    fn test_runtime_string_contains_rust() {
+        let rt = ContextBuilder::runtime_string();
+        assert!(rt.contains("Rust"));
+    }
+
+    #[test]
+    fn test_runtime_string_contains_os() {
+        let rt = ContextBuilder::runtime_string();
+        // Should contain macOS, Linux, or Windows
+        assert!(rt.contains("macOS") || rt.contains("Linux") || rt.contains("Windows"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_telegram() {
+        let hint = ContextBuilder::channel_format_hint("telegram");
+        assert!(hint.contains("messaging app"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_discord() {
+        let hint = ContextBuilder::channel_format_hint("discord");
+        assert!(hint.contains("messaging app"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_qq() {
+        let hint = ContextBuilder::channel_format_hint("qq");
+        assert!(hint.contains("messaging app"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_whatsapp() {
+        let hint = ContextBuilder::channel_format_hint("whatsapp");
+        assert!(hint.contains("plain text"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_sms() {
+        let hint = ContextBuilder::channel_format_hint("sms");
+        assert!(hint.contains("plain text"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_email() {
+        let hint = ContextBuilder::channel_format_hint("email");
+        assert!(hint.contains("email"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_cli() {
+        let hint = ContextBuilder::channel_format_hint("cli");
+        assert!(hint.contains("terminal"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_mochat() {
+        let hint = ContextBuilder::channel_format_hint("mochat");
+        assert!(hint.contains("terminal"));
+    }
+
+    #[test]
+    fn test_channel_format_hint_unknown_returns_empty() {
+        let hint = ContextBuilder::channel_format_hint("unknown-channel");
+        assert!(hint.is_empty());
+    }
 }

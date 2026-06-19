@@ -139,3 +139,67 @@ fn create_directories_and_bootstrap(paths: &PathManager) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mask_api_key_empty() {
+        assert_eq!(mask_api_key(""), "<not set>");
+    }
+
+    #[test]
+    fn test_mask_api_key_short() {
+        // 8 chars or less → full mask
+        assert_eq!(mask_api_key("1234"), "****");
+        assert_eq!(mask_api_key("12345678"), "****");
+    }
+
+    #[test]
+    fn test_mask_api_key_long() {
+        // More than 8 chars → show first 4 and last 4
+        let result = mask_api_key("sk-1234567890abcdef");
+        assert_eq!(result, "sk-1****cdef");
+    }
+
+    #[test]
+    fn test_mask_api_key_exactly_9_chars() {
+        let result = mask_api_key("123456789");
+        assert_eq!(result, "1234****6789");
+    }
+
+    #[test]
+    fn test_create_directories_and_bootstrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let paths = PathManager::resolve(None, Some(data_dir.to_str().unwrap()), None).unwrap();
+
+        create_directories_and_bootstrap(&paths).unwrap();
+
+        assert!(paths.data_dir().exists());
+        assert!(paths.workspace_dir().exists());
+        assert!(paths.skills_dir().exists());
+        assert!(paths.memory_dir().exists());
+
+        // Bootstrap files should exist
+        let workspace = paths.workspace_dir();
+        assert!(workspace.join("AGENTS.md").exists());
+        assert!(workspace.join("USER.md").exists());
+        assert!(workspace.join("SOUL.md").exists());
+        assert!(workspace.join("TOOLS.md").exists());
+    }
+
+    #[test]
+    fn test_create_directories_and_bootstrap_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let paths = PathManager::resolve(None, Some(data_dir.to_str().unwrap()), None).unwrap();
+
+        // First call
+        create_directories_and_bootstrap(&paths).unwrap();
+
+        // Second call should also succeed (files already exist)
+        create_directories_and_bootstrap(&paths).unwrap();
+    }
+}

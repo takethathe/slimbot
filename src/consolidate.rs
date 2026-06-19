@@ -394,4 +394,68 @@ mod tests {
         let msg = Message::user("hello".to_string());
         assert_eq!(message_content_chars(&msg), 5);
     }
+
+    #[test]
+    fn test_cap_consolidation_boundary_over_limit_returns_capped() {
+        let messages: Vec<Message> = (0..80)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("u{i}"))
+                } else {
+                    Message::assistant(Some(format!("a{i}")), None, None, None)
+                }
+            })
+            .collect();
+        let result = Consolidator::cap_consolidation_boundary(&messages, 0, 80);
+        assert!(result.is_some());
+        let end = result.unwrap();
+        assert!(end <= 60); // capped to MAX_CHUNK_MESSAGES (60), looking back for user boundary
+        assert!(end >= 58); // should be near the 60 boundary (58 is the last even index before 60)
+        assert!(matches!(messages[end], Message::User { .. }));
+    }
+
+    #[test]
+    fn test_cap_consolidation_boundary_over_limit_no_user_boundary() {
+        let messages: Vec<Message> = (0..80)
+            .map(|i| Message::assistant(Some(format!("a{i}")), None, None, None))
+            .collect();
+        let result = Consolidator::cap_consolidation_boundary(&messages, 0, 80);
+        assert!(result.is_none()); // no user boundary to cap to
+    }
+
+    #[test]
+    fn test_pick_consolidation_boundary_zero_tokens_to_remove() {
+        let messages = vec![Message::user("hello".to_string())];
+        let result = Consolidator::pick_consolidation_boundary(&messages, 0, 0, 2.0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pick_consolidation_boundary_start_at_end() {
+        let messages = vec![Message::user("hello".to_string())];
+        let result = Consolidator::pick_consolidation_boundary(&messages, 1, 100, 2.0);
+        assert!(result.is_none()); // start_idx >= messages.len()
+    }
+
+    #[test]
+    fn test_format_messages_with_system_role() {
+        let messages = vec![
+            Message::system("system prompt".to_string()),
+            Message::user("hello".to_string()),
+        ];
+        let formatted = Consolidator::format_messages(&messages);
+        assert!(formatted.contains("[SYSTEM] system prompt"));
+        assert!(formatted.contains("[USER] hello"));
+    }
+
+    #[test]
+    fn test_format_messages_empty_message_skipped() {
+        let messages = vec![
+            Message::assistant(None, None, None, None),
+            Message::user("hello".to_string()),
+        ];
+        let formatted = Consolidator::format_messages(&messages);
+        assert!(!formatted.contains("[ASSISTANT]"));
+        assert!(formatted.contains("[USER] hello"));
+    }
 }

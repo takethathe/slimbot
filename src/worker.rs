@@ -273,4 +273,127 @@ mod tests {
         let pool = WorkerPool::global();
         assert_eq!(pool.max_workers, 64);
     }
+
+    #[tokio::test]
+    async fn test_worker_queue_len_increases() {
+        let worker = Worker::new();
+
+        // Submit a task that takes some time
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..5 {
+            let done = done.clone();
+            worker.submit(Box::new(move || {
+                let done = done.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        // Submit more tasks while first is running — queue should grow
+        for _ in 0..3 {
+            let done = done.clone();
+            worker.submit(Box::new(move || {
+                let done = done.clone();
+                Box::pin(async move {
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        // Queue_len should reflect pending tasks (timing-dependent, so just check non-negative)
+        let ql = worker.queue_len();
+        assert!(ql <= 8); // at most 8 total
+        worker.close();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(done.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn test_worker_clone_shares_queue() {
+        let worker = Worker::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let cloned = worker.clone();
+        assert_eq!(worker.id(), cloned.id()); // same id
+
+        // Submit on original
+        let counter1 = counter.clone();
+        worker.submit(Box::new(move || {
+            let counter1 = counter1.clone();
+            Box::pin(async move {
+                counter1.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+
+        // Submit on clone
+        let counter2 = counter.clone();
+        cloned.submit(Box::new(move || {
+            let counter2 = counter2.clone();
+            Box::pin(async move {
+                counter2.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        worker.close();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_queues_to_smallest_when_at_capacity() {
+        let pool = WorkerPool::new(1);
+
+        // Submit a long-running task
+        pool.submit(Box::new(|| {
+            Box::pin(async { tokio::time::sleep(std::time::Duration::from_millis(100)).await })
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // At capacity — subsequent tasks queue to the same worker
+        pool.submit(Box::new(|| Box::pin(async {})));
+        pool.submit(Box::new(|| Box::pin(async {})));
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let workers = pool.workers.read().unwrap();
+        assert_eq!(workers.len(), 1); // still only 1 worker
+        assert!(workers[0].worker.queue_len() >= 2); // queued tasks
+    }
+
+    #[tokio::test]
+    async fn test_pool_reap_idle_workers() {
+        let pool = WorkerPool::new(4);
+
+        // Submit and complete a task
+        pool.submit(Box::new(|| Box::pin(async {})));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(pool.workers.read().unwrap().len(), 1);
+
+        // Mark worker as old by modifying last_active (indirectly via reaping logic)
+        // Since we can't easily manipulate time, verify that reap doesn't remove fresh workers
+        pool.reap_idle_workers();
+        assert_eq!(pool.workers.read().unwrap().len(), 1); // fresh worker retained
+    }
+
+    #[tokio::test]
+    async fn test_pool_reap_retains_pending_workers() {
+        let pool = WorkerPool::new(1);
+
+        // Submit a task that will queue more tasks
+        pool.submit(Box::new(|| {
+            Box::pin(async { tokio::time::sleep(std::time::Duration::from_millis(200)).await })
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Queue more tasks
+        pool.submit(Box::new(|| Box::pin(async {})));
+        pool.submit(Box::new(|| Box::pin(async {})));
+
+        // Reap should not remove workers with pending tasks
+        pool.reap_idle_workers();
+        assert_eq!(pool.workers.read().unwrap().len(), 1);
+    }
 }

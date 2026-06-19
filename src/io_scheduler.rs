@@ -152,3 +152,162 @@ fn read_line_blocking(prompt: &str) -> Result<String, IoReadError> {
     }
     Ok(input)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_io_scheduler_new() {
+        let (tx, _rx) = mpsc::channel(10);
+        let scheduler = IoScheduler::new(tx);
+        // Verify shutdown flag is initially false
+        assert!(!scheduler.shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_io_scheduler_shutdown() {
+        let (tx, _rx) = mpsc::channel(10);
+        let scheduler = IoScheduler::new(tx);
+        scheduler.shutdown();
+        assert!(scheduler.shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_io_scheduler_set_channel_command_cb() {
+        let (tx, _rx) = mpsc::channel(10);
+        let scheduler = IoScheduler::new(tx);
+
+        let cb_called = Arc::new(AtomicBool::new(false));
+        let cb_called_clone = cb_called.clone();
+        let cb: ChannelCommandCallback = Arc::new(move |_session_id, _cmd| {
+            cb_called_clone.store(true, Ordering::Relaxed);
+        });
+
+        scheduler.set_channel_command_cb(cb);
+
+        // Verify callback is set
+        let guard = scheduler.channel_cmd_cb.lock().unwrap();
+        assert!(guard.is_some());
+    }
+
+    #[test]
+    fn test_io_read_error_variants() {
+        // Verify IoReadError variants can be created
+        let eof = IoReadError::Eof;
+        let empty = IoReadError::Empty;
+        let other = IoReadError::Other(anyhow::anyhow!("test error"));
+
+        // Just verify they can be constructed (they're used in match arms)
+        assert!(matches!(eof, IoReadError::Eof));
+        assert!(matches!(empty, IoReadError::Empty));
+        assert!(matches!(other, IoReadError::Other(_)));
+    }
+
+    #[test]
+    fn test_io_handle_struct() {
+        // Verify IoHandle can be constructed
+        let handle = IoHandle {
+            join_handle: None,
+            session_id: "test-session".to_string(),
+            channel_name: "test-channel".to_string(),
+        };
+        assert_eq!(handle.session_id, "test-session");
+        assert_eq!(handle.channel_name, "test-channel");
+        assert!(handle.join_handle.is_none());
+    }
+
+    #[test]
+    fn test_io_scheduler_new_with_capacity() {
+        let (tx, _rx) = mpsc::channel(100);
+        let scheduler = IoScheduler::new(tx);
+        assert!(!scheduler.shutdown.load(Ordering::Relaxed));
+        assert!(scheduler.channel_cmd_cb.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_io_scheduler_shutdown_idempotent() {
+        let (tx, _rx) = mpsc::channel(10);
+        let scheduler = IoScheduler::new(tx);
+        // Shutdown multiple times should not panic
+        scheduler.shutdown();
+        scheduler.shutdown();
+        scheduler.shutdown();
+        assert!(scheduler.shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_io_scheduler_callback_replacement() {
+        let (tx, _rx) = mpsc::channel(10);
+        let scheduler = IoScheduler::new(tx);
+
+        let call_count1 = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_count1_clone = call_count1.clone();
+        let cb1: ChannelCommandCallback = Arc::new(move |_, _| {
+            call_count1_clone.fetch_add(1, Ordering::Relaxed);
+        });
+        scheduler.set_channel_command_cb(cb1);
+
+        let call_count2 = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_count2_clone = call_count2.clone();
+        let cb2: ChannelCommandCallback = Arc::new(move |_, _| {
+            call_count2_clone.fetch_add(1, Ordering::Relaxed);
+        });
+        scheduler.set_channel_command_cb(cb2);
+
+        // Verify only the latest callback is stored
+        let guard = scheduler.channel_cmd_cb.lock().unwrap();
+        assert!(guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_io_scheduler_submit_blocking_read_loop_returns_handle() {
+        let (tx, _rx) = mpsc::channel(10);
+        let scheduler = IoScheduler::new(tx);
+        let hook = crate::session::TaskHook::new("test-session");
+
+        // Just verify the function can be called and returns a JoinHandle
+        // We don't actually run the loop since it would block on stdin
+        let handle = scheduler.submit_blocking_read_loop(
+            "test-session".to_string(),
+            hook,
+            "cli".to_string(),
+            "> ".to_string(),
+        );
+
+        // Verify the handle is valid
+        assert!(!handle.is_finished());
+
+        // Cleanup - shut down to allow the spawned task to exit
+        scheduler.shutdown();
+        // Give the task time to notice the shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_io_read_error_debug() {
+        // Verify IoReadError implements Debug
+        let eof = IoReadError::Eof;
+        let debug_str = format!("{:?}", eof);
+        assert!(debug_str.contains("Eof"));
+
+        let empty = IoReadError::Empty;
+        let debug_str = format!("{:?}", empty);
+        assert!(debug_str.contains("Empty"));
+    }
+
+    #[test]
+    fn test_io_handle_fields_accessible() {
+        let handle = IoHandle {
+            join_handle: None,
+            session_id: "cli:chat-123".to_string(),
+            channel_name: "cli".to_string(),
+        };
+
+        // Verify all fields are accessible
+        assert_eq!(handle.session_id, "cli:chat-123");
+        assert_eq!(handle.channel_name, "cli");
+        assert!(handle.join_handle.is_none());
+    }
+}
