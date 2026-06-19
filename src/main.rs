@@ -68,7 +68,9 @@ async fn run_cli_agent(
 ) -> Result<()> {
     WorkerPool::init_global(64);
     let config = Arc::new(Config::load(paths.config_path().to_str().unwrap())?);
-    let message_bus = Arc::new(MessageBus::new());
-    let agent_loop = AgentLoop::from_config(paths, message_bus.clone(), config.clone()).await?;
+    let (message_bus, receivers) = MessageBus::new();
+    // CLI mode drives tasks directly via run_task. inbound_rx is consumed by
+    // AgentLoop; outbound_rx is unused here and dropped with `receivers`.
+    let agent_loop = AgentLoop::from_config(paths, message_bus, receivers.inbound, config).await?;
     run_agent_session(&agent_loop, session_id, query).await
 }

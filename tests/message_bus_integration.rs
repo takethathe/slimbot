@@ -4,28 +4,25 @@ use slimbot::{BusRequest, BusResult, MessageBus, TaskHook};
 
 #[tokio::test]
 async fn test_message_bus_new_has_all_endpoints() {
-    let bus = MessageBus::new();
+    let (bus, receivers) = MessageBus::new();
     let inbound_tx = bus.inbound_tx();
-    let inbound_rx = bus.inbound_rx();
     let outbound_tx = bus.outbound_tx();
-    let outbound_rx = bus.outbound_rx();
 
-    // All endpoints should be usable
+    // Senders should have positive capacity
     assert!(inbound_tx.capacity() > 0);
     assert!(outbound_tx.capacity() > 0);
-    // rx endpoints are wrapped in Arc<Mutex> so we can't directly check,
-    // but we can verify they exist and can be cloned
-    let _ = inbound_rx.clone();
-    let _ = outbound_rx.clone();
+    // Receivers are owned directly (no Arc<Mutex> wrapping) — verify they exist.
+    let _ = receivers.inbound;
+    let _ = receivers.outbound;
 }
 
 // ── Inbound message flow ──
 
 #[tokio::test]
 async fn test_inbound_request_flow() {
-    let bus = MessageBus::new();
+    let (bus, receivers) = MessageBus::new();
     let tx = bus.inbound_tx();
-    let rx = bus.inbound_rx();
+    let mut rx = receivers.inbound;
 
     let request = BusRequest {
         session_id: "test:chat1".to_string(),
@@ -36,9 +33,8 @@ async fn test_inbound_request_flow() {
 
     tx.send(request).await.unwrap();
 
-    // Receive on the other end
-    let mut guard = rx.lock().await;
-    let received = guard.recv().await.unwrap();
+    // Receive on the other end — no lock, owned receiver
+    let received = rx.recv().await.unwrap();
     assert_eq!(received.session_id, "test:chat1");
     assert_eq!(received.content, "hello");
     assert!(received.channel_inject.is_none());
@@ -48,9 +44,9 @@ async fn test_inbound_request_flow() {
 
 #[tokio::test]
 async fn test_outbound_result_flow() {
-    let bus = MessageBus::new();
+    let (bus, receivers) = MessageBus::new();
     let tx = bus.outbound_tx();
-    let rx = bus.outbound_rx();
+    let mut rx = receivers.outbound;
 
     let result = BusResult {
         session_id: "test:chat1".to_string(),
@@ -60,8 +56,7 @@ async fn test_outbound_result_flow() {
 
     tx.send(result).await.unwrap();
 
-    let mut guard = rx.lock().await;
-    let received = guard.recv().await.unwrap();
+    let received = rx.recv().await.unwrap();
     assert_eq!(received.session_id, "test:chat1");
     assert_eq!(received.task_id, "task-123");
     assert_eq!(received.content, "final answer");
@@ -71,7 +66,7 @@ async fn test_outbound_result_flow() {
 
 #[tokio::test]
 async fn test_inbound_channel_fills_up() {
-    let bus = MessageBus::new();
+    let (bus, _receivers) = MessageBus::new();
     let tx = bus.inbound_tx();
 
     // Fill up the channel (capacity is 32)
@@ -102,22 +97,20 @@ async fn test_inbound_channel_fills_up() {
 
 #[tokio::test]
 async fn test_concurrent_inbound_outbound() {
-    let bus = MessageBus::new();
+    let (bus, receivers) = MessageBus::new();
     let in_tx = bus.inbound_tx();
-    let in_rx = bus.inbound_rx();
+    let mut in_rx = receivers.inbound;
     let out_tx = bus.outbound_tx();
-    let out_rx = bus.outbound_rx();
+    let mut out_rx = receivers.outbound;
 
     // Spawn a task that receives inbound and sends outbound
     let producer = tokio::spawn(async move {
-        let mut guard = in_rx.lock().await;
-        let req = guard.recv().await.unwrap();
+        let req = in_rx.recv().await.unwrap();
         let result = BusResult {
             session_id: req.session_id,
             task_id: "task-1".to_string(),
             content: format!("processed: {}", req.content),
         };
-        drop(guard);
         out_tx.send(result).await.unwrap();
     });
 
@@ -132,9 +125,8 @@ async fn test_concurrent_inbound_outbound() {
         .await
         .unwrap();
 
-    // Receive the result
-    let mut guard = out_rx.lock().await;
-    let result = guard.recv().await.unwrap();
+    // Receive the result — no lock, owned receiver
+    let result = out_rx.recv().await.unwrap();
     assert_eq!(result.content, "processed: do something");
 
     producer.await.unwrap();

@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn test_webui_channel_factory() {
         // Create dummy message bus and session manager for factory test
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let tmp = tempfile::tempdir().unwrap();
         let sm = Arc::new(tokio::sync::Mutex::new(
             crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
@@ -518,7 +518,7 @@ mod tests {
     async fn test_webui_list_chats_empty() {
         let state = Arc::new(AppState {
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().inbound_tx(),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
             channel_id: "webui".to_string(),
             session_manager: None,
             index_html: String::new(),
@@ -549,7 +549,7 @@ mod tests {
 
         let state = Arc::new(AppState {
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().inbound_tx(),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
             channel_id: "webui".to_string(),
             session_manager: Some(sm),
             index_html: String::new(),
@@ -586,7 +586,7 @@ mod tests {
 
         let state = Arc::new(AppState {
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().inbound_tx(),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
             channel_id: "webui".to_string(),
             session_manager: Some(sm),
             index_html: String::new(),
@@ -600,7 +600,7 @@ mod tests {
     fn test_webui_create_chat_handler_generates_id() {
         let state = Arc::new(AppState {
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().inbound_tx(),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
             channel_id: "webui".to_string(),
             session_manager: None,
             index_html: String::new(),
@@ -641,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webui_server_starts_and_shuts_down() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let tmp = tempfile::tempdir().unwrap();
         let sm = Arc::new(tokio::sync::Mutex::new(
             crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
@@ -678,7 +678,7 @@ mod tests {
     async fn test_webui_server_starts_without_shutdown_rx() {
         // Server without shutdown_rx should still start (bind to port).
         // We can't easily test it shutting down, but verify it starts without panic.
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let tmp = tempfile::tempdir().unwrap();
         let sm = Arc::new(tokio::sync::Mutex::new(
             crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),

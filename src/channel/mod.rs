@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::io_scheduler::{ChannelCommandCallback, IoHandle, IoScheduler};
@@ -83,6 +84,8 @@ pub struct ChannelManager {
     channels: Arc<Mutex<HashMap<String, Box<dyn Channel>>>>,
     factories: HashMap<String, Box<dyn ChannelFactory>>,
     message_bus: Arc<MessageBus>,
+    /// Owned outbound receiver, consumed once by `run`/`run_with_shutdown`.
+    outbound_rx: std::sync::Mutex<Option<mpsc::Receiver<BusResult>>>,
     config: Arc<Config>,
     io_handles: Arc<Mutex<HashMap<String, IoHandle>>>,
     io_scheduler: IoScheduler,
@@ -92,6 +95,7 @@ pub struct ChannelManager {
 impl ChannelManager {
     pub fn new(
         message_bus: Arc<MessageBus>,
+        outbound_rx: mpsc::Receiver<BusResult>,
         config: Arc<Config>,
         event_tx: Option<broadcast::Sender<AgentEvent>>,
     ) -> Self {
@@ -100,6 +104,7 @@ impl ChannelManager {
             channels: Arc::new(Mutex::new(HashMap::new())),
             factories: HashMap::new(),
             message_bus,
+            outbound_rx: std::sync::Mutex::new(Some(outbound_rx)),
             config,
             io_handles: Arc::new(Mutex::new(HashMap::new())),
             io_scheduler,
@@ -112,6 +117,16 @@ impl ChannelManager {
     /// Return the event broadcast sender for channels to subscribe to agent events.
     pub fn event_tx(&self) -> Option<broadcast::Sender<AgentEvent>> {
         self.event_tx.clone()
+    }
+
+    /// Take the owned outbound receiver, panicking if already consumed.
+    /// Used by `run()` and `run_with_shutdown()` to enforce single-consumer contract.
+    fn take_outbound_rx(&self) -> mpsc::Receiver<BusResult> {
+        self.outbound_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("outbound_rx already consumed by a previous run/run_with_shutdown call")
     }
 
     /// Set the shutdown broadcast callback that fires when a channel-tier command
@@ -259,10 +274,9 @@ impl ChannelManager {
     /// outbound channel is closed. This is the main event loop for the system.
     pub async fn run(&self) {
         let channels = self.channels.clone();
-        let outbound_rx = self.message_bus.outbound_rx();
+        let mut outbound_rx = self.take_outbound_rx();
 
-        let mut rx_guard = outbound_rx.lock().await;
-        while let Some(result) = rx_guard.recv().await {
+        while let Some(result) = outbound_rx.recv().await {
             let channel_id = extract_channel_id(&result.session_id);
 
             // Skip system-triggered sessions (cron, heartbeat) — they have no user-facing channel
@@ -327,14 +341,11 @@ impl ChannelManager {
 
         // Existing outbound router
         let channels = self.channels.clone();
-        let outbound_rx = self.message_bus.outbound_rx();
+        let mut outbound_rx = self.take_outbound_rx();
 
         loop {
             tokio::select! {
-                result = async {
-                    let mut rx_guard = outbound_rx.lock().await;
-                    rx_guard.recv().await
-                } => {
+                result = outbound_rx.recv() => {
                     let Some(result) = result else { break };
                     let channel_id = result
                         .session_id
@@ -481,9 +492,9 @@ mod tests {
 
     #[test]
     fn test_channel_manager_register_factory() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let config = Arc::new(make_test_config());
-        let mut cm = ChannelManager::new(mb, config, None);
+        let mut cm = ChannelManager::new(mb, _receivers.outbound, config, None);
 
         cm.register_factory("test", Box::new(TestChannelFactory));
         assert!(cm.factories.contains_key("test"));
@@ -500,9 +511,9 @@ mod tests {
                 extra: Default::default(),
             },
         );
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config, None);
+        let mut cm = ChannelManager::new(mb, _receivers.outbound, config, None);
         cm.register_factory("test", Box::new(TestChannelFactory));
 
         cm.init().await.unwrap();
@@ -519,9 +530,9 @@ mod tests {
                 extra: Default::default(),
             },
         );
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config, None);
+        let mut cm = ChannelManager::new(mb, _receivers.outbound, config, None);
         cm.register_factory("test", Box::new(TestChannelFactory));
 
         cm.init().await.unwrap();
@@ -538,9 +549,9 @@ mod tests {
                 extra: Default::default(),
             },
         );
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config, None);
+        let mut cm = ChannelManager::new(mb, _receivers.outbound, config, None);
         // No factory registered for "unknown"
 
         let result = cm.init().await;
@@ -549,18 +560,18 @@ mod tests {
 
     #[test]
     fn test_channel_manager_shutdown_io() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let config = Arc::new(make_test_config());
-        let cm = ChannelManager::new(mb, config, None);
+        let cm = ChannelManager::new(mb, _receivers.outbound, config, None);
         // Should not panic even with no handles
         cm.shutdown_io();
     }
 
     #[test]
     fn test_channel_manager_channel_info_default() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let config = Arc::new(make_test_config());
-        let cm = ChannelManager::new(mb, config, None);
+        let cm = ChannelManager::new(mb, _receivers.outbound, config, None);
         let (sid, prompt) = cm.channel_info();
         assert_eq!(sid, "cli:default");
         assert_eq!(prompt, "> ");
@@ -578,9 +589,9 @@ mod tests {
                 extra: Default::default(),
             },
         );
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config, None);
+        let mut cm = ChannelManager::new(mb, _receivers.outbound, config, None);
         cm.register_factory("test", Box::new(TestChannelFactory));
         cm.init().await.unwrap();
         cm.start_channels().await;
@@ -602,8 +613,8 @@ mod tests {
     async fn test_channel_manager_init_empty_channels() {
         // Config with no channels should init cleanly
         let config = Arc::new(make_test_config());
-        let mb = Arc::new(MessageBus::new());
-        let mut cm = ChannelManager::new(mb, config, None);
+        let (mb, _receivers) = MessageBus::new();
+        let mut cm = ChannelManager::new(mb, _receivers.outbound, config, None);
 
         cm.init().await.unwrap();
         assert!(cm.channels.lock().await.is_empty());
@@ -626,9 +637,9 @@ mod tests {
                 extra: Default::default(),
             },
         );
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let config = Arc::new(config);
-        let mut cm = ChannelManager::new(mb, config, None);
+        let mut cm = ChannelManager::new(mb, _receivers.outbound, config, None);
         // Register factories for both types
         let factory1: Box<dyn ChannelFactory> = Box::new(TestChannelFactory);
         let factory2: Box<dyn ChannelFactory> = Box::new(TestChannelFactory);

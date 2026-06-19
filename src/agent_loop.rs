@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -56,6 +56,8 @@ pub struct AgentLoop {
     session_manager: SharedSessionManager,
     memory_store: SharedMemoryStore,
     message_bus: Arc<MessageBus>,
+    /// Owned inbound receiver, consumed once by `start_inbound`.
+    inbound_rx: Mutex<Option<mpsc::Receiver<BusRequest>>>,
     consolidator: Arc<Consolidator>,
     /// Broadcast sender: triggers shutdown of inbound loop and I/O schedulers.
     shutdown_tx: broadcast::Sender<()>,
@@ -138,6 +140,7 @@ impl AgentLoop {
     pub async fn from_config(
         paths: &PathManager,
         message_bus: Arc<MessageBus>,
+        inbound_rx: mpsc::Receiver<BusRequest>,
         config: Arc<Config>,
     ) -> Result<Self> {
         let provider_config = config
@@ -149,7 +152,15 @@ impl AgentLoop {
         let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
         tool_manager.init_from_config(&config.tools);
 
-        Self::from_parts(paths, message_bus, config, provider, tool_manager).await
+        Self::from_parts(
+            paths,
+            message_bus,
+            inbound_rx,
+            config,
+            provider,
+            tool_manager,
+        )
+        .await
     }
 
     /// Create an AgentLoop from a pre-configured ToolManager.
@@ -157,6 +168,7 @@ impl AgentLoop {
     pub async fn from_config_with_tools(
         paths: &PathManager,
         message_bus: Arc<MessageBus>,
+        inbound_rx: mpsc::Receiver<BusRequest>,
         config: Arc<Config>,
         tool_manager: ToolManager,
     ) -> Result<Self> {
@@ -166,12 +178,21 @@ impl AgentLoop {
             .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", config.agent.provider))?;
         let provider = Arc::new(OpenAIProvider::new(provider_config));
 
-        Self::from_parts(paths, message_bus, config, provider, tool_manager).await
+        Self::from_parts(
+            paths,
+            message_bus,
+            inbound_rx,
+            config,
+            provider,
+            tool_manager,
+        )
+        .await
     }
 
     async fn from_parts(
         paths: &PathManager,
         message_bus: Arc<MessageBus>,
+        inbound_rx: mpsc::Receiver<BusRequest>,
         config: Arc<Config>,
         provider: Arc<dyn Provider>,
         tool_manager: ToolManager,
@@ -213,6 +234,7 @@ impl AgentLoop {
             session_manager: session_manager_arc,
             memory_store,
             message_bus,
+            inbound_rx: Mutex::new(Some(inbound_rx)),
             consolidator,
             shutdown_tx,
             runner,
@@ -282,7 +304,12 @@ impl AgentLoop {
 
     /// Start the inbound listener task.
     pub fn start_inbound(&self, done: Option<Arc<Notify>>) {
-        let inbound_rx = self.message_bus.inbound_rx();
+        let mut inbound_rx = self
+            .inbound_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("inbound_rx already consumed by a previous start_inbound call");
         let session_manager = self.session_manager.clone();
         let tool_manager = self.tool_manager.clone();
         let provider = self.provider.clone();
@@ -291,6 +318,7 @@ impl AgentLoop {
         let memory_store = self.memory_store.clone();
         let outbound_tx = self.message_bus.outbound_tx();
         let consolidator = self.consolidator.clone();
+        let message_bus = self.message_bus.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
@@ -301,10 +329,7 @@ impl AgentLoop {
                         info!("[AgentLoop] Shutdown signal received, stopping inbound listener");
                         break;
                     }
-                    request = async {
-                        let mut rx_guard = inbound_rx.lock().await;
-                        rx_guard.recv().await
-                    } => {
+                    request = inbound_rx.recv() => {
                         let request = match request {
                             Some(r) => r,
                             None => break, // channel closed
@@ -322,7 +347,7 @@ impl AgentLoop {
                                 &request.content,
                             ).await;
                             if !msg.is_empty() {
-                                let _ = outbound_tx.send(BusResult {
+                                message_bus.publish_outbound(BusResult {
                                     session_id: sid.clone(),
                                     task_id: String::new(),
                                     content: msg,
@@ -546,7 +571,7 @@ mod tests {
     async fn test_agent_loop_from_config() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_test_paths(&tmp);
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -586,7 +611,7 @@ mod tests {
             },
         });
 
-        let result = AgentLoop::from_config(&paths, message_bus, config).await;
+        let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
         assert!(result.is_ok());
     }
 
@@ -594,7 +619,7 @@ mod tests {
     async fn test_agent_loop_from_config_with_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_test_paths(&tmp);
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -635,8 +660,14 @@ mod tests {
         });
 
         let tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
-        let result =
-            AgentLoop::from_config_with_tools(&paths, message_bus, config, tool_manager).await;
+        let result = AgentLoop::from_config_with_tools(
+            &paths,
+            message_bus,
+            _receivers.inbound,
+            config,
+            tool_manager,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -644,7 +675,7 @@ mod tests {
     async fn test_agent_loop_session_manager() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_test_paths(&tmp);
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -684,7 +715,7 @@ mod tests {
             },
         });
 
-        let agent_loop = AgentLoop::from_config(&paths, message_bus, config)
+        let agent_loop = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
             .await
             .unwrap();
         let sm = agent_loop.session_manager();
@@ -695,7 +726,7 @@ mod tests {
     async fn test_agent_loop_config() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_test_paths(&tmp);
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -735,9 +766,10 @@ mod tests {
             },
         });
 
-        let agent_loop = AgentLoop::from_config(&paths, message_bus, config.clone())
-            .await
-            .unwrap();
+        let agent_loop =
+            AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config.clone())
+                .await
+                .unwrap();
         assert_eq!(agent_loop.config().agent.provider, "default");
     }
 
@@ -745,7 +777,7 @@ mod tests {
     async fn test_agent_loop_register_tool() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_test_paths(&tmp);
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -785,9 +817,10 @@ mod tests {
             },
         });
 
-        let mut agent_loop = AgentLoop::from_config(&paths, message_bus, config)
-            .await
-            .unwrap();
+        let mut agent_loop =
+            AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
+                .await
+                .unwrap();
         // register_tool is a no-op but should not panic
         agent_loop.register_tool(Box::new(crate::tools::shell::ShellTool::default()));
     }
@@ -808,7 +841,7 @@ mod tests {
 
     async fn make_agent_loop(tmp: &tempfile::TempDir) -> AgentLoop {
         let paths = make_test_paths(tmp);
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -847,7 +880,7 @@ mod tests {
                 },
             },
         });
-        AgentLoop::from_config(&paths, message_bus, config)
+        AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
             .await
             .unwrap()
     }
@@ -892,7 +925,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agent_loop = Arc::new(make_agent_loop(&tmp).await);
 
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -917,6 +950,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel::<crate::session::AgentEvent>(256);
         let channel_manager = Arc::new(crate::channel::ChannelManager::new(
             message_bus,
+            _receivers.outbound,
             config,
             Some(event_tx),
         ));
@@ -953,7 +987,7 @@ mod tests {
     async fn test_agent_loop_from_config_missing_provider() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_test_paths(&tmp);
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "nonexistent".to_string(), // Provider doesn't exist
@@ -993,7 +1027,7 @@ mod tests {
             },
         });
 
-        let result = AgentLoop::from_config(&paths, message_bus, config).await;
+        let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
         assert!(result.is_err());
         let err_str = format!("{}", result.err().unwrap());
         assert!(err_str.contains("not found"));

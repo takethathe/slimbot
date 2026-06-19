@@ -148,13 +148,15 @@
 
 ## 代码优化（2026-05-24 审计）
 
+> 注：2026-06-19 本次仅完成第 155 项；第 154 项经核查已由 `SessionManager::graceful_shutdown()` 完成；第 153 项经核查 `AgentRunner` 已作为字段复用于 `AgentLoop`；第 157 项需新依赖（`arc-swap`）或重新设计 reset 语义，单独留待后续。
+
 ### 高优先级（性能 / 正确性）
 
-- [ ] **复用 AgentRunner 实例** — `AgentLoop::run_task` 每次调用都新建 `AgentRunner`，clone 11 个字段。将 `AgentRunner` 提前构建并复用，避免 `PathBuf` 等堆分配（`agent_loop.rs:256-268`, `runner.rs:306-315`）
-- [ ] **合并 shutdown_session_memory 三次锁为一次** — `shutdown_all()`, `wait_all_idle()`, `sync_all_meta()` 分别获取同一把锁。封装为 `SessionManager` 上的单一方法（`agent_loop.rs:50-55`）
-- [ ] **移除 MessageBus 中 `Arc<Mutex<Receiver>>` 包装** — 每个 receiver 只有单一消费者，`Arc<tokio::sync::Mutex>` 是多余开销。直接传递 `Receiver` 所有权（`message_bus.rs:32-34`）
+- [x] **复用 AgentRunner 实例** — `AgentRunner` 已作为字段复用（`agent_loop.rs:63` `runner: AgentRunner`）
+- [x] **合并 shutdown_session_memory 三次锁为一次** — 已由 `SessionManager::graceful_shutdown()` 合并 `wait_all_idle` + `sync_all_meta` 到单次锁内，且为唯一生产调用路径（2026-06-19 核查确认）
+- [x] **移除 MessageBus 中 `Arc<Mutex<Receiver>>` 包装** — 已改为 `new()` 返回 `(Arc<MessageBus>, MessageBusReceivers)`，receiver 按所有权移交唯一消费者，并新增 `publish_inbound` / `publish_outbound` 发送封装（2026-06-19）
 - [ ] **缓存 ToolManager 的 `to_openai_functions` 结果** — 工具定义是静态的，但每次 LLM 调用都重新分配 `Vec` 并 clone 所有字符串。改为内部缓存，注册时重建（`tool.rs:120-129`）
-- [ ] **移除 CancellationToken 的 Mutex 包装** — `CancellationToken` 本身已线程安全，`Arc<std::sync::Mutex<CancellationToken>>` 是多余序列化。直接 clone 使用（`session.rs:32`）
+- [ ] **移除 CancellationToken 的 Mutex 包装** — 当前 `Mutex` 用于保护 `cancel_and_reset()` 中的 token 交换（`/stop` 重置语义需要），不是冗余锁；真正去锁需引入 `arc-swap` 新依赖或重设 reset 语义（`session.rs:32`）
 
 ### 中优先级（代码质量）
 

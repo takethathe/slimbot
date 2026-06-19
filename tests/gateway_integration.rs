@@ -153,7 +153,7 @@ async fn test_gateway_heartbeat_can_be_enabled() {
 
 #[tokio::test]
 async fn test_gateway_message_bus_creation() {
-    let mb = MessageBus::new();
+    let (mb, _receivers) = MessageBus::new();
     assert!(mb.inbound_tx().capacity() > 0);
     assert!(mb.outbound_tx().capacity() > 0);
 }

@@ -20,7 +20,9 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     WorkerPool::init_global(64);
 
     let config = Arc::new(Config::load(paths.config_path().to_str().unwrap())?);
-    let message_bus = Arc::new(MessageBus::new());
+    let (message_bus, receivers) = MessageBus::new();
+    let outbound_rx = receivers.outbound;
+    let inbound_rx = receivers.inbound;
 
     // Build ToolManager with all tools including message + cron
     let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -51,8 +53,14 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     // Create AgentLoop with pre-configured tool manager
     let agent_loop = Arc::new(
-        AgentLoop::from_config_with_tools(paths, message_bus.clone(), config.clone(), tool_manager)
-            .await?,
+        AgentLoop::from_config_with_tools(
+            paths,
+            message_bus.clone(),
+            inbound_rx,
+            config.clone(),
+            tool_manager,
+        )
+        .await?,
     );
 
     // Set up cron service callback
@@ -77,7 +85,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             // Deliver result to user channel if configured (only if message tool wasn't used)
             if job_clone.payload.deliver && !result.message_sent {
                 if let (Some(channel), Some(chat_id)) = (&job_clone.payload.channel, &job_clone.payload.to) {
-                    let _ = mb.outbound_tx().send(BusResult {
+                    let _ = mb.publish_outbound(BusResult {
                         session_id: format!("{}:{}", channel, chat_id),
                         task_id: String::new(),
                         content: result.content,
@@ -120,14 +128,12 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         let mb = mb_for_notify.clone();
         let resp = response.clone();
         Box::pin(async move {
-            let _ = mb
-                .outbound_tx()
-                .send(BusResult {
-                    session_id: "webui:webui_main".to_string(),
-                    task_id: String::new(),
-                    content: resp,
-                })
-                .await;
+            mb.publish_outbound(BusResult {
+                session_id: "webui:webui_main".to_string(),
+                task_id: String::new(),
+                content: resp,
+            })
+            .await;
         })
     }));
 
@@ -143,8 +149,12 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     // ChannelManager: init channels from config
     let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-    let mut channel_manager =
-        ChannelManager::new(message_bus.clone(), config.clone(), Some(event_tx.clone()));
+    let mut channel_manager = ChannelManager::new(
+        message_bus.clone(),
+        outbound_rx,
+        config.clone(),
+        Some(event_tx.clone()),
+    );
 
     // Create shutdown broadcast for channel servers (webui etc.)
     let (channel_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -292,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_creation() {
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         assert!(message_bus.inbound_tx().capacity() > 0);
         assert!(message_bus.outbound_tx().capacity() > 0);
     }
@@ -361,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_channel_manager_creation() {
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -385,7 +395,8 @@ mod tests {
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-        let channel_manager = ChannelManager::new(message_bus, config, Some(event_tx));
+        let channel_manager =
+            ChannelManager::new(message_bus, _receivers.outbound, config, Some(event_tx));
         assert!(channel_manager.channel_info().0 == "cli:default");
     }
 
@@ -420,7 +431,7 @@ mod tests {
         let memory_dir = workspace_dir.join("memory");
         std::fs::create_dir_all(&memory_dir).unwrap();
 
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -472,6 +483,7 @@ mod tests {
             )
             .unwrap(),
             message_bus,
+            _receivers.inbound,
             config,
             tool_manager,
         )
@@ -481,7 +493,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_shutdown_channels() {
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -505,7 +517,8 @@ mod tests {
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-        let mut channel_manager = ChannelManager::new(message_bus, config, Some(event_tx));
+        let mut channel_manager =
+            ChannelManager::new(message_bus, _receivers.outbound, config, Some(event_tx));
 
         // Verify channel manager can be initialized with no channels
         let result = channel_manager.init().await;
@@ -561,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_send_receive() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
 
         // Send a request
         let req = BusRequest {
@@ -635,7 +648,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_channel_capacity() {
-        let mb = MessageBus::new();
+        let (mb, _receivers) = MessageBus::new();
         // Verify channel capacities
         assert_eq!(mb.inbound_tx().capacity(), 32);
         assert_eq!(mb.outbound_tx().capacity(), 32);
@@ -686,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_channel_manager_no_channels() {
-        let message_bus = Arc::new(MessageBus::new());
+        let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
@@ -710,7 +723,8 @@ mod tests {
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
-        let mut channel_manager = ChannelManager::new(message_bus, config, Some(event_tx));
+        let mut channel_manager =
+            ChannelManager::new(message_bus, _receivers.outbound, config, Some(event_tx));
 
         // Initialize with no channels should succeed
         let result = channel_manager.init().await;
@@ -891,7 +905,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_multiple_sends() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let outbound_tx = mb.outbound_tx();
 
         // Send multiple results
@@ -969,7 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_inbound_channel() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let inbound_tx = mb.inbound_tx();
 
         // Verify inbound channel capacity
@@ -1290,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_outbound_tx_clone() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let tx1 = mb.outbound_tx();
         let tx2 = tx1.clone();
 
@@ -1429,7 +1443,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_inbound_tx_clone() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let tx1 = mb.inbound_tx();
         let tx2 = tx1.clone();
 
@@ -1559,7 +1573,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_creation_and_capacity() {
-        let mb = MessageBus::new();
+        let (mb, _receivers) = MessageBus::new();
         assert_eq!(mb.inbound_tx().capacity(), 32);
         assert_eq!(mb.outbound_tx().capacity(), 32);
     }
@@ -1682,7 +1696,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_concurrent_sends() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let tx = mb.outbound_tx();
 
         // Concurrent sends should work
@@ -1846,7 +1860,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_inbound_outbound_separate() {
-        let mb = MessageBus::new();
+        let (mb, _receivers) = MessageBus::new();
         let inbound_tx = mb.inbound_tx();
         let outbound_tx = mb.outbound_tx();
 
@@ -2009,7 +2023,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_capacity_check() {
-        let mb = MessageBus::new();
+        let (mb, _receivers) = MessageBus::new();
         // Both channels should have capacity > 0
         assert!(mb.inbound_tx().capacity() > 0);
         assert!(mb.outbound_tx().capacity() > 0);
@@ -2141,7 +2155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_clone_senders() {
-        let mb = Arc::new(MessageBus::new());
+        let (mb, _receivers) = MessageBus::new();
         let tx1 = mb.outbound_tx();
         let tx2 = tx1.clone();
 
@@ -2489,14 +2503,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_message_bus_inbound_capacity() {
-        let mb = MessageBus::new();
+        let (mb, _receivers) = MessageBus::new();
         // Inbound channel should have capacity
         assert!(mb.inbound_tx().capacity() > 0);
     }
 
     #[tokio::test]
     async fn test_gateway_message_bus_outbound_capacity() {
-        let mb = MessageBus::new();
+        let (mb, _receivers) = MessageBus::new();
         // Outbound channel should have capacity
         assert!(mb.outbound_tx().capacity() > 0);
     }
