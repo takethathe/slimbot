@@ -142,7 +142,7 @@ run_gateway()
 
 - `SharedSessionManager` = `Arc<Mutex<SessionManager>>`，所有模块通过共享 Mutex 访问
 - `SessionTask` 绑定 `TaskHook`，通过 `broadcast::Sender<AgentEvent>` 广播运行时事件（tool_call、assistant_message 等），各 Channel 订阅后自行处理
-- 消息持久化：append-only 写入 JSONL，meta 数据单独 `.meta.json` 文件
+- 消息持久化：默认 append-only 写入 JSONL，meta 数据单独 `.meta.json` 文件。当 `consolidated_lines > 0` 时，`persist()` 全量重写 JSONL（只写当前消息），重写后 `consolidated_lines` 归零，`total_persisted` 更新为实际行数
 - Session 双列表结构：`history: Arc<[Message]>`（已持久化，零拷贝共享）+ `current_turn: Vec<Message>`（本轮缓冲）
 - Provider 接收消息引用：`Provider::chat(&[&Message])` 避免 clone 开销
 - Consolidator：token 预算触发的会话摘要，在 user-turn 边界对齐，摘要通过 `MemoryStore` 追加到 `history.jsonl`

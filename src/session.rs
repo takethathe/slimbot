@@ -776,6 +776,7 @@ impl SessionManager {
 
     /// List all persisted session files on disk matching the given prefix.
     /// Returns (session_id, message_count, created_time_ms).
+    /// message_count excludes consolidated lines (reads meta for each session).
     pub fn list_persisted_sessions(&self, prefix: &str) -> Vec<(String, usize, i64)> {
         let mut results = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.session_dir) {
@@ -788,7 +789,14 @@ impl SessionManager {
                 if !session_id.starts_with(prefix) {
                     continue;
                 }
-                let msg_count = Self::count_messages_in_jsonl(&entry.path());
+                let total_lines = Self::count_messages_in_jsonl(&entry.path());
+                let skip = self
+                    .load_meta_file(&session_id)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.consolidated_lines)
+                    .unwrap_or(0);
+                let msg_count = total_lines.saturating_sub(skip);
                 let created = entry
                     .metadata()
                     .ok()
@@ -816,8 +824,13 @@ impl SessionManager {
 
     /// Load messages from a persisted session file for API response.
     /// Returns messages suitable for frontend display (user + assistant only).
+    /// Reads consolidated_lines from meta to skip already-consolidated messages.
     pub fn load_session_messages(&self, session_id: &str) -> Result<Vec<FrontendMessage>> {
-        let msgs = Self::load_messages_from_jsonl(&self.session_dir, session_id, 0)?;
+        let skip = self
+            .load_meta_file(session_id)?
+            .map(|m| m.consolidated_lines)
+            .unwrap_or(0);
+        let msgs = Self::load_messages_from_jsonl(&self.session_dir, session_id, skip)?;
         Ok(msgs
             .iter()
             .filter_map(FrontendMessage::from_message)
@@ -1124,7 +1137,6 @@ impl SessionManager {
     }
 
     pub async fn persist(&mut self, session_id: &str) -> Result<()> {
-        // Check if there are pending messages to persist
         let has_pending = self
             .sessions
             .get(session_id)
@@ -1132,7 +1144,15 @@ impl SessionManager {
             .current_turn
             .len();
 
-        if has_pending > 0 {
+        let needs_rewrite = self
+            .sessions
+            .get(session_id)
+            .unwrap()
+            .meta
+            .consolidated_lines
+            > 0;
+
+        if needs_rewrite || has_pending > 0 {
             let session = self.sessions.get_mut(session_id).unwrap();
 
             // Strip runtime_content from current_turn messages before persisting
@@ -1145,24 +1165,43 @@ impl SessionManager {
                 }
             }
 
-            // Append current_turn to JSONL
             let path = self.session_dir.join(format!("{}.jsonl", session_id));
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            for msg in &session.current_turn {
-                let line = serde_json::to_string(msg)?;
-                writeln!(file, "{}", line)?;
-            }
-            let persisted_count = session.current_turn.len();
-            file.flush()?;
-            session.meta.total_persisted += persisted_count;
 
-            // Merge current_turn into history Arc
-            let mut merged = session.history.to_vec();
-            merged.append(&mut session.current_turn);
-            session.history = Arc::from(merged);
+            if needs_rewrite {
+                // Full rewrite: write only history + current_turn (consolidated messages removed)
+                let mut merged = session.history.to_vec();
+                merged.append(&mut session.current_turn);
+
+                let mut content = String::new();
+                for msg in &merged {
+                    let line = serde_json::to_string(msg)?;
+                    content.push_str(&line);
+                    content.push('\n');
+                }
+                write_file_atomic(&path, &content)?;
+
+                session.meta.total_persisted = merged.len();
+                session.meta.consolidated_lines = 0;
+                session.history = Arc::from(merged);
+            } else {
+                // Append-only: existing behavior
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                for msg in &session.current_turn {
+                    let line = serde_json::to_string(msg)?;
+                    writeln!(file, "{}", line)?;
+                }
+                let persisted_count = session.current_turn.len();
+                file.flush()?;
+                session.meta.total_persisted += persisted_count;
+
+                // Merge current_turn into history Arc
+                let mut merged = session.history.to_vec();
+                merged.append(&mut session.current_turn);
+                session.history = Arc::from(merged);
+            }
         }
 
         // Always save meta (may have changed via set_last_summary, etc.)
@@ -1304,15 +1343,15 @@ mod tests {
         assert_eq!(session.history.len(), 2);
         assert!(session.current_turn.is_empty());
 
-        // Persist: nothing new, JSONL still has 4 lines
+        // Persist: triggers rewrite due to consolidated_lines > 0, JSONL has only 2 remaining lines
         sm.persist("s1").await.unwrap();
         let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
-        assert_eq!(jsonl.lines().count(), 4);
+        assert_eq!(jsonl.lines().count(), 2);
 
-        // Reload: line-count skip now implemented
+        // Reload: rewrite resets consolidated_lines to 0
         let mut sm2 = SessionManager::new(session_dir).unwrap();
         let session = sm2.get_or_create("s1").await.unwrap();
-        assert_eq!(session.consolidated_lines(), 2);
+        assert_eq!(session.consolidated_lines(), 0);
         assert_eq!(session.history.len(), 2); // 4 on disk - 2 skipped = 2
         let msgs = sm2.get_messages("s1").await;
         assert_eq!(msgs.len(), 2);
@@ -1453,16 +1492,16 @@ mod tests {
         assert_eq!(session.history.len(), 2);
         assert!(session.current_turn.is_empty());
 
-        // Persist should be a no-op (nothing in current_turn)
+        // Persist: triggers rewrite due to consolidated_lines > 0, JSONL has only 2 remaining lines
         sm.persist("s1").await.unwrap();
         let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
-        assert_eq!(jsonl.lines().count(), 4);
+        assert_eq!(jsonl.lines().count(), 2);
 
-        // Reload: line-count skip now implemented
+        // Reload: rewrite resets consolidated_lines to 0
         let mut sm2 = SessionManager::new(session_dir).unwrap();
         sm2.get_or_create("s1").await.unwrap();
         let session = sm2.sessions.get("s1").unwrap();
-        assert_eq!(session.consolidated_lines(), 2);
+        assert_eq!(session.consolidated_lines(), 0);
         assert_eq!(session.history.len(), 2); // 4 on disk - 2 skipped = 2
         let msgs = sm2.get_messages("s1").await;
         assert_eq!(msgs.len(), 2);
@@ -1488,16 +1527,16 @@ mod tests {
         sm.add_message("s1", user_msg("c")).await.unwrap();
         assert_eq!(sm.sessions.get("s1").unwrap().current_turn.len(), 1);
 
-        // Persist: should only append c — b is already on disk
+        // Persist: triggers rewrite due to consolidated_lines > 0, JSONL has only 2 remaining lines (b + c)
         sm.persist("s1").await.unwrap();
         let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
-        assert_eq!(jsonl.lines().count(), 3); // a, b, c
+        assert_eq!(jsonl.lines().count(), 2);
 
-        // Reload and verify only unconsolidated messages loaded
+        // Reload: rewrite resets consolidated_lines to 0, so all 2 messages loaded
         let mut sm2 = SessionManager::new(session_dir).unwrap();
         sm2.get_or_create("s1").await.unwrap();
         let msgs = sm2.get_messages("s1").await;
-        assert_eq!(msgs.len(), 2); // 3 on disk - 1 consolidated = 2
+        assert_eq!(msgs.len(), 2);
     }
 
     #[tokio::test]
@@ -1673,6 +1712,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_sessions_count_excludes_consolidated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        {
+            let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+            sm.get_or_create("webui:chat1").await.unwrap();
+            sm.add_message("webui:chat1", user_msg("m1")).await.unwrap();
+            sm.add_message("webui:chat1", assistant_msg("m2"))
+                .await
+                .unwrap();
+            sm.add_message("webui:chat1", user_msg("m3")).await.unwrap();
+            sm.add_message("webui:chat1", assistant_msg("m4"))
+                .await
+                .unwrap();
+            sm.persist("webui:chat1").await.unwrap();
+
+            // Consolidate first 2 messages
+            sm.update_consolidated_lines("webui:chat1", 2).await;
+        }
+
+        // list_persisted_sessions should report 2 (4 total - 2 consolidated)
+        let sm = SessionManager::new(session_dir).unwrap();
+        let sessions = sm.list_persisted_sessions("webui:");
+        assert_eq!(sessions.len(), 1);
+        let (_, msg_count, _) = &sessions[0];
+        assert_eq!(*msg_count, 2);
+    }
+
+    #[tokio::test]
     async fn test_load_session_messages() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = tmp.path().join("sessions");
@@ -1699,6 +1767,31 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert!(matches!(&messages[0], FrontendMessage::User { .. }));
         assert!(matches!(&messages[1], FrontendMessage::Assistant { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_load_session_messages_skips_consolidated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        sm.add_message("s1", user_msg("old1")).await.unwrap();
+        sm.add_message("s1", assistant_msg("reply1")).await.unwrap();
+        sm.add_message("s1", user_msg("new1")).await.unwrap();
+        sm.add_message("s1", assistant_msg("reply2")).await.unwrap();
+        sm.persist("s1").await.unwrap();
+
+        // Consolidate first 2 messages
+        sm.update_consolidated_lines("s1", 2).await;
+
+        // load_session_messages should skip consolidated lines
+        let messages = sm.load_session_messages("s1").unwrap();
+        assert_eq!(messages.len(), 2); // only new1 and reply2
+        assert!(matches!(&messages[0], FrontendMessage::User { content } if content == "new1"));
+        assert!(
+            matches!(&messages[1], FrontendMessage::Assistant { content } if content == "reply2")
+        );
     }
 
     #[test]
@@ -2278,5 +2371,54 @@ mod tests {
         // wait_idle should return immediately if not running
         runner.wait_idle();
         assert!(!runner.running.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_persist_rewrites_after_consolidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+
+        // Add 4 messages and persist
+        sm.add_message("s1", user_msg("m1")).await.unwrap();
+        sm.add_message("s1", assistant_msg("m2")).await.unwrap();
+        sm.add_message("s1", user_msg("m3")).await.unwrap();
+        sm.add_message("s1", assistant_msg("m4")).await.unwrap();
+        sm.persist("s1").await.unwrap();
+
+        // JSONL has 4 lines
+        let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
+        assert_eq!(jsonl.lines().count(), 4);
+
+        // Consolidate first 2 messages
+        sm.update_consolidated_lines("s1", 2).await;
+        let session = sm.sessions.get("s1").unwrap();
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(session.consolidated_lines(), 2);
+
+        // JSONL still has 4 lines (not yet rewritten)
+        let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
+        assert_eq!(jsonl.lines().count(), 4);
+
+        // Add a new message and persist — triggers rewrite
+        sm.add_message("s1", user_msg("m5")).await.unwrap();
+        sm.persist("s1").await.unwrap();
+
+        // JSONL now has 3 lines: m3, m4, m5 (consolidated messages removed)
+        let jsonl = std::fs::read_to_string(session_dir.join("s1.jsonl")).unwrap();
+        assert_eq!(jsonl.lines().count(), 3);
+
+        // Meta: consolidated_lines=0, total_persisted=3
+        let session = sm.sessions.get("s1").unwrap();
+        assert_eq!(session.consolidated_lines(), 0);
+        assert_eq!(session.total_persisted(), 3);
+
+        // Reload and verify
+        let mut sm2 = SessionManager::new(session_dir).unwrap();
+        sm2.get_or_create("s1").await.unwrap();
+        let msgs = sm2.get_messages("s1").await;
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].timestamp(), session.history[0].timestamp()); // m3
     }
 }

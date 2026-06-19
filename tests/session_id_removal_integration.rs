@@ -153,7 +153,7 @@ async fn test_multiple_consolidate_rounds_increment_correctly() {
     sm.update_consolidated_lines("s1", 2).await;
     {
         let session = sm.get_or_create("s1").await.unwrap();
-        assert_eq!(session.consolidated_lines(), 4);
+        assert_eq!(session.consolidated_lines(), 2); // rewrite resets to 0, then +2
         assert_eq!(session.history.len(), 2);
     }
 
@@ -162,8 +162,9 @@ async fn test_multiple_consolidate_rounds_increment_correctly() {
 
     let mut sm2 = SessionManager::new(session_dir).unwrap();
     let session = sm2.get_or_create("s1").await.unwrap();
-    assert_eq!(session.consolidated_lines(), 4);
-    assert_eq!(session.total_persisted(), 6);
+    // Rewrite resets consolidated_lines to 0, total_persisted to merged len
+    assert_eq!(session.consolidated_lines(), 0);
+    assert_eq!(session.total_persisted(), 2); // only msg4, msg5 on disk
     assert_eq!(session.history.len(), 2);
     let msgs = sm2.get_messages("s1").await;
     assert_eq!(msgs.len(), 2);
