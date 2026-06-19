@@ -727,6 +727,7 @@ impl FrontendMessage {
             }),
             Message::Assistant { content, .. } => content
                 .as_ref()
+                .filter(|c| !c.trim().is_empty())
                 .map(|c| Self::Assistant { content: c.clone() }),
             _ => None,
         }
@@ -1742,6 +1743,54 @@ mod tests {
             name: None,
         };
         assert!(FrontendMessage::from_message(&tool).is_none());
+    }
+
+    #[test]
+    fn test_frontend_message_from_message_filters_empty_assistant() {
+        // Empty assistant content should be filtered out
+        let empty_asst = Message::Assistant {
+            meta: MessageMeta {
+                timestamp: String::new(),
+            },
+            content: Some("".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
+        assert!(
+            FrontendMessage::from_message(&empty_asst).is_none(),
+            "empty assistant content should be filtered"
+        );
+
+        // Whitespace-only assistant content should also be filtered
+        let whitespace_asst = Message::Assistant {
+            meta: MessageMeta {
+                timestamp: String::new(),
+            },
+            content: Some("   \n\t  ".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
+        assert!(
+            FrontendMessage::from_message(&whitespace_asst).is_none(),
+            "whitespace-only assistant content should be filtered"
+        );
+
+        // None content should be filtered
+        let none_asst = Message::Assistant {
+            meta: MessageMeta {
+                timestamp: String::new(),
+            },
+            content: None,
+            tool_calls: None,
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
+        assert!(
+            FrontendMessage::from_message(&none_asst).is_none(),
+            "None assistant content should be filtered"
+        );
     }
 
     #[test]

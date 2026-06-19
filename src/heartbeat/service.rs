@@ -90,7 +90,7 @@ impl HeartbeatService {
 
         if let Some(ref cb) = self.on_execute {
             let result = cb(content).await;
-            if !result.is_empty() {
+            if !result.trim().is_empty() {
                 if let Some(ref notify) = self.on_notify {
                     notify(result).await;
                 }
@@ -254,6 +254,35 @@ mod tests {
         svc.tick().await;
 
         // Notify should NOT have been called
+        assert!(!notified.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tick_whitespace_only_result_skips_notify() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("HEARTBEAT.md"), "content").unwrap();
+        let mut svc = HeartbeatService::new(tmp.path().to_path_buf(), 60, true);
+
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notif_clone = notified.clone();
+
+        svc.set_on_execute(Arc::new(move |_content| {
+            Box::pin(async move {
+                "   \n\t  ".to_string() // whitespace-only result
+            })
+        }));
+
+        svc.set_on_notify(Arc::new(move |_result| {
+            let n = notif_clone.clone();
+            Box::pin(async move {
+                n.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        }));
+
+        svc.start();
+        svc.tick().await;
+
+        // Notify should NOT have been called for whitespace-only content
         assert!(!notified.load(std::sync::atomic::Ordering::Relaxed));
     }
 

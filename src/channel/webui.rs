@@ -330,6 +330,10 @@ impl Channel for WebuiChannel {
     }
 
     async fn write_output(&mut self, result: &BusResult) -> Result<()> {
+        // Skip empty or whitespace-only content to avoid rendering empty bubbles
+        if result.content.trim().is_empty() {
+            return Ok(());
+        }
         let chat_id = self.chat_id_from(&result.session_id);
         self.prune_and_send(&chat_id, SsePayload::Message(result.content.clone()))
             .await
@@ -503,6 +507,42 @@ mod tests {
 
         // Should not panic when no subscribers exist
         ch.write_output(&result).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_webui_write_output_skips_empty_content() {
+        let config = json!({});
+        let mut ch = WebuiChannel::from_config(&config).unwrap();
+
+        // Register an SSE subscriber with a receiver we can inspect
+        let (tx, mut rx) = mpsc::channel::<SsePayload>(32);
+        {
+            let mut guard = ch.chats.lock().await;
+            guard.entry("abc123".to_string()).or_default().push(tx);
+        }
+
+        // Empty content should be skipped
+        let empty_result = BusResult {
+            session_id: "webui:abc123".to_string(),
+            task_id: "t3".to_string(),
+            content: "".to_string(),
+        };
+        ch.write_output(&empty_result).await.unwrap();
+
+        // Whitespace-only content should also be skipped
+        let whitespace_result = BusResult {
+            session_id: "webui:abc123".to_string(),
+            task_id: "t4".to_string(),
+            content: "   \n\t  ".to_string(),
+        };
+        ch.write_output(&whitespace_result).await.unwrap();
+
+        // Nothing should have been sent to the subscriber
+        let received = rx.try_recv();
+        assert!(
+            received.is_err(),
+            "empty/whitespace content should not be sent to SSE subscribers"
+        );
     }
 
     #[test]
