@@ -139,7 +139,16 @@ fn make_runner(
     workspace_dir: PathBuf,
     ms: Arc<Mutex<MemoryStore>>,
 ) -> AgentRunner {
-    AgentRunner::new(tm, provider, sm, test_config(), workspace_dir, ms, None)
+    AgentRunner::new(
+        tm,
+        provider,
+        sm,
+        test_config(),
+        workspace_dir,
+        ms,
+        None,
+        4096,
+    )
 }
 
 // ── Test: Full event sequence with single tool call ──

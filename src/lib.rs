@@ -23,6 +23,7 @@ pub(crate) mod provider;
 pub(crate) mod runner;
 pub(crate) mod session;
 pub(crate) mod setup;
+pub(crate) mod snip;
 pub(crate) mod tool;
 pub(crate) mod tools;
 pub(crate) mod utils;

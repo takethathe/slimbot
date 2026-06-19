@@ -216,6 +216,13 @@ impl AgentLoop {
 
         let tool_manager_arc = Arc::new(tool_manager);
 
+        let provider_name = &config.agent.provider;
+        let max_tokens = config
+            .providers
+            .get(provider_name)
+            .map(|p| p.max_tokens)
+            .unwrap_or(4096);
+
         let runner = AgentRunner::new(
             tool_manager_arc.clone(),
             provider.clone(),
@@ -224,6 +231,7 @@ impl AgentLoop {
             paths.workspace_dir().to_path_buf(),
             memory_store.clone(),
             Some(consolidator.clone()),
+            max_tokens,
         );
 
         Ok(Self {
@@ -314,12 +322,19 @@ impl AgentLoop {
         let tool_manager = self.tool_manager.clone();
         let provider = self.provider.clone();
         let config = self.config.agent.clone();
+        let full_config = self.config.clone();
         let workspace_dir = self.workspace_dir.clone();
         let memory_store = self.memory_store.clone();
         let outbound_tx = self.message_bus.outbound_tx();
         let consolidator = self.consolidator.clone();
         let message_bus = self.message_bus.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        let max_tokens = full_config
+            .providers
+            .get(&full_config.agent.provider)
+            .map(|p| p.max_tokens)
+            .unwrap_or(4096);
 
         tokio::spawn(async move {
             loop {
@@ -345,6 +360,7 @@ impl AgentLoop {
                                 &outbound_tx,
                                 &sid,
                                 &request.content,
+                                max_tokens,
                             ).await;
                             if !msg.is_empty() {
                                 message_bus.publish_outbound(BusResult {
@@ -382,6 +398,7 @@ impl AgentLoop {
                         .channel_inject(request.channel_inject)
                         .consolidator(Some(consolidator.clone()))
                         .cancel_token(cancel_token)
+                        .max_tokens(max_tokens)
                         .build();
 
                         let mut guard = session_manager.lock().await;
@@ -405,6 +422,7 @@ impl AgentLoop {
         outbound_tx: &tokio::sync::mpsc::Sender<BusResult>,
         session_id: &str,
         command: &str,
+        max_tokens: u32,
     ) -> (String, bool) {
         match command {
             "/stop" => {
@@ -425,6 +443,7 @@ impl AgentLoop {
                     .session_manager(session_manager.clone())
                     .outbound_tx(outbound_tx.clone())
                     .cancel_token(Some(ct))
+                    .max_tokens(max_tokens)
                     .build(),
                     None => {
                         return ("No session to stop.".to_string(), false);
@@ -1057,9 +1076,14 @@ mod tests {
         }
 
         // Test /status command
-        let (response, should_shutdown) =
-            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "test-session", "/status")
-                .await;
+        let (response, should_shutdown) = AgentLoop::handle_agent_loop_command(
+            &sm,
+            &outbound_tx,
+            "test-session",
+            "/status",
+            4096,
+        )
+        .await;
         assert!(!should_shutdown);
         assert!(response.contains("Session: test-session"));
         assert!(response.contains("Messages: 1"));
@@ -1092,7 +1116,8 @@ mod tests {
 
         // Test /clear command
         let (response, should_shutdown) =
-            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "test-session", "/clear").await;
+            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "test-session", "/clear", 4096)
+                .await;
         assert!(!should_shutdown);
         assert!(response.contains("cleared"));
 
@@ -1112,9 +1137,14 @@ mod tests {
         let (outbound_tx, _) = mpsc::channel(10);
 
         // Test /stop command with no session
-        let (response, should_shutdown) =
-            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "nonexistent-session", "/stop")
-                .await;
+        let (response, should_shutdown) = AgentLoop::handle_agent_loop_command(
+            &sm,
+            &outbound_tx,
+            "nonexistent-session",
+            "/stop",
+            4096,
+        )
+        .await;
         assert!(!should_shutdown);
         assert!(response.contains("No session to stop"));
     }
@@ -1131,9 +1161,14 @@ mod tests {
         let (outbound_tx, _) = mpsc::channel(10);
 
         // Test unknown command
-        let (response, should_shutdown) =
-            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "test-session", "/unknown")
-                .await;
+        let (response, should_shutdown) = AgentLoop::handle_agent_loop_command(
+            &sm,
+            &outbound_tx,
+            "test-session",
+            "/unknown",
+            4096,
+        )
+        .await;
         assert!(!should_shutdown);
         assert!(response.is_empty());
     }

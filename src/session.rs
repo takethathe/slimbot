@@ -452,6 +452,7 @@ pub struct SessionTaskBuilder {
     channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
     cancel_token: Option<CancellationToken>,
+    max_tokens: Option<u32>,
 }
 
 impl SessionTaskBuilder {
@@ -470,6 +471,7 @@ impl SessionTaskBuilder {
             channel_inject: None,
             consolidator: None,
             cancel_token: None,
+            max_tokens: None,
         }
     }
 
@@ -523,6 +525,11 @@ impl SessionTaskBuilder {
         self
     }
 
+    pub fn max_tokens(mut self, mt: u32) -> Self {
+        self.max_tokens = Some(mt);
+        self
+    }
+
     pub fn build(self) -> SessionTask {
         let session_manager = self.session_manager.expect("session_manager required");
         let tool_manager = self.tool_manager.expect("tool_manager required");
@@ -531,6 +538,7 @@ impl SessionTaskBuilder {
         let workspace_dir = self.workspace_dir.expect("workspace_dir required");
         let memory_store = self.memory_store.expect("memory_store required");
         let outbound_tx = self.outbound_tx.expect("outbound_tx required");
+        let max_tokens = self.max_tokens.unwrap_or(4096);
 
         let sid1 = self.session_id.clone();
         let sid2 = self.session_id.clone();
@@ -552,6 +560,7 @@ impl SessionTaskBuilder {
                     .workspace_dir(workspace_dir)
                     .memory_store(memory_store)
                     .consolidator(consolidator)
+                    .max_tokens(max_tokens)
                     .build();
                 let result = runner
                     .run(

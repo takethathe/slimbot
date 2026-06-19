@@ -52,6 +52,7 @@ pub struct AgentRunnerBuilder {
     workspace_dir: Option<PathBuf>,
     memory_store: Option<SharedMemoryStore>,
     consolidator: Option<Arc<Consolidator>>,
+    max_tokens: Option<u32>,
 }
 
 impl AgentRunnerBuilder {
@@ -64,6 +65,7 @@ impl AgentRunnerBuilder {
             workspace_dir: None,
             memory_store: None,
             consolidator: None,
+            max_tokens: None,
         }
     }
 
@@ -102,6 +104,11 @@ impl AgentRunnerBuilder {
         self
     }
 
+    pub fn max_tokens(mut self, mt: u32) -> Self {
+        self.max_tokens = Some(mt);
+        self
+    }
+
     pub fn build(self) -> AgentRunner {
         let session_manager = self.session_manager.expect("session_manager required");
         let tool_manager = self.tool_manager.expect("tool_manager required");
@@ -109,6 +116,7 @@ impl AgentRunnerBuilder {
         let config = self.config.expect("config required");
         let workspace_dir = self.workspace_dir.expect("workspace_dir required");
         let memory_store = self.memory_store.expect("memory_store required");
+        let max_tokens = self.max_tokens.unwrap_or(4096);
 
         AgentRunner::new(
             tool_manager,
@@ -118,6 +126,7 @@ impl AgentRunnerBuilder {
             workspace_dir,
             memory_store,
             self.consolidator,
+            max_tokens,
         )
     }
 }
@@ -130,6 +139,7 @@ pub struct AgentRunner {
     workspace_dir: PathBuf,
     memory_store: SharedMemoryStore,
     consolidator: Option<Arc<Consolidator>>,
+    max_tokens: u32,
 }
 
 impl AgentRunner {
@@ -146,6 +156,7 @@ impl AgentRunner {
         workspace_dir: PathBuf,
         memory_store: SharedMemoryStore,
         consolidator: Option<Arc<Consolidator>>,
+        max_tokens: u32,
     ) -> Self {
         Self {
             tool_manager,
@@ -155,6 +166,7 @@ impl AgentRunner {
             workspace_dir,
             memory_store,
             consolidator,
+            max_tokens,
         }
     }
 
@@ -301,6 +313,24 @@ impl AgentRunner {
             );
 
             // History governance: clean orphans and backfill missing tool results
+            Self::drop_orphan_tool_results(&mut all_messages);
+            Self::backfill_missing_tool_results(&mut all_messages);
+
+            // Snip: truncate messages to fit within token budget (stateless, no persistence)
+            let char_per_token_ratio = {
+                let sm = self.session_manager.lock().await;
+                sm.get_session_data(session_id)
+                    .map(|d| d.char_per_token_ratio)
+                    .unwrap_or(4.0)
+            };
+            all_messages = crate::snip::snip_messages(
+                all_messages,
+                self.config.context_window_tokens,
+                self.max_tokens,
+                char_per_token_ratio,
+            );
+
+            // Post-snip cleanup: snipping may have created new orphans
             Self::drop_orphan_tool_results(&mut all_messages);
             Self::backfill_missing_tool_results(&mut all_messages);
 
@@ -953,6 +983,7 @@ mod tests {
             workspace_dir,
             ms,
             None,
+            4096,
         )
     }
 
@@ -1701,6 +1732,7 @@ mod tests {
             workspace_dir.clone(),
             ms,
             None,
+            4096,
         );
         let task = make_task("test persist");
 
@@ -1752,6 +1784,7 @@ mod tests {
             wd,
             ms,
             None,
+            4096,
         );
 
         // Sentinel /stop message should be detected immediately.
@@ -1795,6 +1828,7 @@ mod tests {
             wd,
             ms,
             None,
+            4096,
         );
 
         // Should return cancelled before making any LLM call.
@@ -1884,6 +1918,7 @@ mod tests {
             workspace_dir,
             ms,
             None,
+            4096,
         );
 
         let result = runner
@@ -1957,6 +1992,7 @@ mod tests {
             workspace_dir,
             ms,
             None,
+            4096,
         );
 
         let result = runner
@@ -2020,5 +2056,118 @@ mod tests {
         assert_eq!(total.prompt_tokens, 300);
         assert_eq!(total.prompt_cache_hit_tokens, 60);
         assert_eq!(total.completion_tokens, 130);
+    }
+
+    #[tokio::test]
+    async fn test_snip_truncates_context_before_chat() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
+
+        // Pre-fill session with messages to exceed budget
+        // budget = 1600 - 500 - 1024 = 76 tokens
+        // At ~5 tokens per message (20-30 chars), 50 pairs = ~250 tokens > 76, will snip
+        {
+            let mut sm_lock = sm.lock().await;
+            for i in 0..50 {
+                sm_lock
+                    .add_message("test-session", Message::user(format!("old user msg {}", i)))
+                    .await
+                    .unwrap();
+                sm_lock
+                    .add_message(
+                        "test-session",
+                        Message::assistant(
+                            Some(format!("old assistant reply {}", i)),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Provider that captures the messages it receives
+        let received_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_clone = received_messages.clone();
+
+        struct CapturingProvider {
+            received: Arc<std::sync::Mutex<Vec<usize>>>,
+        }
+
+        #[async_trait]
+        impl Provider for CapturingProvider {
+            async fn chat(
+                &self,
+                messages: &[&Message],
+                _tools: Option<&[ToolDefinition]>,
+            ) -> Result<LLMResponse> {
+                self.received.lock().unwrap().push(messages.len());
+                Ok(LLMResponse {
+                    content: Some("done".to_string()),
+                    tool_calls: None,
+                    finish_reason: FinishReason::Stop,
+                    usage: Usage::default(),
+                })
+            }
+        }
+
+        // Create runner to force snipping with limited budget.
+        // budget = context_window - max_output - SAFETY_BUFFER
+        // With 100 pairs (200 messages) at ~5 tokens each = ~1000 tokens needed
+        // budget = 2000 - 500 - 1024 = 476 tokens (will snip to ~95 messages)
+        // We need budget small enough that snipping reduces count to < 50
+        // budget = 1500 - 500 - 1024 = -24 -> 0 (won't snip!)
+        // budget = 1800 - 500 - 1024 = 276 tokens = ~55 messages (just under 50 is tight)
+        // budget = 1600 - 500 - 1024 = 76 tokens = ~15 messages (will definitely be < 50)
+        // But we still need to exceed the budget, so messages must be > budget
+        // 100 pairs at 5 tokens = 500 tokens > 76, will snip!
+        // Let's use: context=1600, output=500 -> budget = 76
+        let provider = Arc::new(CapturingProvider {
+            received: received_clone,
+        });
+        let runner = AgentRunner::new(
+            tm,
+            provider,
+            sm.clone(),
+            AgentConfig {
+                provider: "test".to_string(),
+                max_iterations: 40,
+                timeout_seconds: 120,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 1600, // Small enough to force snipping
+                unknown: Default::default(),
+            },
+            wd,
+            ms,
+            None,
+            500,
+        );
+
+        let task = make_task("new user message");
+        let result = runner
+            .run(
+                task.content,
+                task.hook,
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(result.success);
+        // Provider should have received fewer messages than the 100+ in session
+        let counts = received_messages.lock().unwrap();
+        assert!(!counts.is_empty());
+        // The number of messages sent to provider should be much less than 100+
+        assert!(
+            counts[0] < 50,
+            "Expected snip to reduce messages, but provider received {}",
+            counts[0]
+        );
     }
 }
