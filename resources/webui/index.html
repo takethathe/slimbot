@@ -810,12 +810,18 @@ function appendMessage(role, content, animate = true) {
 }
 
 function showTyping() {
+  if (!isProcessing) return;
   const container = document.getElementById('messages');
-  if (container.querySelector('.typing-indicator')) return;
-  const div = document.createElement('div');
-  div.className = 'typing-indicator';
-  div.innerHTML = '<span></span><span></span><span></span>';
-  container.appendChild(div);
+  let indicator = container.querySelector('.typing-indicator');
+  if (indicator) {
+    // Move to bottom so it stays at the end as new content is added
+    container.appendChild(indicator);
+  } else {
+    const div = document.createElement('div');
+    div.className = 'typing-indicator';
+    div.innerHTML = '<span></span><span></span><span></span>';
+    container.appendChild(div);
+  }
   scrollToBottom();
 }
 
@@ -948,6 +954,7 @@ function handleAgentEvent(event) {
       break;
 
     case 'pre_iteration':
+      showTyping();
       appendEventCard('iteration', 'Iteration ' + event.iteration);
       break;
 
@@ -958,6 +965,7 @@ function handleAgentEvent(event) {
       break;
 
     case 'tool_call': {
+      showTyping();
       const card = appendEventCard('tool-call', event.name, formatArgs(event.args));
       card.dataset.toolName = event.name;
       break;
