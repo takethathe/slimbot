@@ -1089,9 +1089,15 @@ impl SessionManager {
         }
     }
 
-    /// Gracefully shut down all sessions: wait for running tasks to finish.
+    /// Gracefully shut down all sessions: cancel running tasks, wait briefly,
+    /// then sync metadata.
     pub async fn graceful_shutdown(&self) {
-        self.wait_all_idle().await;
+        // Cancel all running tasks so they stop at next cancel check point
+        self.shutdown_all();
+        // Wait for tasks to finish with a timeout to avoid hanging forever
+        // on in-flight HTTP requests that haven't checked the cancel token yet.
+        const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, self.wait_all_idle()).await;
         self.sync_all_meta();
     }
 

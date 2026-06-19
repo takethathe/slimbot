@@ -19,8 +19,12 @@ pub struct OpenAIProvider {
 impl OpenAIProvider {
     pub fn new(config: &ProviderConfig) -> Self {
         let api_url = Self::resolve_api_url(config);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             config: config.clone(),
             api_url,
         }

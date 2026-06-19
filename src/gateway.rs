@@ -230,10 +230,25 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     // Signal channel servers to stop (webui etc.)
     let _ = channel_shutdown_tx.send(());
 
-    // Graceful shutdown
+    // Graceful shutdown with overall timeout.
+    // Race against a second Ctrl+C for forced exit.
     hb_for_shutdown.stop();
     cron_service_arc.stop();
-    agent_loop.graceful_shutdown(&cm_for_shutdown).await;
+    let shutdown_timeout = std::time::Duration::from_secs(10);
+    tokio::select! {
+        result = tokio::time::timeout(
+            shutdown_timeout,
+            agent_loop.graceful_shutdown(&cm_for_shutdown),
+        ) => {
+            if result.is_err() {
+                crate::error!("[gateway] Graceful shutdown timed out");
+            }
+        }
+        _ = signal::ctrl_c() => {
+            eprintln!("\n[gateway] Second Ctrl+C received, forcing exit");
+            std::process::exit(1);
+        }
+    }
 
     Ok(())
 }

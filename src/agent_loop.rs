@@ -484,6 +484,8 @@ impl AgentLoop {
     /// Graceful shutdown of all components. Called by the main thread after
     /// the stdin loop exits (triggered by /quit).
     pub async fn graceful_shutdown(&self, channel_manager: &Arc<crate::channel::ChannelManager>) {
+        // Signal inbound loop to stop
+        let _ = self.shutdown_tx.send(());
         graceful_shutdown(
             channel_manager,
             &self.session_manager,
