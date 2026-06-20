@@ -159,9 +159,10 @@ impl Tool for FindFilesTool {
                 let name = dir.file_name().unwrap_or_default().to_string_lossy();
 
                 if let Some(g) = glob_filter
-                    && !matches_glob(&rel, &name, g) {
-                        continue;
-                    }
+                    && !matches_glob(&rel, &name, g)
+                {
+                    continue;
+                }
                 if type_filter.is_some() {
                     continue;
                 }
@@ -195,13 +196,15 @@ impl Tool for FindFilesTool {
             let display = self.display_path(file, &ws_for_display);
 
             if let Some(g) = glob_filter
-                && !matches_glob(&rel, &name, g) {
-                    continue;
-                }
+                && !matches_glob(&rel, &name, g)
+            {
+                continue;
+            }
             if let Some(t) = type_filter
-                && !matches_type(&name, t) {
-                    continue;
-                }
+                && !matches_type(&name, t)
+            {
+                continue;
+            }
             if let Some(terms) = &query_terms {
                 let hay = display.to_ascii_lowercase();
                 if !terms.iter().all(|t| hay.contains(t)) {

@@ -91,9 +91,10 @@ impl HeartbeatService {
         if let Some(ref cb) = self.on_execute {
             let result = cb(content).await;
             if !result.trim().is_empty()
-                && let Some(ref notify) = self.on_notify {
-                    notify(result).await;
-                }
+                && let Some(ref notify) = self.on_notify
+            {
+                notify(result).await;
+            }
         }
     }
 

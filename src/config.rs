@@ -293,9 +293,10 @@ impl Config {
                 notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                     if let Ok(event) = res
                         && matches!(event.kind, notify::EventKind::Modify(_))
-                            && let Err(e) = Self::reload_with_inner(&inner_clone) {
-                                crate::error!("[Config] Reload failed: {}", e);
-                            }
+                        && let Err(e) = Self::reload_with_inner(&inner_clone)
+                    {
+                        crate::error!("[Config] Reload failed: {}", e);
+                    }
                 })
                 .context("Failed to create config watcher")?;
 

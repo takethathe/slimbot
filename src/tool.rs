@@ -205,10 +205,11 @@ pub fn persist_tool_result(
 
     let file_path = results_dir.join(format!("{}.txt", tool_call_id));
     if !file_path.exists()
-        && let Err(e) = write_file_atomic(&file_path, content) {
-            error!("Failed to persist tool result: {}", e);
-            return content.to_string();
-        }
+        && let Err(e) = write_file_atomic(&file_path, content)
+    {
+        error!("Failed to persist tool result: {}", e);
+        return content.to_string();
+    }
 
     build_persisted_reference(&file_path, content, TOOL_RESULT_PREVIEW_CHARS)
 }

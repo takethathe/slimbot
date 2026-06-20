@@ -101,10 +101,11 @@ pub fn log(level: LogLevel, args: &Arguments<'_>) {
 
     // File output: plain single-char tag
     if let Ok(mut guard) = logger.file.lock()
-        && let Some(ref mut writer) = *guard {
-            let file_msg = format!("[{}] [{}] {}", timestamp, level.as_char(), args);
-            let _ = writeln!(writer, "{}", file_msg);
-        }
+        && let Some(ref mut writer) = *guard
+    {
+        let file_msg = format!("[{}] [{}] {}", timestamp, level.as_char(), args);
+        let _ = writeln!(writer, "{}", file_msg);
+    }
 }
 
 #[cfg(test)]

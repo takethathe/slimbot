@@ -25,11 +25,12 @@ fn build_runtime_context(channel: &str, chat_id: &str, session_summary: Option<&
         lines.push(format!("Chat ID: {}", chat_id));
     }
     if let Some(summary) = session_summary
-        && !summary.is_empty() {
-            lines.push(String::new());
-            lines.push("[Resumed Session]".to_string());
-            lines.push(summary.to_string());
-        }
+        && !summary.is_empty()
+    {
+        lines.push(String::new());
+        lines.push("[Resumed Session]".to_string());
+        lines.push(summary.to_string());
+    }
     format!(
         "{}\n{}\n{}",
         RUNTIME_CONTEXT_TAG,
@@ -126,9 +127,10 @@ impl ContextBuilder {
         for (filename, template) in bootstrap_files() {
             let path = self.workspace_dir.join(filename);
             if let Some(content) = read_if_modified(&path, template)
-                && !content.is_empty() {
-                    parts.push(format!("[{}] {}", filename, content));
-                }
+                && !content.is_empty()
+            {
+                parts.push(format!("[{}] {}", filename, content));
+            }
         }
 
         // 3. Skills
@@ -172,30 +174,31 @@ impl ContextBuilder {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().is_some_and(|e| e == "md")
-                    && let Ok(content) = std::fs::read_to_string(&path) {
-                        if content.is_empty() {
-                            continue;
-                        }
-                        if let Some(meta) = parse_skill_frontmatter(&content) {
-                            if meta.always {
-                                always_skills
-                                    .push(format!("### Skill: {}\n\n{}", meta.name, meta.content));
-                            } else {
-                                available_skills.push(format!(
-                                    "- **{}** — {}  `{}`",
-                                    meta.name,
-                                    meta.description,
-                                    path.display()
-                                ));
-                            }
-                        } else {
-                            let name = path
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            always_skills.push(format!("### Skill: {}\n\n{}", name, content));
-                        }
+                    && let Ok(content) = std::fs::read_to_string(&path)
+                {
+                    if content.is_empty() {
+                        continue;
                     }
+                    if let Some(meta) = parse_skill_frontmatter(&content) {
+                        if meta.always {
+                            always_skills
+                                .push(format!("### Skill: {}\n\n{}", meta.name, meta.content));
+                        } else {
+                            available_skills.push(format!(
+                                "- **{}** — {}  `{}`",
+                                meta.name,
+                                meta.description,
+                                path.display()
+                            ));
+                        }
+                    } else {
+                        let name = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        always_skills.push(format!("### Skill: {}\n\n{}", name, content));
+                    }
+                }
             }
         }
 
@@ -242,10 +245,11 @@ impl ContextBuilder {
             if let Message::User {
                 runtime_content, ..
             } = msg
-                && runtime_content.is_none() {
-                    *runtime_content = Some(runtime_ctx);
-                    break;
-                }
+                && runtime_content.is_none()
+            {
+                *runtime_content = Some(runtime_ctx);
+                break;
+            }
         }
 
         // Merge consecutive user messages at the end
@@ -270,54 +274,54 @@ impl ContextBuilder {
         let len = messages.len();
         if len >= 2
             && matches!(messages[len - 2], Message::User { .. })
-                && matches!(messages[len - 1], Message::User { .. })
+            && matches!(messages[len - 1], Message::User { .. })
+        {
+            let last = messages.pop().unwrap();
+            if let Message::User {
+                content: last_content,
+                runtime_content: last_runtime,
+                ..
+            } = last
             {
-                let last = messages.pop().unwrap();
+                let prev = std::mem::replace(
+                    &mut messages[len - 2],
+                    Message::user("__temp__".to_string()),
+                );
                 if let Message::User {
-                    content: last_content,
-                    runtime_content: last_runtime,
+                    content: prev_content,
+                    runtime_content: prev_runtime,
                     ..
-                } = last
+                } = prev
                 {
-                    let prev = std::mem::replace(
-                        &mut messages[len - 2],
-                        Message::user("__temp__".to_string()),
-                    );
-                    if let Message::User {
-                        content: prev_content,
-                        runtime_content: prev_runtime,
-                        ..
-                    } = prev
-                    {
-                        let merged = match (prev_content, last_content) {
-                            (Content::Plain(a), Content::Plain(b)) => {
-                                Content::Plain(format!("{}\n\n{}", a, b))
-                            }
-                            (Content::Plain(a), Content::Multi(b)) => {
-                                let mut blocks = vec![ContentBlock::Text { text: a.clone() }];
-                                blocks.extend(b);
-                                Content::Multi(blocks)
-                            }
-                            (Content::Multi(a), Content::Plain(b)) => {
-                                let mut blocks = a.clone();
-                                blocks.push(ContentBlock::Text { text: b });
-                                Content::Multi(blocks)
-                            }
-                            (Content::Multi(a), Content::Multi(b)) => {
-                                let mut blocks = a.clone();
-                                blocks.extend(b);
-                                Content::Multi(blocks)
-                            }
-                        };
-                        let runtime = prev_runtime.or(last_runtime);
-                        messages[len - 2] = Message::User {
-                            meta: MessageMeta::default(),
-                            content: merged,
-                            runtime_content: runtime,
-                        };
-                    }
+                    let merged = match (prev_content, last_content) {
+                        (Content::Plain(a), Content::Plain(b)) => {
+                            Content::Plain(format!("{}\n\n{}", a, b))
+                        }
+                        (Content::Plain(a), Content::Multi(b)) => {
+                            let mut blocks = vec![ContentBlock::Text { text: a.clone() }];
+                            blocks.extend(b);
+                            Content::Multi(blocks)
+                        }
+                        (Content::Multi(a), Content::Plain(b)) => {
+                            let mut blocks = a.clone();
+                            blocks.push(ContentBlock::Text { text: b });
+                            Content::Multi(blocks)
+                        }
+                        (Content::Multi(a), Content::Multi(b)) => {
+                            let mut blocks = a.clone();
+                            blocks.extend(b);
+                            Content::Multi(blocks)
+                        }
+                    };
+                    let runtime = prev_runtime.or(last_runtime);
+                    messages[len - 2] = Message::User {
+                        meta: MessageMeta::default(),
+                        content: merged,
+                        runtime_content: runtime,
+                    };
                 }
             }
+        }
     }
 
     /// Append a tool result message to the message list.

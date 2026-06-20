@@ -159,10 +159,11 @@ impl MemoryStore {
             return cached + 1;
         }
         if let Ok(text) = std::fs::read_to_string(&self.cursor_file)
-            && let Ok(val) = text.trim().parse::<u64>() {
-                self.cursor_cache = Some(val);
-                return val + 1;
-            }
+            && let Ok(val) = text.trim().parse::<u64>()
+        {
+            self.cursor_cache = Some(val);
+            return val + 1;
+        }
         let entries = self.read_entries();
         let cursor = entries.last().map(|e| e.cursor + 1).unwrap_or(1);
         self.cursor_cache = Some(cursor - 1);
@@ -174,10 +175,11 @@ impl MemoryStore {
             return cached;
         }
         if let Ok(text) = std::fs::read_to_string(&self.dream_cursor_file)
-            && let Ok(val) = text.trim().parse::<u64>() {
-                self.dream_cursor_cache = Some(val);
-                return val;
-            }
+            && let Ok(val) = text.trim().parse::<u64>()
+        {
+            self.dream_cursor_cache = Some(val);
+            return val;
+        }
         let entries = self.read_entries();
         let cursor = entries.last().map(|e| e.cursor).unwrap_or(0);
         self.dream_cursor_cache = Some(cursor);

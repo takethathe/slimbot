@@ -229,13 +229,15 @@ impl Tool for GrepTool {
             let name = file.file_name().unwrap_or_default().to_string_lossy();
 
             if let Some(g) = glob_filter
-                && !matches_glob(&rel_path, &name, g) {
-                    continue;
-                }
+                && !matches_glob(&rel_path, &name, g)
+            {
+                continue;
+            }
             if let Some(t) = type_filter
-                && !matches_type(&name, t) {
-                    continue;
-                }
+                && !matches_type(&name, t)
+            {
+                continue;
+            }
 
             let raw = match tokio::fs::read(file).await {
                 Ok(r) => r,
@@ -286,10 +288,11 @@ impl Tool for GrepTool {
                             continue;
                         }
                         if let Some(lim) = limit
-                            && blocks.len() >= lim {
-                                truncated = true;
-                                break;
-                            }
+                            && blocks.len() >= lim
+                        {
+                            truncated = true;
+                            break;
+                        }
                         let block = Self::format_block(
                             &display,
                             &lines,
