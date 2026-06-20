@@ -140,6 +140,7 @@
 
 - [x] `ProviderConfig` 新增 `prompt_cache_enabled` 字段（默认 true），通过 `define_config!` 宏定义
 - [x] OpenAI provider 在最后一条 system message 的 content 上注入 `cache_control: {"type": "ephemeral"}`
+- [x] Runtime context 稳定性：`build_messages` 接受预生成的 `runtime_ctx` 参数，`AgentRunner` 在 turn 开始前生成一次，确保同一次 turn 内多次迭代使用相同的时间戳，提升缓存命中率
 
 ## Gateway 模式
 

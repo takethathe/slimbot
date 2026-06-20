@@ -154,7 +154,7 @@ async fn test_context_builder_injects_summary() {
     let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
 
     // Without summary
-    let ctx = cb.build_messages("s1", "cli", "test", None).await;
+    let ctx = cb.build_messages("s1", "cli", "test", None, None).await;
     let system_text = match &ctx.system_message {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
@@ -163,7 +163,7 @@ async fn test_context_builder_injects_summary() {
 
     // With summary — check system prompt (not runtime context)
     let ctx = cb
-        .build_messages("s1", "cli", "test", Some("user chose SQLite"))
+        .build_messages("s1", "cli", "test", Some("user chose SQLite"), None)
         .await;
     // System message should contain [Archived Context Summary] (not [Resumed Session] in runtime_content)
     let system_text = match &ctx.system_message {
@@ -202,7 +202,7 @@ async fn test_context_builder_skips_empty_summary() {
     let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
 
     // Empty summary should not add [Resumed Session] section
-    let ctx = cb.build_messages("s1", "cli", "test", Some("")).await;
+    let ctx = cb.build_messages("s1", "cli", "test", Some(""), None).await;
     let system_text = match &ctx.system_message {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
@@ -469,7 +469,7 @@ async fn test_context_builder_uses_summary_from_reloaded_session() {
         };
 
         let ctx = cb
-            .build_messages("s1", "cli", "test", summary.as_deref())
+            .build_messages("s1", "cli", "test", summary.as_deref(), None)
             .await;
         // Session summary is now in system prompt as "[Archived Context Summary]", not in runtime_content
         let system_text = match &ctx.system_message {

@@ -17,7 +17,8 @@ const PLATFORM_POLICY_POSIX: &str = "## Platform Policy (POSIX)\n- You are runni
 const PLATFORM_POLICY_WINDOWS: &str = "## Platform Policy (Windows)\n- You are running on Windows. Do not assume GNU tools like `grep`, `sed`, or `awk` exist.\n- Prefer Windows-native commands or file tools when they are more reliable.\n- If terminal output is garbled, retry with UTF-8 output enabled.";
 
 /// Build a transient runtime context string (time, channel, chat_id).
-fn build_runtime_context(channel: &str, chat_id: &str) -> String {
+/// Generated once per turn and reused across iterations for cache stability.
+pub fn build_runtime_context(channel: &str, chat_id: &str) -> String {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z");
     let mut lines = vec![format!("Current Time: {}", now)];
     if !channel.is_empty() && !chat_id.is_empty() {
@@ -258,12 +259,14 @@ impl ContextBuilder {
     }
 
     /// Build the complete message list for an LLM call using two-list approach.
+    /// `runtime_ctx` can be provided to ensure stability across multiple calls within a turn.
     pub async fn build_messages(
         &self,
         session_id: &str,
         channel: &str,
         chat_id: &str,
         session_summary: Option<&str>,
+        runtime_ctx: Option<String>,
     ) -> RunContext {
         debug!(
             "[ContextBuilder] Starting build_messages for session={}",
@@ -283,15 +286,16 @@ impl ContextBuilder {
             )
         };
 
-        // Build runtime context and set on first user message in current_turn that doesn't have it
-        let runtime_ctx = build_runtime_context(channel, chat_id);
+        // Build runtime context and set on first user message in current_turn that doesn't have it.
+        // Use the provided runtime_ctx if available (for stability within a turn), otherwise generate new.
+        let runtime_ctx = runtime_ctx.unwrap_or_else(|| build_runtime_context(channel, chat_id));
         for msg in &mut current_turn {
             if let Message::User {
                 runtime_content, ..
             } = msg
                 && runtime_content.is_none()
             {
-                *runtime_content = Some(runtime_ctx);
+                *runtime_content = Some(runtime_ctx.clone());
                 break;
             }
         }

@@ -39,7 +39,7 @@ pub use config::{
 pub use config_defs::{AgentConfig, ProviderConfig};
 pub use config_macro::{FieldMeta, Normalizable};
 pub use consolidate::Consolidator;
-pub use context::ContextBuilder;
+pub use context::{ContextBuilder, RunContext, build_runtime_context};
 pub use cron::{CronJob, CronPayload, CronSchedule, CronService};
 pub use log::{LogLevel, init as log_init, log, should_log};
 pub use memory::{MemoryStore, SharedMemoryStore};

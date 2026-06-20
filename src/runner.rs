@@ -238,11 +238,15 @@ impl AgentRunner {
         );
         if !tool_channel.is_empty() {
             let ctx = ToolContext {
-                channel: tool_channel,
-                chat_id: tool_chat_id,
+                channel: tool_channel.clone(),
+                chat_id: tool_chat_id.clone(),
             };
             self.tool_manager.set_context(&ctx);
         }
+
+        // Generate runtime context once per turn for cache stability.
+        // This ensures the timestamp doesn't change between iterations within the same turn.
+        let runtime_ctx = crate::context::build_runtime_context(&tool_channel, &tool_chat_id);
 
         // Reset message tool's per-turn tracking before the loop.
         self.tool_manager.start_turn("message");
@@ -293,8 +297,15 @@ impl AgentRunner {
                 self.workspace_dir.clone(),
                 self.memory_store.clone(),
             );
+            // Pass the pre-generated runtime_ctx for cache stability within this turn
             let ctx = context_builder
-                .build_messages(session_id, &channel, &chat_id, session_summary_ref)
+                .build_messages(
+                    session_id,
+                    &channel,
+                    &chat_id,
+                    session_summary_ref,
+                    Some(runtime_ctx.clone()),
+                )
                 .await;
 
             let history_len = ctx.history.len();
