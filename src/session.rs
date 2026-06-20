@@ -15,6 +15,7 @@ use crate::memory::SharedMemoryStore;
 use crate::message_bus::BusResult;
 use crate::provider::Provider;
 use crate::runner::AgentRunner;
+use crate::snip;
 use crate::tool::{ToolCall, ToolManager};
 use crate::utils::write_file_atomic;
 use crate::worker::BoxFuture;
@@ -893,6 +894,9 @@ impl SessionManager {
         // Load messages from JSONL, skipping consolidated lines
         let messages =
             Self::load_messages_from_jsonl(&self.session_dir, session_id, consolidated_lines)?;
+
+        // Apply message count limit
+        let messages = snip::limit_message_count(messages, snip::MAX_MESSAGES);
 
         // Align total_persisted from disk if not yet set
         let total_persisted = if total_persisted > 0 {
@@ -2563,5 +2567,32 @@ mod tests {
         let msgs = sm2.get_messages("s1").await;
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].timestamp(), session.history[0].timestamp()); // m3
+    }
+
+    #[tokio::test]
+    async fn test_get_or_create_limits_message_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().to_path_buf();
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+
+        // Create a session JSONL with 150 messages
+        let session_id = "test-limit";
+        let jsonl_path = session_dir.join(format!("{}.jsonl", session_id));
+        let mut file = std::fs::File::create(&jsonl_path).unwrap();
+        for i in 0..150 {
+            let msg = Message::user(format!("msg {}", i));
+            let line = serde_json::to_string(&msg).unwrap();
+            writeln!(file, "{}", line).unwrap();
+        }
+        drop(file);
+
+        // Load session
+        let session = sm.get_or_create(session_id).await.unwrap();
+        // History should be limited to 120 messages
+        assert!(
+            session.history.len() <= 120,
+            "history should be limited to 120, got {}",
+            session.history.len()
+        );
     }
 }

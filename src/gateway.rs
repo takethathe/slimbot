@@ -635,7 +635,7 @@ mod tests {
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let mut heartbeat = HeartbeatService::new(workspace_dir, 60, true);
+        let heartbeat = HeartbeatService::new(workspace_dir, 60, true);
         heartbeat.start();
 
         // Verify tick doesn't panic
@@ -2077,7 +2077,7 @@ mod tests {
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let cron_service = CronService::new(&workspace_dir);
+        let _cron_service = CronService::new(&workspace_dir);
         // Service should be created without error
         assert!(workspace_dir.exists());
     }

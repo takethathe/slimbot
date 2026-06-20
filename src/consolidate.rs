@@ -18,8 +18,8 @@ use crate::session::{Message, SharedSessionManager, message_content_chars, messa
 const MAX_CHUNK_MESSAGES: usize = 60;
 /// Extra headroom for tokenizer estimation drift.
 const SAFETY_BUFFER: u32 = 512;
-/// Prompt can use up to 85% of context window.
-const CONTEXT_BUDGET_FRACTION: f64 = 0.85;
+/// Prompt can use up to 50% of context window before triggering consolidation.
+const CONTEXT_BUDGET_FRACTION: f64 = 0.5;
 /// Consolidation reduces prompt to 60% of budget, leaving room for next turn.
 const CONSOLIDATION_TARGET_FRACTION: f64 = 0.6;
 
@@ -298,6 +298,11 @@ If nothing noteworthy happened, output: (nothing)"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_consolidation_threshold_is_50_percent() {
+        assert!((CONTEXT_BUDGET_FRACTION - 0.5).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn test_estimate_message_tokens_with_ratio() {

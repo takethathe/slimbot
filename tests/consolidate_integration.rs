@@ -161,23 +161,25 @@ async fn test_context_builder_injects_summary() {
     };
     assert!(!system_text.contains("[Resumed Session]"));
 
-    // With summary — check runtime context in user message (not system prompt)
+    // With summary — check system prompt (not runtime context)
     let ctx = cb
         .build_messages("s1", "cli", "test", Some("user chose SQLite"))
         .await;
-    // System message should NOT contain [Resumed Session] anymore
+    // System message should contain [Archived Context Summary] (not [Resumed Session] in runtime_content)
     let system_text = match &ctx.system_message {
         Message::System { content, .. } => content,
         _ => panic!("expected system message"),
     };
     assert!(!system_text.contains("[Resumed Session]"));
-    // Runtime context is in the runtime_content field of the user message in current_turn
+    assert!(system_text.contains("[Archived Context Summary]"));
+    assert!(system_text.contains("user chose SQLite"));
+    // Runtime context should NOT contain session summary (it was moved to system prompt)
     let has_resumed_in_user = ctx.current_turn.iter().any(|m| {
         matches!(m, Message::User { runtime_content, .. } if runtime_content.as_ref().is_some_and(|rc| rc.contains("[Resumed Session]")))
     });
     assert!(
-        has_resumed_in_user,
-        "[Resumed Session] should be in runtime_content of a user message"
+        !has_resumed_in_user,
+        "[Resumed Session] should NOT be in runtime_content (session summary moved to system prompt)"
     );
 }
 
@@ -469,16 +471,20 @@ async fn test_context_builder_uses_summary_from_reloaded_session() {
         let ctx = cb
             .build_messages("s1", "cli", "test", summary.as_deref())
             .await;
-        // Check runtime context in runtime_content field of current_turn user messages
+        // Session summary is now in system prompt as "[Archived Context Summary]", not in runtime_content
+        let system_text = match &ctx.system_message {
+            Message::System { content, .. } => content,
+            _ => panic!("expected system message"),
+        };
+        assert!(system_text.contains("[Archived Context Summary]"));
+        assert!(system_text.contains("chat bot"));
+        // Runtime context should NOT contain session summary (moved to system prompt)
         let has_resumed_in_user = ctx.current_turn.iter().any(|m| {
             matches!(m, Message::User { runtime_content, .. } if runtime_content.as_ref().is_some_and(|rc| rc.contains("[Resumed Session]")))
         });
-        let has_chat_bot = ctx.current_turn.iter().any(|m| {
-            matches!(m, Message::User { runtime_content, .. } if runtime_content.as_ref().is_some_and(|rc| rc.contains("chat bot")))
-        });
-
-        // Session summary is in runtime context (user message), not system prompt
-        assert!(has_resumed_in_user);
-        assert!(has_chat_bot);
+        assert!(
+            !has_resumed_in_user,
+            "Session summary should be in system prompt, not runtime_content"
+        );
     }
 }

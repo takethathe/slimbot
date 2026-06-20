@@ -16,20 +16,13 @@ const PLATFORM_POLICY_POSIX: &str = "## Platform Policy (POSIX)\n- You are runni
 
 const PLATFORM_POLICY_WINDOWS: &str = "## Platform Policy (Windows)\n- You are running on Windows. Do not assume GNU tools like `grep`, `sed`, or `awk` exist.\n- Prefer Windows-native commands or file tools when they are more reliable.\n- If terminal output is garbled, retry with UTF-8 output enabled.";
 
-/// Build a transient runtime context string (time, channel, chat_id, session summary).
-fn build_runtime_context(channel: &str, chat_id: &str, session_summary: Option<&str>) -> String {
+/// Build a transient runtime context string (time, channel, chat_id).
+fn build_runtime_context(channel: &str, chat_id: &str) -> String {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z");
     let mut lines = vec![format!("Current Time: {}", now)];
     if !channel.is_empty() && !chat_id.is_empty() {
         lines.push(format!("Channel: {}", channel));
         lines.push(format!("Chat ID: {}", chat_id));
-    }
-    if let Some(summary) = session_summary
-        && !summary.is_empty()
-    {
-        lines.push(String::new());
-        lines.push("[Resumed Session]".to_string());
-        lines.push(summary.to_string());
     }
     format!(
         "{}\n{}\n{}",
@@ -93,6 +86,45 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillMeta> {
     })
 }
 
+/// Maximum tokens allowed for recent history section in system prompt.
+const MAX_HISTORY_TOKENS: u32 = 8_000;
+
+/// Truncate recent history text to fit within token budget.
+///
+/// Uses `char_per_token_ratio` to estimate tokens. Drops entries from the
+/// front (keeping the most recent) and appends a truncation suffix.
+fn truncate_recent_history(
+    history_text: &str,
+    max_tokens: u32,
+    char_per_token_ratio: f64,
+) -> String {
+    if char_per_token_ratio <= 0.0 {
+        return history_text.to_string();
+    }
+    let estimated_tokens = (history_text.len() as f64 / char_per_token_ratio).ceil() as u32;
+    if estimated_tokens <= max_tokens {
+        return history_text.to_string();
+    }
+
+    // Drop lines from the front until we fit
+    let mut lines: Vec<&str> = history_text.lines().collect();
+    let suffix = "\n... (truncated)";
+    let suffix_tokens = (suffix.len() as f64 / char_per_token_ratio).ceil() as u32;
+    let budget = max_tokens.saturating_sub(suffix_tokens);
+
+    while !lines.is_empty() {
+        let remaining_text = lines.join("\n");
+        let remaining_tokens = (remaining_text.len() as f64 / char_per_token_ratio).ceil() as u32;
+        if remaining_tokens <= budget {
+            return format!("{}{}", remaining_text, suffix);
+        }
+        lines.remove(0);
+    }
+
+    // Nothing fits
+    suffix.to_string()
+}
+
 pub struct ContextBuilder {
     session_manager: SharedSessionManager,
     tool_manager: Arc<ToolManager>,
@@ -116,7 +148,11 @@ impl ContextBuilder {
     }
 
     /// Build the system prompt string.
-    pub async fn build_system_prompt(&self, channel: &str) -> String {
+    pub async fn build_system_prompt(
+        &self,
+        channel: &str,
+        session_summary: Option<&str>,
+    ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         // 1. Identity
@@ -155,7 +191,15 @@ impl ContextBuilder {
                 .map(|e| format!("- [{}] {}", e.timestamp, e.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            parts.push(format!("# Recent History\n\n{history_text}"));
+            let capped_text = truncate_recent_history(&history_text, MAX_HISTORY_TOKENS, 4.0);
+            parts.push(format!("# Recent History\n\n{capped_text}"));
+        }
+
+        // 6. Session summary (archived context)
+        if let Some(summary) = session_summary
+            && !summary.is_empty()
+        {
+            parts.push(format!("[Archived Context Summary]\n\n{}", summary));
         }
 
         parts.join("\n\n---\n\n")
@@ -227,7 +271,7 @@ impl ContextBuilder {
         );
 
         // Build system prompt
-        let system_prompt = self.build_system_prompt(channel).await;
+        let system_prompt = self.build_system_prompt(channel, session_summary).await;
         let system_message = Message::system(system_prompt);
 
         // Get history Arc and current_turn Vec from SessionManager
@@ -240,7 +284,7 @@ impl ContextBuilder {
         };
 
         // Build runtime context and set on first user message in current_turn that doesn't have it
-        let runtime_ctx = build_runtime_context(channel, chat_id, session_summary);
+        let runtime_ctx = build_runtime_context(channel, chat_id);
         for msg in &mut current_turn {
             if let Message::User {
                 runtime_content, ..
@@ -435,7 +479,7 @@ Skill body.
 
     #[test]
     fn test_build_runtime_context_basic() {
-        let ctx = build_runtime_context("cli", "default", None);
+        let ctx = build_runtime_context("cli", "default");
         assert!(ctx.starts_with(RUNTIME_CONTEXT_TAG));
         assert!(ctx.ends_with(RUNTIME_CONTEXT_END));
         assert!(ctx.contains("Current Time:"));
@@ -445,28 +489,39 @@ Skill body.
     }
 
     #[test]
-    fn test_build_runtime_context_with_summary() {
-        let ctx = build_runtime_context("webui", "chat-1", Some("User asked about files"));
+    fn test_build_runtime_context_no_summary() {
+        // After change, runtime context should NOT contain session summary
+        let ctx = build_runtime_context("cli", "default");
+        assert!(
+            !ctx.contains("[Resumed Session]"),
+            "runtime context should not contain [Resumed Session]"
+        );
+        // But should still contain time and channel
+        assert!(ctx.contains("Current Time:"));
+        assert!(ctx.contains("Channel: cli"));
+    }
+
+    #[test]
+    fn test_build_runtime_context_with_summary_removed() {
+        // This test verifies that session summary is NO LONGER in runtime context
+        // after Task 8 refactoring
+        let ctx = build_runtime_context("webui", "chat-1");
         assert!(ctx.starts_with(RUNTIME_CONTEXT_TAG));
         assert!(ctx.ends_with(RUNTIME_CONTEXT_END));
         assert!(ctx.contains("Channel: webui"));
         assert!(ctx.contains("Chat ID: chat-1"));
-        assert!(ctx.contains("[Resumed Session]"));
-        assert!(ctx.contains("User asked about files"));
+        assert!(
+            !ctx.contains("[Resumed Session]"),
+            "runtime context should not contain [Resumed Session] after Task 8"
+        );
     }
 
     #[test]
     fn test_build_runtime_context_empty_channel() {
-        let ctx = build_runtime_context("", "", None);
+        let ctx = build_runtime_context("", "");
         assert!(ctx.starts_with(RUNTIME_CONTEXT_TAG));
         assert!(!ctx.contains("Channel:"));
         assert!(!ctx.contains("Chat ID:"));
-    }
-
-    #[test]
-    fn test_build_runtime_context_empty_summary() {
-        let ctx = build_runtime_context("cli", "default", Some(""));
-        assert!(!ctx.contains("[Resumed Session]"));
     }
 
     #[test]
@@ -782,19 +837,6 @@ let x = 42;
     }
 
     #[test]
-    fn test_build_runtime_context_with_empty_summary() {
-        let ctx = build_runtime_context("webui", "chat-123", Some(""));
-        assert!(!ctx.contains("[Resumed Session]"));
-    }
-
-    #[test]
-    fn test_build_runtime_context_with_summary_variant() {
-        let ctx = build_runtime_context("cli", "default", Some("User prefers Rust"));
-        assert!(ctx.contains("[Resumed Session]"));
-        assert!(ctx.contains("User prefers Rust"));
-    }
-
-    #[test]
     fn test_runtime_string_contains_rust() {
         let rt = ContextBuilder::runtime_string();
         assert!(rt.contains("Rust"));
@@ -859,5 +901,30 @@ let x = 42;
     fn test_channel_format_hint_unknown_returns_empty() {
         let hint = ContextBuilder::channel_format_hint("unknown-channel");
         assert!(hint.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_recent_history_to_token_budget() {
+        // Create 100 entries, each ~200 chars
+        let entries: Vec<crate::memory::HistoryEntry> = (0..100)
+            .map(|i| crate::memory::HistoryEntry {
+                timestamp: format!("2026-06-20 12:{:02}", i % 60),
+                content: "x".repeat(200),
+            })
+            .collect();
+        let history_text = entries
+            .iter()
+            .map(|e| format!("- [{}] {}", e.timestamp, e.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Total chars: ~100 * 220 = 22,000 → ~5,500 tokens at ratio 4.0
+        // With 8,000 token limit, should NOT be truncated
+        let truncated = truncate_recent_history(&history_text, 8_000, 4.0);
+        assert_eq!(truncated, history_text);
+
+        // Now with a tighter budget (1,000 tokens), should be truncated
+        let tight = truncate_recent_history(&history_text, 1_000, 4.0);
+        assert!(tight.len() < history_text.len());
+        assert!(tight.contains("truncated"));
     }
 }

@@ -312,9 +312,11 @@ impl AgentRunner {
                 history_len, current_turn_len, tools_len
             );
 
-            // History governance: clean orphans and backfill missing tool results
+            // History governance: clean orphans, backfill, microcompact, and budget tool results
             Self::drop_orphan_tool_results(&mut all_messages);
             Self::backfill_missing_tool_results(&mut all_messages);
+            all_messages = crate::snip::microcompact(all_messages);
+            all_messages = crate::snip::apply_tool_result_budget(all_messages);
 
             // Snip: truncate messages to fit within token budget (stateless, no persistence)
             let char_per_token_ratio = {
