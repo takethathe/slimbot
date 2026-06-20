@@ -1,10 +1,6 @@
 # CLAUDE.md
 
-本文档在 Claude Code (claude.ai/code) 操作本仓库时提供指导。
-
-## 项目概述
-
-**slimbot** 是一个使用 Rust 开发的 AI 机器人助手，基于 ReAct 循环与 OpenAI 兼容的 LLM API 交互，支持工具调用和多通道（CLI、WebUI 等）。
+slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支持工具调用和多通道（CLI、WebUI）。
 
 ## 构建和运行
 
@@ -21,152 +17,76 @@
 
 ```
 slimbot/
-├── Cargo.toml          # 包清单
-├── .gitignore          # 排除 /target
-├── docs/
-│   ├── config.md       # 配置指南
-│   ├── tools.md        # 内置工具说明
-│   └── logging.md      # 日志系统说明
-└── src/
-    ├── main.rs         # Entry: load config → init Logger → AgentLoop → MessageBus → ChannelManager
-    ├── log.rs          # Logging: LogLevel enum, global singleton logger, init/log/should_log
-    ├── macros.rs       # Logging macros: debug!, info!, warn!, error!, fatal!
-    ├── cli.rs          # CLI: clap argument parsing, run_agent_session
-    ├── config.rs       # Config: config.json read/write, AgentConfig/ProviderConfig/ChannelConfig/GatewayConfig
-    ├── config_scheme.rs # ConfigScheme: default values, normalization, validation
-    ├── bootstrap.rs    # Bootstrap templates: AGENTS.md, USER.md, SOUL.md, TOOLS.md
-    ├── setup.rs        # Setup command: config normalization + directory + bootstrap creation
-    ├── tool.rs         # Tool trait + ToolManager: tool registration & OpenAI function calling conversion
-    ├── tools/          # Built-in tool implementations
-    │   ├── mod.rs      # Factory function + resolve_data_path() path validation
-    │   ├── shell.rs    # Shell command execution
-    │   ├── file_reader.rs  # File reading
-    │   ├── file_writer.rs  # File writing
-    │   ├── file_editor.rs  # Search-and-replace editing
-    │   ├── list_dir.rs     # Directory listing
-    │   ├── make_dir.rs     # Directory creation
-    │   ├── message.rs      # Message delivery to channels
-    │   └── cron.rs         # Cron job management (add/list/remove)
-    ├── gateway.rs      # Gateway mode: cron + heartbeat + channels + ctrl+c
-    ├── cron/           # Cron service: scheduling, persistence, tick execution
-    │   ├── mod.rs
-    │   ├── types.rs    # CronSchedule, CronJob, CronPayload, CronStore
-    │   └── service.rs  # CronService: CRUD, load/save, tick, compute_next_run
-    ├── heartbeat/      # Heartbeat service
-    │   ├── mod.rs
-    │   └── service.rs  # HeartbeatService: periodic HEARTBEAT.md reading + LLM execution
-    ├── provider/       # Provider trait + OpenAIProvider: LLM API request/response
-    │   ├── mod.rs      # Provider trait, ChatResponse, FinishReason
-    │   └── openai.rs   # OpenAIProvider implementation
-    ├── session.rs      # Session + SessionManager + SharedSessionManager: FIFO task queue, message management, JSONL persistence
-    ├── context.rs      # ContextBuilder: system prompt construction (intro → workspace files → skills → history → channel inject)
-    ├── runner.rs       # AgentRunner: ReAct loop core
-    ├── agent_loop.rs   # AgentLoop: top-level orchestration, initializes all components
-    ├── message_bus.rs  # MessageBus: user request & result delivery
-    └── channel/        # Channel trait + CliChannel + WebuiChannel + ChannelManager + ChannelFactory
-        ├── mod.rs      # Channel/ChannelFactory traits, ChannelManager
-        ├── cli.rs      # CliChannel & CliChannelFactory
-        └── webui.rs    # WebuiChannel: axum HTTP server with SSE, embedded index.html
+├── src/
+│   ├── main.rs          # Entry
+│   ├── cli.rs           # CLI 参数解析
+│   ├── config.rs        # 配置读写
+│   ├── bootstrap.rs     # workspace 模板文件
+│   ├── setup.rs         # setup 命令
+│   ├── agent_loop.rs    # 顶层协调
+│   ├── runner.rs        # ReAct 循环核心
+│   ├── session.rs       # 会话管理 + JSONL 持久化
+│   ├── context.rs       # system prompt 构建
+│   ├── message_bus.rs   # 消息总线
+│   ├── tool.rs          # Tool trait + ToolManager
+│   ├── tools/           # 内置工具实现
+│   ├── channel/         # CLI + WebUI 通道
+│   ├── gateway.rs       # Gateway 模式入口
+│   ├── cron/            # 定时任务
+│   ├── heartbeat/       # 心跳服务
+│   ├── provider/        # LLM API 封装
+│   ├── consolidate.rs   # 会话摘要压缩
+│   ├── memory.rs        # 记忆存储
+│   └── snip.rs          # 上下文截断
+└── docs/                # 文档目录
 ```
 
 ## 架构
 
-### CLI 模式
+**CLI 模式：** `ChannelManager` 轮询输入 → `MessageBus` 封装任务 → `AgentRunner` 执行 ReAct 循环 → 结果回传通道。
 
-```
-AgentLoop ── 初始化 Provider、ToolManager、SessionManager
-   │
-   ▼
-AgentRunner ── ReAct 循环 ── 通过 TaskHook.fire_event() 发送 AgentEvent
-   ├── ContextBuilder.build_messages() → system prompt + 历史 Arc + 当前轮 Vec
-   │   ─ runtime_content 在 Message::User 上独立存储，仅 Provider 序列化时处理
-   ├── Provider.chat(&[&Message]) → LLM API 调用（引用传递，避免 clone）
-   ├── ToolManager.execute() → 工具执行
-   └─ SessionManager.persist() → append-only JSONL + meta 保存
-   │
-   ▼
-MessageBus ── 接收 BusRequest → 封装 SessionTask → 入队/出队 → 调用 AgentRunner
-   │
-   ▼
-ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 → 与 MessageBus 交互
-    通过 broadcast::Sender<AgentEvent> 将事件路由到各通道
-```
+**Gateway 模式：** 额外启动 `CronService`（定时任务）和 `HeartbeatService`（心跳检测），触发 `AgentLoop.run_task()`。WebUI 通过 SSE 广播 `AgentEvent`。
 
-### Gateway 模式
-
-```
-run_gateway()
-   ├── broadcast::channel(256) ─ AgentEvent 广播总线
-   │   ├── 发送给 ChannelManager.event_tx
-   │   └── 传递给 WebuiChannelFactory 注册到每个 WebuiChannel
-   │
-   ├── CronService ── 定时任务调度，JSON 持久化，tick 驱动
-   │   └── on_job → AgentLoop.run_task()
-   ├── HeartbeatService ── 定期读取 HEARTBEAT.md，LLM 判断执行
-   │   └── on_execute → AgentLoop.run_task()
-   ├── AgentLoop ── 预注册 message + cron 工具的 ToolManager
-   │   ├── message tool ── 通过 MessageBus 发送结果到指定 channel:chat_id
-   │   └── cron tool ── 通过 CronService 管理定时任务
-   └── ChannelManager ── 启动 enabled channels (CLI + WebUI)
-       ├── CLI channel ── stdin/stdout
-       └── WebUI channel ── axum HTTP server (SSE + REST API)
-           ├── SSE 消息: BusResult → write_output → 正常文本气泡
-           ├── SSE 事件: AgentEvent → write_event → 前端 event listener
-           └── 事件类型: task_started/completed/failed, tool_call/result,
-               assistant_message, pre_iteration
-```
+**核心数据流：** `ContextBuilder` 构建消息 → `Provider.chat()` 调用 LLM → `ToolManager.execute()` 执行工具 → `SessionManager.persist()` 持久化 JSONL。
 
 ## 数据目录
 
-```
-~/.slimbot/                         # data_dir (默认，运行时数据)
-└── workspace/                      # workspace_dir (默认，工作区)
-    ├── AGENTS.md                   # Agent 行为定义（由 setup 生成）
-    ├── USER.md                     # 用户画像（由 setup 生成）
-    ├── SOUL.md                     # Agent 人格（由 setup 生成）
-    ├── TOOLS.md                    # 工具使用指南（由 setup 生成）
-    ├── HEARTBEAT.md                # Heartbeat 任务定义（gateway 模式）
-    ├── skills/                     # 可选 skill 文件 (*.md)
-    ├── cron/                       # Cron 持久化目录（gateway 模式）
-    │   └── jobs.json               # 定时任务 JSON 存储
-    └── sessions/
-        ├── {session_id}.jsonl      # 会话消息持久化（append-only）
-        └── {session_id}.meta.json  # 会话元数据（cursor、ID、token ratio、summary）
-```
+`~/.slimbot/workspace/` 包含：`AGENTS.md`、`USER.md`、`SOUL.md`、`TOOLS.md`（setup 生成）、`HEARTBEAT.md`、`skills/`、`cron/jobs.json`、`sessions/{id}.jsonl`。
 
-`data_dir` 和 `workspace_dir` 是两个独立配置项。`workspace_dir` 默认值为 `{data_dir}/workspace`。
-
-运行 `cargo run -- setup` 时自动创建上述目录和 4 个 bootstrap 文件。若文件未修改（与模板一致），`context.rs` 加载时会跳过，节省 token。
+`data_dir` 和 `workspace_dir` 独立配置，后者默认 `{data_dir}/workspace`。未修改的 bootstrap 文件会被 `context.rs` 跳过。
 
 ## 关键设计决策
 
-- `SharedSessionManager` = `Arc<Mutex<SessionManager>>`，所有模块通过共享 Mutex 访问
-- `SessionTask` 绑定 `TaskHook`，通过 `broadcast::Sender<AgentEvent>` 广播运行时事件（tool_call、assistant_message 等），各 Channel 订阅后自行处理
-- 消息持久化：默认 append-only 写入 JSONL，meta 数据单独 `.meta.json` 文件。当 `consolidated_lines > 0` 时，`persist()` 全量重写 JSONL（只写当前消息），重写后 `consolidated_lines` 归零，`total_persisted` 更新为实际行数
-- Session 双列表结构：`history: Arc<[Message]>`（已持久化，零拷贝共享）+ `current_turn: Vec<Message>`（本轮缓冲）
-- Provider 接收消息引用：`Provider::chat(&[&Message])` 避免 clone 开销
-- Consolidator：token 预算触发的会话摘要，在 user-turn 边界对齐，摘要通过 `MemoryStore` 追加到 `history.jsonl`
+- 消息持久化：默认 append-only JSONL，`consolidated_lines > 0` 时全量重写
+- Session 双列表：`history: Arc<[Message]>`（已持久化）+ `current_turn: Vec<Message>`（本轮缓冲）
+- Provider 接口：`Provider::chat(&[&Message])` 引用传递，避免 clone
 - Session ID 格式：`{channel_id}:{chat_id}`
-- 循环结束条件：超出 `max_iterations` 或模型返回无 tool_calls
-- WorkerPool：全局异步线程池，用于 Session 任务并发执行
+- 循环结束：超出 `max_iterations` 或模型返回无 tool_calls
 
 ## 开发规范
 
 ### 工作流程
 
-所有开发任务遵循 **规划 → 实现 → 测试 → 更新文档** 四步流程：
+所有开发任务遵循 **规划 → 测试 → 实现 → 验证** 四步流程：
 
 1. **确认需求**：收到用户需求后，先确认理解是否正确，再开始后续工作
-2. **规划**：明确目标和实现方案，确认后再开始编码
-3. **实现**：按照设计方案编写代码，包括功能代码和对应的测试代码
-4. **测试**：使用 `cargo check --message-format=json`（配合 jq 压缩输出）/ `cargo build` / `cargo test` 验证代码正确性，确保新增测试通过
-5. **更新文档**：在 `docs/` 目录下补充或更新相关文档
+2. **规划（Plan）**：明确目标，分解为可测试的行为点，确认后再开始编码
+3. **测试先行（Test First）**：为每个行为点编写测试用例，描述输入/输出/边界条件，此时测试应失败
+4. **实现（Implement）**：编写最小代码使测试通过，同步更新文档
+5. **验证（Verify）**：运行 `cargo check`、`cargo build`、`cargo test` 确保所有测试通过，更新文档和 TODO
+
+### TDD 实践
+
+- **测试命名**：`test_<功能>_<场景>_<预期结果>`，如 `test_parse_config_missing_field_returns_default`
+- **测试粒度**：每个公共函数/方法至少一个单元测试，复杂逻辑覆盖边界条件
+- **测试位置**：`#[cfg(test)] mod tests` 在对应模块内，集成测试放 `tests/` 目录
+- **运行测试**：`cargo test <模块名>` 运行特定模块，`cargo test` 运行全部
 
 ### 文档管理
 
 - **README 文档**：放在项目根目录
 - **其它所有文档**（设计文档、API 文档、模块说明等）：统一放在 `docs/` 目录下
-- **TODO 管理**：新增功能计划或代码中的 TODO 必须以简洁的语言记录到 `docs/TODO.md` 中。工作流程的"更新文档"步骤需包含：添加/完成 TODO 记录，以及编写相关技术文档
+- **TODO 管理**：新增功能计划或代码中的 TODO 必须以简洁的语言记录到 `docs/TODO.md` 中。工作流程的"验证"步骤需包含：添加/完成 TODO 记录，以及编写相关技术文档
 
 ### Git 提交
 
@@ -178,9 +98,3 @@ run_gateway()
 ### 代码注释
 
 - **所有代码注释必须使用英文**
-
-### 测试
-
-- 功能实现时应同步编写对应的测试代码
-- 测试代码放在对应模块的 `#[cfg(test)]` 块或 `tests/` 目录
-- 核心逻辑、公共 API、边界条件必须有测试覆盖
