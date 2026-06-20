@@ -189,7 +189,7 @@ impl DreamService {
         }
     }
 
-    pub async fn build_prompt(&self) -> Option<(String, u64)> {
+    pub async fn build_prompt(&self) -> Option<(String, usize)> {
         let mut ms = self.memory_store.lock().await;
         let dream_cursor = ms.get_last_dream_cursor();
         let entries = ms.read_unprocessed_history(dream_cursor);
@@ -204,7 +204,7 @@ impl DreamService {
             &entries
         };
 
-        let last_cursor = batch.last().map(|e| e.cursor).unwrap_or(0);
+        let lines_processed = dream_cursor + batch.len();
 
         let history_text = batch
             .iter()
@@ -224,7 +224,7 @@ impl DreamService {
         let template = crate::embed::get_content("dream.md")?;
         let prompt = template.replace("{history_text}", &history_text);
 
-        Some((prompt, last_cursor))
+        Some((prompt, lines_processed))
     }
 
     pub fn build_tools(&self) -> ToolManager {
@@ -271,7 +271,7 @@ impl DreamService {
     pub async fn run(&self) -> DreamResult {
         let start = std::time::Instant::now();
 
-        let (prompt, last_cursor) = match self.build_prompt().await {
+        let (prompt, lines_processed) = match self.build_prompt().await {
             Some(result) => result,
             None => {
                 return DreamResult {
@@ -324,7 +324,7 @@ impl DreamService {
         if success {
             // Advance dream cursor
             let mut ms = self.memory_store.lock().await;
-            if let Err(e) = ms.set_last_dream_cursor(last_cursor) {
+            if let Err(e) = ms.set_last_dream_cursor(lines_processed) {
                 crate::error!("[DreamService] Failed to set dream cursor: {}", e);
             }
             drop(ms);
@@ -446,11 +446,11 @@ mod tests {
         let result = service.build_prompt().await;
         assert!(result.is_some());
 
-        let (prompt, cursor) = result.unwrap();
+        let (prompt, lines_processed) = result.unwrap();
         assert!(prompt.contains("["));
         assert!(prompt.contains("First entry content"));
         assert!(prompt.contains("Second entry content"));
-        assert_eq!(cursor, 2);
+        assert_eq!(lines_processed, 2);
     }
 
     #[tokio::test]
@@ -510,11 +510,11 @@ mod tests {
         let result = service.build_prompt().await;
         assert!(result.is_some());
 
-        let (prompt, cursor) = result.unwrap();
+        let (prompt, lines_processed) = result.unwrap();
         assert!(prompt.contains("Entry 1"));
         assert!(prompt.contains("Entry 2"));
         assert!(!prompt.contains("Entry 3"));
-        assert_eq!(cursor, 2);
+        assert_eq!(lines_processed, 2);
     }
 
     #[tokio::test]
@@ -601,11 +601,11 @@ mod tests {
         let entries = ms.read_entries();
         // Should compact to DREAM_KEEP_MINIMUM (50)
         assert_eq!(entries.len(), 50);
-        // First entry should be cursor 2051
-        assert_eq!(entries[0].cursor, 2051);
-        // Last entry should be cursor 2100
-        assert_eq!(entries[49].cursor, 2100);
-        // Dream cursor should be repositioned to 2050 (2051 - 1)
-        assert_eq!(ms.get_last_dream_cursor(), 2050);
+        // First entry content
+        assert_eq!(entries[0].content, "entry 2051");
+        // Last entry content
+        assert_eq!(entries[49].content, "entry 2100");
+        // Dream cursor should be adjusted: 2000 - 2050 = 0 (saturating)
+        assert_eq!(ms.get_last_dream_cursor(), 0);
     }
 }

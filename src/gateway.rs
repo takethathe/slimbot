@@ -1450,7 +1450,7 @@ mod tests {
         ms.lock().await.append_history("entry2").unwrap();
         ms.lock().await.append_history("entry3").unwrap();
 
-        // Read unprocessed history with cursor 0 should return all
+        // Read unprocessed history with skip 0 should return all
         let unprocessed = ms.lock().await.read_unprocessed_history(0);
         assert_eq!(unprocessed.len(), 3);
     }
@@ -1711,7 +1711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_read_unprocessed_history_with_cursor() {
+    async fn test_gateway_memory_store_read_unprocessed_history_with_skip() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
@@ -1724,7 +1724,7 @@ mod tests {
         ms.lock().await.append_history("entry2").unwrap();
         ms.lock().await.append_history("entry3").unwrap();
 
-        // Read unprocessed with cursor 1 should return entries after cursor 1
+        // Read unprocessed with skip 1 should return last 2 entries
         let unprocessed = ms.lock().await.read_unprocessed_history(1);
         assert_eq!(unprocessed.len(), 2);
     }

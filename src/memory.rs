@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 /// History entry in history.jsonl.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
-    pub cursor: u64,
     pub timestamp: String,
     pub content: String,
 }
@@ -22,11 +21,9 @@ pub struct MemoryStore {
     memory_dir: PathBuf,
     memory_file: PathBuf,
     history_file: PathBuf,
-    cursor_file: PathBuf,
     dream_cursor_file: PathBuf,
-    // In-memory cache for cursors, lazily initialized.
-    cursor_cache: Option<u64>,
-    dream_cursor_cache: Option<u64>,
+    // In-memory cache for dream cursor, lazily initialized.
+    dream_cursor_cache: Option<usize>,
 }
 
 impl MemoryStore {
@@ -37,9 +34,7 @@ impl MemoryStore {
             memory_dir: memory_dir.clone(),
             memory_file: memory_dir.join("MEMORY.md"),
             history_file: memory_dir.join("history.jsonl"),
-            cursor_file: memory_dir.join(".cursor"),
             dream_cursor_file: memory_dir.join(".dream_cursor"),
-            cursor_cache: None,
             dream_cursor_cache: None,
         }
     }
@@ -97,7 +92,6 @@ impl MemoryStore {
     /// Sync all memory files to disk (fsync). Called during shutdown.
     pub fn sync_all(&self) -> Result<()> {
         sync_if_exists(&self.history_file, true)?;
-        sync_if_exists(&self.cursor_file, false)?;
         sync_if_exists(&self.dream_cursor_file, false)?;
         sync_if_exists(&self.memory_file, false)?;
         // Sync the memory directory
@@ -112,19 +106,14 @@ impl MemoryStore {
 
     // -- history.jsonl (append-only JSONL) -----------------------------------
 
-    /// Append an entry to history.jsonl and return its auto-incrementing cursor.
-    pub fn append_history(&mut self, entry: &str) -> Result<u64> {
-        let cursor = self.next_cursor();
+    /// Append an entry to history.jsonl.
+    pub fn append_history(&mut self, entry: &str) -> Result<()> {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
         let record = HistoryEntry {
-            cursor,
             timestamp: now.to_string(),
             content: entry.to_string(),
         };
         let line = serde_json::to_string(&record).context("Failed to serialize history entry")?;
-        std::fs::write(&self.cursor_file, cursor.to_string())
-            .context("Failed to write history cursor")?;
-        self.cursor_cache = Some(cursor);
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -132,15 +121,12 @@ impl MemoryStore {
             .open(&self.history_file)
             .context("Failed to open history file")?;
         writeln!(file, "{}", line).context("Failed to write history entry")?;
-        Ok(cursor)
+        Ok(())
     }
 
-    /// Read history entries with cursor > `since_cursor`.
-    pub fn read_unprocessed_history(&mut self, since_cursor: u64) -> Vec<HistoryEntry> {
-        self.read_entries()
-            .into_iter()
-            .filter(|e| e.cursor > since_cursor)
-            .collect()
+    /// Read history entries, skipping the first `skip_lines` entries.
+    pub fn read_unprocessed_history(&self, skip_lines: usize) -> Vec<HistoryEntry> {
+        self.read_entries().into_iter().skip(skip_lines).collect()
     }
 
     /// Read all entries from history.jsonl, capped to `max_entries` if > 0.
@@ -153,30 +139,14 @@ impl MemoryStore {
         }
     }
 
-    // -- cursor management --------------------------------------------------
+    // -- dream cursor management --------------------------------------------
 
-    fn next_cursor(&mut self) -> u64 {
-        if let Some(cached) = self.cursor_cache {
-            return cached + 1;
-        }
-        if let Ok(text) = std::fs::read_to_string(&self.cursor_file)
-            && let Ok(val) = text.trim().parse::<u64>()
-        {
-            self.cursor_cache = Some(val);
-            return val + 1;
-        }
-        let entries = self.read_entries();
-        let cursor = entries.last().map(|e| e.cursor + 1).unwrap_or(1);
-        self.cursor_cache = Some(cursor - 1);
-        cursor
-    }
-
-    pub fn get_last_dream_cursor(&mut self) -> u64 {
+    pub fn get_last_dream_cursor(&mut self) -> usize {
         if let Some(cached) = self.dream_cursor_cache {
             return cached;
         }
         if let Ok(text) = std::fs::read_to_string(&self.dream_cursor_file)
-            && let Ok(val) = text.trim().parse::<u64>()
+            && let Ok(val) = text.trim().parse::<usize>()
         {
             self.dream_cursor_cache = Some(val);
             return val;
@@ -186,7 +156,7 @@ impl MemoryStore {
         0
     }
 
-    pub fn set_last_dream_cursor(&mut self, cursor: u64) -> Result<()> {
+    pub fn set_last_dream_cursor(&mut self, cursor: usize) -> Result<()> {
         self.dream_cursor_cache = Some(cursor);
         std::fs::write(&self.dream_cursor_file, cursor.to_string())
             .context("Failed to write dream cursor")
@@ -276,7 +246,7 @@ impl MemoryStore {
     /// Compact history entries after Dream processing.
     /// Only compacts when history exceeds HISTORY_MAX_ENTRIES.
     /// Keeps the most recent DREAM_KEEP_MINIMUM entries.
-    /// Repositions dream_cursor after compaction.
+    /// Adjusts dream_cursor after compaction based on deleted line count.
     pub fn compact_history_after_dream(&mut self) -> Result<()> {
         let entries = self.read_entries();
 
@@ -291,16 +261,13 @@ impl MemoryStore {
 
         // Keep only the most recent DREAM_KEEP_MINIMUM entries
         let keep_start = entries.len().saturating_sub(Self::DREAM_KEEP_MINIMUM);
+        let deleted_count = keep_start;
         let filtered: Vec<HistoryEntry> = entries.into_iter().skip(keep_start).collect();
 
-        // Reposition dream_cursor to the minimum cursor in the remaining entries - 1
-        // This ensures we don't re-process entries that were kept for recent context
-        if let Some(min_cursor) = filtered.iter().map(|e| e.cursor).min() {
-            // Set dream_cursor to min_cursor - 1, so next read_unprocessed_history
-            // will start from min_cursor (which is > dream_cursor)
-            let new_dream_cursor = min_cursor.saturating_sub(1);
-            self.set_last_dream_cursor(new_dream_cursor)?;
-        }
+        // Adjust dream_cursor: subtract the number of deleted lines
+        let old_cursor = self.get_last_dream_cursor();
+        let new_cursor = old_cursor.saturating_sub(deleted_count);
+        self.set_last_dream_cursor(new_cursor)?;
 
         self.write_entries(filtered)
     }
@@ -347,10 +314,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = make_store(tmp.path());
 
-        let c1 = store.append_history("first entry").unwrap();
-        let c2 = store.append_history("second entry").unwrap();
-        assert_eq!(c1, 1);
-        assert_eq!(c2, 2);
+        store.append_history("first entry").unwrap();
+        store.append_history("second entry").unwrap();
 
         let entries = store.read_entries();
         assert_eq!(entries.len(), 2);
@@ -392,26 +357,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = make_store(tmp.path());
 
-        assert_eq!(store.get_last_dream_cursor(), 0);
-        store.set_last_dream_cursor(42).unwrap();
-        assert_eq!(store.get_last_dream_cursor(), 42);
-    }
-
-    #[test]
-    fn test_cursor_cache_updates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut store = make_store(tmp.path());
-
-        let c1 = store.append_history("first").unwrap();
-        assert_eq!(c1, 1);
-
-        // Second call uses cached cursor.
-        let c2 = store.append_history("second").unwrap();
-        assert_eq!(c2, 2);
-
-        // Third call confirms cache is still correct.
-        let c3 = store.append_history("third").unwrap();
-        assert_eq!(c3, 3);
+        assert_eq!(store.get_last_dream_cursor(), 0usize);
+        store.set_last_dream_cursor(42usize).unwrap();
+        assert_eq!(store.get_last_dream_cursor(), 42usize);
     }
 
     #[test]
@@ -490,28 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn test_next_cursor_starts_at_zero() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut store = make_store(tmp.path());
-
-        assert_eq!(store.next_cursor(), 1);
-    }
-
-    #[test]
-    fn test_next_cursor_increments() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut store = make_store(tmp.path());
-
-        let c1 = store.append_history("entry1").unwrap();
-        let c2 = store.append_history("entry2").unwrap();
-        let c3 = store.append_history("entry3").unwrap();
-
-        assert_eq!(c1, 1);
-        assert_eq!(c2, 2);
-        assert_eq!(c3, 3);
-    }
-
-    #[test]
     fn test_read_recent_history_with_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = make_store(tmp.path());
@@ -543,18 +469,15 @@ mod tests {
     #[test]
     fn test_history_entry_serialization() {
         let entry = HistoryEntry {
-            cursor: 42,
             timestamp: "2024-01-15 10:30".to_string(),
             content: "Test content".to_string(),
         };
 
         let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("42"));
         assert!(json.contains("2024-01-15 10:30"));
         assert!(json.contains("Test content"));
 
         let deserialized: HistoryEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.cursor, 42);
         assert_eq!(deserialized.timestamp, "2024-01-15 10:30");
         assert_eq!(deserialized.content, "Test content");
     }
@@ -608,7 +531,7 @@ mod tests {
             store.append_history(&format!("entry {}", i)).unwrap();
         }
 
-        // Set dream_cursor to 2000
+        // Set dream_cursor to 2000 (meaning 2000 lines processed)
         store.set_last_dream_cursor(2000).unwrap();
 
         // Call compact_history_after_dream - should compact
@@ -618,18 +541,15 @@ mod tests {
         let entries = store.read_entries();
         assert_eq!(entries.len(), 50, "Should compact to DREAM_KEEP_MINIMUM");
 
-        // Dream cursor should be repositioned to min_cursor - 1
-        let min_cursor = entries.iter().map(|e| e.cursor).min().unwrap();
+        // Dream cursor should be adjusted: 2000 - 2050 deleted = 0 (saturating)
         assert_eq!(
             store.get_last_dream_cursor(),
-            min_cursor - 1,
-            "Dream cursor should be repositioned"
+            0,
+            "Dream cursor should be adjusted to 0"
         );
 
-        // First entry should be around cursor 2051
-        assert_eq!(entries[0].cursor, 2051, "First entry cursor should be 2051");
+        // First entry should be "entry 2051"
         assert_eq!(entries[0].content, "entry 2051");
-        assert_eq!(entries[49].cursor, 2100, "Last entry cursor should be 2100");
         assert_eq!(entries[49].content, "entry 2100");
     }
 }
