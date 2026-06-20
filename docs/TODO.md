@@ -4,7 +4,7 @@
 
 ### 核心工具
 
-- [ ] **grep / glob** — 内容搜索和文件发现工具，支持 `output_mode`（`files_with_matches` / `count` / 默认带行号）、`glob` 过滤、`type` 过滤、`head_limit` / `offset` 分页、`context_before` / `context_after`
+- [x] **grep / glob** — 内容搜索和文件发现工具，支持 `output_mode`（`files_with_matches` / `count` / 默认带行号）、`glob` 过滤、`type` 过滤、`head_limit` / `offset` 分页、`context_before` / `context_after`
 - [ ] **web_search / web_fetch** — 网络搜索和网页抓取工具，支持搜索关键词和 URL 获取，返回纯文本内容
 
 ### 高级工具

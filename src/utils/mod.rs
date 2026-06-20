@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+pub(crate) mod search;
+
 /// Truncate text by keeping head + tail portions, with an ellipsis in between.
 /// `max_chars` is a character count (not byte count).
 pub fn truncate_text_head_tail(text: &str, max_chars: usize) -> String {

@@ -2,6 +2,8 @@ pub mod cron;
 pub mod file_editor;
 pub mod file_reader;
 pub mod file_writer;
+pub mod find_files;
+pub mod grep;
 pub mod list_dir;
 pub mod make_dir;
 pub mod message;
@@ -70,6 +72,10 @@ pub fn create_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
             workspace_dir.to_path_buf(),
         ))),
         "file_editor" => Some(Box::new(file_editor::FileEditorTool::new(
+            workspace_dir.to_path_buf(),
+        ))),
+        "grep" => Some(Box::new(grep::GrepTool::new(workspace_dir.to_path_buf()))),
+        "find_files" => Some(Box::new(find_files::FindFilesTool::new(
             workspace_dir.to_path_buf(),
         ))),
         "list_dir" => Some(Box::new(list_dir::ListDirTool::new(

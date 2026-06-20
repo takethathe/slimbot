@@ -107,6 +107,14 @@ impl ToolManager {
                 name: "make_dir".into(),
                 enabled: true,
             },
+            ToolEntry {
+                name: "grep".into(),
+                enabled: true,
+            },
+            ToolEntry {
+                name: "find_files".into(),
+                enabled: true,
+            },
         ];
         let effective = if entries.is_empty() {
             &default_entries
@@ -153,7 +161,7 @@ impl ToolManager {
 
     /// Check if a named tool sent a message this turn.
     pub fn sent_in_turn(&self, name: &str) -> bool {
-        self.tools.get(name).map_or(false, |t| t.sent_in_turn())
+        self.tools.get(name).is_some_and(|t| t.sent_in_turn())
     }
 }
 
@@ -196,12 +204,11 @@ pub fn persist_tool_result(
     }
 
     let file_path = results_dir.join(format!("{}.txt", tool_call_id));
-    if !file_path.exists() {
-        if let Err(e) = write_file_atomic(&file_path, content) {
+    if !file_path.exists()
+        && let Err(e) = write_file_atomic(&file_path, content) {
             error!("Failed to persist tool result: {}", e);
             return content.to_string();
         }
-    }
 
     build_persisted_reference(&file_path, content, TOOL_RESULT_PREVIEW_CHARS)
 }
@@ -248,7 +255,7 @@ mod tests {
 
         let funcs = tm.to_openai_functions();
         assert!(!funcs.is_empty());
-        // All 6 built-in tools should be registered
+        // All 8 built-in tools should be registered
         let names: Vec<_> = funcs.iter().map(|f| &f.name).collect();
         assert!(names.contains(&&"shell".to_string()));
         assert!(names.contains(&&"file_reader".to_string()));
@@ -256,6 +263,8 @@ mod tests {
         assert!(names.contains(&&"file_editor".to_string()));
         assert!(names.contains(&&"list_dir".to_string()));
         assert!(names.contains(&&"make_dir".to_string()));
+        assert!(names.contains(&&"grep".to_string()));
+        assert!(names.contains(&&"find_files".to_string()));
     }
 
     #[test]
@@ -371,6 +380,8 @@ mod tests {
         assert!(create_builtin_tool("file_editor", tmp.path()).is_some());
         assert!(create_builtin_tool("list_dir", tmp.path()).is_some());
         assert!(create_builtin_tool("make_dir", tmp.path()).is_some());
+        assert!(create_builtin_tool("grep", tmp.path()).is_some());
+        assert!(create_builtin_tool("find_files", tmp.path()).is_some());
         assert!(create_builtin_tool("unknown_tool", tmp.path()).is_none());
     }
 }
