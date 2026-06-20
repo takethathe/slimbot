@@ -1061,6 +1061,47 @@ impl SessionManager {
         }
     }
 
+    /// Cap the total messages in a session to the given maximum.
+    /// Keeps the most recent `max` messages, discarding the oldest.
+    /// Persists first, then trims history and rewrites JSONL if over limit.
+    pub async fn cap_messages(&mut self, session_id: &str, max: usize) {
+        // Persist any pending messages first
+        let _ = self.persist(session_id).await;
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            let total = session.history.len();
+            if total <= max {
+                return; // No capping needed
+            }
+
+            // Keep only the most recent `max` messages
+            let skip = total - max;
+            session.history = Arc::from(session.history[skip..].to_vec());
+            // Reset consolidation state since we physically removed old messages
+            session.meta.consolidated_lines = 0;
+            session.meta.total_persisted = max;
+        }
+
+        // Explicitly rewrite JSONL with capped content
+        // We need to do this directly because persist() won't rewrite when
+        // has_pending=0 and consolidated_lines=0
+        if let Some(session) = self.sessions.get(session_id) {
+            let mut merged = session.history.to_vec();
+            merged.extend(session.current_turn.clone());
+
+            let path = self.session_dir.join(format!("{}.jsonl", session_id));
+            let mut content = String::new();
+            for msg in &merged {
+                let line = serde_json::to_string(msg).unwrap();
+                content.push_str(&line);
+                content.push('\n');
+            }
+            let _ = write_file_atomic(&path, &content);
+
+            self.save_session_meta(session_id);
+        }
+    }
+
     /// Get the number of unpersisted messages (current_turn only) for a session.
     /// Used by runner for rollback — records count before turn, truncates back on failure.
     pub fn message_count(&self, session_id: &str) -> usize {
@@ -2026,6 +2067,99 @@ mod tests {
 
         // Truncate non-existent session should not panic
         sm.truncate_messages("nonexistent", 0).await;
+    }
+
+    #[tokio::test]
+    async fn test_cap_messages_trims_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("test-session").await.unwrap();
+
+        // Add 10 messages
+        for i in 0..10 {
+            sm.add_message("test-session", Message::user(format!("msg{}", i)))
+                .await
+                .unwrap();
+        }
+        sm.persist("test-session").await.unwrap();
+
+        // Cap at 5 messages
+        sm.cap_messages("test-session", 5).await;
+
+        // Should have exactly 5 messages (the most recent)
+        let msgs = sm.get_messages("test-session").await;
+        assert_eq!(msgs.len(), 5);
+        // Should be the last 5 messages (msg5 through msg9)
+        assert!(message_content_str(&msgs[0]).contains("msg5"));
+        assert!(message_content_str(&msgs[4]).contains("msg9"));
+    }
+
+    #[tokio::test]
+    async fn test_cap_messages_noop_under_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("test-session").await.unwrap();
+
+        // Add 3 messages
+        for i in 0..3 {
+            sm.add_message("test-session", Message::user(format!("msg{}", i)))
+                .await
+                .unwrap();
+        }
+        sm.persist("test-session").await.unwrap();
+
+        // Cap at 10 messages (more than we have)
+        sm.cap_messages("test-session", 10).await;
+
+        // Should still have 3 messages
+        let msgs = sm.get_messages("test-session").await;
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_cap_messages_rewrites_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("test-session").await.unwrap();
+
+        // Add 10 messages
+        for i in 0..10 {
+            sm.add_message("test-session", Message::user(format!("msg{}", i)))
+                .await
+                .unwrap();
+        }
+        sm.persist("test-session").await.unwrap();
+
+        // Cap at 5 messages
+        sm.cap_messages("test-session", 5).await;
+
+        // Verify JSONL file on disk has only 5 lines
+        let jsonl_path = session_dir.join("test-session.jsonl");
+        let content = std::fs::read_to_string(&jsonl_path).unwrap();
+        let line_count = content.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            line_count, 5,
+            "JSONL file should have exactly 5 lines after cap"
+        );
+
+        // Verify the content is the last 5 messages
+        let msgs: Vec<Message> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(msgs.len(), 5);
+        assert!(message_content_str(&msgs[0]).contains("msg5"));
+        assert!(message_content_str(&msgs[4]).contains("msg9"));
     }
 
     #[test]

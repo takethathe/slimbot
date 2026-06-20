@@ -56,6 +56,7 @@
 - [x] 后台 cron 调度器，每秒 tick 检查并触发到期任务
 - [x] 触发的任务通过 `AgentLoop.run_task()` 执行
 - [x] 模型判断执行结果是否需要 deliver 到 channel（`payload.deliver` + `channel`/`to` 字段）
+- [x] 所有 cron 消息统一记录到 `system:cron` session，最多保留 2000 条消息（滑动窗口）
 
 ## Memory 记忆系统
 

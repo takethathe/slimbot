@@ -82,17 +82,14 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         let job_clone = job.clone();
         let event_tx = event_tx_for_cron.clone();
         Box::pin(async move {
-            let session_id = format!("cron:{}", job_clone.id);
+            let session_id = "system:cron";
             // Use origin session_id for event routing so cron execution
             // events (task_started, tool_call, etc.) appear in the user's
             // WebUI chat instead of being filtered as system-channel events.
-            // TaskHook.session_id is only used for event broadcasting and
-            // status notifications — session persistence uses the session_id
-            // parameter passed separately to run_task().
             let origin_session_id = job_clone.payload.channel.as_deref()
                 .zip(job_clone.payload.to.as_deref())
                 .map(|(ch, cid)| format!("{}:{}", ch, cid));
-            let hook = TaskHook::new(origin_session_id.as_deref().unwrap_or(&session_id))
+            let hook = TaskHook::new(origin_session_id.as_deref().unwrap_or(session_id))
                 .with_events(event_tx);
             let content = format!(
                 "[Scheduled Task] Timer finished.\n\nTask '{}' has been triggered.\nScheduled instruction: {}",
@@ -101,7 +98,11 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             // Pass origin channel/chat_id so the message tool defaults to the target user channel
             let origin_ch = job_clone.payload.channel.clone();
             let origin_cid = job_clone.payload.to.clone();
-            let result = al.run_task(&session_id, content, hook, None, origin_ch, origin_cid).await;
+            let result = al.run_task(session_id, content, hook, None, origin_ch, origin_cid).await;
+
+            // Cap cron session to 2000 messages
+            let sm = al.session_manager();
+            sm.lock().await.cap_messages(session_id, 2000).await;
 
             // Deliver result to user channel if configured (only if message tool wasn't used)
             if job_clone.payload.deliver && !result.message_sent
