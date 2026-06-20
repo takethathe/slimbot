@@ -80,11 +80,15 @@
 
 ## Dream 定时记忆整理
 
-- [ ] 实现 Dream 调度器，基于 cron 定时触发（如每天凌晨）
-- [ ] Phase 1：分析未处理的 `history.jsonl` 记录和当前 `MEMORY.md`，生成修改计划
-- [ ] Phase 2：使用 AgentRunner + file editor 工具执行有针对性的文件编辑
+- [x] 实现 DreamService 模块（`src/dream.rs`），提供 build_prompt/build_tools/build_provider/run 方法
+- [x] Dream 通过 cron 定时触发（`gateway.dream.enabled` + `interval_ms` 配置），默认每 2 小时
+- [x] 支持 `/dream` 手动命令触发（AgentLoop-tier 命令）
+- [x] 支持 `model_override` 配置，允许 dream 使用不同的 provider
+- [x] Dream 使用受限工具集（file_reader + 受限 file_writer/file_editor），仅可编辑 SOUL.md、USER.md、memory/MEMORY.md、skills/
+- [x] Dream prompt 模板从 `resources/templates/dream.md` 嵌入，包含四文件路由、MECE 分类、历史属性标签、删除/保留启发式
+- [x] Dream 完成后推进 dream_cursor，并调用 compact_history_after_dream 清理已处理条目（保留最近 50 条）
+- [x] Dream 使用独立 session `system:dream`，不配置 consolidator
 - [ ] 支持通过 git log 为记忆行添加年龄标注（line age annotation）
-- [ ] Dream 可创建新 skill 文件到 `workspace/skills/`，基于历史中的重复模式
 - [ ] Dream 编辑结果记录到 `history.jsonl` 作为审计日志
 
 ## Context Builder 对齐 nanobot

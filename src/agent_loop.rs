@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -63,6 +64,8 @@ pub struct AgentLoop {
     shutdown_tx: broadcast::Sender<()>,
     /// Pre-built runner with stable components, reused across tasks.
     runner: AgentRunner,
+    /// Dream service for background dream tasks.
+    dream_service: Arc<crate::dream::DreamService>,
 }
 
 /// Returned by `AgentLoop::run()` so the caller can publish input and
@@ -205,6 +208,14 @@ impl AgentLoop {
         )));
         memory_store.lock().await.init()?;
 
+        // Build providers map from config for DreamService
+        let mut providers_map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        for (name, provider_config) in config.providers.iter() {
+            let p = Arc::new(OpenAIProvider::new(provider_config));
+            providers_map.insert(name.clone(), p);
+        }
+        let providers = Arc::new(providers_map);
+
         let consolidator = Arc::new(Consolidator::new(
             provider.clone(),
             session_manager_arc.clone(),
@@ -215,6 +226,16 @@ impl AgentLoop {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
         let tool_manager_arc = Arc::new(tool_manager);
+
+        // Build DreamService
+        let dream_service = Arc::new(crate::dream::DreamService::new(
+            paths.workspace_dir().to_path_buf(),
+            memory_store.clone(),
+            session_manager_arc.clone(),
+            config.gateway.dream.clone(),
+            providers.clone(),
+            provider.clone(),
+        ));
 
         let provider_name = &config.agent.provider;
         let max_tokens = config
@@ -246,6 +267,7 @@ impl AgentLoop {
             consolidator,
             shutdown_tx,
             runner,
+            dream_service,
         })
     }
 
@@ -310,6 +332,36 @@ impl AgentLoop {
         result
     }
 
+    /// Run the dream service to process unprocessed memory entries.
+    pub async fn run_dream(&self) -> crate::dream::DreamResult {
+        self.dream_service.run().await
+    }
+
+    /// Handle /dream command by running the dream service and sending result to outbound.
+    pub async fn handle_dream_command(
+        &self,
+        outbound_tx: &mpsc::Sender<BusResult>,
+        session_id: &str,
+    ) {
+        let result = self.run_dream().await;
+        let response = if result.success {
+            format!(
+                "Dream completed in {}ms. {}",
+                result.elapsed_ms, result.message
+            )
+        } else {
+            format!("Dream failed: {}", result.message)
+        };
+
+        let _ = outbound_tx
+            .send(BusResult {
+                session_id: session_id.to_string(),
+                task_id: String::new(),
+                content: response,
+            })
+            .await;
+    }
+
     /// Start the inbound listener task.
     pub fn start_inbound(&self, done: Option<Arc<Notify>>) {
         let mut inbound_rx = self
@@ -328,6 +380,7 @@ impl AgentLoop {
         let outbound_tx = self.message_bus.outbound_tx();
         let consolidator = self.consolidator.clone();
         let message_bus = self.message_bus.clone();
+        let dream_service = self.dream_service.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let max_tokens = full_config
@@ -346,9 +399,36 @@ impl AgentLoop {
                     }
                     request = inbound_rx.recv() => {
                         let request = match request {
-                            Some(r) => r,
+                            Some(r) => {
+                                info!("[AgentLoop] Received inbound request for session {}: {}", r.session_id, r.content);
+                                r
+                            },
                             None => break, // channel closed
                         };
+
+                        // Check for /dream command (needs dream_service)
+                        if request.content.trim() == "/dream" {
+                            info!("[AgentLoop] /dream command received for session {}", request.session_id);
+                            let result = dream_service.run().await;
+                            let response = if result.success {
+                                format!(
+                                    "Dream completed in {}ms. {}",
+                                    result.elapsed_ms, result.message
+                                )
+                            } else {
+                                format!("Dream failed: {}", result.message)
+                            };
+                            info!("[AgentLoop] /dream result: {}", response);
+
+                            let _ = outbound_tx
+                                .send(BusResult {
+                                    session_id: request.session_id.clone(),
+                                    task_id: String::new(),
+                                    content: response,
+                                })
+                                .await;
+                            continue;
+                        }
 
                         // Check for AgentLoop-tier commands (/stop, /clear, /status)
                         // Channel-tier commands (/quit) are intercepted before reaching here
@@ -575,6 +655,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
@@ -629,6 +710,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -677,6 +759,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -733,6 +816,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -784,6 +868,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -835,6 +920,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -899,6 +985,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
         AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
@@ -966,6 +1053,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
         let (event_tx, _) = broadcast::channel::<crate::session::AgentEvent>(256);
@@ -1045,6 +1133,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 

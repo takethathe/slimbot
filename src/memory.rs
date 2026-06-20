@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -180,10 +181,9 @@ impl MemoryStore {
             self.dream_cursor_cache = Some(val);
             return val;
         }
-        let entries = self.read_entries();
-        let cursor = entries.last().map(|e| e.cursor).unwrap_or(0);
-        self.dream_cursor_cache = Some(cursor);
-        cursor
+        // No dream cursor file exists, start from 0
+        self.dream_cursor_cache = Some(0);
+        0
     }
 
     pub fn set_last_dream_cursor(&mut self, cursor: u64) -> Result<()> {
@@ -194,7 +194,7 @@ impl MemoryStore {
 
     // -- internal helpers ----------------------------------------------------
 
-    fn read_entries(&self) -> Vec<HistoryEntry> {
+    pub fn read_entries(&self) -> Vec<HistoryEntry> {
         let mut entries = Vec::new();
         if let Ok(file) = std::fs::File::open(&self.history_file) {
             let reader = std::io::BufReader::new(file);
@@ -241,6 +241,68 @@ impl MemoryStore {
             }
         }
         None
+    }
+
+    // -- history compaction --------------------------------------------------
+
+    /// Minimum number of recent entries to keep during compaction.
+    const DREAM_KEEP_MINIMUM: usize = 50;
+
+    /// Maximum number of history entries before triggering compaction.
+    const HISTORY_MAX_ENTRIES: usize = 2000;
+
+    /// Write history entries to file atomically via temp file.
+    fn write_entries(&self, entries: Vec<HistoryEntry>) -> Result<()> {
+        let tmp_file = self.history_file.with_extension("jsonl.tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_file)
+            .context("Failed to open temp file")?;
+
+        for entry in entries {
+            let line =
+                serde_json::to_string(&entry).context("Failed to serialize history entry")?;
+            writeln!(file, "{}", line).context("Failed to write history entry")?;
+        }
+
+        file.sync_all().context("Failed to sync temp file")?;
+        std::fs::rename(&tmp_file, &self.history_file)
+            .context("Failed to rename temp file to history file")?;
+        Ok(())
+    }
+
+    /// Compact history entries after Dream processing.
+    /// Only compacts when history exceeds HISTORY_MAX_ENTRIES.
+    /// Keeps the most recent DREAM_KEEP_MINIMUM entries.
+    /// Repositions dream_cursor after compaction.
+    pub fn compact_history_after_dream(&mut self) -> Result<()> {
+        let entries = self.read_entries();
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Only compact when history exceeds the limit
+        if entries.len() < Self::HISTORY_MAX_ENTRIES {
+            return Ok(());
+        }
+
+        // Keep only the most recent DREAM_KEEP_MINIMUM entries
+        let keep_start = entries.len().saturating_sub(Self::DREAM_KEEP_MINIMUM);
+        let filtered: Vec<HistoryEntry> = entries.into_iter().skip(keep_start).collect();
+
+        // Reposition dream_cursor to the minimum cursor in the remaining entries - 1
+        // This ensures we don't re-process entries that were kept for recent context
+        if let Some(min_cursor) = filtered.iter().map(|e| e.cursor).min() {
+            // Set dream_cursor to min_cursor - 1, so next read_unprocessed_history
+            // will start from min_cursor (which is > dream_cursor)
+            let new_dream_cursor = min_cursor.saturating_sub(1);
+            self.set_last_dream_cursor(new_dream_cursor)?;
+        }
+
+        self.write_entries(filtered)
     }
 }
 
@@ -508,5 +570,66 @@ mod tests {
 
         store.init().unwrap();
         assert!(workspace_dir.join("memory").exists());
+    }
+
+    #[test]
+    fn test_compact_history_after_dream_no_compaction_under_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        // Create 100 entries (under HISTORY_MAX_ENTRIES limit)
+        for i in 1..=100 {
+            store.append_history(&format!("entry {}", i)).unwrap();
+        }
+
+        // Set dream_cursor to 60
+        store.set_last_dream_cursor(60).unwrap();
+
+        // Call compact_history_after_dream - should NOT compact
+        store.compact_history_after_dream().unwrap();
+
+        // Verify: all 100 entries remain (no compaction)
+        let entries = store.read_entries();
+        assert_eq!(entries.len(), 100, "Should not compact when under limit");
+        assert_eq!(
+            store.get_last_dream_cursor(),
+            60,
+            "Dream cursor should not change"
+        );
+    }
+
+    #[test]
+    fn test_compact_history_after_dream_compacts_over_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        // Create 2100 entries (over HISTORY_MAX_ENTRIES limit of 2000)
+        for i in 1..=2100 {
+            store.append_history(&format!("entry {}", i)).unwrap();
+        }
+
+        // Set dream_cursor to 2000
+        store.set_last_dream_cursor(2000).unwrap();
+
+        // Call compact_history_after_dream - should compact
+        store.compact_history_after_dream().unwrap();
+
+        // Verify: only 50 entries remain (DREAM_KEEP_MINIMUM)
+        let entries = store.read_entries();
+        assert_eq!(entries.len(), 50, "Should compact to DREAM_KEEP_MINIMUM");
+
+        // Dream cursor should be repositioned to min_cursor - 1
+        let min_cursor = entries.iter().map(|e| e.cursor).min().unwrap();
+        assert_eq!(
+            store.get_last_dream_cursor(),
+            min_cursor - 1,
+            "Dream cursor should be repositioned"
+        );
+
+        // First entry should be around cursor 2051
+        assert_eq!(entries[0].cursor, 2051, "First entry cursor should be 2051");
+        assert_eq!(entries[0].content, "entry 2051");
+        assert_eq!(entries[49].cursor, 2100, "Last entry cursor should be 2100");
+        assert_eq!(entries[49].content, "entry 2100");
     }
 }

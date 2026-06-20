@@ -32,6 +32,8 @@ pub struct GatewayConfig {
     pub cron: CronConfig,
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+    #[serde(default)]
+    pub dream: DreamConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -59,6 +61,29 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: true,
             interval_s: default_heartbeat_interval(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DreamConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_dream_interval_ms")]
+    pub interval_ms: i64,
+    #[serde(default)]
+    pub model_override: Option<String>,
+    #[serde(default = "default_dream_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: default_dream_interval_ms(),
+            model_override: None,
+            max_entries: default_dream_max_entries(),
         }
     }
 }
@@ -92,6 +117,16 @@ fn default_true() -> bool {
 }
 fn default_heartbeat_interval() -> u64 {
     1800
+}
+
+// ── Dream Config Helpers ──
+
+pub fn default_dream_interval_ms() -> i64 {
+    7200000
+}
+
+pub fn default_dream_max_entries() -> usize {
+    20
 }
 
 // ── Backward compat: Vec<ChannelEntry> → HashMap ──
@@ -1244,9 +1279,64 @@ mod tests {
                 enabled: true,
                 interval_s: 120,
             },
+            dream: crate::config::DreamConfig::default(),
         };
         assert!(gateway_config.cron.enabled);
         assert!(gateway_config.heartbeat.enabled);
         assert_eq!(gateway_config.heartbeat.interval_s, 120);
+    }
+
+    #[test]
+    fn test_dream_config_defaults() {
+        let dream_config = crate::config::DreamConfig::default();
+        assert!(dream_config.enabled);
+        assert_eq!(dream_config.interval_ms, 7200000);
+        assert!(dream_config.model_override.is_none());
+        assert_eq!(dream_config.max_entries, 20);
+    }
+
+    #[test]
+    fn test_dream_config_custom_values() {
+        let dream_config = crate::config::DreamConfig {
+            enabled: false,
+            interval_ms: 3600000,
+            model_override: Some("gpt-4-turbo".to_string()),
+            max_entries: 50,
+        };
+        assert!(!dream_config.enabled);
+        assert_eq!(dream_config.interval_ms, 3600000);
+        assert_eq!(dream_config.model_override, Some("gpt-4-turbo".to_string()));
+        assert_eq!(dream_config.max_entries, 50);
+    }
+
+    #[test]
+    fn test_dream_config_serialization() {
+        let dream_config = crate::config::DreamConfig::default();
+        let json = serde_json::to_string(&dream_config).unwrap();
+        assert!(json.contains("enabled"));
+        assert!(json.contains("interval_ms"));
+        assert!(json.contains("max_entries"));
+    }
+
+    #[test]
+    fn test_dream_config_deserialization() {
+        let json =
+            r#"{"enabled":true,"interval_ms":3600000,"model_override":null,"max_entries":10}"#;
+        let dream_config: crate::config::DreamConfig = serde_json::from_str(json).unwrap();
+        assert!(dream_config.enabled);
+        assert_eq!(dream_config.interval_ms, 3600000);
+        assert!(dream_config.model_override.is_none());
+        assert_eq!(dream_config.max_entries, 10);
+    }
+
+    #[test]
+    fn test_dream_config_deserialization_partial() {
+        // Test that missing fields use defaults
+        let json = r#"{"enabled":false}"#;
+        let dream_config: crate::config::DreamConfig = serde_json::from_str(json).unwrap();
+        assert!(!dream_config.enabled);
+        assert_eq!(dream_config.interval_ms, 7200000);
+        assert!(dream_config.model_override.is_none());
+        assert_eq!(dream_config.max_entries, 20);
     }
 }

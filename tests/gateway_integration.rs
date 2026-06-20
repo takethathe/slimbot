@@ -46,6 +46,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
                 enabled: false,
                 interval_s: 60,
             },
+            dream: slimbot::DreamConfig::default(),
         },
     };
     config

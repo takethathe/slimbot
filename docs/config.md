@@ -140,6 +140,12 @@ cargo run -- -d /data/myapp setup
     "heartbeat": {
       "enabled": true,
       "interval_s": 1800
+    },
+    "dream": {
+      "enabled": true,
+      "interval_ms": 7200000,
+      "model_override": null,
+      "max_entries": 20
     }
   }
 }
@@ -150,6 +156,12 @@ cargo run -- -d /data/myapp setup
 | `cron.enabled` | bool | `true` | 是否启用 cron 定时调度 |
 | `heartbeat.enabled` | bool | `true` | 是否启用 heartbeat 定期检查 |
 | `heartbeat.interval_s` | uint | `1800` | heartbeat 检查间隔（秒），默认 30 分钟 |
+| `dream.enabled` | bool | `true` | 是否启用 Dream 定时记忆整理 |
+| `dream.interval_ms` | int | `7200000` | Dream 触发间隔（毫秒），默认 2 小时 |
+| `dream.model_override` | string \| null | `null` | 可选：指定用于 Dream 的 provider 名称（覆盖主 agent 的 provider） |
+| `dream.max_entries` | uint | `20` | 每次 Dream 最多处理的 history 条目数 |
+
+**Dream 说明：** Dream 服务定期分析 `memory/history.jsonl` 中未处理的对话历史，将关键事实整理到长期记忆文件（SOUL.md, USER.md, MEMORY.md, skills/）。可通过 `/dream` 命令手动触发。Dream 完成后会清理已处理的 history 条目（保留最近 50 条）。
 
 ### `agent` — Agent 配置
 

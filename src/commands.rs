@@ -46,6 +46,10 @@ pub fn classify_command(input: &str) -> CommandResult {
             is_command: true,
             tier: CommandTier::AgentLoop,
         },
+        "/dream" => CommandResult {
+            is_command: true,
+            tier: CommandTier::AgentLoop,
+        },
         // Everything else: let the model handle it (e.g. /help, /explain)
         _ => CommandResult {
             is_command: false,
@@ -103,6 +107,13 @@ mod tests {
     #[test]
     fn test_status_is_agent_loop_tier() {
         let result = classify_command("/status");
+        assert!(result.is_command);
+        assert_eq!(result.tier, CommandTier::AgentLoop);
+    }
+
+    #[test]
+    fn test_dream_is_agent_loop_tier() {
+        let result = classify_command("/dream");
         assert!(result.is_command);
         assert_eq!(result.tier, CommandTier::AgentLoop);
     }

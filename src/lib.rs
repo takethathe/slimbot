@@ -10,6 +10,7 @@ pub(crate) mod config_normalize;
 pub(crate) mod consolidate;
 pub(crate) mod context;
 pub(crate) mod cron;
+pub(crate) mod dream;
 pub(crate) mod embed;
 pub(crate) mod gateway;
 pub(crate) mod heartbeat;
@@ -32,8 +33,8 @@ pub(crate) mod worker;
 // Re-export key types for integration tests and binary usage.
 pub use channel::{Channel, ChannelFactory, ChannelManager};
 pub use config::{
-    ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, GatewayConfig, HeartbeatConfig,
-    ToolEntry,
+    ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, DreamConfig, GatewayConfig,
+    HeartbeatConfig, ToolEntry,
 };
 pub use config_defs::{AgentConfig, ProviderConfig};
 pub use config_macro::{FieldMeta, Normalizable};

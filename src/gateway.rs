@@ -77,6 +77,19 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     let mb_for_cron = message_bus.clone();
     let event_tx_for_cron = event_tx.clone();
     cron_service_arc.set_on_job(Arc::new(move |job| {
+        // Dream jobs are handled separately
+        if job.name == "dream" {
+            let al = agent_loop_for_cron.clone();
+            return Box::pin(async move {
+                let result = al.run_dream().await;
+                if result.success {
+                    info!("[cron] dream completed in {}ms: {}", result.elapsed_ms, result.message);
+                } else {
+                    info!("[cron] dream failed: {}", result.message);
+                }
+            });
+        }
+
         let al = agent_loop_for_cron.clone();
         let mb = mb_for_cron.clone();
         let job_clone = job.clone();
@@ -115,6 +128,34 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
                 }
         })
     }));
+
+    // Register dream cron job if enabled
+    if config.gateway.dream.enabled {
+        let dream_job = crate::cron::CronJob {
+            id: "dream".to_string(),
+            name: "dream".to_string(),
+            enabled: true,
+            schedule: crate::cron::CronSchedule::every(config.gateway.dream.interval_ms),
+            payload: crate::cron::CronPayload {
+                kind: "system_event".to_string(),
+                message: "Dream memory consolidation".to_string(),
+                deliver: false,
+                channel: None,
+                to: None,
+            },
+            state: crate::cron::CronJobState::default(),
+            created_at_ms: crate::cron::now_ms(),
+            updated_at_ms: crate::cron::now_ms(),
+            delete_after_run: false,
+        };
+        cron_service_arc.add_job(dream_job);
+        info!(
+            "[gateway] dream cron job registered (interval={}ms)",
+            config.gateway.dream.interval_ms
+        );
+    } else {
+        info!("[gateway] dream service disabled");
+    }
 
     if config.gateway.cron.enabled {
         cron_service_arc.start();
@@ -304,6 +345,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
@@ -418,6 +460,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -495,6 +538,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -540,6 +584,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -746,6 +791,7 @@ mod tests {
                     enabled: false,
                     interval_s: 60,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         });
 
@@ -1173,6 +1219,7 @@ mod tests {
                     enabled: true,
                     interval_s: 300,
                 },
+                dream: crate::config::DreamConfig::default(),
             },
         };
 
