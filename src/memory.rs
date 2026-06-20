@@ -158,12 +158,11 @@ impl MemoryStore {
         if let Some(cached) = self.cursor_cache {
             return cached + 1;
         }
-        if let Ok(text) = std::fs::read_to_string(&self.cursor_file) {
-            if let Ok(val) = text.trim().parse::<u64>() {
+        if let Ok(text) = std::fs::read_to_string(&self.cursor_file)
+            && let Ok(val) = text.trim().parse::<u64>() {
                 self.cursor_cache = Some(val);
                 return val + 1;
             }
-        }
         let entries = self.read_entries();
         let cursor = entries.last().map(|e| e.cursor + 1).unwrap_or(1);
         self.cursor_cache = Some(cursor - 1);
@@ -174,12 +173,11 @@ impl MemoryStore {
         if let Some(cached) = self.dream_cursor_cache {
             return cached;
         }
-        if let Ok(text) = std::fs::read_to_string(&self.dream_cursor_file) {
-            if let Ok(val) = text.trim().parse::<u64>() {
+        if let Ok(text) = std::fs::read_to_string(&self.dream_cursor_file)
+            && let Ok(val) = text.trim().parse::<u64>() {
                 self.dream_cursor_cache = Some(val);
                 return val;
             }
-        }
         let entries = self.read_entries();
         let cursor = entries.last().map(|e| e.cursor).unwrap_or(0);
         self.dream_cursor_cache = Some(cursor);
@@ -198,15 +196,13 @@ impl MemoryStore {
         let mut entries = Vec::new();
         if let Ok(file) = std::fs::File::open(&self.history_file) {
             let reader = std::io::BufReader::new(file);
-            for line in std::io::BufRead::lines(reader) {
-                if let Ok(line) = line {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if let Ok(entry) = serde_json::from_str::<HistoryEntry>(trimmed) {
-                        entries.push(entry);
-                    }
+            for line in std::io::BufRead::lines(reader).flatten() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(entry) = serde_json::from_str::<HistoryEntry>(trimmed) {
+                    entries.push(entry);
                 }
             }
         }
@@ -237,7 +233,7 @@ impl MemoryStore {
             let Ok(text) = String::from_utf8(buf) else {
                 continue;
             };
-            let last_line = text.lines().filter(|l| !l.trim().is_empty()).last()?;
+            let last_line = text.lines().filter(|l| !l.trim().is_empty()).next_back()?;
             if let Ok(entry) = serde_json::from_str::<HistoryEntry>(last_line) {
                 return Some(entry);
             }

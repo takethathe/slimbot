@@ -37,14 +37,12 @@ impl CronService {
     }
 
     pub fn load(&self) {
-        if self.store_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&self.store_path) {
-                if let Ok(store) = serde_json::from_str::<CronStore>(&content) {
+        if self.store_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&self.store_path)
+                && let Ok(store) = serde_json::from_str::<CronStore>(&content) {
                     let mut guard = self.jobs.lock().unwrap();
                     *guard = store.jobs;
                 }
-            }
-        }
     }
 
     pub fn save(&self) {
@@ -113,7 +111,7 @@ impl CronService {
             let guard = self.jobs.lock().unwrap();
             guard
                 .iter()
-                .filter(|j| j.enabled && j.state.next_run_at_ms.map_or(false, |t| now >= t))
+                .filter(|j| j.enabled && j.state.next_run_at_ms.is_some_and(|t| now >= t))
                 .cloned()
                 .collect()
         };

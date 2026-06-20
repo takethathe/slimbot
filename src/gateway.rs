@@ -104,15 +104,14 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             let result = al.run_task(&session_id, content, hook, None, origin_ch, origin_cid).await;
 
             // Deliver result to user channel if configured (only if message tool wasn't used)
-            if job_clone.payload.deliver && !result.message_sent {
-                if let (Some(channel), Some(chat_id)) = (&job_clone.payload.channel, &job_clone.payload.to) {
+            if job_clone.payload.deliver && !result.message_sent
+                && let (Some(channel), Some(chat_id)) = (&job_clone.payload.channel, &job_clone.payload.to) {
                     mb.publish_outbound(BusResult {
                         session_id: format!("{}:{}", channel, chat_id),
                         task_id: String::new(),
                         content: result.content,
                     }).await;
                 }
-            }
         })
     }));
 

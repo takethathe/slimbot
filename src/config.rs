@@ -291,13 +291,11 @@ impl Config {
             let path_clone = path.to_string();
             let mut watcher =
                 notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                    if let Ok(event) = res {
-                        if matches!(event.kind, notify::EventKind::Modify(_)) {
-                            if let Err(e) = Self::reload_with_inner(&inner_clone) {
+                    if let Ok(event) = res
+                        && matches!(event.kind, notify::EventKind::Modify(_))
+                            && let Err(e) = Self::reload_with_inner(&inner_clone) {
                                 crate::error!("[Config] Reload failed: {}", e);
                             }
-                        }
-                    }
                 })
                 .context("Failed to create config watcher")?;
 

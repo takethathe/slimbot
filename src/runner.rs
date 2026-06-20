@@ -188,11 +188,10 @@ impl AgentRunner {
         }
 
         // Check cancellation before starting.
-        if let Some(ref ct) = cancel_token {
-            if ct.is_cancelled() {
+        if let Some(ref ct) = cancel_token
+            && ct.is_cancelled() {
                 return self.cancelled_result(&hook, session_id).await;
             }
-        }
 
         // Record message count before this turn, for rollback on cancellation/error.
         let initial_message_count = {
@@ -340,8 +339,8 @@ impl AgentRunner {
             // Request model
             debug!("[AgentRunner] Sending chat request to provider");
             // Check cancellation before LLM request.
-            if let Some(ref ct) = cancel_token {
-                if ct.is_cancelled() {
+            if let Some(ref ct) = cancel_token
+                && ct.is_cancelled() {
                     return self
                         .rollback_and_fail(
                             &hook,
@@ -352,7 +351,6 @@ impl AgentRunner {
                         )
                         .await;
                 }
-            }
             let response = match self.provider.chat(&messages, ctx.tools.as_deref()).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -380,14 +378,13 @@ impl AgentRunner {
             );
 
             // Emit assistant message content if present
-            if let Some(ref content) = response.content {
-                if !content.is_empty() {
+            if let Some(ref content) = response.content
+                && !content.is_empty() {
                     hook.fire_event(AgentEvent::AssistantMessage {
                         session_id: hook.session_id().to_string(),
                         content: content.clone(),
                     });
                 }
-            }
 
             // No tool calls → done
             let has_tool_calls = response
@@ -490,8 +487,8 @@ impl AgentRunner {
                 // 2. Execute tools and write Tool messages
                 for call in calls {
                     // Check cancellation before each tool call.
-                    if let Some(ref ct) = cancel_token {
-                        if ct.is_cancelled() {
+                    if let Some(ref ct) = cancel_token
+                        && ct.is_cancelled() {
                             return self
                                 .rollback_and_fail(
                                     &hook,
@@ -502,7 +499,6 @@ impl AgentRunner {
                                 )
                                 .await;
                         }
-                    }
                     debug!("[tool_call] name={}, args={}", call.name, call.args);
                     // Fire ToolCall event before execution
                     hook.fire_event(AgentEvent::ToolCall {
@@ -674,11 +670,10 @@ impl AgentRunner {
                         }
                     }
                 }
-                Message::Tool { tool_call_id, .. } => {
-                    if !declared.contains(tool_call_id) {
+                Message::Tool { tool_call_id, .. }
+                    if !declared.contains(tool_call_id) => {
                         orphan_indices.push(i);
                     }
-                }
                 _ => {}
             }
         }

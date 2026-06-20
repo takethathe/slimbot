@@ -24,13 +24,12 @@ fn build_runtime_context(channel: &str, chat_id: &str, session_summary: Option<&
         lines.push(format!("Channel: {}", channel));
         lines.push(format!("Chat ID: {}", chat_id));
     }
-    if let Some(summary) = session_summary {
-        if !summary.is_empty() {
+    if let Some(summary) = session_summary
+        && !summary.is_empty() {
             lines.push(String::new());
             lines.push("[Resumed Session]".to_string());
             lines.push(summary.to_string());
         }
-    }
     format!(
         "{}\n{}\n{}",
         RUNTIME_CONTEXT_TAG,
@@ -126,11 +125,10 @@ impl ContextBuilder {
         // 2. Bootstrap workspace files
         for (filename, template) in bootstrap_files() {
             let path = self.workspace_dir.join(filename);
-            if let Some(content) = read_if_modified(&path, template) {
-                if !content.is_empty() {
+            if let Some(content) = read_if_modified(&path, template)
+                && !content.is_empty() {
                     parts.push(format!("[{}] {}", filename, content));
                 }
-            }
         }
 
         // 3. Skills
@@ -173,8 +171,8 @@ impl ContextBuilder {
         if let Ok(entries) = std::fs::read_dir(&skills_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "md") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
+                if path.extension().is_some_and(|e| e == "md")
+                    && let Ok(content) = std::fs::read_to_string(&path) {
                         if content.is_empty() {
                             continue;
                         }
@@ -198,7 +196,6 @@ impl ContextBuilder {
                             always_skills.push(format!("### Skill: {}\n\n{}", name, content));
                         }
                     }
-                }
             }
         }
 
@@ -245,12 +242,10 @@ impl ContextBuilder {
             if let Message::User {
                 runtime_content, ..
             } = msg
-            {
-                if runtime_content.is_none() {
+                && runtime_content.is_none() {
                     *runtime_content = Some(runtime_ctx);
                     break;
                 }
-            }
         }
 
         // Merge consecutive user messages at the end
@@ -273,8 +268,8 @@ impl ContextBuilder {
     /// Merge consecutive User messages at the end of the list to avoid same-role rejection.
     fn merge_consecutive_user_messages(messages: &mut Vec<Message>) {
         let len = messages.len();
-        if len >= 2 {
-            if matches!(messages[len - 2], Message::User { .. })
+        if len >= 2
+            && matches!(messages[len - 2], Message::User { .. })
                 && matches!(messages[len - 1], Message::User { .. })
             {
                 let last = messages.pop().unwrap();
@@ -323,7 +318,6 @@ impl ContextBuilder {
                     }
                 }
             }
-        }
     }
 
     /// Append a tool result message to the message list.

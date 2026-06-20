@@ -100,12 +100,11 @@ pub fn log(level: LogLevel, args: &Arguments<'_>) {
     let _ = writeln!(stderr(), "{}", term_msg);
 
     // File output: plain single-char tag
-    if let Ok(mut guard) = logger.file.lock() {
-        if let Some(ref mut writer) = *guard {
+    if let Ok(mut guard) = logger.file.lock()
+        && let Some(ref mut writer) = *guard {
             let file_msg = format!("[{}] [{}] {}", timestamp, level.as_char(), args);
             let _ = writeln!(writer, "{}", file_msg);
         }
-    }
 }
 
 #[cfg(test)]

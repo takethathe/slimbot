@@ -321,14 +321,13 @@ impl ChannelManager {
                             }
 
                             let mut ch_guard = channels.lock().await;
-                            if let Some(channel) = ch_guard.get_mut(channel_id) {
-                                if let Err(e) = channel.write_event(&event).await {
+                            if let Some(channel) = ch_guard.get_mut(channel_id)
+                                && let Err(e) = channel.write_event(&event).await {
                                     error!(
                                         "[ChannelManager] Failed to write event to {}: {}",
                                         channel_id, e
                                     );
                                 }
-                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
