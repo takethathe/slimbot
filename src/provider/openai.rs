@@ -86,11 +86,11 @@ fn build_api_messages(messages: &[&Message], prompt_cache_enabled: bool) -> Vec<
                 } => {
                     let mut content_blocks = content.to_openai_blocks();
                     if let Some(ctx) = runtime_content {
-                        content_blocks.insert(0, serde_json::json!({"type": "text", "text": ctx}));
+                        content_blocks.push(serde_json::json!({"type": "text", "text": ctx}));
                     }
-                    if is_cache_target {
-                        let last = content_blocks.len().saturating_sub(1);
-                        content_blocks[last]["cache_control"] =
+                    // Only set cache_control if there are content blocks
+                    if is_cache_target && !content_blocks.is_empty() {
+                        content_blocks[0]["cache_control"] =
                             serde_json::json!({"type": "ephemeral"});
                     }
                     serde_json::json!({"role": "user", "content": content_blocks})
@@ -1739,5 +1739,94 @@ mod tests {
             has_cache_control(&result[3]),
             "Tool message at boundary should have cache_control"
         );
+    }
+
+    #[test]
+    fn test_runtime_content_placed_after_user_content() {
+        // Runtime content must appear AFTER user content for prompt cache prefix stability
+        let mut user_msg = Message::user("Hello, how are you?".to_string());
+        if let Message::User {
+            ref mut runtime_content,
+            ..
+        } = user_msg
+        {
+            *runtime_content = Some(
+                "[Runtime Context]\nCurrent Time: 2026-06-20 10:00:00\n[/Runtime Context]"
+                    .to_string(),
+            );
+        }
+
+        let msgs: Vec<&Message> = vec![&user_msg];
+        let result = super::build_api_messages(&msgs, true);
+
+        // Extract content blocks from the user message
+        let content_blocks = result[0]["content"].as_array().unwrap();
+        assert_eq!(content_blocks.len(), 2, "expected 2 content blocks");
+
+        // First block should be user content
+        let first_block_text = content_blocks[0]["text"].as_str().unwrap();
+        assert_eq!(first_block_text, "Hello, how are you?");
+
+        // Second block should be runtime context
+        let second_block_text = content_blocks[1]["text"].as_str().unwrap();
+        assert!(second_block_text.contains("[Runtime Context]"));
+        assert!(second_block_text.contains("Current Time:"));
+    }
+
+    #[test]
+    fn test_cache_control_on_runtime_content_block() {
+        // When runtime_content is present, cache_control should be on the user content block (first block)
+        // Must use 3+ messages so the user message is at boundary index (len-2)
+        let sys = Message::system("system".to_string());
+        let mut user_msg = Message::user("What is the weather?".to_string());
+        if let Message::User {
+            ref mut runtime_content,
+            ..
+        } = user_msg
+        {
+            *runtime_content = Some(
+                "[Runtime Context]\nCurrent Time: 2026-06-20 10:00:00\n[/Runtime Context]"
+                    .to_string(),
+            );
+        }
+        let assistant = Message::assistant(Some("I don't know".to_string()), None, None, None);
+        let msgs: Vec<&Message> = vec![&sys, &user_msg, &assistant];
+        let result = super::build_api_messages(&msgs, true);
+
+        let content_blocks = result[1]["content"].as_array().unwrap();
+        assert_eq!(content_blocks.len(), 2);
+
+        // First block (user content) SHOULD have cache_control
+        assert!(
+            content_blocks[0].get("cache_control").is_some(),
+            "user content block should have cache_control"
+        );
+        assert_eq!(content_blocks[0]["cache_control"]["type"], "ephemeral");
+
+        // Second block (runtime context) should NOT have cache_control
+        assert!(
+            content_blocks[1].get("cache_control").is_none(),
+            "runtime content block should not have cache_control"
+        );
+    }
+
+    #[test]
+    fn test_empty_content_blocks_no_panic() {
+        // User message with empty Multi content should not panic when is_cache_target=true
+        let sys = Message::system("system".to_string());
+        let user_msg = Message::User {
+            meta: crate::session::MessageMeta::default(),
+            content: Content::Multi(vec![]),
+            runtime_content: None,
+        };
+        let assistant = Message::assistant(Some("reply".to_string()), None, None, None);
+        let msgs: Vec<&Message> = vec![&sys, &user_msg, &assistant];
+
+        // Should not panic even though user message has empty content_blocks
+        let result = super::build_api_messages(&msgs, true);
+        let content_blocks = result[1]["content"].as_array().unwrap();
+        assert_eq!(content_blocks.len(), 0);
+        // No cache_control should be set since there are no blocks
+        assert!(content_blocks.is_empty());
     }
 }

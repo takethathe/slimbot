@@ -1,5 +1,7 @@
+mod mock;
 mod openai;
 
+pub use mock::MockProvider;
 pub use openai::OpenAIProvider;
 
 use anyhow::Result;

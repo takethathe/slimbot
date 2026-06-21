@@ -946,6 +946,64 @@ mod tests {
         assert_eq!(handle.shutdown_tx.receiver_count(), 0);
     }
 
+    use crate::provider::MockProvider;
+
+    async fn make_agent_loop_with_mock(tmp: &tempfile::TempDir) -> AgentLoop {
+        let paths = make_test_paths(tmp);
+        let (message_bus, _receivers) = MessageBus::new();
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "mock".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "mock-model".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig { enabled: false },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                },
+                dream: crate::config::DreamConfig::default(),
+            },
+        });
+        let provider = Arc::new(MockProvider::new());
+        let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
+        AgentLoop::from_parts(
+            &paths,
+            message_bus,
+            _receivers.inbound,
+            config,
+            provider,
+            tool_manager,
+        )
+        .await
+        .unwrap()
+    }
+
     async fn make_agent_loop(tmp: &tempfile::TempDir) -> AgentLoop {
         let paths = make_test_paths(tmp);
         let (message_bus, _receivers) = MessageBus::new();
@@ -1016,7 +1074,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_loop_run_task_nonexistent_session() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent_loop = make_agent_loop(&tmp).await;
+        let agent_loop = make_agent_loop_with_mock(&tmp).await;
         let hook = TaskHook::new("new-session");
         // run_task should create the session and run
         let result = agent_loop

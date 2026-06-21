@@ -288,15 +288,29 @@ impl ContextBuilder {
 
         // Build runtime context and set on first user message in current_turn that doesn't have it.
         // Use the provided runtime_ctx if available (for stability within a turn), otherwise generate new.
-        let runtime_ctx = runtime_ctx.unwrap_or_else(|| build_runtime_context(channel, chat_id));
-        for msg in &mut current_turn {
-            if let Message::User {
-                runtime_content, ..
-            } = msg
-                && runtime_content.is_none()
-            {
-                *runtime_content = Some(runtime_ctx.clone());
-                break;
+        // Only build if there's at least one user message in current_turn that needs it.
+        let has_user_msg_needing_runtime = current_turn.iter().any(|msg| {
+            matches!(
+                msg,
+                Message::User {
+                    runtime_content: None,
+                    ..
+                }
+            )
+        });
+
+        if has_user_msg_needing_runtime {
+            let runtime_ctx =
+                runtime_ctx.unwrap_or_else(|| build_runtime_context(channel, chat_id));
+            for msg in &mut current_turn {
+                if let Message::User {
+                    runtime_content, ..
+                } = msg
+                    && runtime_content.is_none()
+                {
+                    *runtime_content = Some(runtime_ctx.clone());
+                    break;
+                }
             }
         }
 

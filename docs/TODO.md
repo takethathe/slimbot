@@ -142,6 +142,18 @@
 - [x] OpenAI provider 在最后一条 system message 的 content 上注入 `cache_control: {"type": "ephemeral"}`
 - [x] Runtime context 稳定性：`build_messages` 接受预生成的 `runtime_ctx` 参数，`AgentRunner` 在 turn 开始前生成一次，确保同一次 turn 内多次迭代使用相同的时间戳，提升缓存命中率
 
+## Runtime Context Placement 修复（CRITICAL BUG）
+
+> **状态：** 2026-06-20 发现缓存控制标记（cache_control）_placement_ 逻辑错误，导致 volatile data（runtime context）被缓存而非 stable data（user content）。
+
+- [x] **修复 cache_control placement 逻辑** — 将 `cache_control` 从 runtime context block（最后一个 content block）移动到 user content block（第一个 content block），确保 stable 的用户输入被缓存而非 volatile 的时间戳。
+
+  **修复内容：** 
+  - 在 `src/provider/openai.rs` 中，将 runtime_content 的插入方式从 `insert(0, ...)` 改为 `push(...)`，使 runtime context 出现在用户内容之后
+  - 将 `cache_control` 标记放置在 `content_blocks[0]`（user content），而不是 `content_blocks[last]`（runtime context）
+  - 添加了 `MockProvider` 用于测试，解决了 `test_agent_loop_run_task_nonexistent_session` 测试超时 60 秒的问题
+  - 添加了完整的测试覆盖：`test_runtime_content_placed_after_user_content` 和 `test_cache_control_on_runtime_content_block`
+
 ## Gateway 模式
 
 - [x] `slimbot gateway` 命令启动 cron、heartbeat 和 enabled channels
