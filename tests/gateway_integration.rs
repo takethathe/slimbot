@@ -48,6 +48,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
             },
             dream: slimbot::DreamConfig::default(),
         },
+        web_fetch: None,
     };
     config
 }

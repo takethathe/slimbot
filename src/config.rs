@@ -24,6 +24,8 @@ pub struct Config {
     pub channels: HashMap<String, ChannelConfig>,
     #[serde(default)]
     pub gateway: GatewayConfig,
+    #[serde(default)]
+    pub web_fetch: Option<WebFetchConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -112,11 +114,43 @@ pub struct ToolEntry {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WebFetchConfig {
+    #[serde(default = "default_max_chars")]
+    pub max_chars: usize,
+    #[serde(default = "default_timeout")]
+    pub timeout_s: u64,
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            max_chars: 50000,
+            timeout_s: 30,
+            user_agent: default_user_agent(),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
 fn default_heartbeat_interval() -> u64 {
     1800
+}
+
+fn default_max_chars() -> usize {
+    50000
+}
+
+fn default_timeout() -> u64 {
+    30
+}
+
+pub fn default_user_agent() -> String {
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36".to_string()
 }
 
 // ── Dream Config Helpers ──
@@ -355,6 +389,14 @@ impl Config {
         Arc::new(inner.read().config.clone())
     }
 
+    /// Like `get()`, but returns `None` if Config has not been initialized yet.
+    /// Useful in test contexts or during early bootstrap.
+    pub fn try_get() -> Option<Arc<Config>> {
+        CONFIG_INSTANCE
+            .get()
+            .map(|inner| Arc::new(inner.read().config.clone()))
+    }
+
     pub fn subscribe<F>(path: &str, callback: F)
     where
         F: Fn(ConfigChange) + Send + Sync + 'static,
@@ -473,6 +515,18 @@ impl Config {
             }
         }
 
+        // Diff web_fetch config
+        if old.web_fetch != new.web_fetch {
+            Self::diff_json_objects(
+                "web_fetch",
+                &old.web_fetch,
+                &new.web_fetch,
+                &mut paths,
+                &mut old_values,
+                &mut new_values,
+            );
+        }
+
         ConfigChange {
             paths,
             old_values,
@@ -545,6 +599,7 @@ mod tests {
             tools: vec![],
             channels: HashMap::new(),
             gateway: GatewayConfig::default(),
+            web_fetch: None,
         }
     }
 
@@ -553,6 +608,53 @@ mod tests {
         let mut cfg = make_test_config();
         cfg.agent.provider = String::new();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_web_fetch_config_defaults() {
+        let config_str = r#"{
+            "agent": {"provider": "test", "max_iterations": 10},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}}
+        }"#;
+        let config: Config = serde_json::from_str(config_str).unwrap();
+        assert!(config.web_fetch.is_none());
+    }
+
+    #[test]
+    fn test_web_fetch_config_with_values() {
+        let config_str = r#"{
+            "agent": {"provider": "test", "max_iterations": 10},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
+            "web_fetch": {
+                "enabled": true,
+                "max_chars": 10000,
+                "timeout_s": 60,
+                "user_agent": "CustomAgent/1.0"
+            }
+        }"#;
+        let config: Config = serde_json::from_str(config_str).unwrap();
+        let wf = config.web_fetch.unwrap();
+        assert_eq!(wf.max_chars, 10000);
+        assert_eq!(wf.timeout_s, 60);
+        assert_eq!(wf.user_agent, "CustomAgent/1.0");
+    }
+
+    #[test]
+    fn test_web_fetch_config_partial_defaults() {
+        let config_str = r#"{
+            "agent": {"provider": "test", "max_iterations": 10},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
+            "web_fetch": {
+                "max_chars": 8000
+            }
+        }"#;
+        let config: Config = serde_json::from_str(config_str).unwrap();
+        let wf = config.web_fetch.unwrap();
+        // Provided value is used
+        assert_eq!(wf.max_chars, 8000);
+        // Missing fields fall back to defaults
+        assert_eq!(wf.timeout_s, 30);
+        assert!(!wf.user_agent.is_empty());
     }
 
     #[test]

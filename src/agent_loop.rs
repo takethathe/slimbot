@@ -657,6 +657,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -712,6 +713,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
@@ -761,6 +763,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -818,6 +821,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let agent_loop = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
@@ -870,6 +874,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let agent_loop =
@@ -922,6 +927,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let mut agent_loop =
@@ -989,6 +995,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1045,6 +1052,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
         AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
             .await
@@ -1113,6 +1121,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
         let (event_tx, _) = broadcast::channel::<crate::session::AgentEvent>(256);
         let channel_manager = Arc::new(crate::channel::ChannelManager::new(
@@ -1193,6 +1202,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;

@@ -347,6 +347,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -462,6 +463,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -540,6 +542,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let mut tool_manager = ToolManager::new(workspace_dir.clone());
@@ -586,6 +589,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -793,6 +797,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -1221,6 +1226,7 @@ mod tests {
                 },
                 dream: crate::config::DreamConfig::default(),
             },
+            web_fetch: None,
         };
 
         assert_eq!(config.agent.max_iterations, 50);

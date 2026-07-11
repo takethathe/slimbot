@@ -34,7 +34,7 @@ pub(crate) mod worker;
 pub use channel::{Channel, ChannelFactory, ChannelManager};
 pub use config::{
     ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, DreamConfig, GatewayConfig,
-    HeartbeatConfig, ToolEntry,
+    HeartbeatConfig, ToolEntry, WebFetchConfig,
 };
 pub use config_defs::{AgentConfig, ProviderConfig};
 pub use config_macro::{FieldMeta, Normalizable};

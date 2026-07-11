@@ -8,6 +8,7 @@ pub mod list_dir;
 pub mod make_dir;
 pub mod message;
 pub mod shell;
+pub mod web_fetch;
 
 use std::path::{Path, PathBuf};
 
@@ -84,6 +85,11 @@ pub fn create_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
         "make_dir" => Some(Box::new(make_dir::MakeDirTool::new(
             workspace_dir.to_path_buf(),
         ))),
+        "web_fetch" => {
+            let web_fetch_config = crate::config::Config::try_get()
+                .and_then(|c| c.web_fetch.clone());
+            Some(Box::new(web_fetch::WebFetchTool::new(web_fetch_config.as_ref())))
+        }
         _ => None,
     }
 }

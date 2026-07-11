@@ -115,6 +115,10 @@ impl ToolManager {
                 name: "find_files".into(),
                 enabled: true,
             },
+            ToolEntry {
+                name: "web_fetch".into(),
+                enabled: true,
+            },
         ];
         let effective = if entries.is_empty() {
             &default_entries
@@ -256,7 +260,7 @@ mod tests {
 
         let funcs = tm.to_openai_functions();
         assert!(!funcs.is_empty());
-        // All 8 built-in tools should be registered
+        // All 9 built-in tools should be registered
         let names: Vec<_> = funcs.iter().map(|f| &f.name).collect();
         assert!(names.contains(&&"shell".to_string()));
         assert!(names.contains(&&"file_reader".to_string()));
@@ -266,6 +270,7 @@ mod tests {
         assert!(names.contains(&&"make_dir".to_string()));
         assert!(names.contains(&&"grep".to_string()));
         assert!(names.contains(&&"find_files".to_string()));
+        assert!(names.contains(&&"web_fetch".to_string()));
     }
 
     #[test]
@@ -383,6 +388,7 @@ mod tests {
         assert!(create_builtin_tool("make_dir", tmp.path()).is_some());
         assert!(create_builtin_tool("grep", tmp.path()).is_some());
         assert!(create_builtin_tool("find_files", tmp.path()).is_some());
+        assert!(create_builtin_tool("web_fetch", tmp.path()).is_some());
         assert!(create_builtin_tool("unknown_tool", tmp.path()).is_none());
     }
 }

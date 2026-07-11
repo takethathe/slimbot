@@ -16,6 +16,7 @@ fn default_config() -> Config {
         tools: vec![],
         channels: std::collections::HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     }
 }
 

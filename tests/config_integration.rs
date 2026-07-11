@@ -213,6 +213,7 @@ fn test_save_and_reload_round_trip() {
         }],
         channels,
         gateway: GatewayConfig::default(),
+        web_fetch: None,
     };
 
     config.save(path).unwrap();

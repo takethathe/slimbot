@@ -487,6 +487,7 @@ mod tests {
             tools: vec![],
             channels: HashMap::new(),
             gateway: crate::config::GatewayConfig::default(),
+            web_fetch: None,
         }
     }
 

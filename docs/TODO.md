@@ -5,7 +5,8 @@
 ### 核心工具
 
 - [x] **grep / glob** — 内容搜索和文件发现工具，支持 `output_mode`（`files_with_matches` / `count` / 默认带行号）、`glob` 过滤、`type` 过滤、`head_limit` / `offset` 分页、`context_before` / `context_after`
-- [ ] **web_search / web_fetch** — 网络搜索和网页抓取工具，支持搜索关键词和 URL 获取，返回纯文本内容
+- [x] **web_fetch** — URL 内容抓取工具，使用 readability-rust + quick_html2md 提取可读内容为 markdown，支持 `extract_mode`（`markdown` / `text`）和 `max_chars` 参数，返回带元数据的 JSON
+- [ ] **web_search** — 网络搜索工具，支持搜索关键词，返回标题、URL 和摘要
 
 ### 高级工具
 

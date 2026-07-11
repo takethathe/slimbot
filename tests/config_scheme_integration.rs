@@ -17,6 +17,7 @@ fn test_default_config_structure() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
 
     // Normalize fills in default provider name
@@ -46,6 +47,7 @@ fn test_normalize_fills_empty_agent_provider() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
     config.agent.provider.clear();
 
@@ -63,6 +65,7 @@ fn test_normalize_derives_url_from_base_url() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -88,6 +91,7 @@ fn test_normalize_preserves_existing_api_url() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -112,6 +116,7 @@ fn test_normalize_falls_back_to_default_url_when_no_base() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -136,6 +141,7 @@ fn test_normalize_trailing_slash_stripped_from_base_url() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -160,6 +166,7 @@ fn test_normalize_removes_empty_tools_and_channels() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
 
     config.tools.push(ToolEntry {
@@ -196,6 +203,7 @@ fn test_normalize_does_not_touch_api_key() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
 
     config.providers.get_mut("default").unwrap().api_key = "sk-secret".to_string();
@@ -215,6 +223,7 @@ fn test_normalize_max_iterations_and_timeout_via_clamp() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
     config.agent.max_iterations = 0; // below range
     config.agent.timeout_seconds = 0; // below range
@@ -240,6 +249,7 @@ fn test_write_default_config_creates_file() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
     config.save(path).unwrap();
 
@@ -260,6 +270,7 @@ fn test_written_config_is_valid_json() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
     config.save(path).unwrap();
 
@@ -306,6 +317,7 @@ fn test_normalize_multiple_providers() {
         tools: vec![],
         channels: HashMap::new(),
         gateway: Default::default(),
+        web_fetch: None,
     };
 
     config.normalize();
