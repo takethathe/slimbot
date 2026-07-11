@@ -86,9 +86,24 @@ pub fn create_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
             workspace_dir.to_path_buf(),
         ))),
         "web_fetch" => {
-            let web_fetch_config = crate::config::Config::try_get()
-                .and_then(|c| c.web_fetch.clone());
-            Some(Box::new(web_fetch::WebFetchTool::new(web_fetch_config.as_ref())))
+            // Read WebFetchConfig from the process-wide Config singleton.
+            // Config::init() must be called before tool construction (it is,
+            // in gateway/runner startup). If a caller builds tools before init
+            // (e.g. unit tests), try_get() returns None and the tool falls
+            // back to WebFetchConfig::default() -- safe, but config.json
+            // settings are not applied. Threading &Config through the factory
+            // signature would remove this global, at the cost of changing
+            // ~30 call sites; left as a documented trade-off.
+            let web_fetch_config = match crate::config::Config::try_get() {
+                Some(c) => c.web_fetch.clone(),
+                None => {
+                    crate::debug!("[tools] Config not initialized; web_fetch uses default config");
+                    None
+                }
+            };
+            Some(Box::new(web_fetch::WebFetchTool::new(
+                web_fetch_config.as_ref(),
+            )))
         }
         _ => None,
     }

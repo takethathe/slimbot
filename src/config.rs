@@ -126,9 +126,12 @@ pub struct WebFetchConfig {
 
 impl Default for WebFetchConfig {
     fn default() -> Self {
+        // Delegate to the serde default functions so they remain the single
+        // source of truth for default values (used by both deserialization
+        // with missing fields and explicit Default construction).
         Self {
-            max_chars: 50000,
-            timeout_s: 30,
+            max_chars: default_max_chars(),
+            timeout_s: default_timeout(),
             user_agent: default_user_agent(),
         }
     }
