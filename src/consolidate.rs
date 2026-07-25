@@ -22,6 +22,10 @@ const SAFETY_BUFFER: u32 = 512;
 const CONTEXT_BUDGET_FRACTION: f64 = 0.5;
 /// Consolidation reduces prompt to 60% of budget, leaving room for next turn.
 const CONSOLIDATION_TARGET_FRACTION: f64 = 0.6;
+/// Maximum allowed size of a summary in bytes.
+const MAX_SUMMARY_BYTES: usize = 512;
+/// Max retries for LLM-driven summary compression before force-truncating.
+const MAX_COMPRESS_RETRIES: usize = 2;
 
 pub struct Consolidator {
     provider: Arc<dyn Provider>,
@@ -133,34 +137,92 @@ impl Consolidator {
 
     /// Summarize messages via LLM and append to history.jsonl.
     /// Returns the summary text on success.
+    ///
+    /// Enforces MAX_SUMMARY_BYTES in three layers:
+    /// 1. The initial prompt instructs the LLM to stay within 512 bytes.
+    /// 2. If the result is still too large, re-prompt up to MAX_COMPRESS_RETRIES
+    ///    times asking the LLM to compress its output.
+    /// 3. As a last resort, force-truncate the result at a UTF-8 boundary.
     async fn archive(&self, messages: &[Message]) -> Result<Option<String>> {
         if messages.is_empty() {
             return Ok(None);
         }
 
         let formatted = Self::format_messages(messages);
-        let system_prompt = self.system_prompt();
 
-        let response = self
+        // Layer 1: initial summarization (prompt already specifies the size limit).
+        let mut summary = match self
             .provider
             .chat(
-                &[&Message::system(system_prompt), &Message::user(formatted)],
+                &[
+                    &Message::system(self.system_prompt()),
+                    &Message::user(formatted),
+                ],
                 None,
             )
-            .await?;
+            .await?
+        {
+            r if r.finish_reason == FinishReason::Error => {
+                anyhow::bail!(
+                    "LLM returned error: {}",
+                    r.content.as_deref().unwrap_or("(empty)")
+                );
+            }
+            r => r.content.unwrap_or_else(|| "(no summary)".to_string()),
+        };
 
-        if response.finish_reason == FinishReason::Error {
-            anyhow::bail!(
-                "LLM returned error: {}",
-                response.content.as_deref().unwrap_or("(empty)")
-            );
-        }
-
-        let summary = response
-            .content
-            .unwrap_or_else(|| "(no summary)".to_string());
         if summary.is_empty() || summary == "(nothing)" {
             return Ok(None);
+        }
+
+        // Layer 2: LLM-driven compression retries.
+        for attempt in 0..MAX_COMPRESS_RETRIES {
+            if summary.len() <= MAX_SUMMARY_BYTES {
+                break;
+            }
+            info!(
+                "[Consolidator] Summary too large ({} bytes), compressing (attempt {}/{MAX_COMPRESS_RETRIES})",
+                summary.len(),
+                attempt + 1,
+            );
+
+            let response = self
+                .provider
+                .chat(
+                    &[
+                        &Message::system(Self::compress_prompt()),
+                        &Message::user(summary.clone()),
+                    ],
+                    None,
+                )
+                .await?;
+
+            if response.finish_reason == FinishReason::Error {
+                info!(
+                    "[Consolidator] Compress attempt {} failed: {}",
+                    attempt + 1,
+                    response.content.as_deref().unwrap_or("(empty)")
+                );
+                break;
+            }
+
+            match response.content {
+                Some(s) if !s.is_empty() && s != "(nothing)" => summary = s,
+                _ => break,
+            }
+        }
+
+        // Layer 3: force-truncate if still over the limit.
+        if summary.len() > MAX_SUMMARY_BYTES {
+            info!(
+                "[Consolidator] Summary still too large after {MAX_COMPRESS_RETRIES} compress retries ({} bytes), force-truncating",
+                summary.len()
+            );
+            let mut cut = MAX_SUMMARY_BYTES;
+            while cut > 0 && !summary.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            summary.truncate(cut);
         }
 
         let mut ms = self.memory_store.lock().await;
@@ -189,7 +251,13 @@ Priority: user corrections and preferences > solutions > decisions > events > en
 Skip: code patterns derivable from source, git history, or anything already captured in existing memory.
 
 Output as concise bullet points, one fact per line. No preamble, no commentary.
+Your entire output MUST NOT exceed 512 bytes. Be ruthlessly concise — every byte counts.
 If nothing noteworthy happened, output: (nothing)"
+            .to_string()
+    }
+
+    fn compress_prompt() -> String {
+        "Compress the following summary to fit within 512 bytes. Keep only the most important facts. Output the compressed summary directly, with no preamble or commentary."
             .to_string()
     }
 
@@ -462,5 +530,332 @@ mod tests {
         let formatted = Consolidator::format_messages(&messages);
         assert!(!formatted.contains("[ASSISTANT]"));
         assert!(formatted.contains("[USER] hello"));
+    }
+
+    // ── Summary size limit tests ──
+
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    use crate::memory::MemoryStore;
+    use crate::provider::{LLMResponse, Usage};
+    use crate::session::SessionManager;
+
+    /// Mock provider that returns different responses based on call count.
+    struct SequenceMockProvider {
+        responses: Mutex<Vec<(String, FinishReason)>>,
+    }
+
+    impl SequenceMockProvider {
+        fn new(responses: Vec<(String, FinishReason)>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SequenceMockProvider {
+        async fn chat(
+            &self,
+            _messages: &[&Message],
+            _tools: Option<&[crate::tool::ToolDefinition]>,
+        ) -> anyhow::Result<LLMResponse> {
+            let mut responses = self.responses.lock().unwrap();
+            let (content, finish_reason) = if responses.len() > 1 {
+                responses.remove(0)
+            } else {
+                responses
+                    .last()
+                    .cloned()
+                    .unwrap_or(("(nothing)".to_string(), FinishReason::Stop))
+            };
+            Ok(LLMResponse {
+                content: Some(content),
+                tool_calls: None,
+                finish_reason,
+                usage: Usage {
+                    prompt_tokens: 100,
+                    prompt_cache_hit_tokens: 0,
+                    completion_tokens: 10,
+                    total_tokens: 110,
+                },
+            })
+        }
+    }
+
+    async fn setup_consolidator(provider: Arc<dyn Provider>) -> (Consolidator, TempDir, String) {
+        let tmp = TempDir::new().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+        for i in 0..5 {
+            sm.add_message("s1", Message::user(format!("msg {i}")))
+                .await
+                .unwrap();
+            sm.add_message(
+                "s1",
+                Message::assistant(Some(format!("reply {i}")), None, None, None),
+            )
+            .await
+            .unwrap();
+        }
+
+        let sm: SharedSessionManager = Arc::new(tokio::sync::Mutex::new(sm));
+        let ms: SharedMemoryStore =
+            Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
+
+        let consolidator = Consolidator::new(provider, sm, ms, 32768);
+        (consolidator, tmp, "s1".to_string())
+    }
+
+    #[tokio::test]
+    async fn test_summary_within_limit_no_compression() {
+        let short_summary = "- User prefers dark mode".to_string();
+        assert!(short_summary.len() <= MAX_SUMMARY_BYTES);
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![(
+            short_summary.clone(),
+            FinishReason::Stop,
+        )]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let entries = consolidator
+            .memory_store
+            .lock()
+            .await
+            .read_recent_history(10);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("dark mode"));
+    }
+
+    #[tokio::test]
+    async fn test_summary_over_limit_compresses_on_first_retry() {
+        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 100);
+        let compressed_summary = "- User prefers dark mode".to_string();
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![
+            (large_summary, FinishReason::Stop),
+            (compressed_summary.clone(), FinishReason::Stop),
+        ]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let entries = consolidator
+            .memory_store
+            .lock()
+            .await
+            .read_recent_history(10);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("dark mode"));
+        assert!(entries[0].content.len() <= MAX_SUMMARY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_summary_over_limit_needs_multiple_retries() {
+        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 200);
+        let medium_summary = "y".repeat(MAX_SUMMARY_BYTES + 50);
+        let compressed_summary = "- User chose SQLite".to_string();
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![
+            (large_summary, FinishReason::Stop),
+            (medium_summary, FinishReason::Stop),
+            (compressed_summary.clone(), FinishReason::Stop),
+        ]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let entries = consolidator
+            .memory_store
+            .lock()
+            .await
+            .read_recent_history(10);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("SQLite"));
+        assert!(entries[0].content.len() <= MAX_SUMMARY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_summary_over_limit_all_retries_exhausted_force_truncates() {
+        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 100);
+        let still_large_1 = "y".repeat(MAX_SUMMARY_BYTES + 50);
+        let still_large_2 = "z".repeat(MAX_SUMMARY_BYTES + 20);
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![
+            (large_summary, FinishReason::Stop),
+            (still_large_1, FinishReason::Stop),
+            (still_large_2, FinishReason::Stop),
+        ]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let entries = consolidator
+            .memory_store
+            .lock()
+            .await
+            .read_recent_history(10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content.len(), MAX_SUMMARY_BYTES);
+        assert!(entries[0].content.chars().all(|c| c == 'z'));
+    }
+
+    #[tokio::test]
+    async fn test_compress_returns_error_falls_to_truncation() {
+        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 100);
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![
+            (large_summary.clone(), FinishReason::Stop),
+            ("error occurred".to_string(), FinishReason::Error),
+        ]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let entries = consolidator
+            .memory_store
+            .lock()
+            .await
+            .read_recent_history(10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content.len(), MAX_SUMMARY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_compress_returns_empty_falls_to_truncation() {
+        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 100);
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![
+            (large_summary.clone(), FinishReason::Stop),
+            ("".to_string(), FinishReason::Stop),
+        ]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let entries = consolidator
+            .memory_store
+            .lock()
+            .await
+            .read_recent_history(10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content.len(), MAX_SUMMARY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_force_truncate_utf8_boundary() {
+        // Create a summary with multi-byte UTF-8 characters at the boundary
+        // Each emoji is 4 bytes, so 128 emojis = 512 bytes exactly
+        let mut large_summary = "🎉".repeat(128); // exactly 512 bytes
+        large_summary.push_str("extra"); // now 517 bytes
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![(
+            large_summary,
+            FinishReason::Stop,
+        )]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let entries = consolidator
+            .memory_store
+            .lock()
+            .await
+            .read_recent_history(10);
+        assert_eq!(entries.len(), 1);
+        // Should truncate to 512 bytes (128 emojis), not break a character
+        assert_eq!(entries[0].content.len(), 512);
+        assert_eq!(entries[0].content, "🎉".repeat(128));
+    }
+
+    #[tokio::test]
+    async fn test_force_truncate_ascii_exact_boundary() {
+        let large_summary = "a".repeat(MAX_SUMMARY_BYTES + 10);
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![(
+            large_summary,
+            FinishReason::Stop,
+        )]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let entries = consolidator
+            .memory_store
+            .lock()
+            .await
+            .read_recent_history(10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content.len(), MAX_SUMMARY_BYTES);
+    }
+
+    #[test]
+    fn test_compress_prompt_mentions_512_bytes() {
+        let prompt = Consolidator::compress_prompt();
+        assert!(prompt.contains("512 bytes"));
+        assert!(prompt.contains("Compress"));
+    }
+
+    #[test]
+    fn test_system_prompt_mentions_512_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let sm = SessionManager::new(session_dir).unwrap();
+        let sm: SharedSessionManager = Arc::new(tokio::sync::Mutex::new(sm));
+        let ms: SharedMemoryStore =
+            Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+
+        let provider = Arc::new(SequenceMockProvider::new(vec![]));
+        let consolidator = Consolidator::new(provider, sm, ms, 32768);
+
+        let prompt = consolidator.system_prompt();
+        assert!(prompt.contains("512 bytes"));
+    }
+
+    #[test]
+    fn test_max_summary_bytes_constant() {
+        assert_eq!(MAX_SUMMARY_BYTES, 512);
+    }
+
+    #[test]
+    fn test_max_compress_retries_constant() {
+        assert_eq!(MAX_COMPRESS_RETRIES, 2);
     }
 }
