@@ -20,6 +20,27 @@ pub trait Tool: Send + Sync {
 
 实现此 trait 即可接入任意工具。
 
+## TurnContext（per-turn 状态隔离）
+
+`TurnContext` 聚合 per-turn 状态（origin channel/chat_id + `sent_in_turn`），并通过 task-local 隔离，使并发 run（cron/heartbeat 与用户消息共享同一 `Arc<ToolManager>`）各自看到独立状态。
+
+```rust
+pub struct TurnContext {
+    channel: String,
+    chat_id: String,
+    sent_in_turn: AtomicBool,
+}
+```
+
+- `with_turn_context(ctx, fut).await` —— 打开 turn 作用域，`ctx` 在 `fut` 执行期间可被工具读取，future 结束时自动清除（RAII）。
+- `current_turn() -> Option<Arc<TurnContext>>` —— 工具在 `execute` 内读取当前 turn context；不在作用域内返回 `None`（如直接单测调用工具）。
+- `current_turn_target() -> (String, String)` —— 解析当前 turn 的 origin channel/chat_id；无作用域时返回空串。
+- `TurnContext::mark_sent_if_target(channel, chat_id)` —— 仅当目标命中 origin 时标记 `sent_in_turn`（跨 channel 发送不会抑制最终回复）。
+
+`AgentRunner::run()` 在入口构建 `Arc<TurnContext>` 并用 `with_turn_context` 包住整个 ReAct 循环；`MessageTool`/`CronTool` 通过 `current_turn()`/`current_turn_target()` 取值，不再自持 context 副本。作用域外（或空 origin）调用工具时，message 返回 "No target channel/chat specified"、cron 返回 "no session context (channel/chat_id)"。
+
+`TurnContext`/`current_turn()`/`current_turn_target()`/`with_turn_context()` 已从 crate 根 re-export（`slimbot::TurnContext` 等），外部自定义工具可在 `execute` 内读取 turn context。
+
 ## ToolManager
 
 ```rust

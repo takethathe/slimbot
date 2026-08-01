@@ -53,8 +53,8 @@ pub use session::{
     TaskState,
 };
 pub use tool::{
-    Tool, ToolCall, ToolDefinition, ToolManager, ensure_nonempty_tool_result, format_tool_error,
-    persist_tool_result,
+    Tool, ToolCall, ToolDefinition, ToolManager, TurnContext, current_turn, current_turn_target,
+    ensure_nonempty_tool_result, format_tool_error, persist_tool_result, with_turn_context,
 };
 pub use tools::create_tool;
 pub use utils::{

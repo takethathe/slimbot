@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::task_local;
 
 use crate::config::ToolEntry;
 use crate::utils::{
@@ -22,11 +26,72 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
-/// Channel and chat_id context injected into tools at the start of each turn.
-#[derive(Debug, Clone)]
-pub struct ToolContext {
-    pub channel: String,
-    pub chat_id: String,
+/// Per-turn state scoped to a single `AgentRunner::run()` invocation.
+/// Stored in a task-local so concurrent runs sharing one `Arc<ToolManager>`
+/// each observe their own instance (no cross-run context clobbering).
+pub struct TurnContext {
+    channel: String,
+    chat_id: String,
+    sent_in_turn: AtomicBool,
+}
+
+impl TurnContext {
+    pub fn new(channel: String, chat_id: String) -> Self {
+        Self {
+            channel,
+            chat_id,
+            sent_in_turn: AtomicBool::new(false),
+        }
+    }
+
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+
+    pub fn chat_id(&self) -> &str {
+        &self.chat_id
+    }
+
+    /// Mark that the message tool delivered output to the origin channel this turn.
+    /// Only marks when `channel`/`chat_id` match this turn's origin, so
+    /// cross-channel sends never suppress the final response.
+    pub fn mark_sent_if_target(&self, channel: &str, chat_id: &str) {
+        if channel == self.channel && chat_id == self.chat_id {
+            self.sent_in_turn.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn sent_in_turn(&self) -> bool {
+        self.sent_in_turn.load(Ordering::Acquire)
+    }
+}
+
+task_local! {
+    /// The turn context for the currently executing `AgentRunner::run()` invocation.
+    static CURRENT_TURN: Arc<TurnContext>;
+}
+
+/// Open a turn context scope. The context is available to all tool executions
+/// within `fut` and is automatically cleared when the future completes
+/// (RAII via task-local scope).
+pub async fn with_turn_context<R>(ctx: Arc<TurnContext>, fut: impl Future<Output = R>) -> R {
+    CURRENT_TURN.scope(ctx, fut).await
+}
+
+/// Read the current turn context, if running inside a `with_turn_context` scope.
+/// Returns `None` when called outside any turn (e.g. direct unit tests).
+pub fn current_turn() -> Option<Arc<TurnContext>> {
+    CURRENT_TURN.try_get().ok()
+}
+
+/// Resolve the origin (channel, chat_id) of the current turn, defaulting to
+/// empty strings when no turn context is active. Tools that need the turn
+/// itself (e.g. to mark delivery) should use `current_turn()` instead.
+pub fn current_turn_target() -> (String, String) {
+    match current_turn() {
+        Some(t) => (t.channel().to_string(), t.chat_id().to_string()),
+        None => (String::new(), String::new()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,15 +107,6 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> serde_json::Value;
     async fn execute(&self, args: serde_json::Value) -> Result<String>;
-
-    /// Set the current session context. Default is no-op.
-    fn set_context(&self, _ctx: &ToolContext) {}
-    /// Start a new turn (reset per-turn tracking). Default is no-op.
-    fn start_turn(&self) {}
-    /// Check if this tool sent output this turn. Default is false.
-    fn sent_in_turn(&self) -> bool {
-        false
-    }
 }
 
 pub struct ToolManager {
@@ -148,25 +204,6 @@ impl ToolManager {
             .ok_or_else(|| anyhow::anyhow!("Tool not found: {}", name))?;
         tool.execute(args).await
     }
-
-    /// Inject session context into all tools that support it.
-    pub fn set_context(&self, ctx: &ToolContext) {
-        for tool in self.tools.values() {
-            tool.set_context(ctx);
-        }
-    }
-
-    /// Start a new turn for a named tool (resets per-turn tracking).
-    pub fn start_turn(&self, name: &str) {
-        if let Some(tool) = self.tools.get(name) {
-            tool.start_turn();
-        }
-    }
-
-    /// Check if a named tool sent a message this turn.
-    pub fn sent_in_turn(&self, name: &str) -> bool {
-        self.tools.get(name).is_some_and(|t| t.sent_in_turn())
-    }
 }
 
 fn create_builtin_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
@@ -218,10 +255,91 @@ pub fn persist_tool_result(
     build_persisted_reference(&file_path, content, TOOL_RESULT_PREVIEW_CHARS)
 }
 
+/// Test helpers shared by tool tests across modules.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use super::*;
+
+    /// Build a turn context for tests.
+    pub(crate) fn turn_ctx(channel: &str, chat_id: &str) -> Arc<TurnContext> {
+        Arc::new(TurnContext::new(channel.to_string(), chat_id.to_string()))
+    }
+
+    /// Run `fut` inside a fresh turn scope for tests.
+    pub(crate) async fn with_turn<R>(
+        channel: &str,
+        chat_id: &str,
+        fut: impl Future<Output = R>,
+    ) -> R {
+        with_turn_context(turn_ctx(channel, chat_id), fut).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_util::turn_ctx;
     use super::*;
     use crate::config::ToolEntry;
+
+    #[tokio::test]
+    async fn test_turn_context_available_inside_scope_and_cleared_after() {
+        let ctx = turn_ctx("cli", "c1");
+        assert!(current_turn().is_none(), "no context before scope");
+        with_turn_context(ctx, async {
+            assert_eq!(current_turn().unwrap().channel(), "cli");
+            assert_eq!(current_turn().unwrap().chat_id(), "c1");
+        })
+        .await;
+        assert!(current_turn().is_none(), "context cleared after scope");
+    }
+
+    #[tokio::test]
+    async fn test_turn_context_concurrent_isolation() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let make = |channel: &'static str| {
+            let seen = seen.clone();
+            let ctx = turn_ctx(channel, "x");
+            async move {
+                with_turn_context(ctx, async {
+                    // Yield so the other task runs within its own scope.
+                    tokio::task::yield_now().await;
+                    let c = current_turn().unwrap();
+                    seen.lock()
+                        .unwrap()
+                        .push((channel.to_string(), c.channel().to_string()));
+                })
+                .await
+            }
+        };
+        let h1 = tokio::spawn(make("cli"));
+        let h2 = tokio::spawn(make("webui"));
+        h1.await.unwrap();
+        h2.await.unwrap();
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 2, "both tasks should have recorded");
+        for (expected, actual) in got.iter() {
+            assert_eq!(expected, actual, "each task must see its own context");
+        }
+    }
+
+    #[test]
+    fn test_turn_context_mark_sent_if_target() {
+        let ctx = Arc::new(TurnContext::new("cli".into(), "c1".into()));
+        assert!(!ctx.sent_in_turn(), "fresh turn starts false");
+        ctx.mark_sent_if_target("webui", "c1");
+        assert!(
+            !ctx.sent_in_turn(),
+            "cross-channel target must not mark the turn"
+        );
+        ctx.mark_sent_if_target("cli", "c1");
+        assert!(ctx.sent_in_turn(), "origin target marks the turn");
+    }
+
+    #[test]
+    fn test_current_turn_target_outside_scope_defaults_to_empty() {
+        assert!(current_turn().is_none());
+        assert_eq!(current_turn_target(), (String::new(), String::new()));
+    }
 
     #[test]
     fn test_tool_manager_new_empty() {
@@ -304,40 +422,6 @@ mod tests {
 
         // Should be empty since unknown tool is skipped
         assert!(tm.to_openai_functions().is_empty());
-    }
-
-    #[test]
-    fn test_tool_manager_set_context() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut tm = ToolManager::new(tmp.path().to_path_buf());
-        tm.register(Box::new(crate::tools::shell::ShellTool::default()));
-
-        let ctx = ToolContext {
-            channel: "cli".into(),
-            chat_id: "test".into(),
-        };
-        tm.set_context(&ctx);
-        // ShellTool doesn't override set_context, so this should be a no-op
-    }
-
-    #[test]
-    fn test_tool_manager_start_turn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut tm = ToolManager::new(tmp.path().to_path_buf());
-        tm.register(Box::new(crate::tools::shell::ShellTool::default()));
-
-        tm.start_turn("shell");
-        tm.start_turn("nonexistent"); // no-op for nonexistent tools
-    }
-
-    #[test]
-    fn test_tool_manager_sent_in_turn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut tm = ToolManager::new(tmp.path().to_path_buf());
-        tm.register(Box::new(crate::tools::shell::ShellTool::default()));
-
-        assert!(!tm.sent_in_turn("shell"));
-        assert!(!tm.sent_in_turn("nonexistent"));
     }
 
     #[test]

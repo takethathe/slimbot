@@ -2,16 +2,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cron::{CronJob, CronPayload, CronSchedule, CronService};
-use crate::tool::{Tool, ToolContext};
+use crate::tool::Tool;
 
 pub struct CronTool {
     cron_service: Arc<CronService>,
-    default_channel: Arc<std::sync::Mutex<String>>,
-    default_chat_id: Arc<std::sync::Mutex<String>>,
-    in_cron_context: AtomicBool,
 }
 
 /// Parse an `at` datetime string into a UTC epoch millisecond timestamp.
@@ -34,12 +30,7 @@ fn parse_at_datetime(s: &str) -> Option<i64> {
 
 impl CronTool {
     pub fn new(cron_service: Arc<CronService>) -> Self {
-        Self {
-            cron_service,
-            default_channel: Arc::new(std::sync::Mutex::new(String::new())),
-            default_chat_id: Arc::new(std::sync::Mutex::new(String::new())),
-            in_cron_context: AtomicBool::new(false),
-        }
+        Self { cron_service }
     }
 
     fn now_ms() -> i64 {
@@ -50,12 +41,6 @@ impl CronTool {
     }
 
     fn add_job(&self, args: &serde_json::Value) -> Result<String> {
-        if self.in_cron_context.load(Ordering::Relaxed) {
-            return Ok(
-                "Error: cannot schedule new jobs from within a cron job execution".to_string(),
-            );
-        }
-
         let message = args.get("message").and_then(|v| v.as_str());
         let message = match message {
             Some(m) if !m.trim().is_empty() => m.to_string(),
@@ -66,8 +51,7 @@ impl CronTool {
             }
         };
 
-        let channel = self.default_channel.lock().unwrap().clone();
-        let chat_id = self.default_chat_id.lock().unwrap().clone();
+        let (channel, chat_id) = crate::tool::current_turn_target();
         if channel.is_empty() || chat_id.is_empty() {
             return Ok("Error: no session context (channel/chat_id)".to_string());
         }
@@ -206,11 +190,6 @@ impl Tool for CronTool {
             _ => Ok(format!("Unknown action: {}", action)),
         }
     }
-
-    fn set_context(&self, ctx: &ToolContext) {
-        *self.default_channel.lock().unwrap() = ctx.channel.clone();
-        *self.default_chat_id.lock().unwrap() = ctx.chat_id.clone();
-    }
 }
 
 fn format_schedule(schedule: &CronSchedule) -> String {
@@ -240,6 +219,20 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::tool::test_util::with_turn;
+
+    async fn exec_with_ctx(
+        tool: &CronTool,
+        channel: &str,
+        chat_id: &str,
+        args: serde_json::Value,
+    ) -> String {
+        with_turn(channel, chat_id, async {
+            tool.execute(args).await.unwrap()
+        })
+        .await
+    }
+
     fn make_cron_tool() -> CronTool {
         let tmp = tempfile::tempdir().unwrap();
         let cron_svc = Arc::new(CronService::new(tmp.path()));
@@ -249,79 +242,82 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_and_list() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "name": "test job",
                 "message": "do something",
                 "every_seconds": 300
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("Created job"));
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "list"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("test job"));
     }
 
     #[tokio::test]
     async fn test_cron_tool_add_and_remove() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let add_result = tool
-            .execute(serde_json::json!({
+        let add_result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "name": "remove me",
                 "message": "will be removed",
                 "every_seconds": 60
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         let job_id = add_result
             .split("id: ")
             .last()
             .unwrap()
             .trim_end_matches(')');
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "remove",
                 "job_id": job_id
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("Removed job"));
     }
 
     #[tokio::test]
     async fn test_cron_tool_add_missing_message() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "name": "no message"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("requires a non-empty"));
     }
 
@@ -342,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_without_context() {
         let tool = make_cron_tool();
-        // No set_context called — channel/chat_id will be empty
+        // No with_turn_context scope -> current_turn() returns None
 
         let result = tool
             .execute(serde_json::json!({
@@ -371,28 +367,30 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_cron_expression() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "name": "cron job",
                 "message": "run at 9am",
                 "cron_expr": "0 0 9 * * *"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("Created job"));
 
-        let list = tool
-            .execute(serde_json::json!({
+        let list = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "list"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(list.contains("cron job"));
         assert!(list.contains("cron:"));
     }
@@ -400,20 +398,19 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_at_schedule() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "name": "one shot",
                 "message": "once",
                 "at": "2030-01-01T00:00:00Z"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("Created job"));
 
         // At-schedule jobs have delete_after_run=true
@@ -425,38 +422,36 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_at_invalid_date() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "message": "bad date",
                 "at": "not-a-date"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("invalid datetime format"));
     }
 
     #[tokio::test]
     async fn test_cron_tool_add_no_schedule_type() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "message": "no timing",
                 "name": "no timing"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("either every_seconds, cron_expr, or at"));
     }
 
@@ -492,20 +487,19 @@ mod tests {
     #[tokio::test]
     async fn test_cron_tool_add_job_sets_delivery_fields() {
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-42".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-42",
+            serde_json::json!({
                 "action": "add",
                 "name": "remind me",
                 "message": "go to sleep",
                 "every_seconds": 60
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("Created job"));
 
         // Verify the job payload has delivery fields set correctly
@@ -542,38 +536,36 @@ mod tests {
         // (e.g. "2030-01-01T10:30:00"). This should be accepted directly as local
         // time, not rejected and force the model to retry.
         let tool = make_cron_tool();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
+        let result = exec_with_ctx(
+            &tool,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "name": "naive test",
                 "message": "test",
                 "at": "2030-01-01T10:30:00"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result.contains("Created job"));
 
         // Also verify UTC (Z) format is accepted and treated as local time
         let tool2 = make_cron_tool();
-        tool2.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result2 = tool2
-            .execute(serde_json::json!({
+        let result2 = exec_with_ctx(
+            &tool2,
+            "webui",
+            "chat-1",
+            serde_json::json!({
                 "action": "add",
                 "name": "utc test",
                 "message": "test",
                 "at": "2030-01-01T10:30:00Z"
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert!(result2.contains("Created job"));
 
         // Both jobs should have been created on first call (no error-retry needed)

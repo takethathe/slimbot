@@ -58,6 +58,7 @@
 - [x] 触发的任务通过 `AgentLoop.run_task()` 执行
 - [x] 模型判断执行结果是否需要 deliver 到 channel（`payload.deliver` + `channel`/`to` 字段）
 - [x] 所有 cron 消息统一记录到 `system:cron` session，最多保留 2000 条消息（滑动窗口）
+- [ ] **阻止 cron 内再调度 cron** - `CronTool` 曾有 `in_cron_context` 字段意图阻止在 cron 触发的 run 内新增 cron job，但从未接通（已于 2026-08-01 tool context 重构中作为死代码删除）。后续可基于 `TurnContext` 增加 `TurnKind`（User/Cron/Heartbeat）字段，在 `add_job` 中判断 `kind == Cron` 时拒绝调度。
 
 ## Memory 记忆系统
 

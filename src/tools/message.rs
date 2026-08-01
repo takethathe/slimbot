@@ -2,34 +2,30 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::tool::{Tool, ToolContext};
+use crate::tool::Tool;
 
+/// Send callback result: `Ok(())` means the message was delivered, `Err(e)`
+/// means delivery failed (the turn is only marked as sent on success).
 type SendCallback = Arc<
     dyn Fn(
             String,
             String,
             String,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
 
 pub struct MessageTool {
-    default_channel: Arc<std::sync::Mutex<String>>,
-    default_chat_id: Arc<std::sync::Mutex<String>>,
     send_callback: Option<SendCallback>,
-    sent_in_turn: AtomicBool,
 }
 
 impl MessageTool {
     pub fn new() -> Self {
         Self {
-            default_channel: Arc::new(std::sync::Mutex::new(String::new())),
-            default_chat_id: Arc::new(std::sync::Mutex::new(String::new())),
             send_callback: None,
-            sent_in_turn: AtomicBool::new(false),
         }
     }
 
@@ -46,14 +42,6 @@ impl Tool for MessageTool {
 
     fn description(&self) -> &str {
         "Send a message to the user. This is the primary way to deliver results to a channel."
-    }
-
-    fn start_turn(&self) {
-        self.sent_in_turn.store(false, Ordering::Relaxed);
-    }
-
-    fn sent_in_turn(&self) -> bool {
-        self.sent_in_turn.load(Ordering::Relaxed)
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -75,66 +63,80 @@ impl Tool for MessageTool {
             .unwrap_or("")
             .to_string();
 
+        // Check the callback first so no turn-context work is done when
+        // sending is not configured.
+        let cb = match &self.send_callback {
+            Some(cb) => cb,
+            None => return Ok("Error: Message sending not configured".to_string()),
+        };
+
+        let (def_channel, def_chat_id) = crate::tool::current_turn_target();
         let channel = match args.get("channel").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),
-            None => self.default_channel.lock().unwrap().clone(),
+            None => def_channel,
         };
         let chat_id = match args.get("chat_id").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),
-            None => self.default_chat_id.lock().unwrap().clone(),
+            None => def_chat_id,
         };
 
         if channel.is_empty() || chat_id.is_empty() {
             return Ok("Error: No target channel/chat specified".to_string());
         }
 
-        if let Some(ref cb) = self.send_callback {
-            cb(channel.clone(), chat_id.clone(), content.clone()).await;
-            // Only mark as sent when targeting the default (origin) context.
-            // Cross-channel sends should not suppress the final response.
-            let default_ch = self.default_channel.lock().unwrap().clone();
-            let default_chat = self.default_chat_id.lock().unwrap().clone();
-            if channel == default_ch && chat_id == default_chat {
-                self.sent_in_turn.store(true, Ordering::Relaxed);
+        match cb(channel.clone(), chat_id.clone(), content.clone()).await {
+            Ok(()) => {
+                // Only mark as sent when targeting the default (origin) context.
+                // Cross-channel sends should not suppress the final response.
+                if let Some(t) = crate::tool::current_turn() {
+                    t.mark_sent_if_target(&channel, &chat_id);
+                }
+                Ok(format!("Message sent to {}:{}", channel, chat_id))
             }
-            Ok(format!("Message sent to {}:{}", channel, chat_id))
-        } else {
-            Ok("Error: Message sending not configured".to_string())
+            Err(e) => Ok(format!("Error: Message delivery failed: {}", e)),
         }
-    }
-
-    fn set_context(&self, ctx: &ToolContext) {
-        *self.default_channel.lock().unwrap() = ctx.channel.clone();
-        *self.default_chat_id.lock().unwrap() = ctx.chat_id.clone();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::test_util::{turn_ctx, with_turn};
+    use crate::tool::with_turn_context;
+    use std::sync::Arc;
+
+    /// Channel pair used by the message-send callback tests.
+    type SendChannel = (
+        tokio::sync::mpsc::Sender<(String, String, String)>,
+        tokio::sync::mpsc::Receiver<(String, String, String)>,
+    );
+
+    fn make_callback() -> SendChannel {
+        tokio::sync::mpsc::channel::<(String, String, String)>(1)
+    }
+
+    fn send_cb(tx: tokio::sync::mpsc::Sender<(String, String, String)>) -> SendCallback {
+        Arc::new(move |ch, cid, content| {
+            let tx = tx.clone();
+            Box::pin(async move { tx.send((ch, cid, content)).await.map_err(|e| e.to_string()) })
+        })
+    }
 
     #[tokio::test]
     async fn test_message_tool_defaults_context() {
         let mut tool = MessageTool::new();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
+        let (tx, mut rx) = make_callback();
+        tool.set_send_callback(send_cb(tx));
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
-        tool.set_send_callback(Arc::new(move |ch, cid, content| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                let _ = tx.send((ch, cid, content)).await;
-            })
-        }));
-
-        let result = tool
-            .execute(serde_json::json!({ "content": "hello" }))
-            .await
-            .unwrap();
+        let c = turn_ctx("webui", "chat-1");
+        let result = with_turn_context(c.clone(), async {
+            tool.execute(serde_json::json!({ "content": "hello" }))
+                .await
+                .unwrap()
+        })
+        .await;
         assert!(result.contains("webui:chat-1"));
-        assert!(tool.sent_in_turn());
+        assert!(c.sent_in_turn(), "sent to origin must mark the turn");
 
         let (ch, cid, content) = rx.recv().await.unwrap();
         assert_eq!(ch, "webui");
@@ -145,29 +147,25 @@ mod tests {
     #[tokio::test]
     async fn test_message_tool_explicit_target() {
         let mut tool = MessageTool::new();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
+        let (tx, mut rx) = make_callback();
+        tool.set_send_callback(send_cb(tx));
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
-        tool.set_send_callback(Arc::new(move |ch, cid, content| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                let _ = tx.send((ch, cid, content)).await;
-            })
-        }));
-
-        let result = tool
-            .execute(serde_json::json!({
+        let c = turn_ctx("webui", "chat-1");
+        let result = with_turn_context(c.clone(), async {
+            tool.execute(serde_json::json!({
                 "content": "cross channel",
                 "channel": "cli",
                 "chat_id": "other"
             }))
             .await
-            .unwrap();
+            .unwrap()
+        })
+        .await;
         assert!(result.contains("cli:other"));
-        assert!(!tool.sent_in_turn());
+        assert!(
+            !c.sent_in_turn(),
+            "cross-channel send must not mark the turn"
+        );
 
         let (ch, cid, _content) = rx.recv().await.unwrap();
         assert_eq!(ch, "cli");
@@ -177,97 +175,105 @@ mod tests {
     #[tokio::test]
     async fn test_message_tool_no_content() {
         let mut tool = MessageTool::new();
-        tool.set_context(&ToolContext {
-            channel: "cli".into(),
-            chat_id: "chat-1".into(),
-        });
+        let (tx, _rx) = make_callback();
+        tool.set_send_callback(send_cb(tx));
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
-        tool.set_send_callback(Arc::new(move |_ch, _cid, _content| {
-            let _tx = tx.clone();
-            Box::pin(async move {})
-        }));
-
-        // Empty content defaults to ""
-        let result = tool.execute(serde_json::json!({})).await.unwrap();
-        // Should still send (empty string is valid)
+        let result = with_turn("cli", "chat-1", async {
+            tool.execute(serde_json::json!({})).await.unwrap()
+        })
+        .await;
+        // Empty content defaults to "" but still sends to the default channel.
         assert!(result.contains("cli:chat-1"));
     }
 
     #[tokio::test]
     async fn test_message_tool_no_callback() {
         let tool = MessageTool::new();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
 
-        let result = tool
-            .execute(serde_json::json!({
-                "content": "hello"
-            }))
-            .await
-            .unwrap();
+        let result = with_turn("webui", "chat-1", async {
+            tool.execute(serde_json::json!({ "content": "hello" }))
+                .await
+                .unwrap()
+        })
+        .await;
         assert!(result.contains("not configured"));
     }
 
     #[tokio::test]
     async fn test_message_tool_no_context() {
         let mut tool = MessageTool::new();
-        // No set_context called
+        let (tx, _rx) = make_callback();
+        tool.set_send_callback(send_cb(tx));
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
-        tool.set_send_callback(Arc::new(move |_ch, _cid, _content| {
-            let _tx = tx.clone();
-            Box::pin(async move {})
-        }));
-
+        // No with_turn_context scope -> current_turn() returns None.
         let result = tool
-            .execute(serde_json::json!({
-                "content": "test"
-            }))
+            .execute(serde_json::json!({ "content": "test" }))
             .await
             .unwrap();
         assert!(result.contains("No target channel"));
     }
 
     #[tokio::test]
-    async fn test_message_tool_sent_in_turn_tracking() {
+    async fn test_message_tool_empty_turn_defaults_error() {
         let mut tool = MessageTool::new();
-        tool.set_context(&ToolContext {
-            channel: "webui".into(),
-            chat_id: "chat-1".into(),
-        });
+        let (tx, _rx) = make_callback();
+        tool.set_send_callback(send_cb(tx));
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<(String, String, String)>(1);
-        tool.set_send_callback(Arc::new(move |ch, cid, content| {
-            let _tx = tx.clone();
-            Box::pin(async move {
-                let _ = (ch, cid, content);
-            })
+        // Empty-origin turn (colon-less session id): default send must error
+        // cleanly instead of leaking context from another run.
+        let result = with_turn("", "", async {
+            tool.execute(serde_json::json!({ "content": "hi" }))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(result.contains("No target channel"));
+    }
+
+    #[tokio::test]
+    async fn test_message_tool_empty_turn_explicit_target_not_marked() {
+        let mut tool = MessageTool::new();
+        let (tx, mut rx) = make_callback();
+        tool.set_send_callback(send_cb(tx));
+
+        // Empty-origin turn with an explicit target: the message is delivered,
+        // but the turn must not be marked (origin is empty), so the caller
+        // still emits the final response.
+        let c = turn_ctx("", "");
+        let result = with_turn_context(c.clone(), async {
+            tool.execute(serde_json::json!({
+                "content": "hi",
+                "channel": "webui",
+                "chat_id": "chat-1"
+            }))
+            .await
+            .unwrap()
+        })
+        .await;
+        assert!(result.contains("webui:chat-1"));
+        assert!(!c.sent_in_turn(), "empty origin must not mark the turn");
+
+        let (ch, cid, _content) = rx.recv().await.unwrap();
+        assert_eq!(ch, "webui");
+        assert_eq!(cid, "chat-1");
+    }
+
+    #[tokio::test]
+    async fn test_message_tool_delivery_failure_not_marked() {
+        let mut tool = MessageTool::new();
+        tool.set_send_callback(Arc::new(move |_ch, _cid, _content| {
+            Box::pin(async move { Err("outbound receiver dropped".to_string()) })
         }));
 
-        tool.start_turn();
-        assert!(!tool.sent_in_turn());
-
-        // Send to default context
-        tool.execute(serde_json::json!({ "content": "msg" }))
-            .await
-            .unwrap();
-        assert!(tool.sent_in_turn());
-
-        // Start new turn
-        tool.start_turn();
-        assert!(!tool.sent_in_turn());
-
-        // Send to different context
-        tool.execute(serde_json::json!({
-            "content": "msg",
-            "channel": "other"
-        }))
-        .await
-        .unwrap();
-        assert!(!tool.sent_in_turn());
+        let c = turn_ctx("webui", "chat-1");
+        let result = with_turn_context(c.clone(), async {
+            tool.execute(serde_json::json!({ "content": "hi" }))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(result.contains("delivery failed"));
+        assert!(!c.sent_in_turn(), "failed delivery must not mark the turn");
     }
 
     #[test]

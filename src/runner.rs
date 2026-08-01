@@ -11,8 +11,8 @@ use crate::session::{
     parse_session_origin,
 };
 use crate::tool::{
-    ToolContext, ToolManager, ensure_nonempty_tool_result, format_tool_error, persist_tool_result,
-    truncate_text_head_tail,
+    ToolManager, TurnContext, ensure_nonempty_tool_result, format_tool_error, persist_tool_result,
+    truncate_text_head_tail, with_turn_context,
 };
 use crate::{debug, warn_log};
 use tokio_util::sync::CancellationToken;
@@ -226,32 +226,32 @@ impl AgentRunner {
             session_id: hook.session_id().to_string(),
         });
 
-        let max_iterations = self.config.max_iterations;
-        let mut iterations: u32 = 0;
-        let mut result = AgentResult::default();
-
-        // Inject session context into tools (once, before the loop).
+        // Resolve turn context (channel/chat_id) once, before the loop.
         // Prefer origin channel/chat_id (e.g. from cron payload) over session_id-parsed values.
         let (tool_channel, tool_chat_id) = parse_session_origin(
             session_id,
             (origin_channel.as_deref(), origin_chat_id.as_deref()),
         );
-        if !tool_channel.is_empty() {
-            let ctx = ToolContext {
-                channel: tool_channel.clone(),
-                chat_id: tool_chat_id.clone(),
-            };
-            self.tool_manager.set_context(&ctx);
-        }
-
         // Generate runtime context once per turn for cache stability.
         // This ensures the timestamp doesn't change between iterations within the same turn.
         let runtime_ctx = crate::context::build_runtime_context(&tool_channel, &tool_chat_id);
 
-        // Reset message tool's per-turn tracking before the loop.
-        self.tool_manager.start_turn("message");
+        // Scope per-turn state (context + sent_in_turn) via a task-local so that
+        // concurrent runs sharing one Arc<ToolManager> each see their own state.
+        let turn = Arc::new(TurnContext::new(tool_channel.clone(), tool_chat_id.clone()));
+        with_turn_context(turn.clone(), async {
+            // Every exit must carry the sent_in_turn flag: callers suppress the
+            // final response only when the message tool already delivered to the
+            // origin channel, regardless of how the loop ends.
+            let finalize = |mut result: AgentResult| {
+                result.message_sent = turn.sent_in_turn();
+                result
+            };
+            let max_iterations = self.config.max_iterations;
+            let mut iterations: u32 = 0;
+            let mut result = AgentResult::default();
 
-        loop {
+            loop {
             // Exceeded max iterations
             if iterations >= max_iterations {
                 let err_msg = format!("Reached max iterations {}", max_iterations);
@@ -272,7 +272,7 @@ impl AgentRunner {
                     session_id: hook.session_id().to_string(),
                     error: err_msg,
                 });
-                return result;
+                return finalize(result);
             }
 
             // Pre-iteration event
@@ -287,10 +287,7 @@ impl AgentRunner {
                 sm.get_last_summary(session_id).await
             };
             let session_summary_ref = session_summary.as_deref();
-            let (channel, chat_id) = parse_session_origin(
-                session_id,
-                (origin_channel.as_deref(), origin_chat_id.as_deref()),
-            );
+            // Origin is resolved once before the loop (see above); reuse it here.
             let context_builder = ContextBuilder::new(
                 self.session_manager.clone(),
                 self.tool_manager.clone(),
@@ -301,8 +298,8 @@ impl AgentRunner {
             let ctx = context_builder
                 .build_messages(
                     session_id,
-                    &channel,
-                    &chat_id,
+                    &tool_channel,
+                    &tool_chat_id,
                     session_summary_ref,
                     Some(runtime_ctx.clone()),
                 )
@@ -356,30 +353,32 @@ impl AgentRunner {
             if let Some(ref ct) = cancel_token
                 && ct.is_cancelled()
             {
-                return self
-                    .rollback_and_fail(
+                return finalize(
+                    self.rollback_and_fail(
                         &hook,
                         session_id,
                         initial_message_count,
                         "Task cancelled.",
                         iterations,
                     )
-                    .await;
+                    .await,
+                );
             }
             let response = match self.provider.chat(&messages, ctx.tools.as_deref()).await {
                 Ok(r) => r,
                 Err(e) => {
                     let err_msg = format!("LLM API request failed - {}", e);
                     warn_log!("[AgentRunner] {}", err_msg);
-                    return self
-                        .rollback_and_fail(
+                    return finalize(
+                        self.rollback_and_fail(
                             &hook,
                             session_id,
                             initial_message_count,
                             &err_msg,
                             iterations,
                         )
-                        .await;
+                        .await,
+                    );
                 }
             };
             debug!(
@@ -429,14 +428,15 @@ impl AgentRunner {
                         )
                         .await
                     {
-                        return self
-                            .fail_result(
+                        return finalize(
+                            self.fail_result(
                                 &hook,
                                 session_id,
                                 &format!("Failed to write assistant message: {}", e),
                                 iterations,
                             )
-                            .await;
+                            .await,
+                        );
                     }
 
                     // Update token ratio so persist() saves it with the meta.
@@ -458,13 +458,11 @@ impl AgentRunner {
                         .maybe_consolidate(session_id, prompt_tokens)
                         .await;
                 }
-                // Mark if message tool delivered output (caller should suppress final response)
-                result.message_sent = self.tool_manager.sent_in_turn("message");
                 debug!(
                     "[AgentRunner] Run complete: success={}, iterations={}",
                     result.success, result.iterations
                 );
-                return result;
+                return finalize(result);
             }
 
             // Has tool calls → write ONE assistant message with content + all tool_calls,
@@ -489,14 +487,15 @@ impl AgentRunner {
                         )
                         .await
                     {
-                        return self
-                            .fail_result(
+                        return finalize(
+                            self.fail_result(
                                 &hook,
                                 session_id,
                                 &format!("Failed to write assistant message: {}", e),
                                 iterations,
                             )
-                            .await;
+                            .await,
+                        );
                     }
                 }
 
@@ -571,14 +570,15 @@ impl AgentRunner {
                             )
                             .await
                         {
-                            return self
-                                .fail_result(
+                            return finalize(
+                                self.fail_result(
                                     &hook,
                                     session_id,
                                     &format!("Failed to write tool message: {}", e),
                                     iterations,
                                 )
-                                .await;
+                                .await,
+                            );
                         }
                     }
                 }
@@ -595,6 +595,8 @@ impl AgentRunner {
                 hook.notify_status_change(&running_state);
             }
         }
+    })
+    .await
     }
 
     async fn fail_result(
@@ -844,6 +846,159 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> Result<String> {
             Ok(self.return_value.clone())
         }
+    }
+
+    /// Tool that records the turn-context channel it observes during execute.
+    struct TurnCaptureTool {
+        seen: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for TurnCaptureTool {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn description(&self) -> &str {
+            "capture turn context for tests"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<String> {
+            let ch = crate::tool::current_turn().map(|t| t.channel().to_string());
+            *self.seen.lock().unwrap() = ch;
+            Ok("captured".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_runner_wires_turn_context_to_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path();
+        let session_dir = path.join("sessions");
+        let workspace_dir = path.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let sm: SharedSessionManager =
+            Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap()));
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut tm = ToolManager::new(workspace_dir.clone());
+        tm.register(Box::new(TurnCaptureTool { seen: seen.clone() }));
+        let tm = Arc::new(tm);
+        sm.lock().await.get_or_create("webui:chat-7").await.unwrap();
+
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            LLMResponse {
+                content: Some("call it".to_string()),
+                tool_calls: Some(vec![tool_call("tc-1", "capture")]),
+                finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            },
+            LLMResponse {
+                content: Some("done".to_string()),
+                tool_calls: None,
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ]));
+        let runner = make_runner(sm.clone(), tm, provider, workspace_dir, ms);
+
+        let result = runner
+            .run(
+                "hi".to_string(),
+                TaskHook::new("webui:chat-7"),
+                "webui:chat-7",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(result.success);
+
+        let captured = seen.lock().unwrap().clone();
+        assert_eq!(
+            captured.as_deref(),
+            Some("webui"),
+            "tool must observe the turn context channel from session_id"
+        );
+    }
+
+    /// Tool that marks the turn as having delivered output to its origin
+    /// (mirrors MessageTool's origin-marking behavior).
+    struct MarkingTool;
+
+    #[async_trait]
+    impl Tool for MarkingTool {
+        fn name(&self) -> &str {
+            "marker"
+        }
+
+        fn description(&self) -> &str {
+            "mark the turn as sent for tests"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<String> {
+            if let Some(t) = crate::tool::current_turn() {
+                t.mark_sent_if_target(t.channel(), t.chat_id());
+            }
+            Ok("marked".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_runner_message_sent_on_max_iterations_exit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path();
+        let session_dir = path.join("sessions");
+        let workspace_dir = path.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let sm: SharedSessionManager =
+            Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap()));
+        let mut tm = ToolManager::new(workspace_dir.clone());
+        tm.register(Box::new(MarkingTool));
+        let tm = Arc::new(tm);
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
+        sm.lock().await.get_or_create("webui:chat-7").await.unwrap();
+
+        // Provider always returns tool calls, forcing the max-iterations exit.
+        let base_response = LLMResponse {
+            content: None,
+            tool_calls: Some(vec![tool_call("tc", "marker")]),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        };
+        let provider = Arc::new(MockProvider::new(
+            std::iter::repeat(base_response).take(50).collect(),
+        ));
+        let runner = make_runner(sm.clone(), tm, provider.clone(), workspace_dir, ms);
+
+        let result = runner
+            .run(
+                "Loop forever".to_string(),
+                TaskHook::new("webui:chat-7"),
+                "webui:chat-7",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(result.success, false);
+        assert!(result.content.contains("Reached max iterations"));
+        assert!(
+            result.message_sent,
+            "message_sent must reflect delivery even on the max-iterations exit"
+        );
     }
 
     /// Failing tool that always returns an error.

@@ -34,13 +34,13 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     message_tool.set_send_callback(Arc::new(move |channel, chat_id, content| {
         let tx = outbound_tx.clone();
         Box::pin(async move {
-            let _ = tx
-                .send(BusResult {
-                    session_id: format!("{}:{}", channel, chat_id),
-                    task_id: String::new(),
-                    content,
-                })
-                .await;
+            tx.send(BusResult {
+                session_id: format!("{}:{}", channel, chat_id),
+                task_id: String::new(),
+                content,
+            })
+            .await
+            .map_err(|e| e.to_string())
         })
     }));
     tool_manager.register(Box::new(message_tool));
@@ -908,9 +908,8 @@ mod tests {
             guard.get_or_create("session-3").await.unwrap();
         }
 
-        // List sessions
-        let sessions = sm.lock().await.list_persisted_sessions("");
-        assert!(sessions.len() >= 0); // May be 0 if not persisted
+        // List sessions - verifies the call does not panic.
+        let _ = sm.lock().await.list_persisted_sessions("");
     }
 
     #[tokio::test]
@@ -1409,22 +1408,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_tool_manager_set_context() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-
-        let mut tm = ToolManager::new(workspace_dir);
-        tm.init_from_config(&[]); // Use defaults
-
-        // Set context should not panic
-        tm.set_context(&crate::tool::ToolContext {
-            channel: "cli".to_string(),
-            chat_id: "default".to_string(),
-        });
-    }
-
-    #[tokio::test]
     async fn test_gateway_session_manager_has_session() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = tmp.path().join("sessions");
@@ -1491,7 +1474,7 @@ mod tests {
         WorkerPool::init_global(64);
 
         let pool = WorkerPool::global();
-        assert!(pool.submit(Box::new(|| Box::pin(async {}))) == ());
+        pool.submit(Box::new(|| Box::pin(async {})));
     }
 
     #[tokio::test]
@@ -1548,35 +1531,6 @@ mod tests {
             })
             .await;
         assert!(result2.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_gateway_tool_manager_start_turn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-
-        let mut tm = ToolManager::new(workspace_dir);
-        tm.init_from_config(&[]); // Use defaults
-
-        // start_turn should not panic
-        tm.start_turn("shell");
-        tm.start_turn("file_reader");
-    }
-
-    #[tokio::test]
-    async fn test_gateway_tool_manager_sent_in_turn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-
-        let mut tm = ToolManager::new(workspace_dir);
-        tm.init_from_config(&[]); // Use defaults
-
-        // sent_in_turn should return false for tools that haven't sent
-        assert!(!tm.sent_in_turn("shell"));
-        assert!(!tm.sent_in_turn("file_reader"));
-        assert!(!tm.sent_in_turn("nonexistent"));
     }
 
     #[tokio::test]
@@ -2097,8 +2051,8 @@ mod tests {
         // Zero interval should be handled gracefully
         let heartbeat = HeartbeatService::new(workspace_dir, 0, true);
         let duration = heartbeat.sleep_duration();
-        // Duration should be non-negative
-        assert!(duration.as_secs() >= 0);
+        // Zero interval maps to zero sleep (graceful handling, no panic).
+        assert_eq!(duration.as_secs(), 0);
     }
 
     #[tokio::test]
