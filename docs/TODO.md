@@ -1,5 +1,17 @@
 # TODO
 
+## Runner Phase Hooks 重构（2026-08-15 完成）
+
+- [x] **Phase Hook 管线** — `AgentRunner::run()` 重构为约 80 行骨架，七个 phase（PreTurn/PreChat/AfterChat/PreTool/AfterTool/PostIteration/AfterTurn）通过可插拔 hook 实现，`HookRegistry` 封装存储/执行/取消检查
+- [x] **Hook 注册 API** — builder 支持 `with_defaults()` + 每 phase 的 `add_*` 方法，`HookPosition::{Append, Replace, Insert}` 控制位置（越界退化为 Append）
+- [x] **流程控制** — `HookAction::{Continue, Abort}` / `ToolHookAction::{Execute, Skip, Abort}`，abort 跳转 after_turn，pre_tool 可跳过执行返回合成结果
+- [x] **RunSpec/RunState** — 不可变配置 + 可变状态分离，`RunState` 提供类型安全 `set_extension`/`get_extension` 跨 phase 传数据
+- [x] **默认 hook** — 14 个默认 hook 复刻原 run() 全部行为（`src/runner/hooks/` 每 hook 一文件），`AgentRunner::new()` 内部自动注册
+- [x] **取消/回滚语义保留** — after_turn 始终执行（即使取消/出错），LLM 错误/取消回滚到 initial_message_count；PreTurn 阶段取消同样回滚（清除本轮已写入的用户消息，避免会话以未回复的 user 消息结尾）；chat 前增加取消检查，已取消时跳过 LLM 调用并回滚，不浪费请求
+- [x] **测试** — 现有 36 个 runner 测试无修改通过；新增 HookRegistry 单测、每 hook 单测、9 个 hook 行为集成测试
+
+设计文档见 `.scratch/runner-phase-hooks/spec.md`；模块文档见 `docs/runner.md`。
+
 ## 缺失工具（对齐 nanobot）
 
 ### 核心工具
