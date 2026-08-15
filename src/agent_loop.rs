@@ -18,7 +18,53 @@ use crate::session::{
     SessionManager, SessionTaskBuilder, SharedSessionManager, TaskHook, ensure_session,
 };
 use crate::tool::{Tool, ToolManager};
+use crate::trace::backends::{FileBackend, OtelBackend};
+use crate::trace::{TraceBackend, Tracer};
 use crate::{error, info, warn_log};
+
+/// Build a tracer from the `tracing` config section, or `None` when tracing
+/// is disabled or no backend is enabled. This is the wiring-layer mapping from
+/// config to backends; the trace module itself stays free of config.
+fn build_tracer(config: &Config) -> Option<Arc<Tracer>> {
+    if !config.tracing.enabled {
+        return None;
+    }
+    let backends: Vec<Arc<dyn TraceBackend>> = config
+        .tracing
+        .backends
+        .iter()
+        .filter(|b| b.enabled)
+        .filter_map(|b| match b.r#type.as_str() {
+            "file" => match FileBackend::new(&b.path) {
+                Ok(fb) => Some(Arc::new(fb) as Arc<dyn TraceBackend>),
+                Err(e) => {
+                    warn_log!("[Trace] File backend '{}' failed to open: {}", b.path, e);
+                    None
+                }
+            },
+            "otel" => match OtelBackend::new(&b.endpoint, &b.service_name) {
+                Ok(ob) => Some(Arc::new(ob) as Arc<dyn TraceBackend>),
+                Err(e) => {
+                    warn_log!(
+                        "[Trace] OTel backend '{}' failed to build: {}",
+                        b.endpoint,
+                        e
+                    );
+                    None
+                }
+            },
+            _ => {
+                warn_log!("[Trace] Unknown backend type '{}' ignored", b.r#type);
+                None
+            }
+        })
+        .collect();
+    if backends.is_empty() {
+        None
+    } else {
+        Some(Arc::new(Tracer::new(backends)))
+    }
+}
 
 /// Orchestrates graceful shutdown of all components.
 async fn graceful_shutdown(
@@ -244,6 +290,8 @@ impl AgentLoop {
             .map(|p| p.max_tokens)
             .unwrap_or(4096);
 
+        let tracer = build_tracer(&config);
+
         let runner = AgentRunner::new(
             tool_manager_arc.clone(),
             provider.clone(),
@@ -253,6 +301,7 @@ impl AgentLoop {
             memory_store.clone(),
             Some(consolidator.clone()),
             max_tokens,
+            tracer,
         );
 
         Ok(Self {
@@ -658,6 +707,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -714,6 +764,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
@@ -764,6 +815,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
 
         let tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -822,6 +874,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
 
         let agent_loop = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
@@ -875,6 +928,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
 
         let agent_loop =
@@ -928,6 +982,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
 
         let mut agent_loop =
@@ -996,6 +1051,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1053,6 +1109,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
         AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
             .await
@@ -1122,6 +1179,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
         let (event_tx, _) = broadcast::channel::<crate::session::AgentEvent>(256);
         let channel_manager = Arc::new(crate::channel::ChannelManager::new(
@@ -1203,6 +1261,7 @@ mod tests {
                 dream: crate::config::DreamConfig::default(),
             },
             web_fetch: None,
+            tracing: Default::default(),
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;

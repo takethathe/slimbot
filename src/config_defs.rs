@@ -24,3 +24,20 @@ define_config! {
         prompt_cache_enabled: bool = true, none, desc: "Enable prompt caching via cache_control",
     }
 }
+
+define_config! {
+    tracing => TraceConfig {
+        enabled: bool = false, none, desc: "Master switch for trace recording (default off)",
+        backends: Vec<TraceBackendEntry> = Vec::<TraceBackendEntry>::new(), none, desc: "Trace backends (file / otel), each with its own enable switch",
+    }
+}
+
+define_config! {
+    tracing_backend => TraceBackendEntry {
+        r#type: String = "file".to_string(), allowed(["file", "otel"]), desc: "Backend type (file | otel)",
+        enabled: bool = true, none, desc: "Per-backend enable switch",
+        path: String = "".to_string(), str_max(512), desc: "File backend JSONL output path",
+        endpoint: String = "http://localhost:4318".to_string(), str_max(512), desc: "OTLP HTTP exporter endpoint",
+        service_name: String = "slimbot".to_string(), str_max(128), desc: "OpenTelemetry service name",
+    }
+}

@@ -17,6 +17,7 @@ fn default_config() -> Config {
         channels: std::collections::HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     }
 }
 

@@ -9,6 +9,7 @@ use crate::session::{
     AgentEvent, Message, SharedSessionManager, TaskHook, TaskState, parse_session_origin,
 };
 use crate::tool::{ToolManager, TurnContext, format_tool_error, with_turn_context};
+use crate::trace::{SpanGuard, SpanRecorder, SpanStatus, Tracer};
 use crate::{debug, warn_log};
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +24,20 @@ pub use traits::{
     PreTurnHook,
 };
 pub use types::{HookAction, HookPosition, RunSpec, RunState, ToolHookAction};
+
+/// Max characters for the `args` attribute on tool spans.
+const ARGS_MAX_CHARS: usize = 200;
+/// Max characters for the `error` attribute on tool spans.
+const ERROR_MAX_CHARS: usize = 500;
+
+/// Truncate a string at a char boundary to at most `max` characters.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
 
 /// Result returned by AgentRunner after a ReAct loop completes.
 #[derive(Debug, Clone, Default)]
@@ -61,6 +76,7 @@ pub struct AgentRunnerBuilder {
     workspace_dir: Option<PathBuf>,
     memory_store: Option<SharedMemoryStore>,
     consolidator: Option<Arc<Consolidator>>,
+    tracer: Option<Arc<Tracer>>,
     max_tokens: Option<u32>,
     hooks: HookRegistry,
 }
@@ -75,6 +91,7 @@ impl AgentRunnerBuilder {
             workspace_dir: None,
             memory_store: None,
             consolidator: None,
+            tracer: None,
             max_tokens: None,
             hooks: HookRegistry::new(),
         }
@@ -112,6 +129,12 @@ impl AgentRunnerBuilder {
 
     pub fn consolidator(mut self, c: Option<Arc<Consolidator>>) -> Self {
         self.consolidator = c;
+        self
+    }
+
+    /// Set the optional tracer used to emit spans for each run.
+    pub fn tracer(mut self, t: Option<Arc<Tracer>>) -> Self {
+        self.tracer = t;
         self
     }
 
@@ -236,6 +259,7 @@ impl AgentRunnerBuilder {
             workspace_dir,
             memory_store,
             consolidator: self.consolidator,
+            tracer: self.tracer,
             max_tokens,
             hooks,
         }
@@ -250,6 +274,7 @@ pub struct AgentRunner {
     workspace_dir: PathBuf,
     memory_store: SharedMemoryStore,
     consolidator: Option<Arc<Consolidator>>,
+    tracer: Option<Arc<Tracer>>,
     max_tokens: u32,
     hooks: HookRegistry,
 }
@@ -278,6 +303,7 @@ impl AgentRunner {
         memory_store: SharedMemoryStore,
         consolidator: Option<Arc<Consolidator>>,
         max_tokens: u32,
+        tracer: Option<Arc<Tracer>>,
     ) -> Self {
         let builder = AgentRunnerBuilder::new()
             .session_manager(session_manager)
@@ -287,6 +313,7 @@ impl AgentRunner {
             .workspace_dir(workspace_dir)
             .memory_store(memory_store)
             .consolidator(consolidator)
+            .tracer(tracer)
             .max_tokens(max_tokens)
             .with_defaults();
         builder.build()
@@ -309,16 +336,39 @@ impl AgentRunner {
     ) -> AgentResult {
         debug!("[AgentRunner] Starting run for session={}", session_id);
 
+        // Resolve turn context once, before anything else, so the root span
+        // can carry it even on the sentinel / cancellation exits.
+        // Prefer origin channel/chat_id (e.g. from cron payload) over session_id-parsed values.
+        let (tool_channel, tool_chat_id) = parse_session_origin(
+            session_id,
+            (origin_channel.as_deref(), origin_chat_id.as_deref()),
+        );
+
+        // Root trace span covering the whole run (held until after after-turn
+        // hooks, so consolidation/cancellation outcomes can be recorded).
+        let root_span = self.tracer.as_ref().map(|tracer| {
+            let span = tracer.start_span("agent.run", None);
+            span.set_attribute("session_id", serde_json::json!(session_id));
+            span.set_attribute("channel", serde_json::json!(tool_channel));
+            span.set_attribute("chat_id", serde_json::json!(tool_chat_id));
+            span.set_attribute(
+                "max_iterations",
+                serde_json::json!(self.config.max_iterations),
+            );
+            span.set_attribute("max_tokens", serde_json::json!(self.max_tokens));
+            span
+        });
+
         // Sentinel /stop message: all prior tasks were cancelled and drained.
         if cancel_token.is_some() && content == "/stop" {
-            return self.cancelled_result(&hook, session_id).await;
+            return self.cancelled_result(&hook, session_id, &root_span).await;
         }
 
         // Check cancellation before starting.
         if let Some(ref ct) = cancel_token
             && ct.is_cancelled()
         {
-            return self.cancelled_result(&hook, session_id).await;
+            return self.cancelled_result(&hook, session_id, &root_span).await;
         }
 
         // Record message count before this turn, for rollback on cancellation/error.
@@ -327,12 +377,6 @@ impl AgentRunner {
             sm.message_count(session_id)
         };
 
-        // Resolve turn context (channel/chat_id) once, before the loop.
-        // Prefer origin channel/chat_id (e.g. from cron payload) over session_id-parsed values.
-        let (tool_channel, tool_chat_id) = parse_session_origin(
-            session_id,
-            (origin_channel.as_deref(), origin_chat_id.as_deref()),
-        );
         // Generate runtime context once per turn for cache stability.
         // This ensures the timestamp doesn't change between iterations within the same turn.
         let runtime_ctx = crate::context::build_runtime_context(&tool_channel, &tool_chat_id);
@@ -350,6 +394,7 @@ impl AgentRunner {
             config: self.config.clone(),
             memory_store: self.memory_store.clone(),
             consolidator: self.consolidator.clone(),
+            tracer: self.tracer.clone(),
             initial_message_count,
             channel: tool_channel.clone(),
             chat_id: tool_chat_id.clone(),
@@ -399,6 +444,15 @@ impl AgentRunner {
                     break;
                 }
 
+                // Iteration span wrapping the chat call + tool loop.
+                let iteration_span = if let Some(root) = &root_span {
+                    let span = self.start_span(Some(&root.context()), "iteration");
+                    span.set_attribute("iteration", serde_json::json!(state.iterations + 1));
+                    Some(span)
+                } else {
+                    None
+                };
+
                 // PreChat hooks: build context and apply governance.
                 match self.hooks.run_pre_chat(&spec, &mut state).await {
                     Ok(HookAction::Continue) => {}
@@ -427,13 +481,24 @@ impl AgentRunner {
                 }
                 debug!("[AgentRunner] Sending chat request to provider");
                 let messages_ref: Vec<&Message> = state.messages.iter().collect();
+
+                // provider.chat span; the provider records request details (body)
+                // through the recorder, the runner records usage afterwards.
+                let chat_span = iteration_span.as_ref().map(|iteration| {
+                    self.start_span(Some(&iteration.context()), "provider.chat")
+                });
+                let recorder: Option<&dyn SpanRecorder> =
+                    chat_span.as_ref().map(|s| s as &dyn SpanRecorder);
                 let response = match self
                     .provider
-                    .chat(&messages_ref, state.tools.as_deref())
+                    .chat(&messages_ref, state.tools.as_deref(), recorder)
                     .await
                 {
                     Ok(r) => r,
                     Err(e) => {
+                        if let Some(span) = &chat_span {
+                            span.set_status(SpanStatus::Error(e.to_string()));
+                        }
                         let err_msg = format!("LLM API request failed - {}", e);
                         warn_log!("[AgentRunner] {}", err_msg);
                         state.fail(err_msg);
@@ -441,6 +506,13 @@ impl AgentRunner {
                         break;
                     }
                 };
+                if let Some(span) = &chat_span {
+                    span.set_attribute("prompt_tokens", serde_json::json!(response.usage.prompt_tokens));
+                    span.set_attribute("completion_tokens", serde_json::json!(response.usage.completion_tokens));
+                    span.set_attribute("total_tokens", serde_json::json!(response.usage.total_tokens));
+                    span.set_attribute("prompt_cache_hit_tokens", serde_json::json!(response.usage.prompt_cache_hit_tokens));
+                    span.set_attribute("finish_reason", serde_json::json!(response.finish_reason.to_string()));
+                }
                 debug!(
                     "[AgentRunner] Got response: content_len={}, tool_calls={}, prompt_tokens={}, cached_tokens={}, completion_tokens={}, total_tokens={}",
                     response.content.as_ref().map(|s| s.len()).unwrap_or(0),
@@ -481,6 +553,25 @@ impl AgentRunner {
                     .unwrap_or_default();
                 for call in &calls {
                     debug!("[tool_call] name={}, args={}", call.name, call.args);
+                    // tool.{name} span carrying the call id, args and (on
+                    // failure) the error, all keyed under the iteration span.
+                    let tool_span = if let Some(iteration) = &iteration_span {
+                        let span = self.start_span(
+                            Some(&iteration.context()),
+                            &format!("tool.{}", call.name),
+                        );
+                        span.set_attribute("tool_call_id", serde_json::json!(call.id));
+                        span.set_attribute(
+                            "args",
+                            serde_json::json!(truncate_chars(
+                                &serde_json::to_string(&call.args).unwrap_or_default(),
+                                ARGS_MAX_CHARS,
+                            )),
+                        );
+                        Some(span)
+                    } else {
+                        None
+                    };
                     let action = match self.hooks.run_pre_tool(&spec, &mut state, call).await {
                         Ok(a) => a,
                         Err(HookRunError::Cancelled) => {
@@ -501,7 +592,18 @@ impl AgentRunner {
                                 .await
                             {
                                 Ok(r) => r,
-                                Err(e) => format_tool_error(&e.to_string()),
+                                Err(e) => {
+                                    if let Some(span) = &tool_span {
+                                        span.set_attribute(
+                                            "error",
+                                            serde_json::json!(truncate_chars(
+                                                &e.to_string(),
+                                                ERROR_MAX_CHARS,
+                                            )),
+                                        );
+                                    }
+                                    format_tool_error(&e.to_string())
+                                }
                             }
                         }
                         ToolHookAction::Skip { result } => result,
@@ -565,14 +667,46 @@ impl AgentRunner {
                 "[AgentRunner] Run complete: success={}, iterations={}",
                 state.result.success, state.result.iterations
             );
-            finalize(state.result)
+
+            let result = finalize(state.result);
+
+            // Finalize the root span: aggregate tokens, iteration count, and
+            // the outcome status mapped from the run result.
+            if let Some(root) = &root_span {
+                root.set_attribute("total_tokens", serde_json::json!(result.total_tokens));
+                root.set_attribute("prompt_tokens", serde_json::json!(result.prompt_tokens));
+                root.set_attribute("completion_tokens", serde_json::json!(result.completion_tokens));
+                root.set_attribute(
+                    "prompt_cache_hit_tokens",
+                    serde_json::json!(result.prompt_cache_hit_tokens),
+                );
+                root.set_attribute("iterations", serde_json::json!(result.iterations));
+                root.set_attribute("consolidated", serde_json::json!(state.consolidated));
+                root.set_status(if result.success {
+                    SpanStatus::Ok
+                } else {
+                    SpanStatus::Error(result.content.clone())
+                });
+            }
+
+            result
         })
         .await
     }
 
     /// Build a cancelled result (used for the /stop sentinel and pre-run cancellation).
-    async fn cancelled_result(&self, hook: &TaskHook, session_id: &str) -> AgentResult {
+    async fn cancelled_result(
+        &self,
+        hook: &TaskHook,
+        session_id: &str,
+        root_span: &Option<SpanGuard>,
+    ) -> AgentResult {
         let msg = "Task cancelled.".to_string();
+        // Record the cancellation on the root span, matching the run status
+        // mapping (cancellation -> Error).
+        if let Some(root) = root_span {
+            root.set_status(SpanStatus::Error(msg.clone()));
+        }
         let result = AgentResult {
             success: false,
             content: msg.clone(),
@@ -589,6 +723,15 @@ impl AgentRunner {
             error: msg.clone(),
         });
         result
+    }
+
+    /// Start a child span under `parent`, or a cheap no-op guard when tracing
+    /// is disabled (no tracer configured).
+    fn start_span(&self, parent: Option<&crate::trace::SpanContext>, name: &str) -> SpanGuard {
+        match &self.tracer {
+            Some(tracer) => tracer.start_span(name, parent),
+            None => SpanGuard::noop(),
+        }
     }
 }
 

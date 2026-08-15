@@ -27,6 +27,7 @@ pub(crate) mod setup;
 pub(crate) mod snip;
 pub(crate) mod tool;
 pub(crate) mod tools;
+pub mod trace;
 pub(crate) mod utils;
 pub(crate) mod worker;
 
@@ -34,7 +35,7 @@ pub(crate) mod worker;
 pub use channel::{Channel, ChannelFactory, ChannelManager};
 pub use config::{
     ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, DreamConfig, GatewayConfig,
-    HeartbeatConfig, ToolEntry, WebFetchConfig,
+    HeartbeatConfig, ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
 };
 pub use config_defs::{AgentConfig, ProviderConfig};
 pub use config_macro::{FieldMeta, Normalizable};
@@ -57,6 +58,8 @@ pub use tool::{
     ensure_nonempty_tool_result, format_tool_error, persist_tool_result, with_turn_context,
 };
 pub use tools::create_tool;
+pub use trace::backends::{FileBackend, OtelBackend};
+pub use trace::{SpanContext, SpanGuard, SpanRecorder, SpanStatus, TraceBackend, Tracer};
 pub use utils::{
     TOOL_RESULT_PREVIEW_CHARS, TOOL_RESULTS_DIR, build_persisted_reference,
     truncate_text_head_tail, write_file_atomic,

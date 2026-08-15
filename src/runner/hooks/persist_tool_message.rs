@@ -76,6 +76,7 @@ mod tests {
             channel: "cli".into(),
             chat_id: "c1".into(),
             runtime_ctx: "ctx".into(),
+            tracer: None,
         }
     }
 

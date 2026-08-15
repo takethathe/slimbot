@@ -214,6 +214,7 @@ fn test_save_and_reload_round_trip() {
         channels,
         gateway: GatewayConfig::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     config.save(path).unwrap();

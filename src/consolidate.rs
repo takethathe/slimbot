@@ -159,6 +159,7 @@ impl Consolidator {
                     &Message::user(formatted),
                 ],
                 None,
+                None,
             )
             .await?
         {
@@ -193,6 +194,7 @@ impl Consolidator {
                         &Message::system(Self::compress_prompt()),
                         &Message::user(summary.clone()),
                     ],
+                    None,
                     None,
                 )
                 .await?;
@@ -345,26 +347,28 @@ If nothing noteworthy happened, output: (nothing)"
 
     /// Main entry: check token budget, archive old messages if prompt exceeds budget.
     /// Called after each ReAct turn completes.
-    pub async fn maybe_consolidate(&self, session_id: &str, prompt_tokens: u32) -> Result<()> {
+    /// Summarize the session when the prompt exceeds the token budget.
+    /// Returns `true` when a consolidation round actually ran.
+    pub async fn maybe_consolidate(&self, session_id: &str, prompt_tokens: u32) -> Result<bool> {
         if self.context_window_tokens == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         // Budget: allow prompt to use up to 85% of context window, minus safety buffer.
         let budget =
             ((self.context_window_tokens as f64 * CONTEXT_BUDGET_FRACTION) as u32) - SAFETY_BUFFER;
         if prompt_tokens <= budget {
-            return Ok(());
+            return Ok(false);
         }
 
         let target = (budget as f64 * CONSOLIDATION_TARGET_FRACTION) as u32;
         let tokens_to_remove = prompt_tokens.saturating_sub(target);
 
-        let _ = self
+        let consolidated = self
             .consolidate_one_round(session_id, tokens_to_remove)
             .await?;
 
-        Ok(())
+        Ok(consolidated.is_some())
     }
 
     /// Signal the consolidator to cancel any ongoing consolidation.
@@ -571,6 +575,7 @@ mod tests {
             &self,
             _messages: &[&Message],
             _tools: Option<&[crate::tool::ToolDefinition]>,
+            _recorder: Option<&dyn crate::trace::SpanRecorder>,
         ) -> anyhow::Result<LLMResponse> {
             let mut responses = self.responses.lock().unwrap();
             let (content, finish_reason) = if responses.len() > 1 {

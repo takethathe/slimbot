@@ -9,6 +9,7 @@ use crate::memory::SharedMemoryStore;
 use crate::provider::LLMResponse;
 use crate::session::{Message, SharedSessionManager, TaskHook};
 use crate::tool::{ToolCall, ToolDefinition, ToolManager, TurnContext};
+use crate::trace::Tracer;
 use tokio_util::sync::CancellationToken;
 
 use super::AgentResult;
@@ -73,6 +74,8 @@ pub struct RunSpec {
     pub memory_store: SharedMemoryStore,
     /// Optional consolidator triggered after a successful turn.
     pub consolidator: Option<Arc<Consolidator>>,
+    /// Optional tracer; when `None` (or with no backends) tracing is a no-op.
+    pub tracer: Option<Arc<Tracer>>,
     /// Message count recorded before this turn, used for rollback on error/cancellation.
     pub initial_message_count: usize,
     /// Origin channel resolved from the session id / injected origin.
@@ -112,6 +115,8 @@ pub struct RunState {
     pub should_exit: bool,
     /// When `Some(n)`, after-turn hooks roll the session back to `n` messages instead of persisting.
     pub rollback_to: Option<usize>,
+    /// True when the after-turn phase triggered session consolidation.
+    pub consolidated: bool,
     /// Cross-phase custom data store with type-safe accessors.
     extensions: HashMap<String, Box<dyn Any + Send>>,
 }
@@ -129,6 +134,7 @@ impl RunState {
             turn_context,
             should_exit: false,
             rollback_to: None,
+            consolidated: false,
             extensions: HashMap::new(),
         }
     }
@@ -207,6 +213,7 @@ mod tests {
                 &workspace_dir,
             ))),
             consolidator: None,
+            tracer: None,
             initial_message_count: 0,
             channel: "webui".into(),
             chat_id: "c1".into(),

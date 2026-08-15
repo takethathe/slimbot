@@ -223,6 +223,7 @@ impl Provider for SummaryMockProvider {
         &self,
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
+        _recorder: Option<&dyn slimbot::trace::SpanRecorder>,
     ) -> anyhow::Result<LLMResponse> {
         Ok(LLMResponse {
             content: Some(self.summary.clone()),

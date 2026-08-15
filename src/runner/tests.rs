@@ -15,6 +15,7 @@ use crate::tool::{
     Tool, ToolCall, ToolDefinition, ensure_nonempty_tool_result, format_tool_error,
     persist_tool_result, truncate_text_head_tail,
 };
+use crate::trace::SpanRecorder;
 use tokio::sync::broadcast;
 
 /// Mock provider that returns predefined responses in order.
@@ -42,6 +43,7 @@ impl Provider for MockProvider {
         &self,
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
+        _recorder: Option<&dyn SpanRecorder>,
     ) -> Result<LLMResponse> {
         let idx = self
             .call_count
@@ -290,6 +292,7 @@ impl Provider for CancellingProvider {
         &self,
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
+        recorder: Option<&dyn SpanRecorder>,
     ) -> Result<LLMResponse> {
         let count = self
             .call_count
@@ -298,7 +301,7 @@ impl Provider for CancellingProvider {
         if count == 0 {
             self.cancel_token.cancel();
         }
-        self.inner.chat(messages, tools).await
+        self.inner.chat(messages, tools, recorder).await
     }
 }
 
@@ -311,6 +314,7 @@ impl Provider for FailingProvider {
         &self,
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
+        _recorder: Option<&dyn SpanRecorder>,
     ) -> Result<LLMResponse> {
         Err(anyhow::anyhow!("Simulated LLM API failure"))
     }
@@ -373,6 +377,18 @@ fn make_runner(
     workspace_dir: PathBuf,
     ms: Arc<tokio::sync::Mutex<MemoryStore>>,
 ) -> AgentRunner {
+    make_runner_with_tracer(sm, tm, provider, workspace_dir, ms, None)
+}
+
+/// Like [`make_runner`], but with an explicit tracer (used by trace tests).
+fn make_runner_with_tracer(
+    sm: SharedSessionManager,
+    tm: Arc<ToolManager>,
+    provider: Arc<dyn Provider>,
+    workspace_dir: PathBuf,
+    ms: Arc<tokio::sync::Mutex<MemoryStore>>,
+    tracer: Option<Arc<crate::trace::Tracer>>,
+) -> AgentRunner {
     AgentRunner::new(
         tm,
         provider,
@@ -390,6 +406,7 @@ fn make_runner(
         ms,
         None,
         4096,
+        tracer,
     )
 }
 
@@ -1128,6 +1145,7 @@ async fn test_runner_persist_long_output() {
         ms,
         None,
         4096,
+        None,
     );
     let task = make_task("test persist");
 
@@ -1180,6 +1198,7 @@ async fn test_stop_sentinel_returns_cancelled() {
         ms,
         None,
         4096,
+        None,
     );
 
     // Sentinel /stop message should be detected immediately.
@@ -1224,6 +1243,7 @@ async fn test_cancelled_token_before_run() {
         ms,
         None,
         4096,
+        None,
     );
 
     // Should return cancelled before making any LLM call.
@@ -1313,6 +1333,7 @@ async fn test_cancel_in_loop_rolls_back_messages() {
         ms,
         None,
         4096,
+        None,
     );
 
     let result = runner
@@ -1535,6 +1556,7 @@ async fn test_llm_error_rolls_back_messages() {
         ms,
         None,
         4096,
+        None,
     );
 
     let result = runner
@@ -1644,6 +1666,7 @@ async fn test_snip_truncates_context_before_chat() {
             &self,
             messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
+            _recorder: Option<&dyn crate::trace::SpanRecorder>,
         ) -> Result<LLMResponse> {
             self.received.lock().unwrap().push(messages.len());
             Ok(LLMResponse {
@@ -1686,6 +1709,7 @@ async fn test_snip_truncates_context_before_chat() {
         ms,
         None,
         500,
+        None,
     );
 
     let task = make_task("new user message");
@@ -2316,4 +2340,545 @@ async fn test_pre_turn_hook_aborts_run_before_loop() {
         !msgs.is_empty(),
         "after_turn should persist the turn even when pre-turn aborts"
     );
+}
+
+// ── Trace integration ──
+
+/// Recording trace backend for runner-level span-tree assertions.
+#[derive(Default)]
+struct RecordingTraceBackend {
+    events: Arc<std::sync::Mutex<Vec<TraceEvent>>>,
+}
+
+#[derive(Clone)]
+struct TraceEvent {
+    kind: &'static str,
+    span_id: String,
+    trace_id: String,
+    parent_span_id: Option<String>,
+    name: String,
+    status: Option<crate::trace::SpanStatus>,
+    attributes: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl crate::trace::TraceBackend for RecordingTraceBackend {
+    fn on_span_start(
+        &self,
+        ctx: &crate::trace::SpanContext,
+        name: &str,
+        _start: std::time::SystemTime,
+    ) {
+        self.events.lock().unwrap().push(TraceEvent {
+            kind: "start",
+            span_id: ctx.span_id.clone(),
+            trace_id: ctx.trace_id.clone(),
+            parent_span_id: ctx.parent_span_id.clone(),
+            name: name.to_string(),
+            status: None,
+            attributes: Default::default(),
+        });
+    }
+
+    fn on_span_end(
+        &self,
+        ctx: &crate::trace::SpanContext,
+        _end: std::time::SystemTime,
+        status: &crate::trace::SpanStatus,
+        attributes: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.events.lock().unwrap().push(TraceEvent {
+            kind: "end",
+            span_id: ctx.span_id.clone(),
+            trace_id: ctx.trace_id.clone(),
+            parent_span_id: ctx.parent_span_id.clone(),
+            name: String::new(),
+            status: Some(status.clone()),
+            attributes: attributes.clone(),
+        });
+    }
+}
+
+impl RecordingTraceBackend {
+    fn starts(&self) -> Vec<TraceEvent> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "start")
+            .cloned()
+            .collect()
+    }
+
+    fn start_named(&self, name: &str) -> TraceEvent {
+        self.starts()
+            .into_iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("no start event for span {name}"))
+    }
+
+    fn end_for(&self, start: &TraceEvent) -> TraceEvent {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.kind == "end" && e.span_id == start.span_id)
+            .cloned()
+            .expect("missing end event")
+    }
+}
+
+/// Builds a runner over a fresh "webui:chat-7" session with a tracer backed by
+/// the given recording backend.
+async fn make_traced_runner(
+    tmp: &tempfile::TempDir,
+    provider: Arc<dyn Provider>,
+    backend: Arc<RecordingTraceBackend>,
+) -> AgentRunner {
+    let (sm, tm, wd, ms) = make_test_env(tmp, &[("echo", "echo-result")]).await;
+    sm.lock().await.get_or_create("webui:chat-7").await.unwrap();
+    let tracer = Arc::new(crate::trace::Tracer::new(vec![backend]));
+    make_runner_with_tracer(sm, tm, provider, wd, ms, Some(tracer))
+}
+
+#[tokio::test]
+async fn test_runner_emits_full_span_tree() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let provider = Arc::new(MockProvider::new(vec![
+        LLMResponse {
+            content: Some("calling".to_string()),
+            tool_calls: Some(vec![tool_call("tc-1", "echo")]),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage {
+                prompt_tokens: 10,
+                prompt_cache_hit_tokens: 2,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+        },
+        LLMResponse {
+            content: Some("done".to_string()),
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                prompt_tokens: 20,
+                prompt_cache_hit_tokens: 3,
+                completion_tokens: 7,
+                total_tokens: 27,
+            },
+        },
+    ]));
+    let backend = Arc::new(RecordingTraceBackend::default());
+    let runner = make_traced_runner(&tmp, provider, backend.clone()).await;
+
+    let result = runner
+        .run(
+            "hi".to_string(),
+            TaskHook::new("webui:chat-7"),
+            "webui:chat-7",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(result.success);
+
+    // ── Hierarchy: agent.run -> iteration -> provider.chat / tool.echo ──
+    let root = backend.start_named("agent.run");
+    assert_eq!(root.parent_span_id, None);
+
+    let iterations = backend
+        .starts()
+        .into_iter()
+        .filter(|e| e.name == "iteration")
+        .collect::<Vec<_>>();
+    assert_eq!(iterations.len(), 2);
+    for it in &iterations {
+        assert_eq!(it.parent_span_id.as_deref(), Some(root.span_id.as_str()));
+        assert_eq!(it.trace_id, root.trace_id);
+    }
+
+    let chats = backend
+        .starts()
+        .into_iter()
+        .filter(|e| e.name == "provider.chat")
+        .collect::<Vec<_>>();
+    assert_eq!(chats.len(), 2);
+    for chat in &chats {
+        assert!(
+            iterations
+                .iter()
+                .any(|it| it.span_id == chat.parent_span_id.as_deref().unwrap())
+        );
+    }
+
+    let tools = backend
+        .starts()
+        .into_iter()
+        .filter(|e| e.name == "tool.echo")
+        .collect::<Vec<_>>();
+    assert_eq!(tools.len(), 1);
+    assert!(
+        iterations
+            .iter()
+            .any(|it| it.span_id == tools[0].parent_span_id.as_deref().unwrap())
+    );
+
+    // All spans share one trace.
+    let trace_ids: std::collections::HashSet<_> = backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.trace_id.clone())
+        .collect();
+    assert_eq!(trace_ids.len(), 1);
+
+    // ── Root span attributes ──
+    let root_end = backend.end_for(&root);
+    assert_eq!(root_end.status, Some(crate::trace::SpanStatus::Ok));
+    let attrs = &root_end.attributes;
+    assert_eq!(
+        attrs.get("session_id"),
+        Some(&serde_json::json!("webui:chat-7"))
+    );
+    assert_eq!(attrs.get("channel"), Some(&serde_json::json!("webui")));
+    assert_eq!(attrs.get("chat_id"), Some(&serde_json::json!("chat-7")));
+    assert_eq!(attrs.get("max_iterations"), Some(&serde_json::json!(40)));
+    assert_eq!(attrs.get("max_tokens"), Some(&serde_json::json!(4096)));
+    assert_eq!(attrs.get("total_tokens"), Some(&serde_json::json!(42)));
+    assert_eq!(attrs.get("prompt_tokens"), Some(&serde_json::json!(30)));
+    assert_eq!(attrs.get("completion_tokens"), Some(&serde_json::json!(12)));
+    assert_eq!(
+        attrs.get("prompt_cache_hit_tokens"),
+        Some(&serde_json::json!(5))
+    );
+    assert_eq!(attrs.get("iterations"), Some(&serde_json::json!(1)));
+    assert_eq!(attrs.get("consolidated"), Some(&serde_json::json!(false)));
+
+    // ── Iteration attributes ──
+    let it1 = backend.end_for(&iterations[0]);
+    assert_eq!(it1.attributes.get("iteration"), Some(&serde_json::json!(1)));
+    let it2 = backend.end_for(&iterations[1]);
+    assert_eq!(it2.attributes.get("iteration"), Some(&serde_json::json!(2)));
+
+    // ── provider.chat attributes ──
+    for chat in &chats {
+        let end = backend.end_for(chat);
+        assert!(end.attributes.contains_key("prompt_tokens"));
+        assert!(end.attributes.contains_key("total_tokens"));
+        assert!(end.attributes.contains_key("completion_tokens"));
+        assert!(end.attributes.contains_key("prompt_cache_hit_tokens"));
+        assert!(end.attributes.contains_key("finish_reason"));
+    }
+
+    // ── tool.echo attributes ──
+    let tool_end = backend.end_for(&tools[0]);
+    assert_eq!(
+        tool_end.attributes.get("tool_call_id"),
+        Some(&serde_json::json!("tc-1"))
+    );
+    assert!(tool_end.attributes.contains_key("args"));
+    assert!(!tool_end.attributes.contains_key("tool.name"));
+}
+
+#[tokio::test]
+async fn test_runner_root_span_error_on_llm_failure() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let backend = Arc::new(RecordingTraceBackend::default());
+    let runner = make_traced_runner(&tmp, Arc::new(FailingProvider), backend.clone()).await;
+
+    let result = runner
+        .run(
+            "boom".to_string(),
+            TaskHook::new("webui:chat-7"),
+            "webui:chat-7",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(!result.success);
+
+    let root = backend.start_named("agent.run");
+    let root_end = backend.end_for(&root);
+    match &root_end.status {
+        Some(crate::trace::SpanStatus::Error(msg)) => {
+            assert!(msg.contains("LLM API request failed"));
+        }
+        other => panic!("expected error status, got {other:?}"),
+    }
+    // The failing chat span is also marked error (with the raw error).
+    let chat = backend.start_named("provider.chat");
+    let chat_end = backend.end_for(&chat);
+    match &chat_end.status {
+        Some(crate::trace::SpanStatus::Error(msg)) => {
+            assert!(msg.contains("Simulated LLM API failure"));
+        }
+        other => panic!("expected chat error status, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_runner_root_span_error_on_max_iterations() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base_response = LLMResponse {
+        content: None,
+        tool_calls: Some(vec![tool_call("tc", "echo")]),
+        finish_reason: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    };
+    let provider = Arc::new(MockProvider::new(
+        std::iter::repeat_n(base_response, 50).collect(),
+    ));
+    let backend = Arc::new(RecordingTraceBackend::default());
+    let runner = make_traced_runner(&tmp, provider, backend.clone()).await;
+
+    let result = runner
+        .run(
+            "loop".to_string(),
+            TaskHook::new("webui:chat-7"),
+            "webui:chat-7",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(!result.success);
+
+    let root = backend.start_named("agent.run");
+    let root_end = backend.end_for(&root);
+    match &root_end.status {
+        Some(crate::trace::SpanStatus::Error(msg)) => {
+            assert!(msg.contains("Reached max iterations"));
+        }
+        other => panic!("expected error status, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_runner_file_backend_writes_root_span_jsonl() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("traces.jsonl");
+    let file_backend = crate::FileBackend::new(path.to_str().unwrap()).unwrap();
+    let backend = Arc::new(file_backend);
+    let tracer = Arc::new(crate::trace::Tracer::new(vec![backend]));
+
+    let provider = Arc::new(MockProvider::new(vec![LLMResponse {
+        content: Some("done".to_string()),
+        tool_calls: None,
+        finish_reason: FinishReason::Stop,
+        usage: Usage::default(),
+    }]));
+    let (sm, tm, wd, ms) = make_test_env(&tmp, &[("echo", "echo-result")]).await;
+    let runner = make_runner_with_tracer(sm, tm, provider, wd, ms, Some(tracer));
+
+    let result = runner
+        .run(
+            "hi".to_string(),
+            TaskHook::new("test-session"),
+            "test-session",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(result.success);
+
+    // Every finished span (root + iteration + chat) got a JSONL line; the
+    // root line carries the session/channel attributes.
+    let content = std::fs::read_to_string(&path).unwrap();
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(records.len(), 3, "root + iteration + chat spans");
+    let root_record = records
+        .iter()
+        .find(|r| r["name"] == "agent.run")
+        .expect("root span record");
+    assert_eq!(root_record["status"], "ok");
+    assert!(root_record["duration_us"].as_u64().is_some());
+}
+
+/// Provider wrapper that writes a request body through the recorder before
+/// delegating; proves the runner forwards the recorder into `chat`.
+struct BodyRecordingProvider {
+    inner: Arc<dyn Provider>,
+}
+
+#[async_trait]
+impl Provider for BodyRecordingProvider {
+    async fn chat(
+        &self,
+        messages: &[&Message],
+        tools: Option<&[ToolDefinition]>,
+        recorder: Option<&dyn SpanRecorder>,
+    ) -> Result<LLMResponse> {
+        if let Some(rec) = recorder {
+            rec.set_attribute(
+                "http.request.body",
+                serde_json::json!("{\"model\":\"gpt-4\",\"messages\":[]}"),
+            );
+        }
+        self.inner.chat(messages, tools, recorder).await
+    }
+}
+
+#[tokio::test]
+async fn test_runner_chat_span_carries_provider_recorded_body() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let provider = Arc::new(BodyRecordingProvider {
+        inner: Arc::new(MockProvider::new(vec![LLMResponse {
+            content: Some("done".to_string()),
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        }])),
+    });
+    let backend = Arc::new(RecordingTraceBackend::default());
+    let runner = make_traced_runner(&tmp, provider, backend.clone()).await;
+
+    let result = runner
+        .run(
+            "hi".to_string(),
+            TaskHook::new("webui:chat-7"),
+            "webui:chat-7",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(result.success);
+
+    let chat = backend.start_named("provider.chat");
+    let chat_end = backend.end_for(&chat);
+    assert_eq!(
+        chat_end.attributes.get("http.request.body"),
+        Some(&serde_json::json!("{\"model\":\"gpt-4\",\"messages\":[]}"))
+    );
+}
+
+#[tokio::test]
+async fn test_runner_tool_span_records_error_and_truncates_args() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path();
+    let session_dir = path.join("sessions");
+    let workspace_dir = path.join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let sm: SharedSessionManager = Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap()));
+    let mut tool_manager = ToolManager::new(workspace_dir.clone());
+    tool_manager.register(Box::new(FailingTool));
+    let tm = Arc::new(tool_manager);
+    sm.lock().await.get_or_create("webui:chat-7").await.unwrap();
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    ms.lock().await.init().unwrap();
+
+    // A tool call with oversized args exercises the 200-char truncation.
+    let long_args = serde_json::json!({ "payload": "x".repeat(500) });
+    let provider = Arc::new(MockProvider::new(vec![
+        LLMResponse {
+            content: Some("calling".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                id: "tc-fail".to_string(),
+                name: "fail_tool".to_string(),
+                args: long_args,
+            }]),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        },
+        LLMResponse {
+            content: Some("done".to_string()),
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        },
+    ]));
+    let backend = Arc::new(RecordingTraceBackend::default());
+    let tracer = Arc::new(crate::trace::Tracer::new(vec![backend.clone()]));
+    let runner = make_runner_with_tracer(sm, tm, provider, workspace_dir, ms, Some(tracer));
+
+    let result = runner
+        .run(
+            "fail".to_string(),
+            TaskHook::new("webui:chat-7"),
+            "webui:chat-7",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        result.success,
+        "tool errors surface as results, not run failures"
+    );
+
+    let tool = backend.start_named("tool.fail_tool");
+    let tool_end = backend.end_for(&tool);
+    let args = tool_end.attributes.get("args").and_then(|v| v.as_str());
+    let args = args.expect("args attribute");
+    assert!(args.len() <= 200, "args must be truncated to 200 chars");
+    let error = tool_end
+        .attributes
+        .get("error")
+        .and_then(|v| v.as_str())
+        .expect("error attribute on failed tool span");
+    assert!(error.contains("Tool execution failed"));
+    assert!(error.len() <= 500, "error must be truncated to 500 chars");
+}
+
+#[test]
+fn test_truncate_chars_limits_and_char_boundary() {
+    assert_eq!(truncate_chars("abc", 5), "abc");
+    assert_eq!(truncate_chars("abcde", 3), "abc");
+    // Multi-byte chars must not be split mid-character.
+    assert_eq!(truncate_chars("héllo", 3), "hél");
+    assert_eq!(truncate_chars("日本語", 2), "日本");
+    assert_eq!(truncate_chars("", 10), "");
+}
+
+#[tokio::test]
+async fn test_runner_root_span_error_on_cancelled_run() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
+    let provider = Arc::new(MockProvider::new(vec![LLMResponse {
+        content: Some("done".to_string()),
+        tool_calls: None,
+        finish_reason: FinishReason::Stop,
+        usage: Usage::default(),
+    }]));
+    let backend = Arc::new(RecordingTraceBackend::default());
+    let tracer = Arc::new(crate::trace::Tracer::new(vec![backend.clone()]));
+    let runner = make_runner_with_tracer(sm, tm, provider, wd, ms, Some(tracer));
+
+    // Pre-cancelled run: the root span must still be emitted with Error status.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    cancel_token.cancel();
+    let result = runner
+        .run(
+            "hi".to_string(),
+            TaskHook::new("webui:chat-7"),
+            "webui:chat-7",
+            None,
+            Some(cancel_token),
+            None,
+            None,
+        )
+        .await;
+    assert!(!result.success);
+
+    let root = backend.start_named("agent.run");
+    let root_end = backend.end_for(&root);
+    match &root_end.status {
+        Some(crate::trace::SpanStatus::Error(msg)) => {
+            assert!(msg.contains("Task cancelled"));
+        }
+        other => panic!("expected error status, got {other:?}"),
+    }
 }

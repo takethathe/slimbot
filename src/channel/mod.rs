@@ -488,6 +488,7 @@ mod tests {
             channels: HashMap::new(),
             gateway: crate::config::GatewayConfig::default(),
             web_fetch: None,
+            tracing: Default::default(),
         }
     }
 

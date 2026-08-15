@@ -6,6 +6,7 @@ use crate::config::ProviderConfig;
 use crate::debug;
 use crate::session::Message;
 use crate::tool::ToolDefinition;
+use crate::trace::SpanRecorder;
 
 use super::{FinishReason, LLMResponse, Usage};
 
@@ -246,6 +247,7 @@ impl crate::provider::Provider for OpenAIProvider {
         &self,
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
+        recorder: Option<&dyn SpanRecorder>,
     ) -> Result<LLMResponse> {
         debug!(
             "[OpenAIProvider] POST {} (model={}, messages={}, tools={})",
@@ -267,6 +269,16 @@ impl crate::provider::Provider for OpenAIProvider {
         if let Some(tools) = tools {
             let tool_defs = build_tool_defs(tools, self.config.prompt_cache_enabled);
             body["tools"] = serde_json::json!(tool_defs);
+        }
+
+        // Record provider identity and the full request body before the HTTP
+        // request, so the body is available on the failure path too.
+        if let Some(rec) = recorder {
+            rec.set_attribute("provider", serde_json::json!("openai"));
+            rec.set_attribute("model", serde_json::json!(self.config.model));
+            if let Ok(body_str) = serde_json::to_string(&body) {
+                rec.set_attribute("http.request.body", serde_json::json!(body_str));
+            }
         }
 
         let resp = self
@@ -366,6 +378,7 @@ impl crate::provider::Provider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Provider;
     use crate::session::Content;
 
     #[test]
@@ -1826,5 +1839,45 @@ mod tests {
         assert_eq!(content_blocks.len(), 0);
         // No cache_control should be set since there are no blocks
         assert!(content_blocks.is_empty());
+    }
+
+    // ── Request body capture (Seam 3: provider with a mock recorder) ──
+
+    struct MockRecorder {
+        attributes: std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
+    }
+
+    impl crate::trace::SpanRecorder for MockRecorder {
+        fn set_attribute(&self, key: &str, value: serde_json::Value) {
+            self.attributes
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_records_request_body_even_on_transport_error() {
+        // Port 1 is unreachable, so the transport fails fast.
+        let provider =
+            OpenAIProvider::new(&make_config("http://127.0.0.1:1/v1/chat/completions", ""));
+        let recorder = MockRecorder {
+            attributes: Default::default(),
+        };
+        let user = Message::user("hello".to_string());
+        let messages: Vec<&Message> = vec![&user];
+        let result = provider.chat(&messages, None, Some(&recorder)).await;
+        assert!(result.is_err(), "unreachable endpoint must fail");
+
+        let attrs = recorder.attributes.lock().unwrap();
+        assert_eq!(attrs.get("provider"), Some(&serde_json::json!("openai")));
+        assert_eq!(attrs.get("model"), Some(&serde_json::json!("gpt-4")));
+        let body = attrs
+            .get("http.request.body")
+            .expect("request body recorded even on failure");
+        let body_str = body.as_str().expect("body stored as a string attribute");
+        let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        assert_eq!(parsed["model"], "gpt-4");
+        assert!(parsed["messages"].is_array());
     }
 }

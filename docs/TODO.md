@@ -1,5 +1,18 @@
 # TODO
 
+## Trace 机制（2026-08-15 完成）
+
+- [x] **span 模型** — `src/trace/`：`SpanContext`（trace_id 16B / span_id 8B / parent_span_id）、`SpanGuard`（RAII：构造 start、Drop end、`set_status`/`set_attribute` 累积）、`SpanRecorder` trait
+- [x] **Tracer + registry** — `Tracer`（`Option<Arc<Tracer>>` 显式 DI，零 backend 时 no-op）、fan-out 多路、每 backend 隔离不可失败
+- [x] **TraceBackend trait** — `on_span_start`/`on_span_end`（同步 `&self`、不可失败）
+- [x] **file backend** — 每 span 结束时同步 append 一行 JSONL（`parking_lot::Mutex<File>`）
+- [x] **otel backend** — `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp`（`http-proto`），HTTP 导出默认 `http://localhost:4318`
+- [x] **埋点** — 骨架 `run()` 开 `agent.run` 根 span、每轮 `iteration`、`provider.chat`/`tool.{name}` 子 span；span 单独创建不耦合 hook；provider.chat 经 `Option<&dyn SpanRecorder>` 记录完整 body
+- [x] **config** — `tracing.enabled` + `backends` 数组（同 type 多实例），走 `define_config!`
+- [x] **测试** — mock backend 断言 span 树/属性/状态；RAII Drop、fan-out、隔离、file JSONL、body 捕获、config 解析
+
+设计文档见 `docs/trace.md`；决策见 `docs/adr/0001-self-built-span-model.md`。
+
 ## Runner Phase Hooks 重构（2026-08-15 完成）
 
 - [x] **Phase Hook 管线** — `AgentRunner::run()` 重构为约 80 行骨架，七个 phase（PreTurn/PreChat/AfterChat/PreTool/AfterTool/PostIteration/AfterTurn）通过可插拔 hook 实现，`HookRegistry` 封装存储/执行/取消检查

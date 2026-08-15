@@ -32,6 +32,7 @@ impl Provider for MockProvider {
         &self,
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
+        _recorder: Option<&dyn slimbot::trace::SpanRecorder>,
     ) -> anyhow::Result<LLMResponse> {
         let idx = self
             .call_count
@@ -148,6 +149,7 @@ fn make_runner(
         ms,
         None,
         4096,
+        None,
     )
 }
 
@@ -352,6 +354,7 @@ async fn test_event_task_failed_on_error() {
             &self,
             _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
+            _recorder: Option<&dyn slimbot::trace::SpanRecorder>,
         ) -> anyhow::Result<LLMResponse> {
             Err(anyhow::anyhow!("Simulated LLM failure"))
         }

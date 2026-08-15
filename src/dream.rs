@@ -298,6 +298,7 @@ impl DreamService {
             self.memory_store.clone(),
             None, // No consolidator for dream
             4096,
+            None, // Dream runs are not traced (out of scope)
         );
 
         let hook = crate::session::TaskHook::new("system:dream");

@@ -35,6 +35,7 @@
 | [配置方案](config_scheme.md) | `config_scheme.rs` | 默认值、配置规范化、URL 派生 |
 | [Bootstrap 模板](bootstrap.md) | `bootstrap.rs`, `embed.rs` | 嵌入文件、模板加载、技能文件 |
 | [工具函数](utils.md) | `utils/mod.rs` | 文本截断、原子写入、持久化引用 |
+| [Trace](trace.md) | `trace/` | span 埋点、多 backend 导出（file / OpenTelemetry） |
 
 ## 快速链接
 

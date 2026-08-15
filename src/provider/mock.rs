@@ -3,6 +3,7 @@ use async_trait::async_trait;
 
 use crate::session::Message;
 use crate::tool::ToolDefinition;
+use crate::trace::SpanRecorder;
 
 use super::{FinishReason, LLMResponse, Provider, Usage};
 
@@ -48,6 +49,7 @@ impl Provider for MockProvider {
         &self,
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
+        _recorder: Option<&dyn SpanRecorder>,
     ) -> Result<LLMResponse> {
         Ok(self.response.clone())
     }
@@ -61,7 +63,7 @@ mod tests {
     async fn test_mock_provider_returns_response() {
         let provider = MockProvider::new();
         let messages: Vec<&Message> = vec![];
-        let result = provider.chat(&messages, None).await;
+        let result = provider.chat(&messages, None, None).await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
@@ -79,7 +81,7 @@ mod tests {
         };
         let provider = MockProvider::with_response(custom_response.clone());
         let messages: Vec<&Message> = vec![];
-        let result = provider.chat(&messages, None).await;
+        let result = provider.chat(&messages, None, None).await;
 
         assert!(result.is_ok());
         let response = result.unwrap();

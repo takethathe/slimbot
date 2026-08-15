@@ -78,6 +78,7 @@ macro_rules! _cfg_mixed_expand {
                 CACHE.get_or_init(|| BTreeMap::from_iter([$( (stringify!($field), serde_json::json!($def)), )+]))
             }
             pub fn clamp(&mut self) {
+                #[allow(unused_variables)]
                 let s = &mut *self;
                 $(
                     $crate::_clamp_gen!(s.$field, $fty, $def, $cname $( ($($args)+) )?);

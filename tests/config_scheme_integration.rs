@@ -18,6 +18,7 @@ fn test_default_config_structure() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     // Normalize fills in default provider name
@@ -48,6 +49,7 @@ fn test_normalize_fills_empty_agent_provider() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
     config.agent.provider.clear();
 
@@ -66,6 +68,7 @@ fn test_normalize_derives_url_from_base_url() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -92,6 +95,7 @@ fn test_normalize_preserves_existing_api_url() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -117,6 +121,7 @@ fn test_normalize_falls_back_to_default_url_when_no_base() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -142,6 +147,7 @@ fn test_normalize_trailing_slash_stripped_from_base_url() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -167,6 +173,7 @@ fn test_normalize_removes_empty_tools_and_channels() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     config.tools.push(ToolEntry {
@@ -204,6 +211,7 @@ fn test_normalize_does_not_touch_api_key() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     config.providers.get_mut("default").unwrap().api_key = "sk-secret".to_string();
@@ -224,6 +232,7 @@ fn test_normalize_max_iterations_and_timeout_via_clamp() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
     config.agent.max_iterations = 0; // below range
     config.agent.timeout_seconds = 0; // below range
@@ -250,6 +259,7 @@ fn test_write_default_config_creates_file() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
     config.save(path).unwrap();
 
@@ -271,6 +281,7 @@ fn test_written_config_is_valid_json() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
     config.save(path).unwrap();
 
@@ -320,6 +331,7 @@ fn test_normalize_multiple_providers() {
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
+        tracing: Default::default(),
     };
 
     config.normalize();

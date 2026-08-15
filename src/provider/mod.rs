@@ -12,6 +12,7 @@ use async_trait::async_trait;
 
 use crate::session::Message;
 use crate::tool::ToolDefinition;
+use crate::trace::SpanRecorder;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FinishReason {
@@ -86,10 +87,16 @@ impl std::fmt::Display for LLMResponse {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Call the LLM.
+    ///
+    /// `recorder`, when provided, receives attributes recorded during the
+    /// call (e.g. the serialized request body) so that they land on the
+    /// `provider.chat` span even when the transport fails.
     async fn chat(
         &self,
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
+        recorder: Option<&dyn SpanRecorder>,
     ) -> Result<LLMResponse>;
 }
 

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::config_normalize::apply_normalize;
 
 // Re-export for backward compatibility (other modules import these from crate::config)
-pub use crate::config_defs::{AgentConfig, ProviderConfig};
+pub use crate::config_defs::{AgentConfig, ProviderConfig, TraceBackendEntry, TraceConfig};
 
 // ── Root Config ──
 
@@ -26,6 +26,8 @@ pub struct Config {
     pub gateway: GatewayConfig,
     #[serde(default)]
     pub web_fetch: Option<WebFetchConfig>,
+    #[serde(default)]
+    pub tracing: TraceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -248,6 +250,7 @@ impl Config {
         for provider in self.providers.values_mut() {
             provider.clamp();
         }
+        self.tracing.clamp();
     }
 
     pub fn normalize(&mut self) {
@@ -606,6 +609,7 @@ mod tests {
             channels: HashMap::new(),
             gateway: GatewayConfig::default(),
             web_fetch: None,
+            tracing: Default::default(),
         }
     }
 
@@ -1051,6 +1055,79 @@ mod tests {
         assert_eq!(agent.max_tool_result_chars, 8000);
         assert!(agent.persist_tool_results);
         assert_eq!(agent.context_window_tokens, 32768);
+    }
+
+    // ── Tracing config ──
+
+    #[test]
+    fn test_tracing_config_defaults_to_disabled() {
+        let tracing = crate::config::TraceConfig::default();
+        assert!(!tracing.enabled);
+        assert!(tracing.backends.is_empty());
+    }
+
+    #[test]
+    fn test_tracing_config_absent_in_config_defaults_off() {
+        // A config without a `tracing` section must stay disabled.
+        let config_str = r#"{
+            "agent": {"provider": "test", "max_iterations": 10},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}}
+        }"#;
+        let config: Config = serde_json::from_str(config_str).unwrap();
+        assert!(!config.tracing.enabled);
+        assert!(config.tracing.backends.is_empty());
+    }
+
+    #[test]
+    fn test_tracing_config_parses_backends_and_multiple_instances() {
+        let config_str = r#"{
+            "agent": {"provider": "test"},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
+            "tracing": {
+                "enabled": true,
+                "backends": [
+                    { "type": "file", "enabled": true, "path": "~/.slimbot/traces.jsonl" },
+                    { "type": "file", "enabled": true, "path": "/tmp/second.jsonl" },
+                    { "type": "otel", "enabled": true, "endpoint": "http://collector:4318", "service_name": "mybot" },
+                    { "type": "file", "enabled": false, "path": "/tmp/disabled.jsonl" }
+                ]
+            }
+        }"#;
+        let config: Config = serde_json::from_str(config_str).unwrap();
+        assert!(config.tracing.enabled);
+        let backends = &config.tracing.backends;
+        assert_eq!(backends.len(), 4);
+        // Same type multiple instances are preserved.
+        let files: Vec<_> = backends.iter().filter(|b| b.r#type == "file").collect();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "~/.slimbot/traces.jsonl");
+        assert_eq!(files[1].path, "/tmp/second.jsonl");
+        // Per-backend enable switch.
+        assert!(!files[2].enabled);
+        let otel = backends.iter().find(|b| b.r#type == "otel").unwrap();
+        assert_eq!(otel.endpoint, "http://collector:4318");
+        assert_eq!(otel.service_name, "mybot");
+        // Defaults for unset fields.
+        assert_eq!(otel.path, "");
+        assert_eq!(files[0].endpoint, "http://localhost:4318");
+        assert_eq!(files[0].service_name, "slimbot");
+    }
+
+    #[test]
+    fn test_tracing_config_clamp_leaves_backend_entries_untouched() {
+        // The config macro clamps struct-level fields only; backend entries
+        // are validated/ignored at tracer construction time (unknown types
+        // are skipped there), not clamped here.
+        let config_str = r#"{
+            "agent": {"provider": "test"},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
+            "tracing": {"enabled": true, "backends": [{"type": "nope", "enabled": true}]}
+        }"#;
+        let mut config: Config = serde_json::from_str(config_str).unwrap();
+        config.clamp();
+        assert!(config.tracing.enabled);
+        assert_eq!(config.tracing.backends.len(), 1);
+        assert_eq!(config.tracing.backends[0].r#type, "nope");
     }
 
     #[test]
