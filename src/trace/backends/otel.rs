@@ -9,7 +9,7 @@ use opentelemetry::trace::{
     Span as OtelSpan, SpanContext as OtelSpanContext, SpanId, Status, TraceContextExt, TraceFlags,
     TraceId, TraceState, Tracer, TracerProvider,
 };
-use opentelemetry::{Context, KeyValue, Value};
+use opentelemetry::{Array, Context, KeyValue, Value};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{
@@ -176,8 +176,9 @@ impl Drop for OtelBackend {
     }
 }
 
-/// Maps a serde_json value to an OTel attribute value; structured values are
-/// stringified since OTel attributes are scalar.
+/// Maps a serde_json value to an OTel attribute value. Scalars map directly;
+/// arrays become homogeneous OTel arrays (falling back to string arrays for
+/// mixed content), matching `gen_ai.response.finish_reasons` and friends.
 fn otel_value(v: &serde_json::Value) -> Value {
     match v {
         serde_json::Value::String(s) => s.clone().into(),
@@ -191,6 +192,26 @@ fn otel_value(v: &serde_json::Value) -> Value {
                 n.to_string().into()
             }
         }
+        serde_json::Value::Array(items) => Value::Array(match items {
+            _ if items.iter().all(|i| i.is_boolean()) => {
+                Array::Bool(items.iter().filter_map(|i| i.as_bool()).collect())
+            }
+            _ if items.iter().all(|i| i.is_i64()) => {
+                Array::I64(items.iter().filter_map(|i| i.as_i64()).collect())
+            }
+            _ if items.iter().all(|i| i.is_number()) => {
+                Array::F64(items.iter().filter_map(|i| i.as_f64()).collect())
+            }
+            _ => Array::String(
+                items
+                    .iter()
+                    .map(|i| match i {
+                        serde_json::Value::String(s) => s.clone().into(),
+                        other => other.to_string().into(),
+                    })
+                    .collect(),
+            ),
+        }),
         other => other.to_string().into(),
     }
 }

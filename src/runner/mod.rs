@@ -13,6 +13,9 @@ use crate::trace::{SpanGuard, SpanRecorder, SpanStatus, Tracer};
 use crate::{debug, warn_log};
 use tokio_util::sync::CancellationToken;
 
+/// Agent name reported on GenAI spans via `gen_ai.agent.name`.
+const AGENT_NAME: &str = "slimbot";
+
 mod hooks;
 mod registry;
 mod traits;
@@ -36,6 +39,20 @@ fn truncate_chars(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect()
+    }
+}
+
+/// Map a failed run's message to a low-cardinality `error.type` per the
+/// GenAI semantic conventions (fallback `_OTHER`).
+fn classify_run_error(message: &str) -> &'static str {
+    if message.contains("LLM API request failed") {
+        "provider_error"
+    } else if message.contains("Reached max iterations") {
+        "max_iterations"
+    } else if message.contains("Task cancelled") {
+        "cancelled"
+    } else {
+        "_OTHER"
     }
 }
 
@@ -347,8 +364,10 @@ impl AgentRunner {
         // Root trace span covering the whole run (held until after after-turn
         // hooks, so consolidation/cancellation outcomes can be recorded).
         let root_span = self.tracer.as_ref().map(|tracer| {
-            let span = tracer.start_span("agent.run", None);
-            span.set_attribute("session_id", serde_json::json!(session_id));
+            let span = tracer.start_span(&format!("invoke_agent {AGENT_NAME}"), None);
+            span.set_attribute("gen_ai.operation.name", serde_json::json!("invoke_agent"));
+            span.set_attribute("gen_ai.agent.name", serde_json::json!(AGENT_NAME));
+            span.set_attribute("gen_ai.conversation.id", serde_json::json!(session_id));
             span.set_attribute("channel", serde_json::json!(tool_channel));
             span.set_attribute("chat_id", serde_json::json!(tool_chat_id));
             span.set_attribute(
@@ -482,10 +501,17 @@ impl AgentRunner {
                 debug!("[AgentRunner] Sending chat request to provider");
                 let messages_ref: Vec<&Message> = state.messages.iter().collect();
 
-                // provider.chat span; the provider records request details (body)
-                // through the recorder, the runner records usage afterwards.
+                // chat span: an inference call. The provider records request
+                // details (provider/model/body) through the recorder, the runner
+                // records usage and the outcome afterwards.
                 let chat_span = iteration_span.as_ref().map(|iteration| {
-                    self.start_span(Some(&iteration.context()), "provider.chat")
+                    let span = self.start_span(Some(&iteration.context()), "chat");
+                    span.set_attribute("gen_ai.operation.name", serde_json::json!("chat"));
+                    span.set_attribute(
+                        "gen_ai.request.max_tokens",
+                        serde_json::json!(self.max_tokens),
+                    );
+                    span
                 });
                 let recorder: Option<&dyn SpanRecorder> =
                     chat_span.as_ref().map(|s| s as &dyn SpanRecorder);
@@ -497,6 +523,7 @@ impl AgentRunner {
                     Ok(r) => r,
                     Err(e) => {
                         if let Some(span) = &chat_span {
+                            span.set_attribute("error.type", serde_json::json!("provider_error"));
                             span.set_status(SpanStatus::Error(e.to_string()));
                         }
                         let err_msg = format!("LLM API request failed - {}", e);
@@ -507,11 +534,22 @@ impl AgentRunner {
                     }
                 };
                 if let Some(span) = &chat_span {
-                    span.set_attribute("prompt_tokens", serde_json::json!(response.usage.prompt_tokens));
-                    span.set_attribute("completion_tokens", serde_json::json!(response.usage.completion_tokens));
-                    span.set_attribute("total_tokens", serde_json::json!(response.usage.total_tokens));
-                    span.set_attribute("prompt_cache_hit_tokens", serde_json::json!(response.usage.prompt_cache_hit_tokens));
-                    span.set_attribute("finish_reason", serde_json::json!(response.finish_reason.to_string()));
+                    span.set_attribute(
+                        "gen_ai.usage.input_tokens",
+                        serde_json::json!(response.usage.prompt_tokens),
+                    );
+                    span.set_attribute(
+                        "gen_ai.usage.output_tokens",
+                        serde_json::json!(response.usage.completion_tokens),
+                    );
+                    span.set_attribute(
+                        "gen_ai.usage.cache_read.input_tokens",
+                        serde_json::json!(response.usage.prompt_cache_hit_tokens),
+                    );
+                    span.set_attribute(
+                        "gen_ai.response.finish_reasons",
+                        serde_json::json!([response.finish_reason.to_string()]),
+                    );
                 }
                 debug!(
                     "[AgentRunner] Got response: content_len={}, tool_calls={}, prompt_tokens={}, cached_tokens={}, completion_tokens={}, total_tokens={}",
@@ -553,16 +591,22 @@ impl AgentRunner {
                     .unwrap_or_default();
                 for call in &calls {
                     debug!("[tool_call] name={}, args={}", call.name, call.args);
-                    // tool.{name} span carrying the call id, args and (on
-                    // failure) the error, all keyed under the iteration span.
+                    // execute_tool span carrying the call id, arguments and (on
+                    // failure) the error, keyed under the iteration span.
                     let tool_span = if let Some(iteration) = &iteration_span {
                         let span = self.start_span(
                             Some(&iteration.context()),
-                            &format!("tool.{}", call.name),
+                            &format!("execute_tool {}", call.name),
                         );
-                        span.set_attribute("tool_call_id", serde_json::json!(call.id));
                         span.set_attribute(
-                            "args",
+                            "gen_ai.operation.name",
+                            serde_json::json!("execute_tool"),
+                        );
+                        span.set_attribute("gen_ai.tool.name", serde_json::json!(call.name));
+                        span.set_attribute("gen_ai.agent.name", serde_json::json!(AGENT_NAME));
+                        span.set_attribute("gen_ai.tool.call.id", serde_json::json!(call.id));
+                        span.set_attribute(
+                            "gen_ai.tool.call.arguments",
                             serde_json::json!(truncate_chars(
                                 &serde_json::to_string(&call.args).unwrap_or_default(),
                                 ARGS_MAX_CHARS,
@@ -595,12 +639,13 @@ impl AgentRunner {
                                 Err(e) => {
                                     if let Some(span) = &tool_span {
                                         span.set_attribute(
-                                            "error",
-                                            serde_json::json!(truncate_chars(
-                                                &e.to_string(),
-                                                ERROR_MAX_CHARS,
-                                            )),
+                                            "error.type",
+                                            serde_json::json!("tool_error"),
                                         );
+                                        span.set_status(SpanStatus::Error(truncate_chars(
+                                            &e.to_string(),
+                                            ERROR_MAX_CHARS,
+                                        )));
                                     }
                                     format_tool_error(&e.to_string())
                                 }
@@ -670,21 +715,30 @@ impl AgentRunner {
 
             let result = finalize(state.result);
 
-            // Finalize the root span: aggregate tokens, iteration count, and
-            // the outcome status mapped from the run result.
+            // Finalize the root span: aggregate usage, iteration count, and the
+            // outcome status mapped from the run result (low-cardinality
+            // error.type + detailed message in the status).
             if let Some(root) = &root_span {
-                root.set_attribute("total_tokens", serde_json::json!(result.total_tokens));
-                root.set_attribute("prompt_tokens", serde_json::json!(result.prompt_tokens));
-                root.set_attribute("completion_tokens", serde_json::json!(result.completion_tokens));
                 root.set_attribute(
-                    "prompt_cache_hit_tokens",
-                    serde_json::json!(result.prompt_cache_hit_tokens),
+                    "gen_ai.usage.input_tokens",
+                    serde_json::json!(result.prompt_tokens),
+                );
+                root.set_attribute(
+                    "gen_ai.usage.output_tokens",
+                    serde_json::json!(result.completion_tokens),
                 );
                 root.set_attribute("iterations", serde_json::json!(result.iterations));
-                root.set_attribute("consolidated", serde_json::json!(state.consolidated));
+                root.set_attribute(
+                    "gen_ai.conversation.compacted",
+                    serde_json::json!(state.consolidated),
+                );
                 root.set_status(if result.success {
                     SpanStatus::Ok
                 } else {
+                    root.set_attribute(
+                        "error.type",
+                        serde_json::json!(classify_run_error(&result.content)),
+                    );
                     SpanStatus::Error(result.content.clone())
                 });
             }
@@ -705,6 +759,7 @@ impl AgentRunner {
         // Record the cancellation on the root span, matching the run status
         // mapping (cancellation -> Error).
         if let Some(root) = root_span {
+            root.set_attribute("error.type", serde_json::json!("cancelled"));
             root.set_status(SpanStatus::Error(msg.clone()));
         }
         let result = AgentResult {

@@ -53,7 +53,7 @@ pub struct SpanContext {
 - `Tracer::start_span(name, parent: Option<&SpanContext>) -> SpanGuard`
 - 构造即 `on_span_start` 广播给所有 backend
 - 存活期通过 `&self` 方法累积：`set_status(Ok | Error(msg))`、`set_attribute(key, value)`（属性在创建后按需设置，无初始 attributes 参数）
-- 实现 `SpanRecorder`（见下），provider 用它对 `provider.chat` span 写 body
+- 实现 `SpanRecorder`（见下），provider 用它对 `chat` span 写 body
 - `Drop` 时把累积的 attributes + status + 结束时间戳一次性 `on_span_end` 广播
 - 内部 `Arc<Mutex<...>>`（`parking_lot`）累积状态，`Send + Sync` 满足跨 `.await` 存活
 - **无 tracer 或零 backend 时，`start_span` 返回廉价 no-op guard**（Drop 空操作），骨架无需 `if let` 判断
@@ -91,24 +91,33 @@ pub struct Tracer {
 
 | 调用点 | span 名 | 父 | 说明 |
 |---|---|---|---|
-| `AgentRunner::run()` 进入、`AfterTurn` 退出前 | `agent.run` | 无（根） | 用 guard 持有跨整个 run |
-| 每次 ReAct 循环迭代 | `iteration` | `agent.run` | 包裹 provider.chat + 工具循环 |
-| 骨架调用 `provider.chat()` 处 | `provider.chat` | `iteration` | guard 传给 provider 写 body |
-| 骨架调用 `tool.execute()` 处 | `tool.{name}` | `iteration` | 如 `tool.shell` |
+| `AgentRunner::run()` 进入、`AfterTurn` 退出前 | `invoke_agent slimbot` | 无（根） | 用 guard 持有跨整个 run；`gen_ai.operation.name=invoke_agent` |
+| 每次 ReAct 循环迭代 | `iteration` | `invoke_agent slimbot` | 框架自定义 span，包裹 chat + 工具循环 |
+| 骨架调用 `provider.chat()` 处 | `chat` | `iteration` | guard 传给 provider 写 body；`gen_ai.operation.name=chat` |
+| 骨架调用 `tool.execute()` 处 | `execute_tool {name}` | `iteration` | 如 `execute_tool shell`；`gen_ai.operation.name=execute_tool` |
 
-根 span 的 guard 生命周期覆盖整个 `run()` 的骨架作用域；`provider.chat` / `tool.{name}` 的 guard 只包裹各自调用。
+根 span 的 guard 生命周期覆盖整个 `run()` 的骨架作用域；`chat` / `execute_tool {name}` 的 guard 只包裹各自调用。
+
+> span 名与 attribute 遵循 OpenTelemetry GenAI 语义约定（`gen-ai-agent-spans.md` / `gen-ai-spans.md`）：
+> 根 span 对应 `invoke_agent`（进程内 agent 调用），chat span 对应 Inference（`chat`），工具 span 对应 `execute_tool`。
+> `iteration` 是 slimbot 特有的中间层，spec 允许自定义 span，故不设 `gen_ai.operation.name`。
+> 因 runner 在调用 provider 前创建 chat span、不知道 model，span 名用固定 `chat`（spec 允许自定义格式），model 由 provider 写为 `gen_ai.request.model` 属性。
 
 ## Attribute 清单
 
-**`agent.run`**（根）：`session_id`、`channel`、`chat_id`、`max_iterations`、`max_tokens`、`total_tokens`、`prompt_tokens`、`completion_tokens`、`prompt_cache_hit_tokens`、`iterations`、`consolidated`（bool）
+**`invoke_agent slimbot`**（根）：
+- GenAI：`gen_ai.operation.name`（`invoke_agent`）、`gen_ai.agent.name`（`slimbot`）、`gen_ai.conversation.id`（session_id）、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`gen_ai.conversation.compacted`（bool，consolidation 是否触发）、`error.type`（失败时）
+- 自定义：`channel`、`chat_id`、`max_iterations`、`max_tokens`、`iterations`
 
 **`iteration`**：`iteration`（序号）
 
-**`provider.chat`**：`provider`（type）、`model`、`prompt_tokens`、`completion_tokens`、`total_tokens`、`prompt_cache_hit_tokens`、`finish_reason`、`http.request.body`（**完整 body，字符串 attribute，非嵌套 JSON**）
+**`chat`**：
+- GenAI：`gen_ai.operation.name`（`chat`）、`gen_ai.provider.name`（如 `openai`）、`gen_ai.request.model`、`gen_ai.request.max_tokens`、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`gen_ai.usage.cache_read.input_tokens`、`gen_ai.response.finish_reasons`（string 数组）、`error.type`（失败时，`provider_error`）
+- HTTP：`http.request.body`（**完整 body，字符串 attribute，非嵌套 JSON**；HTTP 标准 semconv，保留以在传输失败时可见）
 
-**`tool.{name}`**：`tool_call_id`、`args`（截断 200 字符）、`error`（失败时，截断 500 字符）。不存 `tool.name`（已在 span 名中）。
+**`execute_tool {name}`**：`gen_ai.operation.name`（`execute_tool`）、`gen_ai.tool.name`、`gen_ai.agent.name`（`slimbot`）、`gen_ai.tool.call.id`、`gen_ai.tool.call.arguments`（截断 200 字符）、`error.type`（失败时，`tool_error`）。
 
-敏感内容截断：`args` 200 字符、`error` 500 字符；body 全量不截断（按决策）。
+`error.type` 为低基数错误类别（`provider_error` / `max_iterations` / `cancelled` / `tool_error` / `_OTHER`），详细消息在 span status；`gen_ai.tool.call.arguments` 截断 200 字符、tool 错误消息截断 500 字符；body 全量不截断（按决策）。
 
 ## 最终 body 捕获
 
@@ -156,13 +165,13 @@ pub struct Tracer {
 
 根 span `set_status` 映射（与 `AgentResult.success` 对齐）：
 
-| 结束条件 | status |
-|---|---|
-| 模型返回无 tool_calls | Ok |
-| 超出 `max_iterations` | Error |
-| LLM 调用错误 | Error |
-| hook 返回 `Abort` | Error |
-| 取消 | Error |
+| 结束条件 | status | `error.type` |
+|---|---|---|
+| 模型返回无 tool_calls | Ok | — |
+| 超出 `max_iterations` | Error | `max_iterations` |
+| LLM 调用错误 | Error | `provider_error` |
+| hook 返回 `Abort` | Error | `_OTHER` |
+| 取消（`/stop` / 预取消） | Error | `cancelled` |
 
 ## 边界
 
@@ -177,6 +186,7 @@ pub struct Tracer {
 - fan-out：所有 backend 都收到 start/end；单 backend 报错不影响其它 backend 与 run
 - file backend：每 span 结束写一行 JSONL，字段完整
 - otel backend：构造 + 导出 smoke（可选：本地 mock OTLP 服务）
-- runner 集成（mock backend 捕获）：span 树层级 `agent.run → iteration → provider.chat / tool.{name}` 正确、attribute 齐全；失败 run → 根 span `Error`、成功 → `Ok`
+- runner 集成（mock backend 捕获）：span 树层级 `invoke_agent slimbot → iteration → chat / execute_tool {name}` 正确、attribute 齐全（`gen_ai.*`）；失败 run → 根 span `Error` + `error.type`、成功 → `Ok`
 - body 捕获：provider 单测（mock recorder）断言 `http.request.body` 为完整序列化 body
+- otel backend：数组 attribute（如 `gen_ai.response.finish_reasons`）导出为 OTel array
 - config：解析 `tracing` 段、同 type 多实例、默认值

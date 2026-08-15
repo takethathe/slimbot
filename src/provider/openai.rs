@@ -274,8 +274,8 @@ impl crate::provider::Provider for OpenAIProvider {
         // Record provider identity and the full request body before the HTTP
         // request, so the body is available on the failure path too.
         if let Some(rec) = recorder {
-            rec.set_attribute("provider", serde_json::json!("openai"));
-            rec.set_attribute("model", serde_json::json!(self.config.model));
+            rec.set_attribute("gen_ai.provider.name", serde_json::json!("openai"));
+            rec.set_attribute("gen_ai.request.model", serde_json::json!(self.config.model));
             if let Ok(body_str) = serde_json::to_string(&body) {
                 rec.set_attribute("http.request.body", serde_json::json!(body_str));
             }
@@ -1870,8 +1870,14 @@ mod tests {
         assert!(result.is_err(), "unreachable endpoint must fail");
 
         let attrs = recorder.attributes.lock().unwrap();
-        assert_eq!(attrs.get("provider"), Some(&serde_json::json!("openai")));
-        assert_eq!(attrs.get("model"), Some(&serde_json::json!("gpt-4")));
+        assert_eq!(
+            attrs.get("gen_ai.provider.name"),
+            Some(&serde_json::json!("openai"))
+        );
+        assert_eq!(
+            attrs.get("gen_ai.request.model"),
+            Some(&serde_json::json!("gpt-4"))
+        );
         let body = attrs
             .get("http.request.body")
             .expect("request body recorded even on failure");

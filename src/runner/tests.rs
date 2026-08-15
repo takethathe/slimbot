@@ -2483,8 +2483,8 @@ async fn test_runner_emits_full_span_tree() {
         .await;
     assert!(result.success);
 
-    // ── Hierarchy: agent.run -> iteration -> provider.chat / tool.echo ──
-    let root = backend.start_named("agent.run");
+    // ── Hierarchy: invoke_agent slimbot -> iteration -> chat / execute_tool echo ──
+    let root = backend.start_named("invoke_agent slimbot");
     assert_eq!(root.parent_span_id, None);
 
     let iterations = backend
@@ -2501,7 +2501,7 @@ async fn test_runner_emits_full_span_tree() {
     let chats = backend
         .starts()
         .into_iter()
-        .filter(|e| e.name == "provider.chat")
+        .filter(|e| e.name == "chat")
         .collect::<Vec<_>>();
     assert_eq!(chats.len(), 2);
     for chat in &chats {
@@ -2515,7 +2515,7 @@ async fn test_runner_emits_full_span_tree() {
     let tools = backend
         .starts()
         .into_iter()
-        .filter(|e| e.name == "tool.echo")
+        .filter(|e| e.name == "execute_tool echo")
         .collect::<Vec<_>>();
     assert_eq!(tools.len(), 1);
     assert!(
@@ -2534,27 +2534,39 @@ async fn test_runner_emits_full_span_tree() {
         .collect();
     assert_eq!(trace_ids.len(), 1);
 
-    // ── Root span attributes ──
+    // ── Root span attributes (GenAI semantic conventions) ──
     let root_end = backend.end_for(&root);
     assert_eq!(root_end.status, Some(crate::trace::SpanStatus::Ok));
     let attrs = &root_end.attributes;
     assert_eq!(
-        attrs.get("session_id"),
+        attrs.get("gen_ai.operation.name"),
+        Some(&serde_json::json!("invoke_agent"))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.agent.name"),
+        Some(&serde_json::json!("slimbot"))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.conversation.id"),
         Some(&serde_json::json!("webui:chat-7"))
     );
     assert_eq!(attrs.get("channel"), Some(&serde_json::json!("webui")));
     assert_eq!(attrs.get("chat_id"), Some(&serde_json::json!("chat-7")));
     assert_eq!(attrs.get("max_iterations"), Some(&serde_json::json!(40)));
     assert_eq!(attrs.get("max_tokens"), Some(&serde_json::json!(4096)));
-    assert_eq!(attrs.get("total_tokens"), Some(&serde_json::json!(42)));
-    assert_eq!(attrs.get("prompt_tokens"), Some(&serde_json::json!(30)));
-    assert_eq!(attrs.get("completion_tokens"), Some(&serde_json::json!(12)));
     assert_eq!(
-        attrs.get("prompt_cache_hit_tokens"),
-        Some(&serde_json::json!(5))
+        attrs.get("gen_ai.usage.input_tokens"),
+        Some(&serde_json::json!(30))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.usage.output_tokens"),
+        Some(&serde_json::json!(12))
     );
     assert_eq!(attrs.get("iterations"), Some(&serde_json::json!(1)));
-    assert_eq!(attrs.get("consolidated"), Some(&serde_json::json!(false)));
+    assert_eq!(
+        attrs.get("gen_ai.conversation.compacted"),
+        Some(&serde_json::json!(false))
+    );
 
     // ── Iteration attributes ──
     let it1 = backend.end_for(&iterations[0]);
@@ -2562,24 +2574,41 @@ async fn test_runner_emits_full_span_tree() {
     let it2 = backend.end_for(&iterations[1]);
     assert_eq!(it2.attributes.get("iteration"), Some(&serde_json::json!(2)));
 
-    // ── provider.chat attributes ──
+    // ── chat attributes (GenAI inference) ──
     for chat in &chats {
         let end = backend.end_for(chat);
-        assert!(end.attributes.contains_key("prompt_tokens"));
-        assert!(end.attributes.contains_key("total_tokens"));
-        assert!(end.attributes.contains_key("completion_tokens"));
-        assert!(end.attributes.contains_key("prompt_cache_hit_tokens"));
-        assert!(end.attributes.contains_key("finish_reason"));
+        assert!(end.attributes.contains_key("gen_ai.operation.name"));
+        assert!(end.attributes.contains_key("gen_ai.usage.input_tokens"));
+        assert!(end.attributes.contains_key("gen_ai.usage.output_tokens"));
+        assert!(
+            end.attributes
+                .contains_key("gen_ai.usage.cache_read.input_tokens")
+        );
+        assert!(
+            end.attributes
+                .contains_key("gen_ai.response.finish_reasons")
+        );
     }
 
-    // ── tool.echo attributes ──
+    // ── execute_tool echo attributes ──
     let tool_end = backend.end_for(&tools[0]);
     assert_eq!(
-        tool_end.attributes.get("tool_call_id"),
+        tool_end.attributes.get("gen_ai.operation.name"),
+        Some(&serde_json::json!("execute_tool"))
+    );
+    assert_eq!(
+        tool_end.attributes.get("gen_ai.tool.name"),
+        Some(&serde_json::json!("echo"))
+    );
+    assert_eq!(
+        tool_end.attributes.get("gen_ai.tool.call.id"),
         Some(&serde_json::json!("tc-1"))
     );
-    assert!(tool_end.attributes.contains_key("args"));
-    assert!(!tool_end.attributes.contains_key("tool.name"));
+    assert!(
+        tool_end
+            .attributes
+            .contains_key("gen_ai.tool.call.arguments")
+    );
 }
 
 #[tokio::test]
@@ -2601,7 +2630,7 @@ async fn test_runner_root_span_error_on_llm_failure() {
         .await;
     assert!(!result.success);
 
-    let root = backend.start_named("agent.run");
+    let root = backend.start_named("invoke_agent slimbot");
     let root_end = backend.end_for(&root);
     match &root_end.status {
         Some(crate::trace::SpanStatus::Error(msg)) => {
@@ -2609,8 +2638,12 @@ async fn test_runner_root_span_error_on_llm_failure() {
         }
         other => panic!("expected error status, got {other:?}"),
     }
+    assert_eq!(
+        root_end.attributes.get("error.type"),
+        Some(&serde_json::json!("provider_error"))
+    );
     // The failing chat span is also marked error (with the raw error).
-    let chat = backend.start_named("provider.chat");
+    let chat = backend.start_named("chat");
     let chat_end = backend.end_for(&chat);
     match &chat_end.status {
         Some(crate::trace::SpanStatus::Error(msg)) => {
@@ -2618,6 +2651,10 @@ async fn test_runner_root_span_error_on_llm_failure() {
         }
         other => panic!("expected chat error status, got {other:?}"),
     }
+    assert_eq!(
+        chat_end.attributes.get("error.type"),
+        Some(&serde_json::json!("provider_error"))
+    );
 }
 
 #[tokio::test]
@@ -2648,7 +2685,7 @@ async fn test_runner_root_span_error_on_max_iterations() {
         .await;
     assert!(!result.success);
 
-    let root = backend.start_named("agent.run");
+    let root = backend.start_named("invoke_agent slimbot");
     let root_end = backend.end_for(&root);
     match &root_end.status {
         Some(crate::trace::SpanStatus::Error(msg)) => {
@@ -2656,6 +2693,10 @@ async fn test_runner_root_span_error_on_max_iterations() {
         }
         other => panic!("expected error status, got {other:?}"),
     }
+    assert_eq!(
+        root_end.attributes.get("error.type"),
+        Some(&serde_json::json!("max_iterations"))
+    );
 }
 
 #[tokio::test]
@@ -2698,7 +2739,7 @@ async fn test_runner_file_backend_writes_root_span_jsonl() {
     assert_eq!(records.len(), 3, "root + iteration + chat spans");
     let root_record = records
         .iter()
-        .find(|r| r["name"] == "agent.run")
+        .find(|r| r["name"] == "invoke_agent slimbot")
         .expect("root span record");
     assert_eq!(root_record["status"], "ok");
     assert!(root_record["duration_us"].as_u64().is_some());
@@ -2755,7 +2796,7 @@ async fn test_runner_chat_span_carries_provider_recorded_body() {
         .await;
     assert!(result.success);
 
-    let chat = backend.start_named("provider.chat");
+    let chat = backend.start_named("chat");
     let chat_end = backend.end_for(&chat);
     assert_eq!(
         chat_end.attributes.get("http.request.body"),
@@ -2819,18 +2860,28 @@ async fn test_runner_tool_span_records_error_and_truncates_args() {
         "tool errors surface as results, not run failures"
     );
 
-    let tool = backend.start_named("tool.fail_tool");
+    let tool = backend.start_named("execute_tool fail_tool");
     let tool_end = backend.end_for(&tool);
-    let args = tool_end.attributes.get("args").and_then(|v| v.as_str());
-    let args = args.expect("args attribute");
-    assert!(args.len() <= 200, "args must be truncated to 200 chars");
-    let error = tool_end
+    let args = tool_end
         .attributes
-        .get("error")
-        .and_then(|v| v.as_str())
-        .expect("error attribute on failed tool span");
-    assert!(error.contains("Tool execution failed"));
-    assert!(error.len() <= 500, "error must be truncated to 500 chars");
+        .get("gen_ai.tool.call.arguments")
+        .and_then(|v| v.as_str());
+    let args = args.expect("gen_ai.tool.call.arguments attribute");
+    assert!(args.len() <= 200, "args must be truncated to 200 chars");
+    assert_eq!(
+        tool_end.attributes.get("error.type"),
+        Some(&serde_json::json!("tool_error"))
+    );
+    match &tool_end.status {
+        Some(crate::trace::SpanStatus::Error(msg)) => {
+            assert!(msg.contains("Tool execution failed"));
+            assert!(
+                msg.len() <= 500,
+                "error message must be truncated to 500 chars"
+            );
+        }
+        other => panic!("expected error status, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2873,7 +2924,7 @@ async fn test_runner_root_span_error_on_cancelled_run() {
         .await;
     assert!(!result.success);
 
-    let root = backend.start_named("agent.run");
+    let root = backend.start_named("invoke_agent slimbot");
     let root_end = backend.end_for(&root);
     match &root_end.status {
         Some(crate::trace::SpanStatus::Error(msg)) => {
@@ -2881,4 +2932,8 @@ async fn test_runner_root_span_error_on_cancelled_run() {
         }
         other => panic!("expected error status, got {other:?}"),
     }
+    assert_eq!(
+        root_end.attributes.get("error.type"),
+        Some(&serde_json::json!("cancelled"))
+    );
 }

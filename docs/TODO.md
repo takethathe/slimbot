@@ -10,6 +10,7 @@
 - [x] **埋点** — 骨架 `run()` 开 `agent.run` 根 span、每轮 `iteration`、`provider.chat`/`tool.{name}` 子 span；span 单独创建不耦合 hook；provider.chat 经 `Option<&dyn SpanRecorder>` 记录完整 body
 - [x] **config** — `tracing.enabled` + `backends` 数组（同 type 多实例），走 `define_config!`
 - [x] **测试** — mock backend 断言 span 树/属性/状态；RAII Drop、fan-out、隔离、file JSONL、body 捕获、config 解析
+- [x] **OTel GenAI 语义约定对齐** — span 名与 attribute 遵循 `gen-ai-agent-spans.md`/`gen-ai-spans.md`：根 `invoke_agent {agent}`（`gen_ai.operation.name`/`gen_ai.agent.name`/`gen_ai.conversation.id`/`gen_ai.conversation.compacted`/`gen_ai.usage.*`）、`chat`（`gen_ai.provider.name`/`gen_ai.request.model`/`gen_ai.usage.*`/`gen_ai.response.finish_reasons`）、`execute_tool {name}`（`gen_ai.tool.name`/`gen_ai.tool.call.id`/`gen_ai.tool.call.arguments`）；错误用低基数 `error.type`；otel backend 支持数组 attribute
 
 设计文档见 `docs/trace.md`；决策见 `docs/adr/0001-self-built-span-model.md`。
 
