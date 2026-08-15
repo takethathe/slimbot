@@ -4,42 +4,21 @@ slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支�
 
 ## 构建和运行
 
-- **构建：** `cargo build`
 - **运行：** `cargo run -- setup` （初始化配置、目录和 bootstrap 文件），然后 `cargo run -- <config.json路径>` （默认 `~/.slimbot/config.json`）
 - **Gateway 模式：** `cargo run -- gateway` （启动 cron、heartbeat 和 enabled channels，包括 WebUI）
 - **快速检查：** `cargo check --message-format=json 2>/dev/null | jq -c 'select(.reason == "compiler-message") | {level: .message.level, location: (.message.spans[0] | "\(.file_name):\(.line_start)"), message: .message.message}'` （JSON 输出 + jq 压缩，仅保留诊断信息，减少 token 消耗）
-- **代码格式化：** `cargo fmt` / `cargo fmt -- --check` （提交前必须先运行）
-- **静态分析：** `cargo clippy` （lint 检查，提交前确保无新 warning）
-- **测试：** `cargo test` （提交前确保所有测试通过）
-- **Rust Edition：** 2024
+- **提交前检查：** `cargo fmt -- --check`、`cargo clippy`（无新 warning）、`cargo test` 全部通过
 
 ## 目录结构
 
-```
-slimbot/
-├── src/
-│   ├── main.rs          # Entry
-│   ├── cli.rs           # CLI 参数解析
-│   ├── config.rs        # 配置读写
-│   ├── bootstrap.rs     # workspace 模板文件
-│   ├── setup.rs         # setup 命令
-│   ├── agent_loop.rs    # 顶层协调
-│   ├── runner.rs        # ReAct 循环核心
-│   ├── session.rs       # 会话管理 + JSONL 持久化
-│   ├── context.rs       # system prompt 构建
-│   ├── message_bus.rs   # 消息总线
-│   ├── tool.rs          # Tool trait + ToolManager
-│   ├── tools/           # 内置工具实现
-│   ├── channel/         # CLI + WebUI 通道
-│   ├── gateway.rs       # Gateway 模式入口
-│   ├── cron/            # 定时任务
-│   ├── heartbeat/       # 心跳服务
-│   ├── provider/        # LLM API 封装
-│   ├── consolidate.rs   # 会话摘要压缩
-│   ├── memory.rs        # 记忆存储
-│   └── snip.rs          # 上下文截断
-└── docs/                # 文档目录
-```
+`src/` 模块及职责：
+
+- `main`（Entry）、`cli`（参数解析）、`config`（配置读写）、`bootstrap`（workspace 模板）、`setup`（setup 命令）、`agent_loop`（顶层协调）、`runner`（ReAct 循环核心）
+- `session`（会话管理 + JSONL 持久化）、`context`（system prompt 构建）、`message_bus`（消息总线）、`tool`（Tool trait + ToolManager）、`tools/`（内置工具实现）、`channel/`（CLI + WebUI 通道）
+- `gateway`（Gateway 模式入口）、`cron/`（定时任务）、`heartbeat/`（心跳服务）、`provider/`（LLM API 封装）
+- `consolidate`（会话摘要压缩）、`memory`（记忆存储）、`snip`（上下文截断）
+
+`docs/` 为文档目录。
 
 ## 架构
 
@@ -73,7 +52,7 @@ slimbot/
 2. **规划（Plan）**：明确目标，分解为可测试的行为点，确认后再开始编码
 3. **测试先行（Test First）**：为每个行为点编写测试用例，描述输入/输出/边界条件，此时测试应失败
 4. **实现（Implement）**：编写最小代码使测试通过，同步更新文档
-5. **验证（Verify）**：运行 `cargo check`、`cargo build`、`cargo test` 确保所有测试通过，更新文档和 TODO
+5. **验证（Verify）**：运行「构建和运行」中的提交前检查确保所有测试通过，更新文档和 TODO
 
 ### TDD 实践
 
@@ -90,11 +69,25 @@ slimbot/
 
 ### Git 提交
 
-- 使用 git 进行代码版本管理
 - **提交前必须进行 code review**，确认代码质量和变更合理性
 - **commit message 必须使用英文**
+- **commit message 遵循 Conventional Commits 规范**：title 格式为 `<type>: <subject>`，常用类型：`feat`（新功能）、`fix`（修复）、`refactor`（重构）、`style`（格式化）、`test`（测试）、`chore`（杂项/配置）、`docs`（文档）；复杂改动在 body 中用 `- ` 列表说明细节
 - **绝对禁止在 commit message 中添加 `Co-Authored-By: Claude` 或任何将 Claude / AI 列为贡献者的内容。这是硬性规则，无例外。**
 
 ### 代码注释
 
 - **所有代码注释必须使用英文**
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as markdown files under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical roles map to `Status:` line values in issue files. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
