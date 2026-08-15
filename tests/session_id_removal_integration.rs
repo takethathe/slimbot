@@ -1,4 +1,4 @@
-use slimbot::{Content, Message, SessionManager};
+use slimbot::{Message, SessionManager};
 use std::fs;
 use tempfile::TempDir;
 

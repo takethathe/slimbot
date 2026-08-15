@@ -1,8 +1,11 @@
+#[cfg(test)]
 mod mock;
 mod openai;
 
-pub use mock::MockProvider;
 pub use openai::OpenAIProvider;
+
+#[cfg(test)]
+pub use mock::MockProvider;
 
 use anyhow::Result;
 use async_trait::async_trait;

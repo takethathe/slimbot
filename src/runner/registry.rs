@@ -265,7 +265,6 @@ mod tests {
 
     struct RecordingHook {
         order: Arc<AtomicUsize>,
-        id: usize,
     }
 
     #[async_trait]
@@ -341,21 +340,18 @@ mod tests {
         reg.add_pre_chat(
             Arc::new(RecordingHook {
                 order: order.clone(),
-                id: 1,
             }),
             HookPosition::Append,
         );
         reg.add_pre_chat(
             Arc::new(RecordingHook {
                 order: order.clone(),
-                id: 2,
             }),
             HookPosition::Append,
         );
         reg.add_pre_chat(
             Arc::new(RecordingHook {
                 order: order.clone(),
-                id: 3,
             }),
             HookPosition::Append,
         );
@@ -374,7 +370,6 @@ mod tests {
         reg.add_pre_chat(
             Arc::new(RecordingHook {
                 order: order.clone(),
-                id: 1,
             }),
             HookPosition::Append,
         );
@@ -383,7 +378,6 @@ mod tests {
         reg.add_pre_chat(
             Arc::new(RecordingHook {
                 order: order.clone(),
-                id: 3,
             }),
             HookPosition::Append,
         );
@@ -447,7 +441,6 @@ mod tests {
         reg.add_pre_chat(
             Arc::new(RecordingHook {
                 order: order.clone(),
-                id: 1,
             }),
             HookPosition::Append,
         );
@@ -455,7 +448,6 @@ mod tests {
         reg.add_pre_chat(
             Arc::new(RecordingHook {
                 order: order.clone(),
-                id: 2,
             }),
             HookPosition::Replace(5),
         );
@@ -487,7 +479,6 @@ mod tests {
         reg.add_pre_chat(
             Arc::new(RecordingHook {
                 order: order.clone(),
-                id: 1,
             }),
             HookPosition::Append,
         );

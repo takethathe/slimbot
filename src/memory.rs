@@ -168,7 +168,7 @@ impl MemoryStore {
         let mut entries = Vec::new();
         if let Ok(file) = std::fs::File::open(&self.history_file) {
             let reader = std::io::BufReader::new(file);
-            for line in std::io::BufRead::lines(reader).flatten() {
+            for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -179,38 +179,6 @@ impl MemoryStore {
             }
         }
         entries
-    }
-
-    fn read_last_entry(&self) -> Option<HistoryEntry> {
-        use std::io::{Read, Seek, SeekFrom};
-        let Ok(mut file) = std::fs::File::open(&self.history_file) else {
-            return None;
-        };
-        let Ok(size) = file.metadata().map(|m| m.len()) else {
-            return None;
-        };
-        if size == 0 {
-            return None;
-        }
-        // Try progressively larger windows to handle long entries.
-        for window_kb in [4, 16, 64, 256] {
-            let read_size = (window_kb * 1024).min(size as usize);
-            if file.seek(SeekFrom::End(-(read_size as i64))).is_err() {
-                continue;
-            }
-            let mut buf = vec![0u8; read_size];
-            if file.read_exact(&mut buf).is_err() {
-                continue;
-            }
-            let Ok(text) = String::from_utf8(buf) else {
-                continue;
-            };
-            let last_line = text.lines().filter(|l| !l.trim().is_empty()).next_back()?;
-            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(last_line) {
-                return Some(entry);
-            }
-        }
-        None
     }
 
     // -- history compaction --------------------------------------------------

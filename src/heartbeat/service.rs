@@ -70,6 +70,8 @@ impl HeartbeatService {
         self.running.store(false, Ordering::Relaxed);
     }
 
+    /// Whether the heartbeat service is enabled in the config.
+    #[cfg(test)]
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }

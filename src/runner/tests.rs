@@ -219,7 +219,7 @@ async fn test_runner_message_sent_on_max_iterations_exit() {
         usage: Usage::default(),
     };
     let provider = Arc::new(MockProvider::new(
-        std::iter::repeat(base_response).take(50).collect(),
+        std::iter::repeat_n(base_response, 50).collect(),
     ));
     let runner = make_runner(sm.clone(), tm, provider.clone(), workspace_dir, ms);
 
@@ -234,7 +234,7 @@ async fn test_runner_message_sent_on_max_iterations_exit() {
             None,
         )
         .await;
-    assert_eq!(result.success, false);
+    assert!(!result.success);
     assert!(result.content.contains("Reached max iterations"));
     assert!(
         result.message_sent,
@@ -423,7 +423,7 @@ async fn test_direct_reply_no_tool_calls() {
         )
         .await;
     assert_eq!(result.content, "Hello, world!");
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert_eq!(result.total_tokens, 15);
     assert_eq!(provider.call_count(), 1);
 
@@ -480,7 +480,7 @@ async fn test_single_tool_call_with_content() {
         )
         .await;
     assert_eq!(result.content, "Done!");
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert_eq!(result.total_tokens, 75); // 30 + 45
     assert_eq!(result.prompt_cache_hit_tokens, 0);
     assert_eq!(provider.call_count(), 2);
@@ -570,7 +570,7 @@ async fn test_multiple_tool_calls_content_preserved() {
         result.content,
         "Here are the results: listing-contents and file-contents."
     );
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert_eq!(result.total_tokens, 165); // 70 + 95
     assert_eq!(provider.call_count(), 2);
 
@@ -646,7 +646,7 @@ async fn test_multiple_tool_calls_with_empty_content() {
         )
         .await;
     assert_eq!(result.content, "Final answer");
-    assert_eq!(result.success, true);
+    assert!(result.success);
 
     let msgs = sm.lock().await.get_messages("test-session").await;
     match &msgs[1] {
@@ -674,7 +674,7 @@ async fn test_max_iterations_exceeded() {
         usage: Usage::default(),
     };
     let provider = Arc::new(MockProvider::new(
-        std::iter::repeat(base_response).take(50).collect(),
+        std::iter::repeat_n(base_response, 50).collect(),
     ));
     let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
     let task = make_task("Loop forever");
@@ -690,7 +690,7 @@ async fn test_max_iterations_exceeded() {
             None,
         )
         .await;
-    assert_eq!(result.success, false);
+    assert!(!result.success);
     assert!(result.content.contains("Reached max iterations 40"));
 
     // Verify session was persisted
@@ -1972,7 +1972,7 @@ async fn test_pre_chat_hook_aborts_run() {
 #[tokio::test]
 async fn test_pre_tool_hook_skips_execution() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
+    let (sm, _tm, wd, ms) = make_test_env(&tmp, &[]).await;
     let executions = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut tmm = ToolManager::new(wd.clone());
     tmm.register(Box::new(CountingTool::new("echo", executions.clone())));

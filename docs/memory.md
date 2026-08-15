@@ -79,4 +79,3 @@ pub fn append_history(&self, entry: &str) -> Result<u64>
 
 - 历史记录使用**追加写入**（与 session JSONL 的全量写入不同）
 - 游标文件单独存储，避免每次写历史都读全文件
-- `read_last_entry` 使用**反向扫描**策略：从文件末尾逐步扩大窗口读取，避免全文件加载

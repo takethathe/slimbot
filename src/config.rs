@@ -340,10 +340,13 @@ use std::sync::OnceLock;
 
 static CONFIG_INSTANCE: OnceLock<Arc<RwLock<ConfigInner>>> = OnceLock::new();
 
+/// Subscriber callback for config change notifications.
+type ConfigSubscriber = Arc<dyn Fn(ConfigChange) + Send + Sync>;
+
 struct ConfigInner {
     config: Config,
     config_path: String,
-    subscribers: Vec<(String, Arc<dyn Fn(ConfigChange) + Send + Sync>)>,
+    subscribers: Vec<(String, ConfigSubscriber)>,
     watcher: Option<notify::RecommendedWatcher>,
 }
 

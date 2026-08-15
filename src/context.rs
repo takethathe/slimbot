@@ -66,12 +66,12 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillMeta> {
 
     for line in front.lines() {
         let line = line.trim();
-        if line.starts_with("name:") {
-            name = line["name:".len()..].trim().to_string();
-        } else if line.starts_with("description:") {
-            description = line["description:".len()..].trim().to_string();
-        } else if line.starts_with("always:") {
-            always = line["always:".len()..].trim() == "true";
+        if let Some(rest) = line.strip_prefix("name:") {
+            name = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("description:") {
+            description = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("always:") {
+            always = rest.trim() == "true";
         }
     }
 
@@ -467,7 +467,7 @@ always: true
         let meta = parse_skill_frontmatter(input).unwrap();
         assert_eq!(meta.name, "memory");
         assert_eq!(meta.description, "Two-layer memory system.");
-        assert_eq!(meta.always, true);
+        assert!(meta.always);
         assert_eq!(meta.content, "# Memory content here");
     }
 
@@ -482,7 +482,7 @@ Skill body.
 "#;
         let meta = parse_skill_frontmatter(input).unwrap();
         assert_eq!(meta.name, "custom");
-        assert_eq!(meta.always, false);
+        assert!(!meta.always);
     }
 
     #[test]

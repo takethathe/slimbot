@@ -13,7 +13,6 @@ pub type CronJobCallback = Arc<
 
 pub struct CronService {
     store_path: PathBuf,
-    action_path: PathBuf,
     jobs: Arc<Mutex<Vec<CronJob>>>,
     on_job: Mutex<Option<CronJobCallback>>,
     running: AtomicBool,
@@ -25,7 +24,6 @@ impl CronService {
         std::fs::create_dir_all(&cron_dir).ok();
         Self {
             store_path: cron_dir.join("jobs.json"),
-            action_path: cron_dir.join("action.jsonl"),
             jobs: Arc::new(Mutex::new(Vec::new())),
             on_job: Mutex::new(None),
             running: AtomicBool::new(false),

@@ -264,6 +264,11 @@ impl AgentRunner {
     ///
     /// Existing callers that use `AgentRunner::new` keep working unchanged;
     /// they automatically get the default hook pipeline.
+    //
+    // The 8-argument signature is part of the public API (see
+    // .scratch/runner-phase-hooks/issues/03: "keep AgentRunner::new()
+    // signature"); a `RunSpec`-style struct would change every call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tool_manager: Arc<ToolManager>,
         provider: Arc<dyn Provider>,
@@ -287,6 +292,11 @@ impl AgentRunner {
         builder.build()
     }
 
+    /// Run a ReAct loop turn against the phase-hook pipeline.
+    //
+    // The 8-argument signature is part of the public API used by AgentLoop
+    // and the gateway; grouped params live in `RunSpec` internally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         content: String,
@@ -563,9 +573,11 @@ impl AgentRunner {
     /// Build a cancelled result (used for the /stop sentinel and pre-run cancellation).
     async fn cancelled_result(&self, hook: &TaskHook, session_id: &str) -> AgentResult {
         let msg = "Task cancelled.".to_string();
-        let mut result = AgentResult::default();
-        result.success = false;
-        result.content = msg.clone();
+        let result = AgentResult {
+            success: false,
+            content: msg.clone(),
+            ..Default::default()
+        };
         let failed_state = TaskState::Failed { error: msg.clone() };
         {
             let mut sm = self.session_manager.lock().await;
@@ -587,11 +599,12 @@ impl AgentRunner {
         let mut orphan_indices: Vec<usize> = Vec::new();
         for (i, msg) in messages.iter().enumerate() {
             match msg {
-                Message::Assistant { tool_calls, .. } => {
-                    if let Some(calls) = tool_calls {
-                        for call in calls {
-                            declared.insert(call.id.clone());
-                        }
+                Message::Assistant {
+                    tool_calls: Some(calls),
+                    ..
+                } => {
+                    for call in calls {
+                        declared.insert(call.id.clone());
                     }
                 }
                 Message::Tool { tool_call_id, .. } if !declared.contains(tool_call_id) => {
@@ -616,11 +629,12 @@ impl AgentRunner {
 
         for (i, msg) in messages.iter().enumerate() {
             match msg {
-                Message::Assistant { tool_calls, .. } => {
-                    if let Some(calls) = tool_calls {
-                        for call in calls {
-                            declared.push((i, call.id.clone(), call.name.clone()));
-                        }
+                Message::Assistant {
+                    tool_calls: Some(calls),
+                    ..
+                } => {
+                    for call in calls {
+                        declared.push((i, call.id.clone(), call.name.clone()));
                     }
                 }
                 Message::Tool { tool_call_id, .. } => {

@@ -2295,13 +2295,12 @@ mod tests {
         sm.add_message("s1", user_msg("hello")).await.unwrap();
 
         // Simulate ContextBuilder setting runtime_content
-        if let Some(msg) = sm.sessions.get_mut("s1").unwrap().current_turn.first_mut() {
-            if let Message::User {
+        if let Some(msg) = sm.sessions.get_mut("s1").unwrap().current_turn.first_mut()
+            && let Message::User {
                 runtime_content, ..
             } = msg
-            {
-                *runtime_content = Some("runtime context here".to_string());
-            }
+        {
+            *runtime_content = Some("runtime context here".to_string());
         }
 
         // Verify it's set
@@ -2512,11 +2511,11 @@ mod tests {
         assert!(!runner.running.load(Ordering::Relaxed));
     }
 
-    #[test]
-    fn test_session_runner_wait_idle() {
+    #[tokio::test]
+    async fn test_session_runner_wait_idle() {
         let runner = SessionRunner::new();
         // wait_idle should return immediately if not running
-        runner.wait_idle();
+        runner.wait_idle().await;
         assert!(!runner.running.load(Ordering::Relaxed));
     }
 

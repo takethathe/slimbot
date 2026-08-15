@@ -62,11 +62,6 @@ pub fn get_content(name: &str) -> Option<&'static str> {
 pub fn get_content_by_dest(dest: &str) -> Option<&'static str> {
     EMBEDDED_FILES.iter().find(|(_, _, d)| *d == dest).map(|(_, c, _)| *c)
 }
-
-/// Look up destination path by filename.
-pub fn get_dest(name: &str) -> Option<&'static str> {
-    EMBEDDED_FILES.iter().find(|(n, _, _)| *n == name).map(|(_, _, d)| *d)
-}
 "#,
     );
 

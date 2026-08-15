@@ -316,7 +316,7 @@ mod tests {
     fn test_validate_path_sandbox_strips_leading_slash() {
         let tmp = tempdir().unwrap();
         let ws = tmp.path().join("ws");
-        std::fs::create_dir_all(&ws.join("etc")).unwrap();
+        std::fs::create_dir_all(ws.join("etc")).unwrap();
         let pm = PathManager::resolve(None, Some(ws.to_str().unwrap()), None).unwrap();
 
         // Leading slash stripped, treated as workspace-relative
@@ -329,7 +329,7 @@ mod tests {
     fn test_validate_path_sandbox_deep_escape() {
         let tmp = tempdir().unwrap();
         let ws = tmp.path().join("ws");
-        std::fs::create_dir_all(&ws.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(ws.join("a/b/c")).unwrap();
         let pm = PathManager::resolve(None, Some(ws.to_str().unwrap()), None).unwrap();
 
         // Deep escape attempt with many .. segments

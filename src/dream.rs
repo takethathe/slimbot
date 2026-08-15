@@ -140,7 +140,7 @@ impl Tool for DreamFileEditorTool {
         let path = resolve_workspace_path(path_str, &self.workspace_dir)?;
 
         // Check if path is allowed
-        let is_allowed_file = self.allowed_files.iter().any(|f| path == *f);
+        let is_allowed_file = self.allowed_files.contains(&path);
         let is_in_allowed_dir = path.starts_with(&self.allowed_dir);
 
         if !is_allowed_file && !is_in_allowed_dir {
@@ -362,6 +362,9 @@ mod tests {
 
     use crate::memory::MemoryStore;
 
+    /// Map of provider name to provider instance.
+    type ProviderMap = Arc<HashMap<String, Arc<dyn Provider>>>;
+
     async fn make_memory_store(workspace_dir: &std::path::Path) -> SharedMemoryStore {
         let memory_store = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(workspace_dir)));
         memory_store
@@ -378,7 +381,7 @@ mod tests {
         ))
     }
 
-    fn make_providers() -> (Arc<HashMap<String, Arc<dyn Provider>>>, Arc<dyn Provider>) {
+    fn make_providers() -> (ProviderMap, Arc<dyn Provider>) {
         use crate::config::ProviderConfig;
         use crate::provider::OpenAIProvider;
 
@@ -556,8 +559,10 @@ mod tests {
         providers.insert("default".to_string(), default_provider.clone());
 
         // Create an override provider with different config
-        let mut override_config = crate::config::ProviderConfig::default();
-        override_config.model = "gpt-3.5-turbo".to_string();
+        let override_config = crate::config::ProviderConfig {
+            model: "gpt-3.5-turbo".to_string(),
+            ..Default::default()
+        };
         let override_provider: Arc<dyn Provider> =
             Arc::new(crate::provider::OpenAIProvider::new(&override_config));
         providers.insert("cheap".to_string(), override_provider.clone());

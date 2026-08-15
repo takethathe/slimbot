@@ -649,6 +649,6 @@ mod tests {
 
         cm.init().await.unwrap();
         // Channels are stored in a map keyed by type, so we should have 2 entries
-        assert!(cm.channels.lock().await.len() >= 1); // At least 1 since both factory create same channel
+        assert!(!cm.channels.lock().await.is_empty()); // At least 1 since both factory create same channel
     }
 }

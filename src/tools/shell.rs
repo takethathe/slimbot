@@ -9,6 +9,7 @@ pub struct ShellTool {
 }
 
 impl ShellTool {
+    #[cfg(test)]
     pub fn new(timeout_secs: u64) -> Self {
         Self { timeout_secs }
     }

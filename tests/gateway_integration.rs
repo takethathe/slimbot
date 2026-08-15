@@ -10,7 +10,7 @@ use slimbot::{
 
 /// Helper to create a minimal test config
 fn make_test_config(_data_dir: &std::path::Path) -> Config {
-    let config = Config {
+    Config {
         agent: slimbot::AgentConfig {
             provider: "default".to_string(),
             max_iterations: 10,
@@ -49,8 +49,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
             dream: slimbot::DreamConfig::default(),
         },
         web_fetch: None,
-    };
-    config
+    }
 }
 
 #[tokio::test]

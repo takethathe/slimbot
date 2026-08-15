@@ -9,9 +9,6 @@ use tokio::sync::{Notify, mpsc};
 /// Type-erased async future returning ().
 pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Type-erased async future returning T.
-pub type BoxFutureResult<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
 /// A single-threaded async executor that processes tasks in FIFO order.
 pub struct Worker {
     queue_tx: mpsc::UnboundedSender<Box<dyn FnOnce() -> BoxFuture + Send>>,
@@ -69,6 +66,7 @@ impl Worker {
     }
 
     /// Explicitly shut down this worker. Drains remaining queued tasks before exiting.
+    #[cfg(test)]
     pub fn close(self) {
         self.shutdown.notify_waiters();
     }
@@ -78,6 +76,7 @@ impl Worker {
         self.queue_len.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn id(&self) -> usize {
         self.id
     }
@@ -269,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_global_pool_init_and_access() {
-        let _ = WorkerPool::init_global(64);
+        WorkerPool::init_global(64);
         let pool = WorkerPool::global();
         assert_eq!(pool.max_workers, 64);
     }

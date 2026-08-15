@@ -285,8 +285,10 @@ fn test_written_config_is_valid_json() {
 #[test]
 fn test_normalize_multiple_providers() {
     let mut providers = HashMap::new();
-    let mut default_p = ProviderConfig::default();
-    default_p.api_key = "sk-key".to_string();
+    let default_p = ProviderConfig {
+        api_key: "sk-key".to_string(),
+        ..Default::default()
+    };
     providers.insert("default".to_string(), default_p);
 
     providers.insert(

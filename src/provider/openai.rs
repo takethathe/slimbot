@@ -215,7 +215,6 @@ struct ApiChoice {
 
 #[derive(Deserialize)]
 struct ApiMessage {
-    role: Option<String>,
     content: Option<String>,
     tool_calls: Option<Vec<ApiToolCall>>,
 }
@@ -232,7 +231,6 @@ where
 struct ApiToolCall {
     #[serde(default, deserialize_with = "deserialize_null_default")]
     id: String,
-    r#type: String,
     function: ApiFunction,
 }
 
@@ -1708,7 +1706,7 @@ mod tests {
         let u2 = Message::user("follow up".to_string());
         let msgs: Vec<&Message> = vec![&sys, &u1, &a1, &t1, &u2];
         let result = super::build_api_messages(&msgs, true);
-        let total: usize = result.iter().map(|m| cache_control_count(m)).sum();
+        let total: usize = result.iter().map(cache_control_count).sum();
         assert_eq!(total, 2, "expected 2 message markers (system + boundary)");
     }
 
