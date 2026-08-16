@@ -454,6 +454,7 @@ pub struct SessionTaskBuilder {
     consolidator: Option<Arc<Consolidator>>,
     cancel_token: Option<CancellationToken>,
     max_tokens: Option<u32>,
+    tracer: Option<Arc<crate::trace::Tracer>>,
 }
 
 impl SessionTaskBuilder {
@@ -473,6 +474,7 @@ impl SessionTaskBuilder {
             consolidator: None,
             cancel_token: None,
             max_tokens: None,
+            tracer: None,
         }
     }
 
@@ -531,6 +533,12 @@ impl SessionTaskBuilder {
         self
     }
 
+    /// Attach the run tracer so gateway-built tasks emit spans.
+    pub fn tracer(mut self, t: Option<Arc<crate::trace::Tracer>>) -> Self {
+        self.tracer = t;
+        self
+    }
+
     pub fn build(self) -> SessionTask {
         let session_manager = self.session_manager.expect("session_manager required");
         let tool_manager = self.tool_manager.expect("tool_manager required");
@@ -550,6 +558,7 @@ impl SessionTaskBuilder {
         let consolidator = self.consolidator;
         let channel_inject = self.channel_inject;
         let cancel_token = self.cancel_token;
+        let tracer = self.tracer;
 
         let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> = Box::new(move || {
             Box::pin(async move {
@@ -561,6 +570,7 @@ impl SessionTaskBuilder {
                     .workspace_dir(workspace_dir)
                     .memory_store(memory_store)
                     .consolidator(consolidator)
+                    .tracer(tracer)
                     .max_tokens(max_tokens)
                     .build();
                 let result = runner

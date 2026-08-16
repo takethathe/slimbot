@@ -180,6 +180,10 @@ pub struct AgentLoop {
     shutdown_tx: broadcast::Sender<()>,
     /// Pre-built runner with stable components, reused across tasks.
     runner: AgentRunner,
+    /// Shared tracer for runs dispatched through the inbound loop. WebUI
+    /// inbound requests (and the `/stop` sentinel) build their own runner via
+    /// `SessionTaskBuilder`; cron/heartbeat instead reuse `self.runner`.
+    tracer: Option<Arc<Tracer>>,
     /// Dream service for background dream tasks.
     dream_service: Arc<crate::dream::DreamService>,
 }
@@ -371,7 +375,7 @@ impl AgentLoop {
             memory_store.clone(),
             Some(consolidator.clone()),
             max_tokens,
-            tracer,
+            tracer.clone(),
         );
 
         Ok(Self {
@@ -386,6 +390,7 @@ impl AgentLoop {
             consolidator,
             shutdown_tx,
             runner,
+            tracer,
             dream_service,
         })
     }
@@ -498,6 +503,7 @@ impl AgentLoop {
         let memory_store = self.memory_store.clone();
         let outbound_tx = self.message_bus.outbound_tx();
         let consolidator = self.consolidator.clone();
+        let tracer = self.tracer.clone();
         let message_bus = self.message_bus.clone();
         let dream_service = self.dream_service.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -560,6 +566,12 @@ impl AgentLoop {
                                 &sid,
                                 &request.content,
                                 max_tokens,
+                                tracer.clone(),
+                                tool_manager.clone(),
+                                provider.clone(),
+                                config.clone(),
+                                workspace_dir.clone(),
+                                memory_store.clone(),
                             ).await;
                             if !msg.is_empty() {
                                 message_bus.publish_outbound(BusResult {
@@ -598,6 +610,7 @@ impl AgentLoop {
                         .consolidator(Some(consolidator.clone()))
                         .cancel_token(cancel_token)
                         .max_tokens(max_tokens)
+                        .tracer(tracer.clone())
                         .build();
 
                         let mut guard = session_manager.lock().await;
@@ -616,12 +629,22 @@ impl AgentLoop {
     /// For /stop: cancels the session and enqueues a sentinel task; returns empty response
     /// (the sentinel task's result signals completion to the user).
     /// For /clear and /status: returns a response message directly.
+    ///
+    /// The runner components are required to build the /stop sentinel task's
+    /// runner (a full `AgentRunner`); commands that don't enqueue a task ignore them.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_agent_loop_command(
         session_manager: &SharedSessionManager,
         outbound_tx: &tokio::sync::mpsc::Sender<BusResult>,
         session_id: &str,
         command: &str,
         max_tokens: u32,
+        tracer: Option<Arc<Tracer>>,
+        tool_manager: Arc<ToolManager>,
+        provider: Arc<dyn Provider>,
+        config: crate::config::AgentConfig,
+        workspace_dir: std::path::PathBuf,
+        memory_store: SharedMemoryStore,
     ) -> (String, bool) {
         match command {
             "/stop" => {
@@ -640,9 +663,15 @@ impl AgentLoop {
                         TaskHook::new(session_id),
                     )
                     .session_manager(session_manager.clone())
+                    .tool_manager(tool_manager)
+                    .provider(provider)
+                    .config(config)
+                    .workspace_dir(workspace_dir)
+                    .memory_store(memory_store)
                     .outbound_tx(outbound_tx.clone())
                     .cancel_token(Some(ct))
                     .max_tokens(max_tokens)
+                    .tracer(tracer)
                     .build(),
                     None => {
                         return ("No session to stop.".to_string(), false);
@@ -1250,6 +1279,27 @@ mod tests {
 
     use crate::provider::MockProvider;
 
+    /// Minimal runner components for `handle_agent_loop_command` tests that
+    /// don't exercise the `/stop` sentinel (which needs them to build a task).
+    async fn make_command_env(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        Arc<ToolManager>,
+        Arc<dyn Provider>,
+        crate::config::AgentConfig,
+        std::path::PathBuf,
+        SharedMemoryStore,
+    ) {
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tm = Arc::new(ToolManager::new(workspace.clone()));
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new());
+        let config = crate::config::AgentConfig::default();
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace)));
+        ms.lock().await.init().unwrap();
+        (tm, provider, config, workspace, ms)
+    }
+
     async fn make_agent_loop_with_mock(tmp: &tempfile::TempDir) -> AgentLoop {
         let paths = make_test_paths(tmp);
         let (message_bus, _receivers) = MessageBus::new();
@@ -1537,6 +1587,7 @@ mod tests {
             SessionManager::new(session_dir).unwrap(),
         ));
         let (outbound_tx, _) = mpsc::channel(10);
+        let (tm, provider, config, workspace, ms) = make_command_env(&tmp).await;
 
         // Create a session
         {
@@ -1555,11 +1606,122 @@ mod tests {
             "test-session",
             "/status",
             4096,
+            None,
+            tm,
+            provider,
+            config,
+            workspace,
+            ms,
         )
         .await;
         assert!(!should_shutdown);
         assert!(response.contains("Session: test-session"));
         assert!(response.contains("Messages: 1"));
+    }
+
+    // ── /stop sentinel with an existing session must run (regression: builder
+    //    previously omitted tool_manager/provider/config/workspace_dir/
+    //    memory_store → `.expect()` panicked in `SessionTaskBuilder::build`) ──
+    #[tokio::test]
+    async fn test_stop_sentinel_with_existing_session_runs() {
+        crate::WorkerPool::init_global(64);
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let (message_bus, receivers) = MessageBus::new();
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "mock".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "mock-model".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                    unknown: Default::default(),
+                },
+                dream: crate::config::DreamConfig::default(),
+            },
+            web_fetch: None,
+            tracing: crate::config::TraceConfig::default(),
+        });
+        let provider = Arc::new(MockProvider::new());
+        let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
+        let agent_loop = AgentLoop::from_parts(
+            &paths,
+            message_bus.clone(),
+            receivers.inbound,
+            config,
+            provider,
+            tool_manager,
+        )
+        .await
+        .unwrap();
+
+        // An existing session is required: cancel_and_reset_session returns
+        // Some only when a session runner exists.
+        let sm = agent_loop.session_manager();
+        sm.lock()
+            .await
+            .get_or_create("webui:stop-regression")
+            .await
+            .unwrap();
+
+        let mut outbound_rx = receivers.outbound;
+        agent_loop.start_inbound(None);
+        message_bus
+            .inbound_tx()
+            .send(crate::message_bus::BusRequest {
+                session_id: "webui:stop-regression".to_string(),
+                content: "/stop".to_string(),
+                channel_inject: None,
+                hook: TaskHook::new("webui:stop-regression"),
+            })
+            .await
+            .unwrap();
+
+        // The sentinel task must complete and send its result; a panic in
+        // `SessionTaskBuilder::build` kills the inbound loop and nothing
+        // arrives (timeout → red).
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            outbound_rx.recv().await
+        })
+        .await
+        .expect("sentinel /stop task should complete")
+        .expect("outbound result");
+        assert!(
+            result.content.contains("Task cancelled"),
+            "unexpected sentinel result: {:?}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -1572,6 +1734,7 @@ mod tests {
             SessionManager::new(session_dir.clone()).unwrap(),
         ));
         let (outbound_tx, _) = mpsc::channel(10);
+        let (tm, provider, config, workspace, ms) = make_command_env(&tmp).await;
 
         // Create a session with messages
         {
@@ -1588,9 +1751,20 @@ mod tests {
         assert!(session_dir.join("test-session.jsonl").exists());
 
         // Test /clear command
-        let (response, should_shutdown) =
-            AgentLoop::handle_agent_loop_command(&sm, &outbound_tx, "test-session", "/clear", 4096)
-                .await;
+        let (response, should_shutdown) = AgentLoop::handle_agent_loop_command(
+            &sm,
+            &outbound_tx,
+            "test-session",
+            "/clear",
+            4096,
+            None,
+            tm,
+            provider,
+            config,
+            workspace,
+            ms,
+        )
+        .await;
         assert!(!should_shutdown);
         assert!(response.contains("cleared"));
 
@@ -1608,6 +1782,7 @@ mod tests {
             SessionManager::new(session_dir).unwrap(),
         ));
         let (outbound_tx, _) = mpsc::channel(10);
+        let (tm, provider, config, workspace, ms) = make_command_env(&tmp).await;
 
         // Test /stop command with no session
         let (response, should_shutdown) = AgentLoop::handle_agent_loop_command(
@@ -1616,6 +1791,12 @@ mod tests {
             "nonexistent-session",
             "/stop",
             4096,
+            None,
+            tm,
+            provider,
+            config,
+            workspace,
+            ms,
         )
         .await;
         assert!(!should_shutdown);
@@ -1632,6 +1813,7 @@ mod tests {
             SessionManager::new(session_dir).unwrap(),
         ));
         let (outbound_tx, _) = mpsc::channel(10);
+        let (tm, provider, config, workspace, ms) = make_command_env(&tmp).await;
 
         // Test unknown command
         let (response, should_shutdown) = AgentLoop::handle_agent_loop_command(
@@ -1640,9 +1822,129 @@ mod tests {
             "test-session",
             "/unknown",
             4096,
+            None,
+            tm,
+            provider,
+            config,
+            workspace,
+            ms,
         )
         .await;
         assert!(!should_shutdown);
         assert!(response.is_empty());
+    }
+
+    // ── Gateway inbound path: task built via SessionTaskBuilder must trace ──
+    #[tokio::test]
+    async fn test_gateway_inbound_task_writes_trace_spans() {
+        crate::WorkerPool::init_global(64);
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let (message_bus, receivers) = MessageBus::new();
+        let config = Arc::new(crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "default".to_string(),
+                max_iterations: 10,
+                timeout_seconds: 30,
+                max_tool_result_chars: 8000,
+                persist_tool_results: false,
+                context_window_tokens: 32768,
+                unknown: Default::default(),
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "default".to_string(),
+                    crate::config::ProviderConfig {
+                        r#type: "mock".to_string(),
+                        api_url: "".to_string(),
+                        base_url: "".to_string(),
+                        api_key: "test-key".to_string(),
+                        model: "mock-model".to_string(),
+                        temperature: 0.7,
+                        max_tokens: 4096,
+                        prompt_cache_enabled: false,
+                        unknown: Default::default(),
+                    },
+                );
+                map
+            },
+            tools: vec![],
+            channels: std::collections::HashMap::new(),
+            gateway: crate::config::GatewayConfig {
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
+                heartbeat: crate::config::HeartbeatConfig {
+                    enabled: false,
+                    interval_s: 60,
+                    unknown: Default::default(),
+                },
+                dream: crate::config::DreamConfig::default(),
+            },
+            web_fetch: None,
+            tracing: crate::config::TraceConfig {
+                enabled: true,
+                reset_on_start: true,
+                backends: vec![crate::config::TraceBackendEntry {
+                    r#type: "file".to_string(),
+                    enabled: true,
+                    path: String::new(), // empty → {workspace}/traces.jsonl
+                    endpoint: String::new(),
+                    service_name: "slimbot".to_string(),
+                    unknown: Default::default(),
+                }],
+                unknown: Default::default(),
+            },
+        });
+        let provider = Arc::new(MockProvider::new());
+        let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
+        let agent_loop = AgentLoop::from_parts(
+            &paths,
+            message_bus.clone(),
+            receivers.inbound,
+            config,
+            provider,
+            tool_manager,
+        )
+        .await
+        .unwrap();
+
+        // Drain outbound so the task's result send never blocks.
+        let mut outbound_rx = receivers.outbound;
+        let drain = tokio::spawn(async move {
+            while let Some(r) = outbound_rx.recv().await {
+                if r.content.contains("Mock response") {
+                    break;
+                }
+            }
+        });
+
+        agent_loop.start_inbound(None);
+        message_bus
+            .inbound_tx()
+            .send(crate::message_bus::BusRequest {
+                session_id: "webui:gateway-trace-test".to_string(),
+                content: "hi".to_string(),
+                channel_inject: None,
+                hook: TaskHook::new("webui:gateway-trace-test"),
+            })
+            .await
+            .unwrap();
+
+        // Wait for the task to complete (outbound result received).
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), drain)
+            .await
+            .expect("task should complete within timeout");
+
+        let file = paths.workspace_dir().join("traces.jsonl");
+        let content = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(
+            content.lines().count() >= 1,
+            "gateway inbound task must write span lines to {:?}; got: {:?}",
+            file,
+            content
+        );
     }
 }

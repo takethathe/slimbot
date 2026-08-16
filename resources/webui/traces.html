@@ -617,7 +617,10 @@ function renderFlatSpan(span) {
 }
 
 function renderNode(node, guide) {
-  const span = node.span;
+  // The Rust serializer flattens the span fields onto the tree node
+  // (SpanNode { #[serde(flatten)] span, children }), so the node itself is
+  // the span plus a `children` array.
+  const span = node;
   const hasChildren = node.children && node.children.length > 0;
 
   let row = '<div class="span-row" data-node>';
@@ -632,10 +635,7 @@ function renderNode(node, guide) {
   let children = '';
   if (hasChildren) {
     children = '<div class="span-children">' +
-      node.children.map((c, i) => {
-        const g = guide + (i === node.children.length - 1 ? '&nbsp;&nbsp;&nbsp;' : '&#9500;&#9472; ');
-        return renderNode(c, g);
-      }).join('') +
+      node.children.map((c) => renderNode(c, guide + '\u00A0\u00A0\u00A0')).join('') +
       '</div>';
   }
 

@@ -2805,6 +2805,113 @@ async fn test_runner_chat_span_carries_provider_recorded_body() {
 }
 
 #[tokio::test]
+async fn test_runner_chat_span_records_response_content() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let provider = Arc::new(MockProvider::new(vec![
+        LLMResponse {
+            content: Some("first reply".to_string()),
+            tool_calls: Some(vec![tool_call("tc-1", "echo")]),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        },
+        LLMResponse {
+            content: Some("second reply".to_string()),
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        },
+    ]));
+    let backend = Arc::new(RecordingTraceBackend::default());
+    let runner = make_traced_runner(&tmp, provider, backend.clone()).await;
+
+    let result = runner
+        .run(
+            "hi".to_string(),
+            TaskHook::new("webui:chat-7"),
+            "webui:chat-7",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(result.success);
+
+    let chats = backend
+        .starts()
+        .into_iter()
+        .filter(|e| e.name == "chat")
+        .collect::<Vec<_>>();
+    assert_eq!(chats.len(), 2);
+    assert_eq!(
+        backend
+            .end_for(&chats[0])
+            .attributes
+            .get("gen_ai.response.content"),
+        Some(&serde_json::json!("first reply"))
+    );
+    assert_eq!(
+        backend
+            .end_for(&chats[1])
+            .attributes
+            .get("gen_ai.response.content"),
+        Some(&serde_json::json!("second reply"))
+    );
+}
+
+#[tokio::test]
+async fn test_runner_chat_span_omits_content_when_absent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Tool-call-only responses carry no content, so the attribute must not
+    // be recorded on those chat spans.
+    let provider = Arc::new(MockProvider::new(vec![
+        LLMResponse {
+            content: None,
+            tool_calls: Some(vec![tool_call("tc-1", "echo")]),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        },
+        LLMResponse {
+            content: None,
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        },
+    ]));
+    let backend = Arc::new(RecordingTraceBackend::default());
+    let runner = make_traced_runner(&tmp, provider, backend.clone()).await;
+
+    let result = runner
+        .run(
+            "hi".to_string(),
+            TaskHook::new("webui:chat-7"),
+            "webui:chat-7",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(result.success);
+
+    let chats = backend
+        .starts()
+        .into_iter()
+        .filter(|e| e.name == "chat")
+        .collect::<Vec<_>>();
+    assert_eq!(chats.len(), 2);
+    for chat in &chats {
+        assert!(
+            !backend
+                .end_for(chat)
+                .attributes
+                .contains_key("gen_ai.response.content"),
+            "chat span must not record content when the response has none"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_runner_tool_span_records_error_and_truncates_args() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path();

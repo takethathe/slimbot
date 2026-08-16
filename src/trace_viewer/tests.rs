@@ -525,3 +525,47 @@ fn test_span_node_serializes_attributes() {
     assert_eq!(json["attributes"]["gen_ai.agent.name"], "slimbot");
     assert_eq!(json["children"], json!([]));
 }
+
+#[test]
+fn test_detail_wire_shape_matches_trace_viewer_frontend() {
+    // The frontend (resources/webui/traces.html) renders tree nodes as bare
+    // span records: `renderNode` reads span fields directly off the node
+    // (`const span = node`), never a `span` wrapper. Lock this wire contract
+    // so a serializer change cannot silently break the trace viewer UI.
+    let root = span_line(
+        "w1",
+        "root001",
+        None,
+        "invoke_agent slimbot",
+        "2026-08-15T10:00:00.000000Z",
+        "2026-08-15T10:00:01.000000Z",
+        "ok",
+        json!({"gen_ai.agent.name": "slimbot"}),
+    );
+    let child = span_line(
+        "w1",
+        "child01",
+        Some("root001"),
+        "chat",
+        "2026-08-15T10:00:00.100000Z",
+        "2026-08-15T10:00:00.500000Z",
+        "ok",
+        json!({}),
+    );
+    let spans = parse_span_lines(&format!("{}\n{}", root, child));
+    let detail = build_detail("w1", &spans).unwrap();
+    let json = serde_json::to_value(&detail).unwrap();
+
+    let node = &json["root"];
+    // Span fields are flattened onto the tree node...
+    assert_eq!(node["span_id"], "root001");
+    assert_eq!(node["name"], "invoke_agent slimbot");
+    assert_eq!(node["attributes"]["gen_ai.agent.name"], "slimbot");
+    // ...there is no `span` wrapper (the original frontend bug read node.span).
+    assert!(node.get("span").is_none());
+    // Children nest recursively as bare spans too.
+    assert_eq!(node["children"][0]["span_id"], "child01");
+    assert!(node["children"][0].get("span").is_none());
+    // The flat list is bare span records as well.
+    assert_eq!(json["spans"][0]["span_id"], "root001");
+}

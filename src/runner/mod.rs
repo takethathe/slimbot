@@ -550,6 +550,12 @@ impl AgentRunner {
                         "gen_ai.response.finish_reasons",
                         serde_json::json!([response.finish_reason.to_string()]),
                     );
+                    if let Some(content) = &response.content {
+                        span.set_attribute(
+                            "gen_ai.response.content",
+                            serde_json::json!(content),
+                        );
+                    }
                 }
                 debug!(
                     "[AgentRunner] Got response: content_len={}, tool_calls={}, prompt_tokens={}, cached_tokens={}, completion_tokens={}, total_tokens={}",

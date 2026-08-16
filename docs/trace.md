@@ -112,12 +112,12 @@ pub struct Tracer {
 **`iteration`**：`iteration`（序号）
 
 **`chat`**：
-- GenAI：`gen_ai.operation.name`（`chat`）、`gen_ai.provider.name`（如 `openai`）、`gen_ai.request.model`、`gen_ai.request.max_tokens`、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`gen_ai.usage.cache_read.input_tokens`、`gen_ai.response.finish_reasons`（string 数组）、`error.type`（失败时，`provider_error`）
+- GenAI：`gen_ai.operation.name`（`chat`）、`gen_ai.provider.name`（如 `openai`）、`gen_ai.request.model`、`gen_ai.request.max_tokens`、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`gen_ai.usage.cache_read.input_tokens`、`gen_ai.response.finish_reasons`（string 数组）、`gen_ai.response.content`（string，完整 content；无 content 的纯工具调用响应不设置）、`error.type`（失败时，`provider_error`）
 - HTTP：`http.request.body`（**完整 body，字符串 attribute，非嵌套 JSON**；HTTP 标准 semconv，保留以在传输失败时可见）
 
 **`execute_tool {name}`**：`gen_ai.operation.name`（`execute_tool`）、`gen_ai.tool.name`、`gen_ai.agent.name`（`slimbot`）、`gen_ai.tool.call.id`、`gen_ai.tool.call.arguments`（截断 200 字符）、`error.type`（失败时，`tool_error`）。
 
-`error.type` 为低基数错误类别（`provider_error` / `max_iterations` / `cancelled` / `tool_error` / `_OTHER`），详细消息在 span status；`gen_ai.tool.call.arguments` 截断 200 字符、tool 错误消息截断 500 字符；body 全量不截断（按决策）。
+`error.type` 为低基数错误类别（`provider_error` / `max_iterations` / `cancelled` / `tool_error` / `_OTHER`），详细消息在 span status；`gen_ai.tool.call.arguments` 截断 200 字符、tool 错误消息截断 500 字符；body 全量不截断（按决策）；`gen_ai.response.content` 同样全量不截断（便于在 trace 中检视模型输出，前端对超长字符串折叠展示）。
 
 ## 最终 body 捕获
 

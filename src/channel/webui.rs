@@ -166,45 +166,27 @@ impl WebuiChannel {
         let config_path = self.config_path.clone();
 
         let handle = tokio::spawn(async move {
-            let index_html = embed::get_content_by_dest("webui/index.html")
-                .unwrap_or("<h1>SlimBot Gateway</h1>")
-                .to_string();
-            let traces_html = embed::get_content_by_dest("webui/traces.html")
-                .unwrap_or("<h1>Trace Viewer</h1>")
-                .to_string();
-            let config_html = embed::get_content_by_dest("webui/config.html")
-                .unwrap_or("<h1>Config Editor</h1>")
-                .to_string();
-
             let state = AppState {
                 chats,
                 inbound_tx,
                 channel_id,
                 session_manager,
-                index_html,
-                traces_html,
-                config_html,
+                index_html: embed::get_content_by_dest("webui/index.html")
+                    .unwrap_or("<h1>SlimBot Gateway</h1>")
+                    .to_string(),
+                traces_html: embed::get_content_by_dest("webui/traces.html")
+                    .unwrap_or("<h1>Trace Viewer</h1>")
+                    .to_string(),
+                config_html: embed::get_content_by_dest("webui/config.html")
+                    .unwrap_or("<h1>Config Editor</h1>")
+                    .to_string(),
                 config_path,
                 event_tx,
                 trace_paths,
                 trace_startup_ms,
             };
 
-            let app = axum::Router::new()
-                .route("/", get(index_handler))
-                .route("/chats", get(list_chats_handler))
-                .route("/chats", post(create_chat_handler))
-                .route("/sse", get(sse_handler))
-                .route("/message", post(message_handler))
-                .route("/session/*chat_id", get(session_history_handler))
-                .route("/traces", get(traces_page_handler))
-                .route("/traces/api/traces", get(traces_list_handler))
-                .route("/traces/api/trace/{id}", get(trace_detail_handler))
-                .route("/config", get(config_page_handler))
-                .route("/config/api/state", get(config_state_handler))
-                .route("/config/api/update", post(config_update_handler))
-                .route("/common.css", get(common_css_handler))
-                .with_state(Arc::new(state));
+            let app = build_router(Arc::new(state));
 
             let listener = match tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await {
                 Ok(l) => l,
@@ -239,6 +221,30 @@ impl WebuiChannel {
             channel_name,
         }
     }
+}
+
+/// Build the axum router for the WebUI channel.
+///
+/// Extracted from `start_server` so HTTP-level tests can exercise the real
+/// route table (handler-direct tests bypass route matching entirely).
+fn build_router(state: Arc<AppState>) -> axum::Router {
+    // Note: axum 0.7 captures use `:id` (not `{id}` — that is axum 0.8+
+    // syntax and would register a literal `{id}` segment that never matches).
+    axum::Router::new()
+        .route("/", get(index_handler))
+        .route("/chats", get(list_chats_handler))
+        .route("/chats", post(create_chat_handler))
+        .route("/sse", get(sse_handler))
+        .route("/message", post(message_handler))
+        .route("/session/*chat_id", get(session_history_handler))
+        .route("/traces", get(traces_page_handler))
+        .route("/traces/api/traces", get(traces_list_handler))
+        .route("/traces/api/trace/:id", get(trace_detail_handler))
+        .route("/config", get(config_page_handler))
+        .route("/config/api/state", get(config_state_handler))
+        .route("/config/api/update", post(config_update_handler))
+        .route("/common.css", get(common_css_handler))
+        .with_state(state)
 }
 
 /// Chat info returned by the chat list endpoint.
@@ -1087,6 +1093,47 @@ mod tests {
         assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
     }
 
+    #[tokio::test]
+    async fn test_webui_trace_detail_route_matches_full_trace_id() {
+        // Regression: the detail endpoint must be reachable over HTTP with the
+        // full trace id from the list. Handler-direct tests bypass route
+        // matching, so a route table bug (e.g. `{id}` instead of `:id` under
+        // axum 0.7) would slip through them and surface as a 404 here.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_trace_file(tmp.path(), "r0ute-id-0123456789abcdef", "ok");
+        let state = trace_state(vec![path]);
+
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!(
+            "http://127.0.0.1:{}/traces/api/trace/r0ute-id-0123456789abcdef",
+            addr.port()
+        );
+        let mut last_status = None;
+        for _ in 0..50 {
+            if let Ok(res) = client.get(&url).send().await {
+                last_status = Some(res.status());
+                if res.status().is_success() {
+                    let body: serde_json::Value = res.json().await.unwrap();
+                    assert_eq!(body["full_trace_id"], "r0ute-id-0123456789abcdef");
+                    assert_eq!(body["span_count"], 2);
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!(
+            "trace detail route did not match full trace id (last HTTP {:?})",
+            last_status
+        );
+    }
+
     // ── Config editor handlers ──
 
     /// Build a minimal AppState for config handler tests.
@@ -1239,5 +1286,31 @@ mod tests {
         let css = crate::embed::get_content_by_dest("webui/common.css");
         assert!(css.is_some(), "webui/common.css should be embedded");
         assert!(css.unwrap().contains("--accent"));
+    }
+
+    #[test]
+    fn test_traces_html_guide_uses_real_chars_not_html_entities() {
+        // Regression: renderNode() builds the span-tree indentation guide and
+        // passes it through esc(), which HTML-escapes `&`. The guide therefore
+        // must be real characters (non-breaking spaces), not HTML entity
+        // strings like `&nbsp;` — those rendered literally as
+        // `&nbsp;&nbsp;&nbsp;` text next to every child span in the tree.
+        let traces = crate::embed::get_content_by_dest("webui/traces.html")
+            .expect("webui/traces.html should be embedded");
+
+        // Each nesting level indents with three non-breaking spaces.
+        assert!(
+            traces.contains("'\\u00A0\\u00A0\\u00A0'"),
+            "renderNode guide must be real nbsp chars"
+        );
+        // Plain space indentation only: no box-drawing decoration and no
+        // entity forms that esc() would double-escape.
+        assert!(
+            !traces.contains("\\u251C\\u2500")
+                && !traces.contains("&nbsp;")
+                && !traces.contains("&#9500;")
+                && !traces.contains("&#9472;"),
+            "span-tree guide must be plain nbsp indentation only"
+        );
     }
 }

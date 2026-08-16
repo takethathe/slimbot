@@ -1,5 +1,38 @@
 # TODO
 
+## Trace chat span 增加 response content attribute（2026-08-16）
+
+- [x] **chat span 记录 response content** — `src/runner/mod.rs` 在收到 provider 响应后为 chat span 设置 `gen_ai.response.content`（string，完整 content 不截断，与 `http.request.body` 的「全量不截断」决策一致）；无 content 的纯工具调用响应不设置该 attribute
+- [x] **测试** — `test_runner_chat_span_records_response_content`（多轮迭代各携带自己的 content）、`test_runner_chat_span_omits_content_when_absent`（纯工具调用响应不设置）
+- [x] **验证** — `cargo fmt -- --check`、`cargo clippy`（无新 warning）、`cargo test` 全过
+
+## Gateway 入站任务缺失 tracer（2026-08-16 修复）
+
+- [x] **根因** — `AgentLoop.start_inbound`（Gateway WebUI/cron/heartbeat 任务路径）经 `SessionTaskBuilder` 构建 runner，但 builder 从未携带 tracer → 入站任务全部无埋点，`traces.jsonl` 保持空文件（CLI 模式走 `run_task`/`self.runner` 正常）。证据：Gateway 启动时 `reset_trace_files` 创建了空 `traces.jsonl`（17:53:00），同一进程内 WebUI 任务完成但零 span 落盘
+- [x] **修复** — `SessionTaskBuilder` 新增 `tracer` 字段 + `.tracer()` builder 方法并在 `build()` 中传入 `AgentRunner`；`AgentLoop` 增加 `tracer` 字段（`from_parts` 中与 runner 共享同一实例），`start_inbound` 的普通任务与 `/stop` sentinel 任务均传入；dream 保持显式不追踪（原设计）
+- [x] **回归测试** — `test_gateway_inbound_task_writes_trace_spans`：tracing 开启 + file backend（空 path）→ `from_parts` → `start_inbound` → 经 message_bus 发送任务 → 断言 `{workspace}/traces.jsonl` 出现 span 行（修复前 RED：文件为空；修复后 GREEN）
+- [x] **验证** — `cargo fmt -- --check`、`cargo clippy`（无新 warning）、`cargo test` 全过（1137 lib + 集成，4 连跑稳定）
+
+## Trace viewer 详情路由 404（2026-08-16 修复）
+
+- [x] **根因** — `build_router` 中详情路由写作 `/traces/api/trace/{id}`，但项目依赖 axum 0.7（matchit 0.7），其捕获语法是 `:id`；`{id}` 是 axum 0.8+ 语法，在 0.7 下会被注册为**字面量**路径段 `{id}`，导致列表页能列出 trace（`/traces/api/traces` 正常），展开详情时 `/traces/api/trace/<full_trace_id>` 永不匹配 → 404 → 前端显示 "Trace not found (maybe still in progress)." 证据：同一数据直调 handler 返回 200，经路由即 404；echo 路由实验证明 `{id}` 不匹配、`:id` 匹配
+- [x] **修复** — 路由改为 `/traces/api/trace/:id`；同时把 `start_server` 中的路由表提取为 `build_router()`，使 HTTP 层可测（原 handler 直调测试绕过路由匹配，无法捕获此类 bug）
+- [x] **回归测试** — `test_webui_trace_detail_route_matches_full_trace_id`：真实 HTTP 请求经 `build_router` 打到详情端点，断言 200 + `full_trace_id` 回显（修复前 RED：404；修复后 GREEN）
+- [x] **验证** — `cargo fmt -- --check`、`cargo clippy`（0 warning）、`cargo test` 全过（990 lib + 集成）；用真实 `~/.slimbot/workspace/traces.jsonl` 复跑原复现循环，详情请求 404 → 200
+
+## Trace viewer 详情渲染崩溃（2026-08-16 修复）
+
+- [x] **根因** — `SpanNode` 用 `#[serde(flatten)]` 序列化（span 字段直接内联到树节点，无 `span` 包装），但前端 `renderNode` 读取 `node.span` → `undefined` → 展开详情时 JS 崩溃 "undefined is not an object (evaluating 'span.span_id')"。Rust 侧序列化测试 `test_span_node_serializes_attributes` 已锁定 flatten 形状，前端是偏离方
+- [x] **修复** — `resources/webui/traces.html` 的 `renderNode` 改为 `const span = node`（节点本身即 span + children），与 in-flight 扁平路径 `renderFlatSpan` 的读取方式统一
+- [x] **回归测试** — `test_detail_wire_shape_matches_trace_viewer_frontend`：锁定 detail 载荷线契约（root/children 均为裸 span 字段、无 `span` 包装），防止序列化变更再次静默破坏前端
+- [x] **验证** — 用真实 `traces.jsonl` 的 detail 载荷跑真实前端渲染（node 抽取 `traces.html` 脚本）：修复前 CRASH（`Cannot read properties of undefined (reading 'span_id')`），修复后渲染 3 行且全部 span_id 存在；`cargo fmt -- --check`、`cargo clippy`（0 warning）、`cargo test` 全过（1139）
+
+## Review 修复（2026-08-16，code review 子代理发现）
+
+- [x] **`/stop` sentinel 对已存在会话 panic（既有 bug）** — `handle_agent_loop_command` 的 `/stop` 分支经 `SessionTaskBuilder` 建任务时只传了 session_manager/outbound_tx/cancel_token/max_tokens，`build()` 对缺失字段 `.expect(...)` → 任何已存在会话的 `/stop` 都会 panic（`tool_manager required`）。修复：`handle_agent_loop_command` 增加 tool_manager/provider/config/workspace_dir/memory_store 参数并完整构建 sentinel；回归测试 `test_stop_sentinel_with_existing_session_runs`（修复前 RED：inbound loop 被 panic 杀死，超时）
+- [x] **全局 WorkerPool 跨 runtime 复用死 worker（既有 bug，测试暴露）** — `WorkerPool` 是进程级 OnceLock 单例，但 worker 的 loop 是 `tokio::spawn` 在创建它的 runtime 上；并行测试中某 runtime 结束 → 其 worker 仍被后续 submit 当作空闲复用 → 任务永久搁浅（生产单 runtime 不受影响，测试多 runtime 触发）。修复：worker 记录 `runtime_id`，submit 只复用当前 runtime 的 worker（否则新建，上限内）；loop 加 `AliveGuard`（future 被取消/退出时置 dead）并在 submit/reap 时剔除死 worker；回归测试 `test_pool_skips_dead_workers_from_finished_runtime`
+- [x] **注释准确性** — `AgentLoop.tracer` 字段注释修正：仅 WebUI 入站请求与 `/stop` sentinel 走 `SessionTaskBuilder`，cron/heartbeat 复用 `self.runner`
+
 ## WebUI 配置编辑器（2026-08-16 完成）
 
 - [x] **config 定义扩展** — `define_config!` 新增 `secret` 约束（`FieldMeta.secret`）；section 改为字符串字面量（支持 `gateway.cron` 等点分路径）；修复 `allowed_max` 元数据派发；迁移 `CronConfig`/`HeartbeatConfig`/`DreamConfig`/`WebFetchConfig` 进 `config_defs.rs`；`ProviderConfig.api_key` 标 `secret`；`Config::clamp()` 补调新结构体

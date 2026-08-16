@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -15,12 +15,31 @@ pub struct Worker {
     shutdown: Arc<Notify>,
     id: usize,
     queue_len: Arc<AtomicUsize>,
+    /// Cleared to `false` when this worker's message loop terminates (runtime
+    /// shutdown or explicit close). The pool must never submit to a dead
+    /// worker: its loop may live on another (finished) tokio runtime.
+    alive: Arc<AtomicBool>,
+    /// The tokio runtime this worker's loop is spawned on. A worker's queue is
+    /// only drained while that runtime lives, so the pool only reuses workers
+    /// from the submitting runtime.
+    runtime_id: tokio::runtime::Id,
+}
+
+/// Clears the worker's `alive` flag when dropped (i.e. when the message-loop
+/// future is cancelled by its runtime shutting down, or exits normally).
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 static WORKER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl Worker {
     /// Create a new Worker and spawn its internal message loop.
+    /// Must be called from within a tokio runtime.
     pub fn new() -> Self {
         let (queue_tx, mut queue_rx) =
             mpsc::unbounded_channel::<Box<dyn FnOnce() -> BoxFuture + Send>>();
@@ -28,10 +47,17 @@ impl Worker {
         let shutdown_clone = shutdown.clone();
         let id = WORKER_COUNTER.fetch_add(1, Ordering::Relaxed);
         let queue_len = Arc::new(AtomicUsize::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_clone = alive.clone();
+        let runtime_id = tokio::runtime::Handle::current().id();
 
         tokio::spawn({
             let queue_len = queue_len.clone();
+            let _alive_guard = AliveGuard(alive_clone);
             async move {
+                // Held for the lifetime of this future; dropping it (runtime
+                // shutdown or exit) marks the worker dead.
+                let _alive_guard = _alive_guard;
                 loop {
                     tokio::select! {
                         biased;
@@ -56,6 +82,8 @@ impl Worker {
             shutdown,
             id,
             queue_len,
+            alive,
+            runtime_id,
         }
     }
 
@@ -76,6 +104,17 @@ impl Worker {
         self.queue_len.load(Ordering::Relaxed)
     }
 
+    /// Whether this worker's message loop is still running. A worker whose
+    /// originating tokio runtime shut down is dead and must not be reused.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// The tokio runtime this worker's message loop is spawned on.
+    pub fn runtime_id(&self) -> tokio::runtime::Id {
+        self.runtime_id
+    }
+
     #[cfg(test)]
     pub fn id(&self) -> usize {
         self.id
@@ -89,6 +128,8 @@ impl Clone for Worker {
             shutdown: self.shutdown.clone(),
             id: self.id,
             queue_len: self.queue_len.clone(),
+            alive: self.alive.clone(),
+            runtime_id: self.runtime_id,
         }
     }
 }
@@ -138,19 +179,34 @@ impl WorkerPool {
         }
     }
 
-    /// Submit a closure. The pool finds an idle worker or creates a new one
-    /// (up to max_workers). If all workers are busy, queues to the least busy one.
+    /// Submit a closure. The pool finds an idle worker from the *current*
+    /// runtime or creates a new one (up to max_workers). If all workers are
+    /// busy, queues to the least busy one.
+    ///
+    /// Workers are only reused by the runtime that created them: a worker's
+    /// queue is drained by its own tokio runtime, and once that runtime shuts
+    /// down the worker dies with it. Handing a task to another runtime's
+    /// worker can strand the task when that runtime finishes (as happens with
+    /// parallel tests, each on its own runtime).
     pub fn submit(&self, f: Box<dyn FnOnce() -> BoxFuture + Send>) {
         let mut guard = self.workers.write().unwrap_or_else(|e| e.into_inner());
+        let current_runtime = tokio::runtime::Handle::current().id();
 
-        // Try to find an idle worker
-        if let Some(entry) = guard.iter_mut().find(|e| e.worker.queue_len() == 0) {
+        // Drop workers whose message loop died with a previous runtime; they
+        // can never process another task and would otherwise be picked as idle.
+        guard.retain(|e| e.worker.is_alive());
+
+        // Try to find an idle worker from the current runtime
+        if let Some(entry) = guard
+            .iter_mut()
+            .find(|e| e.worker.runtime_id() == current_runtime && e.worker.queue_len() == 0)
+        {
             entry.worker.submit(f);
             entry.last_active = Instant::now();
             return;
         }
 
-        // No idle worker — try to create a new one
+        // No idle worker on this runtime — try to create a new one
         if guard.len() < self.max_workers {
             let worker = Worker::new();
             worker.submit(f);
@@ -171,6 +227,10 @@ impl WorkerPool {
     fn reap_idle_workers(&self) {
         let mut guard = self.workers.write().unwrap_or_else(|e| e.into_inner());
         guard.retain(|entry| {
+            // Dead workers (runtime shut down) are removed immediately.
+            if !entry.worker.is_alive() {
+                return false;
+            }
             // Keep workers that have pending messages or were active recently
             if entry.worker.queue_len() > 0 {
                 return true;
@@ -394,5 +454,45 @@ mod tests {
         // Reap should not remove workers with pending tasks
         pool.reap_idle_workers();
         assert_eq!(pool.workers.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_pool_skips_dead_workers_from_finished_runtime() {
+        let pool = WorkerPool::new(4);
+
+        // Create a worker on a short-lived runtime, then let that runtime die.
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                pool.submit(Box::new(|| Box::pin(async {})));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            });
+        }
+
+        // The pool must not submit to the dead worker; it creates a fresh one
+        // on the current runtime, so the task actually runs.
+        let done = Arc::new(AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let done2 = done.clone();
+            pool.submit(Box::new(move || {
+                Box::pin(async move {
+                    done2.store(true, Ordering::SeqCst);
+                })
+            }));
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !done.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("task must run on a fresh worker, not a dead one");
+        });
     }
 }
