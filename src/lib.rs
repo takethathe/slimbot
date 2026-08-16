@@ -7,6 +7,7 @@ pub(crate) mod config;
 pub(crate) mod config_defs;
 pub(crate) mod config_macro;
 pub(crate) mod config_normalize;
+pub(crate) mod config_schema;
 pub(crate) mod consolidate;
 pub(crate) mod context;
 pub(crate) mod cron;

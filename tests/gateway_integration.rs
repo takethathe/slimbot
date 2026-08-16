@@ -41,10 +41,14 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
         tools: vec![],
         channels: std::collections::HashMap::new(),
         gateway: slimbot::GatewayConfig {
-            cron: slimbot::CronConfig { enabled: false },
+            cron: slimbot::CronConfig {
+                enabled: false,
+                unknown: Default::default(),
+            },
             heartbeat: slimbot::HeartbeatConfig {
                 enabled: false,
                 interval_s: 60,
+                unknown: Default::default(),
             },
             dream: slimbot::DreamConfig::default(),
         },

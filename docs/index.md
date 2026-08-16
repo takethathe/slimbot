@@ -32,7 +32,7 @@
 | [内存与历史](memory.md) | `memory.rs` | 长期记忆、历史记录、游标管理 |
 | [工作池](worker.md) | `worker.rs` | 异步 Worker 与动态 WorkerPool |
 | [I/O 调度器](io_scheduler.md) | `io_scheduler.rs` | 阻塞读取循环、stdin 处理 |
-| [配置方案](config_scheme.md) | `config_scheme.rs` | 默认值、配置规范化、URL 派生 |
+| [配置编辑 schema](config.md#webui-配置编辑器) | `config_schema.rs` | schema 序列化 + path-patch 引擎（WebUI 配置编辑器后端） |
 | [Bootstrap 模板](bootstrap.md) | `bootstrap.rs`, `embed.rs` | 嵌入文件、模板加载、技能文件 |
 | [工具函数](utils.md) | `utils/mod.rs` | 文本截断、原子写入、持久化引用 |
 | [Trace](trace.md) | `trace/` | span 埋点、多 backend 导出（file / OpenTelemetry） |

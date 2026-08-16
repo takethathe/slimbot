@@ -1,5 +1,17 @@
 # TODO
 
+## WebUI 配置编辑器（2026-08-16 完成）
+
+- [x] **config 定义扩展** — `define_config!` 新增 `secret` 约束（`FieldMeta.secret`）；section 改为字符串字面量（支持 `gateway.cron` 等点分路径）；修复 `allowed_max` 元数据派发；迁移 `CronConfig`/`HeartbeatConfig`/`DreamConfig`/`WebFetchConfig` 进 `config_defs.rs`；`ProviderConfig.api_key` 标 `secret`；`Config::clamp()` 补调新结构体
+- [x] **schema 序列化** — 新增 `src/config_schema.rs`：宏结构体 + 集合 → schema 树（kind 派生、secret 掩码、`r#type` 归一化）；10 个 section（agent/gateway.cron/heartbeat/dream/web_fetch/tracing + providers/tools/channels/tracing.backends）
+- [x] **patch 引擎** — `apply_config_patch`（set/add/remove 按 dot-path），应用后 clamp→normalize→validate，失败返回逐字段错误不写盘；非法 path/类型错误返回 Err
+- [x] **WebUI 接线** — `config_path` 穿入 `register_webui_factory`→`WebuiChannelFactory`→`WebuiChannel`→`AppState`；新增 `GET /config`、`GET /config/api/state`（schema + 密钥掩码）、`POST /config/api/update`（patch 应用 + 写回）；handler 为薄壳
+- [x] **前端** — `resources/webui/config.html`：按 schema kind 动态渲染表单、集合 CRUD（providers/backends 结构化、tools/channels 开关+裸 JSON）、api_key 掩码 + 留空不变、逐字段错误高亮 + 放弃重载、顶部重启生效提示、index/traces/config 双向互链
+- [x] **文档** — `docs/config.md` 增补「WebUI 配置编辑器」章节；`docs/index.md` 修正陈旧 `config_scheme.md` 条目（删除该陈旧文档）；`CONTEXT.md` 术语与 `docs/adr/0002` 已落盘
+- [x] **验证** — `cargo fmt --check`、`cargo clippy`（无新 warning）、`cargo test` 全过（982 lib + 集成）
+
+Spec 见 `.scratch/webui-config-editor/spec.md`。
+
 ## WebUI Trace 查看器（2026-08-16 完成）
 
 - [x] **配置** — `TraceConfig` 增加 `reset_on_start`（默认 true，无范围/白名单约束，`clamp()` 不破坏）

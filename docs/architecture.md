@@ -147,7 +147,7 @@ AgentRunner 状态变更 → TaskHook.notify_status()
 main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   │
   ├── setup.rs ── 配置规范化、目录创建、bootstrap 文件
-  │     ├── config_scheme.rs ── 默认值、规范化、URL 派生
+  │     ├── config_defs.rs ── define_config! 字段定义与默认值
   │     └── bootstrap.rs + embed.rs ── 嵌入模板文件
   │
   ├── cli.rs ── clap 参数解析、CLI agent session

@@ -11,6 +11,9 @@ pub struct FieldMeta {
     pub max: Option<serde_json::Value>,
     pub allowed: &'static [&'static str],
     pub desc: &'static str,
+    /// True when the value is a secret (e.g. api_key). Secrets are masked
+    /// in the config schema and never sent back to the UI as plaintext.
+    pub secret: bool,
 }
 
 /// Trait for custom normalization. Called after `clamp()` during both
@@ -21,16 +24,20 @@ pub trait Normalizable {
 
 /// Define config structs with embedded metadata.
 ///
+/// `$section` is a string literal used as the dot-path prefix of every field
+/// (e.g. `"gateway.cron"` yields field paths like `"gateway.cron.enabled"`).
+///
 /// Constraint helpers:
 /// - `range(min, max)` — numeric range clamp
 /// - `str_max(n)` — String max length (truncation)
 /// - `allowed(["val1", "val2"])` — whitelist (fallback to default)
 /// - `allowed_max(["val1", "val2"], n)` — whitelist + max length
+/// - `secret` — no clamp, but marks the field as a secret (masked in schema)
 /// - `none` — no constraint
 #[macro_export]
 macro_rules! define_config {
     (
-        $section:ident => $name:ident {
+        $section:literal => $name:ident {
             $(
                 $field:ident : $fty:ty = $def:expr,
                 $cname:tt $( ($($args:tt)+) )? ,
@@ -50,7 +57,7 @@ macro_rules! define_config {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! _cfg_mixed_expand {
-    (@sec $section:ident, $name:ident,
+    (@sec $section:literal, $name:ident,
      [ $( ($field:ident, $fty:ty, $def:expr, $cname:tt $( ($($args:tt)+) )? , $desc:expr) )+ ]) => {
         #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
         #[serde(default)]
@@ -123,6 +130,8 @@ macro_rules! _clamp_gen {
     };
     // none: no constraint
     ($self:expr, $fty:ty, $def:expr, none) => {};
+    // secret: no constraint (masked in schema, value passthrough)
+    ($self:expr, $fty:ty, $def:expr, secret) => {};
 }
 
 // ── FieldMeta generator ──
@@ -130,58 +139,69 @@ macro_rules! _clamp_gen {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! _cfg_field_meta {
-    ($section:ident, $field:ident, $fty:ty, $def:expr, $c:tt($($a:tt)+), $desc:expr) => {
+    ($section:literal, $field:ident, $fty:ty, $def:expr, $c:tt($($a:tt)+), $desc:expr) => {
         $crate::_cfg_field_meta!(@dispatch $c, $section, $field, $fty, $def, $($a)+, $desc)
     };
-    ($section:ident, $field:ident, $fty:ty, $def:expr, none, $desc:expr) => {
+    ($section:literal, $field:ident, $fty:ty, $def:expr, none, $desc:expr) => {
         $crate::config_macro::FieldMeta {
             name: stringify!($field),
-            path: concat!(stringify!($section), ".", stringify!($field)),
+            path: concat!($section, ".", stringify!($field)),
             ty: stringify!($fty),
             default: serde_json::json!($def),
-            min: None, max: None, allowed: &[], desc: $desc,
+            min: None, max: None, allowed: &[], desc: $desc, secret: false,
+        }
+    };
+    ($section:literal, $field:ident, $fty:ty, $def:expr, secret, $desc:expr) => {
+        $crate::config_macro::FieldMeta {
+            name: stringify!($field),
+            path: concat!($section, ".", stringify!($field)),
+            ty: stringify!($fty),
+            default: serde_json::json!($def),
+            min: None, max: None, allowed: &[], desc: $desc, secret: true,
         }
     };
 
-    (@dispatch $kind:tt, $section:ident, $field:ident, $fty:ty, $def:expr, $min:tt, $max:tt, $desc:expr) => {
+    // allowed_max must be matched before the generic two-argument arm below
+    // (both take two token groups, but only allowed_max carries a whitelist).
+    (@dispatch allowed_max, $section:literal, $field:ident, $fty:ty, $def:expr, [$($v:tt),+], $mx:tt, $desc:expr) => {
         $crate::config_macro::FieldMeta {
             name: stringify!($field),
-            path: concat!(stringify!($section), ".", stringify!($field)),
+            path: concat!($section, ".", stringify!($field)),
+            ty: stringify!($fty),
+            default: serde_json::json!($def),
+            min: None, max: Some(serde_json::json!($mx)), allowed: &[$($v),+], desc: $desc, secret: false,
+        }
+    };
+    (@dispatch $kind:tt, $section:literal, $field:ident, $fty:ty, $def:expr, $min:tt, $max:tt, $desc:expr) => {
+        $crate::config_macro::FieldMeta {
+            name: stringify!($field),
+            path: concat!($section, ".", stringify!($field)),
             ty: stringify!($fty),
             default: serde_json::json!($def),
             min: Some(serde_json::json!($min)),
-            max: Some(serde_json::json!($max)), allowed: &[], desc: $desc,
+            max: Some(serde_json::json!($max)), allowed: &[], desc: $desc, secret: false,
         }
     };
-    (@dispatch $kind:tt, $section:ident, $field:ident, $fty:ty, $def:expr, $max:tt, $desc:expr) => {
+    (@dispatch $kind:tt, $section:literal, $field:ident, $fty:ty, $def:expr, $max:tt, $desc:expr) => {
         $crate::_cfg_field_meta!(@str_dispatch $kind, $section, $field, $fty, $def, $max, $desc)
     };
 
-    (@str_dispatch str_max, $section:ident, $field:ident, $fty:ty, $def:expr, $max:tt, $desc:expr) => {
+    (@str_dispatch str_max, $section:literal, $field:ident, $fty:ty, $def:expr, $max:tt, $desc:expr) => {
         $crate::config_macro::FieldMeta {
             name: stringify!($field),
-            path: concat!(stringify!($section), ".", stringify!($field)),
+            path: concat!($section, ".", stringify!($field)),
             ty: stringify!($fty),
             default: serde_json::json!($def),
-            min: None, max: Some(serde_json::json!($max)), allowed: &[], desc: $desc,
+            min: None, max: Some(serde_json::json!($max)), allowed: &[], desc: $desc, secret: false,
         }
     };
-    (@str_dispatch allowed, $section:ident, $field:ident, $fty:ty, $def:expr, [$($v:tt),+], $desc:expr) => {
+    (@str_dispatch allowed, $section:literal, $field:ident, $fty:ty, $def:expr, [$($v:tt),+], $desc:expr) => {
         $crate::config_macro::FieldMeta {
             name: stringify!($field),
-            path: concat!(stringify!($section), ".", stringify!($field)),
+            path: concat!($section, ".", stringify!($field)),
             ty: stringify!($fty),
             default: serde_json::json!($def),
-            min: None, max: None, allowed: &[$($v),+], desc: $desc,
-        }
-    };
-    (@str_dispatch allowed_max, $section:ident, $field:ident, $fty:ty, $def:expr, [$($v:tt),+], $mx:tt, $desc:expr) => {
-        $crate::config_macro::FieldMeta {
-            name: stringify!($field),
-            path: concat!(stringify!($section), ".", stringify!($field)),
-            ty: stringify!($fty),
-            default: serde_json::json!($def),
-            min: None, max: Some(serde_json::json!($mx)), allowed: &[$($v),+], desc: $desc,
+            min: None, max: None, allowed: &[$($v),+], desc: $desc, secret: false,
         }
     };
 }
@@ -193,12 +213,14 @@ mod tests {
     use super::*;
 
     define_config! {
-        test => TestConfig {
+        "test" => TestConfig {
             count: u32 = 10, range(1, 100), desc: "Test count",
             ratio: f32 = 0.5, range(0.0, 1.0), desc: "Test ratio",
             name: String = "default".to_string(), str_max(32), desc: "Test name",
             enabled: bool = true, none, desc: "Test enabled",
             kind: String = "a".to_string(), allowed(["a", "b", "c"]), desc: "Test kind",
+            secret_key: String = "".to_string(), secret, desc: "Test secret key",
+            region: String = "us".to_string(), allowed_max(["us", "eu"], 4), desc: "Test region",
         }
     }
 
@@ -215,11 +237,50 @@ mod tests {
     #[test]
     fn test_schema_has_all_metas() {
         let metas = TestConfig::fields();
-        assert_eq!(metas.len(), 5);
+        assert_eq!(metas.len(), 7);
         let count_meta = metas.iter().find(|m| m.name == "count").unwrap();
         assert_eq!(count_meta.path, "test.count");
         assert_eq!(count_meta.ty, "u32");
         assert_eq!(count_meta.desc, "Test count");
+    }
+
+    #[test]
+    fn test_secret_field_meta() {
+        let metas = TestConfig::fields();
+        // Only the `secret` constraint marks a field as secret.
+        let key_meta = metas.iter().find(|m| m.name == "secret_key").unwrap();
+        assert!(key_meta.secret);
+        assert_eq!(key_meta.path, "test.secret_key");
+        for m in metas.iter().filter(|m| m.name != "secret_key") {
+            assert!(!m.secret, "field {} must not be secret", m.name);
+        }
+    }
+
+    #[test]
+    fn test_allowed_max_meta_has_whitelist_and_max() {
+        let metas = TestConfig::fields();
+        let region_meta = metas.iter().find(|m| m.name == "region").unwrap();
+        assert_eq!(region_meta.allowed, &["us", "eu"]);
+        assert_eq!(region_meta.max, Some(serde_json::json!(4)));
+        assert_eq!(region_meta.min, None);
+    }
+
+    #[test]
+    fn test_clamp_allowed_max_fallback() {
+        let mut c = TestConfig {
+            count: 10,
+            ratio: 0.5,
+            name: "ok".to_string(),
+            enabled: true,
+            kind: "a".to_string(),
+            secret_key: "sk-123".to_string(),
+            region: "xx".to_string(),
+            unknown: Default::default(),
+        };
+        c.clamp();
+        // secret passes through untouched; invalid allowed_max value falls back.
+        assert_eq!(c.secret_key, "sk-123");
+        assert_eq!(c.region, "us");
     }
 
     #[test]
@@ -230,7 +291,10 @@ mod tests {
         assert!(defaults.contains_key("name"));
         assert!(defaults.contains_key("enabled"));
         assert!(defaults.contains_key("kind"));
+        assert!(defaults.contains_key("secret_key"));
+        assert!(defaults.contains_key("region"));
         assert_eq!(defaults["count"], serde_json::json!(10));
+        assert_eq!(defaults["secret_key"], serde_json::json!(""));
     }
 
     #[test]
@@ -241,6 +305,8 @@ mod tests {
             name: "ok".to_string(),
             enabled: true,
             kind: "a".to_string(),
+            secret_key: "".to_string(),
+            region: "us".to_string(),
             unknown: Default::default(),
         };
         c.clamp();
@@ -256,6 +322,8 @@ mod tests {
             name: "ok".to_string(),
             enabled: true,
             kind: "invalid".to_string(),
+            secret_key: "".to_string(),
+            region: "us".to_string(),
             unknown: Default::default(),
         };
         c.clamp();
@@ -270,6 +338,8 @@ mod tests {
             name: "this is a very long name that exceeds 32 chars".to_string(),
             enabled: true,
             kind: "a".to_string(),
+            secret_key: "".to_string(),
+            region: "us".to_string(),
             unknown: Default::default(),
         };
         c.clamp();
@@ -284,6 +354,8 @@ mod tests {
             "name": "test",
             "enabled": true,
             "kind": "a",
+            "secret_key": "",
+            "region": "us",
             "future_field": "hello",
             "another": 42
         }"#;

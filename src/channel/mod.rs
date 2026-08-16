@@ -189,6 +189,7 @@ impl ChannelManager {
         event_tx: broadcast::Sender<AgentEvent>,
         trace_paths: Vec<String>,
         trace_startup_ms: Option<i64>,
+        config_path: String,
     ) {
         let factory = WebuiChannelFactory::new(
             self.message_bus.clone(),
@@ -197,6 +198,7 @@ impl ChannelManager {
             event_tx,
             trace_paths,
             trace_startup_ms,
+            config_path,
         );
         self.factories
             .insert("webui".to_string(), Box::new(factory));

@@ -1,0 +1,1231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SlimBot · Config</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/common.css">
+<style>
+/* Config editor specific styles. The shared visual language (variables,
+   dark theme, noise, glow, app shell, animations) lives in common.css. */
+
+#config-app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* ─ Header ─ */
+.config-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.config-header .left {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.config-header h1 {
+  font-family: var(--font-mono);
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.config-header h1 span { color: var(--accent); }
+
+.config-header .header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: all 0.2s ease;
+}
+
+.nav-link:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#back {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+#back:hover {
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+}
+
+/* ─ Restart notice (always visible) ─ */
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 1.5rem;
+  font-size: 0.78rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border-accent);
+  flex-shrink: 0;
+  letter-spacing: 0.01em;
+}
+
+.notice .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+/* ─ Status banner ─ */
+.status {
+  display: none;
+  padding: 0.7rem 1.5rem;
+  font-size: 0.82rem;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.status.show { display: flex; }
+.status.ok { color: var(--status-done); background: rgba(76, 175, 106, 0.08); border-color: rgba(76, 175, 106, 0.25); }
+.status.err { color: var(--status-failed); background: rgba(217, 79, 85, 0.08); border-color: rgba(217, 79, 85, 0.25); }
+
+.status .actions { margin-left: auto; display: flex; gap: 0.5rem; }
+
+.status button {
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.status button:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ─ Sections ─ */
+#config-panel {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.2rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-subtle) transparent;
+}
+
+#config-panel::-webkit-scrollbar { width: 5px; }
+#config-panel::-webkit-scrollbar-track { background: transparent; }
+#config-panel::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 10px; }
+
+.section {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  padding: 1.2rem 1.4rem;
+  animation: fadeUp 0.4s ease both;
+}
+
+.section h2 {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.01em;
+  margin-bottom: 0.15rem;
+}
+
+.section h2 .sec-path {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 0.72rem;
+  margin-left: 0.5rem;
+}
+
+.fields { display: flex; flex-direction: column; }
+
+/* ─ Field rows ─ */
+.field-row {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 1rem;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--border-subtle);
+  align-items: start;
+}
+
+.field-row:last-child { border-bottom: none; }
+
+.field-row .label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.field-row .label .fname {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.field-row .label .fdesc {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.field-row .control { min-width: 0; }
+
+.field-row .error-msg {
+  display: none;
+  margin-top: 0.4rem;
+  font-size: 0.74rem;
+  color: var(--status-failed);
+  grid-column: 2;
+}
+
+.field-row.has-error .error-msg { display: block; }
+.field-row.has-error input,
+.field-row.has-error select,
+.field-row.has-error textarea {
+  border-color: var(--status-failed);
+  box-shadow: 0 0 0 3px rgba(217, 79, 85, 0.12);
+}
+
+input[type="text"],
+input[type="number"],
+input[type="password"],
+select,
+textarea {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238a8f98' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.7rem center;
+  padding-right: 2rem;
+}
+
+textarea { resize: vertical; min-height: 70px; font-family: var(--font-mono); }
+
+/* Toggle switch */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.switch input { opacity: 0; width: 0; height: 0; }
+
+.switch .track {
+  position: absolute;
+  inset: 0;
+  border-radius: 22px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-accent);
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.switch .track::before {
+  content: '';
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  left: 2px;
+  top: 2px;
+  background: var(--text-muted);
+  transition: all 0.2s ease;
+}
+
+.switch input:checked + .track {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.switch input:checked + .track::before {
+  transform: translateX(18px);
+  background: var(--accent);
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.control-row .bool-hint {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+/* Secret placeholder hint */
+.secret-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin-top: 0.3rem;
+}
+
+/* ─ Collections ─ */
+.collection {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  margin-top: 0.8rem;
+}
+
+.item {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  padding: 0.9rem 1rem;
+  animation: fadeUp 0.3s ease both;
+}
+
+.item .item-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.7rem;
+}
+
+.item .item-head .key-input {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.6rem;
+  outline: none;
+  min-width: 0;
+  flex: 1;
+}
+
+.item .item-head .key-input:focus { border-color: var(--accent); }
+
+.item .item-head .key-label {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.item .item-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.item .field-row {
+  grid-template-columns: 170px 1fr;
+  padding: 0.45rem 0;
+}
+
+.item .field-row .fname { font-size: 0.72rem; }
+.item .field-row .fdesc { font-size: 0.68rem; }
+.item .field-row .error-msg { grid-column: 2; }
+
+.remove-btn {
+  font-size: 0.72rem;
+  font-weight: 500;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+  font-family: var(--font-body);
+}
+
+.remove-btn:hover {
+  border-color: var(--status-failed);
+  color: var(--status-failed);
+  background: rgba(217, 79, 85, 0.08);
+}
+
+.add-btn {
+  align-self: flex-start;
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 0.45rem 1rem;
+  border: 1px dashed var(--border-accent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.add-btn:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.empty-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  padding: 0.4rem 0;
+}
+
+.list-hint {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.list-hint a { color: var(--accent); text-decoration: none; }
+.list-hint a:hover { text-decoration: underline; }
+
+/* ─ Footer ─ */
+.config-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 1.5rem;
+  border-top: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+#save-btn {
+  font-family: var(--font-body);
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.65rem 1.6rem;
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--accent);
+  color: var(--bg-deep);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  letter-spacing: 0.02em;
+}
+
+#save-btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
+#save-btn:active { transform: translateY(0); }
+#save-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; filter: none; }
+
+#discard-btn {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  font-weight: 500;
+  padding: 0.6rem 1.1rem;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: none;
+}
+
+#discard-btn:hover { background: var(--accent-soft); color: var(--accent); }
+
+.config-footer .dirty-hint {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+/* Loading / error states */
+.state-msg {
+  padding: 3rem 1.5rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+/* ─ Responsive ─ */
+@media (max-width: 760px) {
+  #config-panel { padding: 1rem; }
+  .config-header { padding: 0.9rem 1rem; }
+  .notice { padding: 0.55rem 1rem; }
+  .field-row { grid-template-columns: 1fr; gap: 0.4rem; }
+  .item .field-row { grid-template-columns: 1fr; gap: 0.3rem; }
+}
+</style>
+</head>
+<body>
+<div id="config-app">
+  <header class="config-header">
+    <div class="left">
+      <a id="back" href="/" aria-label="Back to chat">&#8592;</a>
+      <h1>config<span>editor</span></h1>
+    </div>
+    <div class="header-actions">
+      <a href="/traces" class="nav-link" title="Trace viewer" aria-label="Open trace viewer">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      </a>
+      <a href="/" class="nav-link" title="Chat" aria-label="Open chat">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </a>
+    </div>
+  </header>
+
+  <div class="notice">
+    <span class="dot"></span>
+    <span>Changes are saved to config.json and take effect after a Gateway restart.</span>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <main id="config-panel"></main>
+
+  <footer class="config-footer">
+    <button id="save-btn" disabled>Save Changes</button>
+    <button id="discard-btn">Discard &amp; Reload</button>
+    <span class="dirty-hint" id="dirty-hint"></span>
+  </footer>
+</div>
+
+<script>
+'use strict';
+
+let schema = null;
+let formValues = {};    // internal control path -> JSON-string value (dirty tracking)
+let collectionRows = {}; // sectionName -> { rows: [row], nextId }
+
+const $ = (id) => document.getElementById(id);
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+
+function jsonEq(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function qPath(path) {
+  // Find a control by its data-path attribute (paths may contain dots/colons).
+  return document.querySelector('[data-path="' + String(path).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]');
+}
+
+function readControl(field, el) {
+  switch (field.kind) {
+    case 'bool': return el.checked;
+    case 'int': {
+      const n = parseInt(el.value, 10);
+      return Number.isFinite(n) ? n : null;
+    }
+    case 'float': {
+      const n = parseFloat(el.value);
+      return Number.isFinite(n) ? n : null;
+    }
+    case 'optional_string': return el.value === '' ? null : el.value;
+    case 'secret': return el.value.trim();
+    default: return el.value;
+  }
+}
+
+function setValue(path, value, pristine) {
+  if (JSON.stringify(value) === JSON.stringify(pristine)) {
+    delete formValues[path];
+  } else {
+    formValues[path] = JSON.stringify(value);
+  }
+  refreshDirty();
+}
+
+function refreshDirty() {
+  const collectionCount = Object.values(collectionRows).reduce(
+    (n, cs) => n + cs.rows.filter(r => r.removed || r.isNew).length, 0);
+  const count = Object.keys(formValues).length + collectionCount;
+  $('save-btn').disabled = count === 0;
+  $('dirty-hint').textContent = count > 0 ? count + ' pending change' + (count > 1 ? 's' : '') : '';
+}
+
+/* ── Control builders ── */
+
+function buildControl(field, path) {
+  const wrap = document.createElement('div');
+  switch (field.kind) {
+    case 'bool': {
+      const row = document.createElement('div');
+      row.className = 'control-row';
+      const label = document.createElement('label');
+      label.className = 'switch';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.dataset.path = path;
+      input.checked = !!field.value;
+      const track = document.createElement('span');
+      track.className = 'track';
+      label.appendChild(input);
+      label.appendChild(track);
+      const hint = document.createElement('span');
+      hint.className = 'bool-hint';
+      hint.textContent = input.checked ? 'on' : 'off';
+      input.addEventListener('change', () => {
+        hint.textContent = input.checked ? 'on' : 'off';
+        setValue(path, input.checked, field.value);
+      });
+      row.appendChild(label);
+      row.appendChild(hint);
+      wrap.appendChild(row);
+      break;
+    }
+    case 'int': {
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = '1';
+      if (field.min != null) input.min = field.min;
+      if (field.max != null) input.max = field.max;
+      input.value = field.value == null ? '' : field.value;
+      input.dataset.path = path;
+      input.addEventListener('input', () => {
+        const v = readControl(field, input);
+        if (v !== null) setValue(path, v, field.value);
+      });
+      wrap.appendChild(input);
+      break;
+    }
+    case 'float': {
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = 'any';
+      if (field.min != null) input.min = field.min;
+      if (field.max != null) input.max = field.max;
+      input.value = field.value == null ? '' : field.value;
+      input.dataset.path = path;
+      input.addEventListener('input', () => {
+        const v = readControl(field, input);
+        if (v !== null) setValue(path, v, field.value);
+      });
+      wrap.appendChild(input);
+      break;
+    }
+    case 'string': {
+      const input = document.createElement('input');
+      input.type = 'text';
+      if (field.max != null) input.maxLength = field.max;
+      input.value = field.value == null ? '' : field.value;
+      input.dataset.path = path;
+      input.addEventListener('input', () => setValue(path, input.value, field.value));
+      wrap.appendChild(input);
+      break;
+    }
+    case 'select': {
+      const select = document.createElement('select');
+      (field.allowed || []).forEach(opt => {
+        const o = document.createElement('option');
+        o.value = opt;
+        o.textContent = opt;
+        select.appendChild(o);
+      });
+      select.value = field.value == null ? '' : field.value;
+      select.dataset.path = path;
+      select.addEventListener('change', () => setValue(path, select.value, field.value));
+      wrap.appendChild(select);
+      break;
+    }
+    case 'secret': {
+      const input = document.createElement('input');
+      input.type = 'password';
+      input.placeholder = '••••••••  (leave empty to keep unchanged)';
+      input.autocomplete = 'new-password';
+      input.dataset.path = path;
+      input.addEventListener('input', () => setValue(path, input.value.trim(), ''));
+      wrap.appendChild(input);
+      const hint = document.createElement('div');
+      hint.className = 'secret-hint';
+      hint.textContent = 'Secret value is never shown. Enter a new value to rotate it.';
+      wrap.appendChild(hint);
+      break;
+    }
+    case 'optional_string': {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.placeholder = '(empty = null / not set)';
+      input.value = field.value == null ? '' : field.value;
+      input.dataset.path = path;
+      input.addEventListener('input', () => setValue(path, readControl(field, input), field.value == null ? null : field.value));
+      wrap.appendChild(input);
+      break;
+    }
+    case 'json': {
+      const ta = document.createElement('textarea');
+      ta.value = field.value == null ? '{}' : JSON.stringify(field.value, null, 2);
+      ta.dataset.path = path;
+      ta.addEventListener('input', () => setValue(path, ta.value, JSON.stringify(field.value, null, 2)));
+      wrap.appendChild(ta);
+      break;
+    }
+    case 'list': {
+      const info = document.createElement('div');
+      info.className = 'list-hint';
+      const n = Array.isArray(field.value) ? field.value.length : 0;
+      info.innerHTML = n + ' item' + (n === 1 ? '' : 's') + ' — edited in the <a href="#sec-tracing.backends">tracing.backends</a> section below.';
+      wrap.appendChild(info);
+      break;
+    }
+    default: {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = field.value == null ? '' : String(field.value);
+      wrap.appendChild(input);
+    }
+  }
+  return wrap;
+}
+
+function buildFieldRow(field, path) {
+  const row = document.createElement('div');
+  row.className = 'field-row';
+  row.dataset.rowPath = path;
+
+  const label = document.createElement('div');
+  label.className = 'label';
+  const name = document.createElement('div');
+  name.className = 'fname';
+  name.textContent = field.name;
+  const desc = document.createElement('div');
+  desc.className = 'fdesc';
+  desc.textContent = field.desc;
+  label.appendChild(name);
+  label.appendChild(desc);
+
+  const control = document.createElement('div');
+  control.className = 'control';
+  control.appendChild(buildControl(field, path));
+
+  const err = document.createElement('div');
+  err.className = 'error-msg';
+
+  row.appendChild(label);
+  row.appendChild(control);
+  row.appendChild(err);
+  return row;
+}
+
+/* ── Collection rendering ── */
+
+function makeRow(secName, item, idx, isNew) {
+  if (!collectionRows[secName]) collectionRows[secName] = { rows: [], nextId: 1 };
+  const id = (isNew ? 'new' + (collectionRows[secName].nextId++) : 'row' + idx);
+  return {
+    id: id,
+    secName: secName,
+    key: item && item.key != null ? item.key : '',
+    origKey: item && item.key != null ? item.key : null,
+    origIdx: item ? idx : null,
+    isNew: isNew,
+    removed: false,
+    fields: item ? item.fields : null,
+    extraText: item && item.extra != null ? JSON.stringify(item.extra, null, 2) : '{}',
+    pristineExtra: item && item.extra != null ? JSON.stringify(item.extra) : '{}',
+  };
+}
+
+function collectionNoun(secName) {
+  if (secName === 'providers') return 'provider';
+  if (secName === 'tools') return 'tool';
+  if (secName === 'channels') return 'channel';
+  return 'backend';
+}
+
+function renderCollection(sec) {
+  const cs = collectionRows[sec.name];
+
+  function controlPath(row, fieldName) {
+    return sec.name + '.' + row.id + '.' + fieldName;
+  }
+
+  function renderItem(row) {
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.dataset.rowId = row.id;
+
+    const head = document.createElement('div');
+    head.className = 'item-head';
+    const isMap = sec.name === 'providers' || sec.name === 'channels';
+    if (isMap) {
+      const keyLabel = document.createElement('span');
+      keyLabel.className = 'key-label';
+      keyLabel.textContent = sec.name === 'providers' ? 'name' : 'channel';
+      const keyInput = document.createElement('input');
+      keyInput.className = 'key-input';
+      keyInput.value = row.key;
+      keyInput.placeholder = 'identifier';
+      keyInput.addEventListener('input', () => { row.key = keyInput.value; refreshDirty(); });
+      head.appendChild(keyLabel);
+      head.appendChild(keyInput);
+    } else {
+      const keyLabel = document.createElement('span');
+      keyLabel.className = 'key-label';
+      keyLabel.textContent = '#' + (row.origIdx != null ? row.origIdx : 'new');
+      head.appendChild(keyLabel);
+    }
+    const remove = document.createElement('button');
+    remove.className = 'remove-btn';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => {
+      row.removed = true;
+      item.style.display = 'none';
+      refreshDirty();
+    });
+    head.appendChild(remove);
+    item.appendChild(head);
+
+    const fieldsWrap = document.createElement('div');
+    fieldsWrap.className = 'item-fields';
+
+    if (sec.name === 'channels') {
+      // enabled toggle + raw extra JSON editor.
+      const enabledPristine = row.fields ? row.fields[0].value : true;
+      const enabledField = {
+        name: 'enabled',
+        kind: 'bool',
+        desc: 'Whether this channel is enabled',
+        default: true,
+        value: enabledPristine,
+      };
+      fieldsWrap.appendChild(buildFieldRow(enabledField, controlPath(row, 'enabled')));
+
+      const extraRow = document.createElement('div');
+      extraRow.className = 'field-row';
+      extraRow.dataset.rowPath = controlPath(row, 'extra');
+      const label = document.createElement('div');
+      label.className = 'label';
+      const name = document.createElement('div');
+      name.className = 'fname';
+      name.textContent = 'extra';
+      const desc = document.createElement('div');
+      desc.className = 'fdesc';
+      desc.textContent = 'Channel-specific raw JSON config (e.g. host, port)';
+      label.appendChild(name);
+      label.appendChild(desc);
+      const control = document.createElement('div');
+      control.className = 'control';
+      const ta = document.createElement('textarea');
+      ta.value = row.extraText;
+      ta.dataset.path = controlPath(row, 'extra');
+      ta.addEventListener('input', () => setValue(controlPath(row, 'extra'), ta.value, row.pristineExtra));
+      control.appendChild(ta);
+      const err = document.createElement('div');
+      err.className = 'error-msg';
+      extraRow.appendChild(label);
+      extraRow.appendChild(control);
+      extraRow.appendChild(err);
+      fieldsWrap.appendChild(extraRow);
+    } else if (row.fields) {
+      row.fields.forEach(f => fieldsWrap.appendChild(buildFieldRow(f, f.path)));
+    } else {
+      // New provider / backend / tool: render from the element template.
+      (sec.item_fields || []).forEach(f => fieldsWrap.appendChild(buildFieldRow(f, controlPath(row, f.name))));
+    }
+    item.appendChild(fieldsWrap);
+    return item;
+  }
+
+  function renderAll() {
+    const shell = document.createElement('div');
+    shell.className = 'collection';
+    const visible = cs.rows.filter(r => !r.removed);
+    if (visible.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-hint';
+      empty.textContent = 'No ' + collectionNoun(sec.name) + 's configured yet.';
+      shell.appendChild(empty);
+    } else {
+      visible.forEach(r => shell.appendChild(renderItem(r)));
+    }
+    const add = document.createElement('button');
+    add.className = 'add-btn';
+    add.textContent = '+ Add ' + collectionNoun(sec.name);
+    add.addEventListener('click', () => {
+      const row = makeRow(sec.name, null, null, true);
+      if (sec.name === 'providers') row.key = 'new_provider_' + row.id;
+      else if (sec.name === 'channels') row.key = 'new_channel_' + row.id;
+      cs.rows.push(row);
+      shell.replaceWith(renderAll());
+      refreshDirty();
+    });
+    shell.appendChild(add);
+    return shell;
+  }
+
+  return renderAll();
+}
+
+/* ── Section rendering ── */
+
+function renderSection(sec) {
+  const section = document.createElement('section');
+  section.className = 'section';
+  section.id = 'sec-' + sec.name;
+
+  const h2 = document.createElement('h2');
+  h2.appendChild(document.createTextNode(sec.label));
+  const path = document.createElement('span');
+  path.className = 'sec-path';
+  path.textContent = sec.name;
+  h2.appendChild(path);
+  section.appendChild(h2);
+
+  if (sec.items != null) {
+    if (!collectionRows[sec.name]) {
+      collectionRows[sec.name] = { rows: [], nextId: 1 };
+      sec.items.forEach((item, idx) => collectionRows[sec.name].rows.push(makeRow(sec.name, item, idx, false)));
+    }
+    section.appendChild(renderCollection(sec));
+  } else {
+    const fields = document.createElement('div');
+    fields.className = 'fields';
+    sec.fields.forEach(f => fields.appendChild(buildFieldRow(f, f.path)));
+    section.appendChild(fields);
+  }
+  return section;
+}
+
+/* ── Submit: compile dirty state into patches ── */
+
+function currentValue(field) {
+  const el = qPath(field.path);
+  return el ? readControl(field, el) : field.value;
+}
+
+function buildPatchOps() {
+  const ops = [];
+  const errors = [];
+
+  // ── Scalar sections ──
+  schema.sections.forEach(sec => {
+    if (sec.items != null) return;
+    sec.fields.forEach(f => {
+      if (f.kind === 'list' || f.kind === 'json') return;
+      const current = currentValue(f);
+      if (current === null) return; // unparseable numeric input → skip
+      if (f.kind === 'secret' && current === '') return; // leave unchanged
+      if (f.kind === 'optional_string') {
+        if ((f.value == null ? null : f.value) !== current) {
+          ops.push({ op: 'set', path: f.path, value: current });
+        }
+        return;
+      }
+      if (!jsonEq(f.value, current)) {
+        ops.push({ op: 'set', path: f.path, value: current });
+      }
+    });
+  });
+
+  // ── Collection sections ──
+  schema.sections.forEach(sec => {
+    if (sec.items == null) return;
+    const cs = collectionRows[sec.name];
+    if (!cs) return;
+    const isMap = sec.name === 'providers' || sec.name === 'channels';
+
+    if (isMap) {
+      cs.rows.forEach(row => {
+        const key = (row.key || '').trim();
+        if (row.removed) {
+          if (row.origKey != null) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
+          return;
+        }
+        if (!key) {
+          errors.push({ path: sec.name, message: 'Every ' + collectionNoun(sec.name) + ' needs a non-empty name.' });
+          return;
+        }
+        const isRename = row.origKey != null && key !== row.origKey;
+        if (row.isNew || isRename) {
+          // Build the add object from the REAL controls. Existing rows are
+          // keyed by absolute schema paths (e.g. `providers.default.model`);
+          // new rows use `sec.name + row.id + field`. For a rename the add op
+          // carries `from` so the backend inherits masked fields (api_key).
+          // The add must be emitted BEFORE the remove so the source entry
+          // still exists when `from` resolves.
+          const obj = {};
+          if (sec.name === 'providers') {
+            (sec.item_fields || []).forEach(f => {
+              let el = qPath('providers.' + row.id + '.' + f.name);
+              if (!el && row.fields) {
+                const existing = row.fields.find(x => x.name === f.name);
+                el = existing ? qPath(existing.path) : null;
+              }
+              const val = el ? readControl(f, el) : f.value;
+              if (f.kind === 'secret' && (val === '' || val == null)) return; // empty secret → inherit via `from`
+              if (f.kind === 'optional_string') { obj[f.name] = val == null ? null : val; return; }
+              if (val !== null && val !== undefined) obj[f.name] = val;
+            });
+            const addOp = { op: 'add', path: sec.name + '.' + key, value: obj };
+            if (isRename) addOp.from = row.origKey;
+            ops.push(addOp);
+            if (isRename) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
+          } else if (sec.name === 'channels') {
+            const en = qPath('channels.' + row.id + '.enabled');
+            if (en) obj.enabled = en.checked;
+            const ta = qPath('channels.' + row.id + '.extra');
+            if (ta) {
+              try { obj.extra = JSON.parse(ta.value); } catch (e) { errors.push({ path: 'channels.' + key + '.extra', message: 'Invalid JSON: ' + e.message }); }
+            }
+            ops.push({ op: 'add', path: sec.name + '.' + key, value: obj });
+            if (isRename) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
+          }
+          return;
+        }
+        // Existing, same key: diff fields.
+        if (sec.name === 'providers') {
+          row.fields.forEach(f => {
+            const current = currentValue(f);
+            if (f.kind === 'secret') {
+              if (current === '' || current == null) return;
+              ops.push({ op: 'set', path: f.path, value: current });
+              return;
+            }
+            if (current === null) return;
+            if (f.kind === 'optional_string') {
+              if ((f.value == null ? null : f.value) !== current) ops.push({ op: 'set', path: f.path, value: current });
+              return;
+            }
+            if (!jsonEq(f.value, current)) ops.push({ op: 'set', path: f.path, value: current });
+          });
+        } else if (sec.name === 'channels') {
+          const en = qPath('channels.' + row.id + '.enabled');
+          const pristineEnabled = row.fields[0] ? row.fields[0].value : true;
+          if (en && en.checked !== pristineEnabled) {
+            ops.push({ op: 'set', path: 'channels.' + key + '.enabled', value: en.checked });
+          }
+          const ta = qPath('channels.' + row.id + '.extra');
+          if (ta) {
+            let parsed;
+            try { parsed = JSON.parse(ta.value); } catch (e) { errors.push({ path: 'channels.' + key + '.extra', message: 'Invalid JSON: ' + e.message }); }
+            if (parsed !== undefined && JSON.stringify(parsed) !== row.pristineExtra) {
+              ops.push({ op: 'set', path: 'channels.' + key + '.extra', value: parsed });
+            }
+          }
+        }
+      });
+    } else {
+      // Vec collections (tools / tracing.backends): removes (desc) first,
+      // then sets with final post-removal indices, then appends for new rows.
+      const removes = cs.rows
+        .filter(r => r.removed && r.origIdx != null)
+        .map(r => r.origIdx)
+        .sort((a, b) => b - a);
+      removes.forEach(idx => ops.push({ op: 'remove', path: sec.name + '.' + idx }));
+
+      const kept = cs.rows.filter(r => !r.removed);
+      kept.forEach((row, newIdx) => {
+        if (row.isNew) {
+          const obj = {};
+          (sec.item_fields || []).forEach(f => {
+            const el = qPath(sec.name + '.' + row.id + '.' + f.name);
+            const val = el ? readControl(f, el) : f.value;
+            if (val !== null && val !== undefined) obj[f.name] = val;
+          });
+          ops.push({ op: 'add', path: sec.name, value: obj });
+          return;
+        }
+        row.fields.forEach(f => {
+          const current = currentValue(f);
+          if (current === null) return;
+          if (!jsonEq(f.value, current)) {
+            const fieldName = f.path.split('.').pop();
+            ops.push({ op: 'set', path: sec.name + '.' + newIdx + '.' + fieldName, value: current });
+          }
+        });
+      });
+    }
+  });
+
+  return { ops, errors };
+}
+
+/* ── Status / errors ── */
+
+function showStatus(kind, html) {
+  const st = $('status');
+  st.className = 'status show ' + kind;
+  st.innerHTML = html;
+}
+
+function clearErrors() {
+  document.querySelectorAll('.field-row.has-error').forEach(r => {
+    r.classList.remove('has-error');
+    const msg = r.querySelector('.error-msg');
+    if (msg) msg.textContent = '';
+  });
+}
+
+function applyErrors(errors) {
+  clearErrors();
+  $('discard-btn').style.display = 'inline-block';
+  errors.forEach(e => {
+    document.querySelectorAll('.field-row[data-row-path]').forEach(row => {
+      const rp = row.dataset.rowPath;
+      if (rp === e.path || rp.startsWith(e.path + '.') || e.path.startsWith(rp + '.')) {
+        row.classList.add('has-error');
+        const msg = row.querySelector('.error-msg');
+        if (msg) msg.textContent = e.message;
+      }
+    });
+  });
+}
+
+async function submit() {
+  clearErrors();
+  const { ops, errors } = buildPatchOps();
+  if (errors.length) {
+    applyErrors(errors);
+    showStatus('err', '<span>Fix the highlighted fields before saving.</span>');
+    return;
+  }
+  if (!ops.length) {
+    showStatus('ok', '<span>No changes to save.</span>');
+    return;
+  }
+
+  $('save-btn').disabled = true;
+  try {
+    const res = await fetch('/config/api/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ops),
+    });
+    if (res.status === 400) {
+      const text = await res.text();
+      showStatus('err', '<span>Patch rejected: ' + esc(text.slice(0, 300)) + '</span>');
+      $('discard-btn').style.display = 'inline-block';
+      return;
+    }
+    if (!res.ok) {
+      showStatus('err', '<span>Server error (' + res.status + ').</span>');
+      $('discard-btn').style.display = 'inline-block';
+      return;
+    }
+    const data = await res.json();
+    if (data.ok) {
+      showStatus('ok', '<span>&#10003; Saved to config.json. Restart the Gateway for changes to take effect.</span>');
+      $('discard-btn').style.display = 'inline-block';
+      refreshDirty();
+    } else {
+      applyErrors(data.errors || []);
+      const n = (data.errors || []).length;
+      showStatus('err', '<span>Validation failed (' + n + ' error' + (n === 1 ? '' : 's') + ') — nothing was saved.</span>');
+    }
+  } catch (err) {
+    showStatus('err', '<span>Network error: ' + esc(err.message) + '</span>');
+  } finally {
+    $('save-btn').disabled = Object.keys(formValues).length === 0 &&
+      Object.values(collectionRows).every(cs => cs.rows.every(r => !r.removed && !r.isNew));
+  }
+}
+
+function reloadPage() {
+  location.reload();
+}
+
+/* ── Boot ── */
+
+async function boot() {
+  try {
+    const res = await fetch('/config/api/state');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    schema = data.schema;
+    const panel = $('config-panel');
+    panel.innerHTML = '';
+    schema.sections.forEach(sec => panel.appendChild(renderSection(sec)));
+  } catch (err) {
+    $('config-panel').innerHTML = '<div class="state-msg">Failed to load config state: ' + esc(err.message) + '</div>';
+  }
+}
+
+$('save-btn').addEventListener('click', submit);
+$('discard-btn').addEventListener('click', reloadPage);
+
+boot();
+</script>
+</body>
+</html>

@@ -239,6 +239,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             event_tx.clone(),
             trace_paths.clone(),
             trace_startup_ms,
+            paths.config_path().to_string_lossy().to_string(),
         );
     }
 
@@ -361,10 +362,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -478,10 +483,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -608,10 +617,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -656,10 +669,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -865,10 +882,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1294,10 +1315,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: true },
+                cron: crate::config::CronConfig {
+                    enabled: true,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: true,
                     interval_s: 300,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },

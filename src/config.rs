@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::config_normalize::apply_normalize;
 
 // Re-export for backward compatibility (other modules import these from crate::config)
-pub use crate::config_defs::{AgentConfig, ProviderConfig, TraceBackendEntry, TraceConfig};
+pub use crate::config_defs::{
+    AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, ProviderConfig, TraceBackendEntry,
+    TraceConfig, WebFetchConfig,
+};
 
 // ── Root Config ──
 
@@ -41,58 +44,6 @@ pub struct GatewayConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CronConfig {
-    #[serde(default)]
-    pub enabled: bool,
-}
-
-impl Default for CronConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HeartbeatConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_heartbeat_interval")]
-    pub interval_s: u64,
-}
-
-impl Default for HeartbeatConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            interval_s: default_heartbeat_interval(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DreamConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_dream_interval_ms")]
-    pub interval_ms: i64,
-    #[serde(default)]
-    pub model_override: Option<String>,
-    #[serde(default = "default_dream_max_entries")]
-    pub max_entries: usize,
-}
-
-impl Default for DreamConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            interval_ms: default_dream_interval_ms(),
-            model_override: None,
-            max_entries: default_dream_max_entries(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -116,41 +67,19 @@ pub struct ToolEntry {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct WebFetchConfig {
-    #[serde(default = "default_max_chars")]
-    pub max_chars: usize,
-    #[serde(default = "default_timeout")]
-    pub timeout_s: u64,
-    #[serde(default = "default_user_agent")]
-    pub user_agent: String,
-}
-
-impl Default for WebFetchConfig {
-    fn default() -> Self {
-        // Delegate to the serde default functions so they remain the single
-        // source of truth for default values (used by both deserialization
-        // with missing fields and explicit Default construction).
-        Self {
-            max_chars: default_max_chars(),
-            timeout_s: default_timeout(),
-            user_agent: default_user_agent(),
-        }
-    }
-}
-
 fn default_true() -> bool {
     true
 }
-fn default_heartbeat_interval() -> u64 {
+
+pub fn default_heartbeat_interval() -> u64 {
     1800
 }
 
-fn default_max_chars() -> usize {
+pub fn default_max_chars() -> usize {
     50000
 }
 
-fn default_timeout() -> u64 {
+pub fn default_timeout() -> u64 {
     30
 }
 
@@ -251,6 +180,12 @@ impl Config {
             provider.clamp();
         }
         self.tracing.clamp();
+        self.gateway.cron.clamp();
+        self.gateway.heartbeat.clamp();
+        self.gateway.dream.clamp();
+        if let Some(wf) = &mut self.web_fetch {
+            wf.clamp();
+        }
     }
 
     pub fn normalize(&mut self) {
@@ -1487,7 +1422,10 @@ mod tests {
 
     #[test]
     fn test_config_cron_config_disabled() {
-        let cron_config = crate::config::CronConfig { enabled: false };
+        let cron_config = crate::config::CronConfig {
+            enabled: false,
+            unknown: Default::default(),
+        };
         assert!(!cron_config.enabled);
     }
 
@@ -1496,6 +1434,7 @@ mod tests {
         let heartbeat_config = crate::config::HeartbeatConfig {
             enabled: true,
             interval_s: 300,
+            unknown: Default::default(),
         };
         assert!(heartbeat_config.enabled);
         assert_eq!(heartbeat_config.interval_s, 300);
@@ -1504,10 +1443,14 @@ mod tests {
     #[test]
     fn test_config_gateway_config_custom() {
         let gateway_config = crate::config::GatewayConfig {
-            cron: crate::config::CronConfig { enabled: true },
+            cron: crate::config::CronConfig {
+                enabled: true,
+                unknown: Default::default(),
+            },
             heartbeat: crate::config::HeartbeatConfig {
                 enabled: true,
                 interval_s: 120,
+                unknown: Default::default(),
             },
             dream: crate::config::DreamConfig::default(),
         };
@@ -1532,6 +1475,7 @@ mod tests {
             interval_ms: 3600000,
             model_override: Some("gpt-4-turbo".to_string()),
             max_entries: 50,
+            unknown: Default::default(),
         };
         assert!(!dream_config.enabled);
         assert_eq!(dream_config.interval_ms, 3600000);

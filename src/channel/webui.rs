@@ -26,6 +26,8 @@ struct AppState {
     session_manager: Option<SharedSessionManager>,
     index_html: String,
     traces_html: String,
+    config_html: String,
+    config_path: String,
     event_tx: Option<broadcast::Sender<AgentEvent>>,
     /// Enabled file-backend trace file paths (empty when tracing/file backend off).
     trace_paths: Vec<String>,
@@ -53,6 +55,7 @@ pub struct WebuiChannel {
     event_tx: Option<broadcast::Sender<AgentEvent>>,
     trace_paths: Vec<String>,
     trace_startup_ms: Option<i64>,
+    config_path: String,
 }
 
 impl WebuiChannel {
@@ -75,6 +78,7 @@ impl WebuiChannel {
             event_tx: None,
             trace_paths: Vec::new(),
             trace_startup_ms: None,
+            config_path: String::new(),
         })
     }
 
@@ -100,6 +104,10 @@ impl WebuiChannel {
 
     pub fn set_trace_startup_ms(&mut self, startup_ms: Option<i64>) {
         self.trace_startup_ms = startup_ms;
+    }
+
+    pub fn set_config_path(&mut self, path: String) {
+        self.config_path = path;
     }
 
     /// Prune disconnected SSE subscribers for a chat and send payload to remaining.
@@ -155,6 +163,7 @@ impl WebuiChannel {
         let event_tx = self.event_tx.clone();
         let trace_paths = self.trace_paths.clone();
         let trace_startup_ms = self.trace_startup_ms;
+        let config_path = self.config_path.clone();
 
         let handle = tokio::spawn(async move {
             let index_html = embed::get_content_by_dest("webui/index.html")
@@ -162,6 +171,9 @@ impl WebuiChannel {
                 .to_string();
             let traces_html = embed::get_content_by_dest("webui/traces.html")
                 .unwrap_or("<h1>Trace Viewer</h1>")
+                .to_string();
+            let config_html = embed::get_content_by_dest("webui/config.html")
+                .unwrap_or("<h1>Config Editor</h1>")
                 .to_string();
 
             let state = AppState {
@@ -171,6 +183,8 @@ impl WebuiChannel {
                 session_manager,
                 index_html,
                 traces_html,
+                config_html,
+                config_path,
                 event_tx,
                 trace_paths,
                 trace_startup_ms,
@@ -186,6 +200,9 @@ impl WebuiChannel {
                 .route("/traces", get(traces_page_handler))
                 .route("/traces/api/traces", get(traces_list_handler))
                 .route("/traces/api/trace/{id}", get(trace_detail_handler))
+                .route("/config", get(config_page_handler))
+                .route("/config/api/state", get(config_state_handler))
+                .route("/config/api/update", post(config_update_handler))
                 .route("/common.css", get(common_css_handler))
                 .with_state(Arc::new(state));
 
@@ -327,6 +344,61 @@ async fn trace_detail_handler(
         Some(detail) => Ok(axum::Json(detail)),
         None => Err(StatusCode::NOT_FOUND),
     }
+}
+
+/// Serve the standalone config editor page.
+async fn config_page_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    (
+        StatusCode::OK,
+        [("content-type", "text/html")],
+        state.config_html.clone(),
+    )
+}
+
+/// `GET /config/api/state`: schema + current values (secrets masked).
+/// Reads the config file fresh so the editor always reflects disk state.
+async fn config_state_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+    let config = crate::config::Config::load_for_preview(&state.config_path).map_err(|e| {
+        crate::error!("[webui] Failed to load config for editor: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let schema = crate::config_schema::serialize_schema(&config);
+    Ok(axum::Json(serde_json::json!({ "schema": schema })))
+}
+
+/// `POST /config/api/update`: apply `[{op, path, value}]` patches and persist.
+/// On validation failure the config is NOT written; per-field errors are returned.
+async fn config_update_handler(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+    let ops: Vec<crate::config_schema::PatchOp> = serde_json::from_str(&body).map_err(|e| {
+        crate::error!("[webui] Invalid config patch body: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    let mut config = crate::config::Config::load_for_preview(&state.config_path).map_err(|e| {
+        crate::error!("[webui] Failed to load config for update: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let errors = crate::config_schema::apply_config_patch(&mut config, &ops).map_err(|e| {
+        crate::error!("[webui] Config patch rejected: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    if errors.is_empty() {
+        config.save(&state.config_path).map_err(|e| {
+            crate::error!("[webui] Failed to save config: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        crate::info!("[webui] Config updated via config editor");
+    }
+    Ok(axum::Json(serde_json::json!({
+        "ok": errors.is_empty(),
+        "errors": errors,
+    })))
 }
 
 async fn list_chats_handler(State(state): State<Arc<AppState>>) -> axum::Json<Vec<ChatInfo>> {
@@ -487,6 +559,7 @@ pub struct WebuiChannelFactory {
     event_tx: broadcast::Sender<AgentEvent>,
     trace_paths: Vec<String>,
     trace_startup_ms: Option<i64>,
+    config_path: String,
 }
 
 impl WebuiChannelFactory {
@@ -497,6 +570,7 @@ impl WebuiChannelFactory {
         event_tx: broadcast::Sender<AgentEvent>,
         trace_paths: Vec<String>,
         trace_startup_ms: Option<i64>,
+        config_path: String,
     ) -> Self {
         Self {
             message_bus,
@@ -505,6 +579,7 @@ impl WebuiChannelFactory {
             event_tx,
             trace_paths,
             trace_startup_ms,
+            config_path,
         }
     }
 }
@@ -522,6 +597,7 @@ impl ChannelFactory for WebuiChannelFactory {
         ch.set_event_tx(self.event_tx.clone());
         ch.set_trace_paths(self.trace_paths.clone());
         ch.set_trace_startup_ms(self.trace_startup_ms);
+        ch.set_config_path(self.config_path.clone());
         Ok(Box::new(ch))
     }
 }
@@ -588,7 +664,15 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let (event_tx, _) = broadcast::channel::<AgentEvent>(32);
 
-        let factory = WebuiChannelFactory::new(mb, sm, shutdown_tx, event_tx, Vec::new(), None);
+        let factory = WebuiChannelFactory::new(
+            mb,
+            sm,
+            shutdown_tx,
+            event_tx,
+            Vec::new(),
+            None,
+            String::new(),
+        );
         assert_eq!(factory.channel_type(), "webui");
 
         let config = json!({"host": "127.0.0.1", "port": 9999});
@@ -689,6 +773,8 @@ mod tests {
             index_html: String::new(),
             event_tx: None,
             traces_html: String::new(),
+            config_html: String::new(),
+            config_path: String::new(),
             trace_paths: Vec::new(),
             trace_startup_ms: None,
         });
@@ -723,6 +809,8 @@ mod tests {
             index_html: String::new(),
             event_tx: None,
             traces_html: String::new(),
+            config_html: String::new(),
+            config_path: String::new(),
             trace_paths: Vec::new(),
             trace_startup_ms: None,
         });
@@ -763,6 +851,8 @@ mod tests {
             index_html: String::new(),
             event_tx: None,
             traces_html: String::new(),
+            config_html: String::new(),
+            config_path: String::new(),
             trace_paths: Vec::new(),
             trace_startup_ms: None,
         });
@@ -780,6 +870,8 @@ mod tests {
             index_html: String::new(),
             event_tx: None,
             traces_html: String::new(),
+            config_html: String::new(),
+            config_path: String::new(),
             trace_paths: Vec::new(),
             trace_startup_ms: None,
         });
@@ -887,6 +979,8 @@ mod tests {
             session_manager: None,
             index_html: String::new(),
             traces_html: "<h1>Trace Viewer</h1>".to_string(),
+            config_html: String::new(),
+            config_path: String::new(),
             event_tx: None,
             trace_paths,
             trace_startup_ms: None,
@@ -991,6 +1085,148 @@ mod tests {
         let state = trace_state(Vec::new());
         let res = trace_detail_handler(State(state), Path("anything".to_string())).await;
         assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    // ── Config editor handlers ──
+
+    /// Build a minimal AppState for config handler tests.
+    fn config_state(config_path: String) -> Arc<AppState> {
+        Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: None,
+            index_html: String::new(),
+            traces_html: String::new(),
+            config_html: "<h1>Config Editor</h1>".to_string(),
+            config_path,
+            event_tx: None,
+            trace_paths: Vec::new(),
+            trace_startup_ms: None,
+        })
+    }
+
+    /// Write a minimal valid config file and return its path.
+    fn write_config_file(dir: &std::path::Path) -> String {
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "agent": {"provider": "default", "max_iterations": 40},
+                "providers": {"default": {"type": "openai", "api_key": "sk-test", "model": "gpt-4o"}},
+                "tools": [{"name": "shell", "enabled": true}],
+                "channels": {"webui": {"enabled": true, "host": "127.0.0.1", "port": 8080}}
+            }"#,
+        )
+        .unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_webui_config_page_returns_html() {
+        let state = config_state(String::new());
+        let (status, headers, body) = config_page_handler(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0], ("content-type", "text/html"));
+        assert!(body.contains("Config Editor"));
+    }
+
+    #[tokio::test]
+    async fn test_webui_config_state_returns_schema_with_masked_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path());
+        let state = config_state(path);
+        let res = config_state_handler(State(state)).await.unwrap();
+        let schema = &res.0["schema"];
+        let sections = schema["sections"].as_array().unwrap();
+        assert!(sections.iter().any(|s| s["name"] == "agent"));
+        assert!(sections.iter().any(|s| s["name"] == "gateway.cron"));
+        assert!(sections.iter().any(|s| s["name"] == "providers"));
+        assert!(sections.iter().any(|s| s["name"] == "tools"));
+        assert!(sections.iter().any(|s| s["name"] == "channels"));
+
+        // api_key must be masked (null value) in provider items.
+        let providers = sections.iter().find(|s| s["name"] == "providers").unwrap();
+        let item = &providers["items"][0];
+        assert_eq!(item["key"], "default");
+        let fields = item["fields"].as_array().unwrap();
+        let api_key = fields.iter().find(|f| f["name"] == "api_key").unwrap();
+        assert_eq!(api_key["secret"], true);
+        assert_eq!(api_key["value"], serde_json::Value::Null);
+        let model = fields.iter().find(|f| f["name"] == "model").unwrap();
+        assert_eq!(model["value"], "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn test_webui_config_update_applies_patch_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path());
+        let state = config_state(path.clone());
+        let body = r#"[{"op":"set","path":"agent.max_iterations","value":55}]"#;
+        let res = config_update_handler(State(state), body.to_string())
+            .await
+            .unwrap();
+        assert_eq!(res.0["ok"], true);
+        assert!(res.0["errors"].as_array().unwrap().is_empty());
+        // Reload from disk: the persisted config reflects the patch.
+        let reloaded = crate::config::Config::load_for_preview(&path).unwrap();
+        assert_eq!(reloaded.agent.max_iterations, 55);
+    }
+
+    #[tokio::test]
+    async fn test_webui_config_update_rejects_invalid_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let state = config_state(path.clone());
+        let body = r#"[{"op":"set","path":"agent.provider","value":"ghost"}]"#;
+        let res = config_update_handler(State(state), body.to_string())
+            .await
+            .unwrap();
+        assert_eq!(res.0["ok"], false);
+        let errors = res.0["errors"].as_array().unwrap();
+        assert!(!errors.is_empty());
+        assert_eq!(errors[0]["path"], "agent.provider");
+        // The config file must be untouched when validation fails.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_webui_config_update_bad_body_is_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path());
+        let state = config_state(path);
+        let res = config_update_handler(State(state), "not json".to_string()).await;
+        assert_eq!(res.err(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn test_webui_config_state_missing_file_is_500() {
+        let state = config_state("/nonexistent/config.json".to_string());
+        let res = config_state_handler(State(state)).await;
+        assert_eq!(res.err(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[tokio::test]
+    async fn test_webui_config_update_unknown_path_is_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path());
+        let state = config_state(path);
+        let body = r#"[{"op":"set","path":"agent.nope","value":1}]"#;
+        let res = config_update_handler(State(state), body.to_string()).await;
+        assert_eq!(res.err(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn test_embed_get_content_by_dest_finds_webui_config() {
+        // The config editor page must be embedded and served at /config.
+        let config = crate::embed::get_content_by_dest("webui/config.html");
+        assert!(config.is_some(), "webui/config.html should be embedded");
+        let html = config.unwrap();
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("/config/api/state"), "should fetch schema");
+        assert!(html.contains("/config/api/update"), "should post patches");
     }
 
     #[test]

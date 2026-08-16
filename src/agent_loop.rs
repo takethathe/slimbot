@@ -769,10 +769,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -973,10 +977,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1024,10 +1032,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1083,10 +1095,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1137,10 +1153,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1191,10 +1211,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1260,10 +1284,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1318,10 +1346,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1388,10 +1420,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },
@@ -1470,10 +1506,14 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
-                cron: crate::config::CronConfig { enabled: false },
+                cron: crate::config::CronConfig {
+                    enabled: false,
+                    unknown: Default::default(),
+                },
                 heartbeat: crate::config::HeartbeatConfig {
                     enabled: false,
                     interval_s: 60,
+                    unknown: Default::default(),
                 },
                 dream: crate::config::DreamConfig::default(),
             },

@@ -39,3 +39,17 @@ _Avoid_: log file（与 `log.rs` 的日志文件无关）
 **Trace viewer**:
 WebUI 上专门查看 trace 的页面（`/traces`），按 trace 开始时间降序列出 trace，并可展开查看每个 span 的详情。
 _Avoid_: trace UI（术语不用首字母缩写与界面层级概念混写）
+
+### Configuration
+
+**Config editor**:
+WebUI 上可视化编辑 slimbot 配置的页面（`/config`），表单由 config schema 自动生成。
+_Avoid_: settings page, 设置页
+
+**Config schema**:
+由 `define_config!` 宏生成的字段元数据集合（名称、类型、描述、约束、默认值、是否密钥），是 Config editor 表单的单一数据源。
+_Avoid_: form spec, 表单定义
+
+**Config field**:
+config schema 中一个可编辑项，对应一份字段元数据。
+_Avoid_: setting, option

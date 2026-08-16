@@ -174,7 +174,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `timeout_seconds` | uint | range(1, 600) | `120` | 每轮 Agent 超时时间（秒） |
 | `max_tool_result_chars` | uint | range(100, 100000) | `8000` | 工具返回结果的最大字符数，超过此值会被截断 |
 | `persist_tool_results` | bool | — | `true` | 超大工具结果是否持久化到磁盘 |
-| `context_window_tokens` | uint | range(1024, 200000) | `8192` | LLM 上下文窗口大小（token），用于 Consolidator 预算检查 |
+| `context_window_tokens` | uint | range(1024, 200000) | `32768` | LLM 上下文窗口大小（token），用于 Consolidator 预算检查 |
 
 ```json
 {
@@ -195,7 +195,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `type` | string | allowed(["openai", "anthropic", "custom"]) | `"openai"` | Provider 类型标识符 |
 | `api_url` | string | str_max(512), 归一化 | 见下文 | 完整 API 端点 URL |
 | `base_url` | string | str_max(512) | `"https://api.openai.com"` | Provider 基础 URL |
-| `api_key` | string | str_max(512) | `""` | API 认证密钥（加载时验证） |
+| `api_key` | string | secret（掩码，不截断） | `""` | API 认证密钥（加载时验证；WebUI 中掩码显示，留空 = 不变） |
 | `model` | string | str_max(128) | `"gpt-4o"` | 模型标识符（加载时验证） |
 | `temperature` | float | range(0.0, 2.0) | `0.7` | 采样温度 |
 | `max_tokens` | uint | range(1, 100000) | `4096` | 单次最大响应 token 数 |
@@ -334,6 +334,16 @@ Config::subscribe("agent", |change| {
 未知 JSON 字段通过 `#[serde(flatten)]` 保留在配置的 `unknown` 字段中。这意味着：
 - 未来版本添加的新字段在旧版本加载时不会报错
 - 保存时未知字段会原样写回 JSON 文件
+
+## WebUI 配置编辑器
+
+Gateway 模式的 WebUI 提供可视化配置编辑页面（入口 `/config`，从聊天页/查看器页顶部图标进入）。**表单由配置定义自动生成，前端不手写任何配置项**：
+
+- **Schema 自动生成** — 后端把 `define_config!` 宏生成的字段元数据（`FieldMeta`）序列化为 config schema（`src/config_schema.rs::serialize_schema`），前端按 schema 的 `kind` 渲染控件（bool 开关 / int/float 数字框带 min/max / string 文本框带 maxlength / select 下拉 / secret 密码框 / optional_string / 集合编辑器）。新增/修改 Rust 配置字段后表单自动跟随。
+- **集合编辑** — `providers`（键值映射，结构化增删改/重命名）、`tracing.backends`（数组）、`tools`（名称下拉 + enabled 开关）、`channels`（enabled 开关 + extra 裸 JSON）。
+- **写入语义** — 提交时把脏字段编译为 `[{op, path, value}]`（`set`/`add`/`remove`，dot-path 如 `agent.max_iterations`、`providers.<name>.temperature`、`gateway.cron.enabled`），服务端读取当前 `config.json` → 应用 patch → 按与 `Config::load` 相同的顺序执行 clamp → normalize → validate → 写回。校验失败**不写盘**，返回逐字段错误供前端高亮。未知 JSON 字段在 patch 写入中保留。重命名 provider 时 `add` 操作携带 `from`（源 key），服务端从源条目继承掩码字段（如 `api_key`）与未知字段，避免重命名丢密钥。
+- **密钥保护** — `api_key` 等 `secret` 字段在 schema 中 value 恒为 `null`，绝不回明文；编辑时留空 = 不变，填入新值即轮换密钥。
+- **重启生效** — 改动写回 `config.json` 后需重启 Gateway 才生效（v1 不做进程内热重载，见 `docs/adr/0002`）。页面顶部常驻提示。
 
 ## 完整示例
 
