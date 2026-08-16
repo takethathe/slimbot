@@ -1,5 +1,18 @@
 # TODO
 
+## WebUI Trace 查看器（2026-08-16 完成）
+
+- [x] **配置** — `TraceConfig` 增加 `reset_on_start`（默认 true，无范围/白名单约束，`clamp()` 不破坏）
+- [x] **文件生命周期** — `reset_trace_files` 纯函数（true 截断 / false 保留 / 返回重置数）；Gateway 启动时调用（CLI 不触发，`run_cli_agent` 不调用）
+- [x] **默认路径** — file backend `path` 为空时解析为 `{workspace_dir}/traces.jsonl`（共享 `resolve_trace_file_paths` 供 build_tracer 与 WebUI 复用）
+- [x] **WebUI 接线** — `resolve_trace_file_paths` 结果注入 `WebuiChannelFactory` → `WebuiChannel` → `AppState`；无 file backend 时路径为空，查看器显示禁用态
+- [x] **后端接口** — `GET /traces`（HTML）+ `/traces/api/traces`（列表，按开始时间降序，含 `startup_ms`/`disabled`/`too_large`）+ `/traces/api/trace/{id}`（span 树详情，404 兜底）+ `/common.css`；解析/分组/排序/建树在 `src/trace_viewer.rs` 纯函数（可单测），handler 为薄壳；50 MiB 大小保护
+- [x] **前端** — 抽公共 `webui/common.css`（index.html 视觉零变化）；新增 `resources/webui/traces.html`（列表 + 树形展开 + 大 JSON 折叠 + 超长截断 + 空态/禁用态 + 双向互链 + 启动时间/已运行时长 + 手动刷新/自动加载）
+- [x] **文档** — `docs/trace.md` 截断语义与默认路径更新、CONTEXT.md 增补 trace file / trace viewer 术语、ADR-0001 不涉及无需更新
+- [x] **验证** — `cargo fmt --check`、`cargo clippy`（无新 warning）、`cargo test` 全过（941 lib + 集成）
+
+Spec 见 `.scratch/webui-trace-viewer/spec.md`。
+
 ## Trace 机制（2026-08-15 完成）
 
 - [x] **span 模型** — `src/trace/`：`SpanContext`（trace_id 16B / span_id 8B / parent_span_id）、`SpanGuard`（RAII：构造 start、Drop end、`set_status`/`set_attribute` 累积）、`SpanRecorder` trait

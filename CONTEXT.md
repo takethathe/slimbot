@@ -31,3 +31,11 @@ _Avoid_: exporter, sink
 **AgentEvent**:
 面向通道（WebUI SSE）实时展示的细粒度生命周期通知，与 span 独立共存、互不派生。
 _Avoid_: event（裸用易与 span event 混淆）
+
+**Trace file**:
+span 记录被 append 到的 JSONL 文件（默认 `{workspace_dir}/traces.jsonl`）。默认在每次 Gateway 启动时截断（`tracing.reset_on_start`，默认 true），因此只保留当前进程运行期间的 trace；CLI 模式不截断。
+_Avoid_: log file（与 `log.rs` 的日志文件无关）
+
+**Trace viewer**:
+WebUI 上专门查看 trace 的页面（`/traces`），按 trace 开始时间降序列出 trace，并可展开查看每个 span 的详情。
+_Avoid_: trace UI（术语不用首字母缩写与界面层级概念混写）

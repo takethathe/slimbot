@@ -187,12 +187,14 @@ impl ChannelManager {
         session_manager: SharedSessionManager,
         shutdown_tx: tokio::sync::broadcast::Sender<()>,
         event_tx: broadcast::Sender<AgentEvent>,
+        trace_paths: Vec<String>,
     ) {
         let factory = WebuiChannelFactory::new(
             self.message_bus.clone(),
             session_manager,
             shutdown_tx,
             event_tx,
+            trace_paths,
         );
         self.factories
             .insert("webui".to_string(), Box::new(factory));

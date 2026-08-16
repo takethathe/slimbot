@@ -28,6 +28,7 @@ define_config! {
 define_config! {
     tracing => TraceConfig {
         enabled: bool = false, none, desc: "Master switch for trace recording (default off)",
+        reset_on_start: bool = true, none, desc: "Truncate trace file(s) on Gateway startup (CLI never truncates)",
         backends: Vec<TraceBackendEntry> = Vec::<TraceBackendEntry>::new(), none, desc: "Trace backends (file / otel), each with its own enable switch",
     }
 }

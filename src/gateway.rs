@@ -24,6 +24,18 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     let outbound_rx = receivers.outbound;
     let inbound_rx = receivers.inbound;
 
+    // Reset trace file(s) on Gateway startup so the viewer reflects the
+    // current process run. CLI mode never truncates (this is the only place
+    // reset_trace_files is called). The append handle of a live FileBackend
+    // stays valid across truncation.
+    let trace_paths =
+        crate::agent_loop::resolve_trace_file_paths(config.as_ref(), paths.workspace_dir());
+    let reset_count =
+        crate::agent_loop::reset_trace_files(&trace_paths, config.tracing.reset_on_start);
+    if reset_count > 0 {
+        info!("[gateway] Reset {} trace file(s) at startup", reset_count);
+    }
+
     // Build ToolManager with all tools including message + cron
     let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
     tool_manager.init_from_config(&config.tools);
@@ -218,6 +230,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             agent_loop.session_manager(),
             channel_shutdown_tx.clone(),
             event_tx.clone(),
+            trace_paths.clone(),
         );
     }
 
@@ -491,6 +504,56 @@ mod tests {
 
         let config = Config::load(paths.config_path().to_str().unwrap());
         assert!(config.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gateway_trace_reset_wiring_truncates_workspace_trace() {
+        // The gateway startup path resolves the default workspace trace path and
+        // resets it when `reset_on_start` is true (the default).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let trace_path = paths.workspace_dir().join("traces.jsonl");
+        std::fs::write(&trace_path, "old span\n").unwrap();
+
+        let config = Config::load(paths.config_path().to_str().unwrap()).unwrap();
+        // The generated test config has tracing disabled; enable it with a file
+        // backend so the resolution finds the default workspace path.
+        let trace_paths = crate::agent_loop::resolve_trace_file_paths(
+            &Config {
+                tracing: serde_json::from_value(serde_json::json!({
+                    "enabled": true,
+                    "backends": [
+                        { "type": "file", "enabled": true, "path": "" }
+                    ]
+                }))
+                .unwrap(),
+                ..config
+            },
+            paths.workspace_dir(),
+        );
+        assert_eq!(trace_paths, vec![trace_path.to_string_lossy().to_string()]);
+
+        let count =
+            crate::agent_loop::reset_trace_files(&trace_paths, config.tracing.reset_on_start);
+        assert_eq!(count, 1);
+        assert_eq!(std::fs::read_to_string(&trace_path).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn test_gateway_trace_reset_preserved_when_reset_off() {
+        // When `reset_on_start` is false the gateway startup leaves existing
+        // trace files intact (the CLI path never calls reset at all).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let trace_path = paths.workspace_dir().join("traces.jsonl");
+        std::fs::write(&trace_path, "kept span\n").unwrap();
+
+        let count = crate::agent_loop::reset_trace_files(
+            &[trace_path.to_string_lossy().to_string()],
+            false,
+        );
+        assert_eq!(count, 0);
+        assert_eq!(std::fs::read_to_string(&trace_path).unwrap(), "kept span\n");
     }
 
     #[tokio::test]

@@ -22,43 +22,101 @@ use crate::trace::backends::{FileBackend, OtelBackend};
 use crate::trace::{TraceBackend, Tracer};
 use crate::{error, info, warn_log};
 
-/// Build a tracer from the `tracing` config section, or `None` when tracing
-/// is disabled or no backend is enabled. This is the wiring-layer mapping from
-/// config to backends; the trace module itself stays free of config.
-fn build_tracer(config: &Config) -> Option<Arc<Tracer>> {
+/// Resolve the list of enabled file-backend trace file paths.
+///
+/// This is the single wiring-layer source of truth for where spans are
+/// written, shared by `build_tracer` (constructing `FileBackend`s) and the
+/// WebUI trace viewer (reading the same files). A file backend with an empty
+/// `path` resolves to `{workspace_dir}/traces.jsonl`; a non-empty path is used
+/// as-is (with `~` expansion). Tracing disabled, otel backends, and disabled
+/// backends are excluded.
+pub(crate) fn resolve_trace_file_paths(
+    config: &Config,
+    workspace_dir: &std::path::Path,
+) -> Vec<String> {
     if !config.tracing.enabled {
-        return None;
+        return Vec::new();
     }
-    let backends: Vec<Arc<dyn TraceBackend>> = config
+    config
         .tracing
         .backends
         .iter()
-        .filter(|b| b.enabled)
-        .filter_map(|b| match b.r#type.as_str() {
-            "file" => match FileBackend::new(&b.path) {
-                Ok(fb) => Some(Arc::new(fb) as Arc<dyn TraceBackend>),
-                Err(e) => {
-                    warn_log!("[Trace] File backend '{}' failed to open: {}", b.path, e);
-                    None
-                }
-            },
-            "otel" => match OtelBackend::new(&b.endpoint, &b.service_name) {
-                Ok(ob) => Some(Arc::new(ob) as Arc<dyn TraceBackend>),
-                Err(e) => {
-                    warn_log!(
-                        "[Trace] OTel backend '{}' failed to build: {}",
-                        b.endpoint,
-                        e
-                    );
-                    None
-                }
-            },
-            _ => {
-                warn_log!("[Trace] Unknown backend type '{}' ignored", b.r#type);
-                None
+        .filter(|b| b.enabled && b.r#type == "file")
+        .map(|b| {
+            if b.path.trim().is_empty() {
+                workspace_dir
+                    .join("traces.jsonl")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                crate::path::expand_home(&b.path)
+                    .to_string_lossy()
+                    .into_owned()
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Truncate the given trace files at Gateway startup.
+///
+/// When `reset_on_start` is true each file is truncated (recreated empty);
+/// otherwise the files are left untouched. Returns how many files were reset,
+/// so the behavior is observable in tests. CLI mode never calls this function.
+pub(crate) fn reset_trace_files(paths: &[String], reset_on_start: bool) -> usize {
+    if !reset_on_start {
+        return 0;
+    }
+    let mut reset = 0;
+    for path in paths {
+        let expanded = crate::path::expand_home(path);
+        if let Some(parent) = expanded.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // `File::create` truncates an existing file; a concurrent append handle
+        // stays valid (O_APPEND writes land at the new end).
+        match std::fs::File::create(&expanded) {
+            Ok(_) => reset += 1,
+            Err(e) => warn_log!("[Trace] Failed to reset {}: {}", expanded.display(), e),
+        }
+    }
+    reset
+}
+
+/// Build a tracer from the `tracing` config section, or `None` when tracing
+/// is disabled or no backend is enabled. This is the wiring-layer mapping from
+/// config to backends; the trace module itself stays free of config.
+fn build_tracer(config: &Config, workspace_dir: &std::path::Path) -> Option<Arc<Tracer>> {
+    if !config.tracing.enabled {
+        return None;
+    }
+    let mut backends: Vec<Arc<dyn TraceBackend>> = Vec::new();
+    // File backends are constructed from the shared path resolution so the
+    // viewer reads exactly the files the tracer writes.
+    for path in resolve_trace_file_paths(config, workspace_dir) {
+        match FileBackend::new(&path) {
+            Ok(fb) => backends.push(Arc::new(fb) as Arc<dyn TraceBackend>),
+            Err(e) => {
+                warn_log!("[Trace] File backend '{}' failed to open: {}", path, e);
+            }
+        }
+    }
+    for backend in config
+        .tracing
+        .backends
+        .iter()
+        .filter(|b| b.enabled && b.r#type == "otel")
+    {
+        match OtelBackend::new(&backend.endpoint, &backend.service_name) {
+            Ok(ob) => backends.push(Arc::new(ob) as Arc<dyn TraceBackend>),
+            Err(e) => {
+                warn_log!(
+                    "[Trace] OTel backend '{}' failed to build: {}",
+                    backend.endpoint,
+                    e
+                );
+            }
+        }
+    }
     if backends.is_empty() {
         None
     } else {
@@ -290,7 +348,7 @@ impl AgentLoop {
             .map(|p| p.max_tokens)
             .unwrap_or(4096);
 
-        let tracer = build_tracer(&config);
+        let tracer = build_tracer(&config, paths.workspace_dir());
 
         let runner = AgentRunner::new(
             tool_manager_arc.clone(),
@@ -718,6 +776,141 @@ mod tests {
             Some(workspace_dir.to_str().unwrap()),
         )
         .unwrap()
+    }
+
+    /// Build a full `Config` from a JSON string with a `tracing` section.
+    fn config_with_tracing(tracing_json: serde_json::Value) -> crate::config::Config {
+        serde_json::from_value(serde_json::json!({
+            "agent": {"provider": "test"},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
+            "tracing": tracing_json,
+        }))
+        .unwrap()
+    }
+
+    // ── Trace wiring: resolve_trace_file_paths ──
+
+    #[test]
+    fn test_resolve_trace_file_paths_empty_path_defaults_to_workspace() {
+        let config = config_with_tracing(serde_json::json!({
+            "enabled": true,
+            "backends": [
+                { "type": "file", "enabled": true, "path": "" }
+            ]
+        }));
+        let paths = resolve_trace_file_paths(&config, std::path::Path::new("/ws"));
+        assert_eq!(paths, vec!["/ws/traces.jsonl"]);
+    }
+
+    #[test]
+    fn test_resolve_trace_file_paths_custom_path_kept() {
+        let config = config_with_tracing(serde_json::json!({
+            "enabled": true,
+            "backends": [
+                { "type": "file", "enabled": true, "path": "/tmp/custom.jsonl" }
+            ]
+        }));
+        let paths = resolve_trace_file_paths(&config, std::path::Path::new("/ws"));
+        assert_eq!(paths, vec!["/tmp/custom.jsonl"]);
+    }
+
+    #[test]
+    fn test_resolve_trace_file_paths_multiple_file_backends_collected() {
+        let config = config_with_tracing(serde_json::json!({
+            "enabled": true,
+            "backends": [
+                { "type": "file", "enabled": true, "path": "" },
+                { "type": "file", "enabled": true, "path": "/tmp/second.jsonl" },
+                { "type": "file", "enabled": false, "path": "/tmp/off.jsonl" }
+            ]
+        }));
+        let paths = resolve_trace_file_paths(&config, std::path::Path::new("/ws"));
+        assert_eq!(paths, vec!["/ws/traces.jsonl", "/tmp/second.jsonl"]);
+    }
+
+    #[test]
+    fn test_resolve_trace_file_paths_otel_and_disabled_excluded() {
+        let config = config_with_tracing(serde_json::json!({
+            "enabled": true,
+            "backends": [
+                { "type": "otel", "enabled": true },
+                { "type": "file", "enabled": false, "path": "/tmp/x.jsonl" }
+            ]
+        }));
+        assert!(resolve_trace_file_paths(&config, std::path::Path::new("/ws")).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_trace_file_paths_tracing_disabled_empty() {
+        let config = config_with_tracing(serde_json::json!({ "enabled": false }));
+        assert!(resolve_trace_file_paths(&config, std::path::Path::new("/ws")).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_trace_file_paths_expands_home() {
+        let home = dirs::home_dir().unwrap();
+        let config = config_with_tracing(serde_json::json!({
+            "enabled": true,
+            "backends": [
+                { "type": "file", "enabled": true, "path": "~/traces.jsonl" }
+            ]
+        }));
+        let paths = resolve_trace_file_paths(&config, std::path::Path::new("/ws"));
+        assert_eq!(
+            paths,
+            vec![home.join("traces.jsonl").to_string_lossy().to_string()]
+        );
+    }
+
+    // ── Trace wiring: reset_trace_files ──
+
+    #[test]
+    fn test_reset_trace_files_truncates_when_reset_on_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("traces.jsonl");
+        std::fs::write(&path, "old span data\n").unwrap();
+
+        let count = reset_trace_files(&[path.to_string_lossy().to_string()], true);
+        assert_eq!(count, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn test_reset_trace_files_preserves_when_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("traces.jsonl");
+        std::fs::write(&path, "old span data\n").unwrap();
+
+        let count = reset_trace_files(&[path.to_string_lossy().to_string()], false);
+        assert_eq!(count, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old span data\n");
+    }
+
+    #[test]
+    fn test_reset_trace_files_returns_reset_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.jsonl");
+        let b = tmp.path().join("b.jsonl");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "y").unwrap();
+
+        let count = reset_trace_files(
+            &[
+                a.to_string_lossy().to_string(),
+                b.to_string_lossy().to_string(),
+            ],
+            true,
+        );
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_reset_trace_files_creates_missing_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/deep/traces.jsonl");
+        let count = reset_trace_files(&[path.to_string_lossy().to_string()], true);
+        assert_eq!(count, 1);
+        assert!(path.exists());
     }
 
     #[tokio::test]

@@ -1067,6 +1067,51 @@ mod tests {
     }
 
     #[test]
+    fn test_tracing_config_reset_on_start_defaults_true() {
+        // The default reset-on-start behavior truncates trace files on Gateway
+        // startup; it must default to true.
+        let tracing = crate::config::TraceConfig::default();
+        assert!(tracing.reset_on_start);
+    }
+
+    #[test]
+    fn test_tracing_config_reset_on_start_missing_field_defaults_true() {
+        // A tracing section without `reset_on_start` must default to true.
+        let config_str = r#"{
+            "agent": {"provider": "test"},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
+            "tracing": {"enabled": true}
+        }"#;
+        let config: Config = serde_json::from_str(config_str).unwrap();
+        assert!(config.tracing.reset_on_start);
+    }
+
+    #[test]
+    fn test_tracing_config_reset_on_start_explicit_false_preserved() {
+        // An explicit false must be preserved, not reset to the default.
+        let config_str = r#"{
+            "agent": {"provider": "test"},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
+            "tracing": {"enabled": true, "reset_on_start": false}
+        }"#;
+        let config: Config = serde_json::from_str(config_str).unwrap();
+        assert!(!config.tracing.reset_on_start);
+    }
+
+    #[test]
+    fn test_tracing_config_reset_on_start_clamp_untouched() {
+        // `clamp()` must not corrupt the reset_on_start field.
+        let config_str = r#"{
+            "agent": {"provider": "test"},
+            "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
+            "tracing": {"enabled": true, "reset_on_start": false}
+        }"#;
+        let mut config: Config = serde_json::from_str(config_str).unwrap();
+        config.clamp();
+        assert!(!config.tracing.reset_on_start);
+    }
+
+    #[test]
     fn test_tracing_config_absent_in_config_defaults_off() {
         // A config without a `tracing` section must stay disabled.
         let config_str = r#"{
@@ -1086,7 +1131,7 @@ mod tests {
             "tracing": {
                 "enabled": true,
                 "backends": [
-                    { "type": "file", "enabled": true, "path": "~/.slimbot/traces.jsonl" },
+                    { "type": "file", "enabled": true, "path": "traces.jsonl" },
                     { "type": "file", "enabled": true, "path": "/tmp/second.jsonl" },
                     { "type": "otel", "enabled": true, "endpoint": "http://collector:4318", "service_name": "mybot" },
                     { "type": "file", "enabled": false, "path": "/tmp/disabled.jsonl" }
@@ -1100,7 +1145,7 @@ mod tests {
         // Same type multiple instances are preserved.
         let files: Vec<_> = backends.iter().filter(|b| b.r#type == "file").collect();
         assert_eq!(files.len(), 3);
-        assert_eq!(files[0].path, "~/.slimbot/traces.jsonl");
+        assert_eq!(files[0].path, "traces.jsonl");
         assert_eq!(files[1].path, "/tmp/second.jsonl");
         // Per-backend enable switch.
         assert!(!files[2].enabled);

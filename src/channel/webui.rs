@@ -25,7 +25,10 @@ struct AppState {
     channel_id: String,
     session_manager: Option<SharedSessionManager>,
     index_html: String,
+    traces_html: String,
     event_tx: Option<broadcast::Sender<AgentEvent>>,
+    /// Enabled file-backend trace file paths (empty when tracing/file backend off).
+    trace_paths: Vec<String>,
 }
 
 /// SSE payload with event type discrimination.
@@ -45,6 +48,7 @@ pub struct WebuiChannel {
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<SsePayload>>>>>,
     shutdown_rx: Option<broadcast::Receiver<()>>,
     event_tx: Option<broadcast::Sender<AgentEvent>>,
+    trace_paths: Vec<String>,
 }
 
 impl WebuiChannel {
@@ -65,6 +69,7 @@ impl WebuiChannel {
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             shutdown_rx: None,
             event_tx: None,
+            trace_paths: Vec::new(),
         })
     }
 
@@ -82,6 +87,10 @@ impl WebuiChannel {
 
     pub fn set_event_tx(&mut self, tx: broadcast::Sender<AgentEvent>) {
         self.event_tx = Some(tx);
+    }
+
+    pub fn set_trace_paths(&mut self, paths: Vec<String>) {
+        self.trace_paths = paths;
     }
 
     /// Prune disconnected SSE subscribers for a chat and send payload to remaining.
@@ -135,10 +144,14 @@ impl WebuiChannel {
         let session_manager = self.session_manager.clone();
         let shutdown_rx = self.shutdown_rx.as_ref().map(|rx| rx.resubscribe());
         let event_tx = self.event_tx.clone();
+        let trace_paths = self.trace_paths.clone();
 
         let handle = tokio::spawn(async move {
             let index_html = embed::get_content_by_dest("webui/index.html")
                 .unwrap_or("<h1>SlimBot Gateway</h1>")
+                .to_string();
+            let traces_html = embed::get_content_by_dest("webui/traces.html")
+                .unwrap_or("<h1>Trace Viewer</h1>")
                 .to_string();
 
             let state = AppState {
@@ -147,7 +160,9 @@ impl WebuiChannel {
                 channel_id,
                 session_manager,
                 index_html,
+                traces_html,
                 event_tx,
+                trace_paths,
             };
 
             let app = axum::Router::new()
@@ -157,6 +172,10 @@ impl WebuiChannel {
                 .route("/sse", get(sse_handler))
                 .route("/message", post(message_handler))
                 .route("/session/*chat_id", get(session_history_handler))
+                .route("/traces", get(traces_page_handler))
+                .route("/traces/api/traces", get(traces_list_handler))
+                .route("/traces/api/trace/{id}", get(trace_detail_handler))
+                .route("/common.css", get(common_css_handler))
                 .with_state(Arc::new(state));
 
             let listener = match tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await {
@@ -210,6 +229,93 @@ async fn index_handler(
         [("content-type", "text/html")],
         state.index_html.clone(),
     )
+}
+
+/// Serve the shared WebUI stylesheet (used by both the chat and trace pages).
+async fn common_css_handler() -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    let css = embed::get_content_by_dest("webui/common.css").unwrap_or("");
+    (
+        StatusCode::OK,
+        [("content-type", "text/css")],
+        css.to_string(),
+    )
+}
+
+/// Serve the standalone trace viewer page.
+async fn traces_page_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    (
+        StatusCode::OK,
+        [("content-type", "text/html")],
+        state.traces_html.clone(),
+    )
+}
+
+/// List of trace summaries (newest first) plus viewer metadata.
+#[derive(serde::Serialize)]
+struct TracesListResponse {
+    /// True when no file backend is configured / tracing is disabled.
+    disabled: bool,
+    /// True when a trace file was larger than the size guard (still read).
+    too_large: bool,
+    /// Trace file startup (epoch ms) — the Gateway's startup time when
+    /// `reset_on_start` is on. None when no trace file exists yet.
+    startup_ms: Option<i64>,
+    traces: Vec<crate::trace_viewer::TraceSummary>,
+}
+
+/// Read + parse all trace files once, shared by the list and detail handlers.
+/// Returns (spans, too_large).
+fn load_trace_spans(paths: &[String]) -> (Vec<crate::trace_viewer::SpanRecord>, bool) {
+    let read = crate::trace_viewer::read_trace_files(paths);
+    if read.too_large {
+        crate::warn_log!(
+            "[webui] Trace file exceeded {} bytes; still reading",
+            crate::trace_viewer::MAX_TRACE_FILE_BYTES
+        );
+    }
+    (
+        crate::trace_viewer::parse_span_lines(&read.content),
+        read.too_large,
+    )
+}
+
+/// `GET /traces/api/traces`: parse the trace file(s), group by trace id, and
+/// return summaries sorted by start time descending.
+async fn traces_list_handler(State(state): State<Arc<AppState>>) -> axum::Json<TracesListResponse> {
+    if state.trace_paths.is_empty() {
+        return axum::Json(TracesListResponse {
+            disabled: true,
+            too_large: false,
+            startup_ms: None,
+            traces: Vec::new(),
+        });
+    }
+    let startup_ms = crate::trace_viewer::trace_file_startup_ms(&state.trace_paths);
+    let (spans, too_large) = load_trace_spans(&state.trace_paths);
+    let traces = crate::trace_viewer::build_summaries(&spans);
+    axum::Json(TracesListResponse {
+        disabled: false,
+        too_large,
+        startup_ms,
+        traces,
+    })
+}
+
+/// `GET /traces/api/trace/{id}`: full span tree for one trace, or 404.
+async fn trace_detail_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<axum::Json<crate::trace_viewer::TraceDetail>, StatusCode> {
+    if state.trace_paths.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let (spans, _) = load_trace_spans(&state.trace_paths);
+    match crate::trace_viewer::build_detail(&id, &spans) {
+        Some(detail) => Ok(axum::Json(detail)),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 async fn list_chats_handler(State(state): State<Arc<AppState>>) -> axum::Json<Vec<ChatInfo>> {
@@ -368,6 +474,7 @@ pub struct WebuiChannelFactory {
     session_manager: SharedSessionManager,
     shutdown_tx: broadcast::Sender<()>,
     event_tx: broadcast::Sender<AgentEvent>,
+    trace_paths: Vec<String>,
 }
 
 impl WebuiChannelFactory {
@@ -376,12 +483,14 @@ impl WebuiChannelFactory {
         session_manager: SharedSessionManager,
         shutdown_tx: broadcast::Sender<()>,
         event_tx: broadcast::Sender<AgentEvent>,
+        trace_paths: Vec<String>,
     ) -> Self {
         Self {
             message_bus,
             session_manager,
             shutdown_tx,
             event_tx,
+            trace_paths,
         }
     }
 }
@@ -397,6 +506,7 @@ impl ChannelFactory for WebuiChannelFactory {
         ch.set_session_manager(self.session_manager.clone());
         ch.set_shutdown_rx(self.shutdown_tx.subscribe());
         ch.set_event_tx(self.event_tx.clone());
+        ch.set_trace_paths(self.trace_paths.clone());
         Ok(Box::new(ch))
     }
 }
@@ -463,7 +573,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let (event_tx, _) = broadcast::channel::<AgentEvent>(32);
 
-        let factory = WebuiChannelFactory::new(mb, sm, shutdown_tx, event_tx);
+        let factory = WebuiChannelFactory::new(mb, sm, shutdown_tx, event_tx, Vec::new());
         assert_eq!(factory.channel_type(), "webui");
 
         let config = json!({"host": "127.0.0.1", "port": 9999});
@@ -563,6 +673,8 @@ mod tests {
             session_manager: None,
             index_html: String::new(),
             event_tx: None,
+            traces_html: String::new(),
+            trace_paths: Vec::new(),
         });
         let result = list_chats_handler(State(state)).await;
         assert!(result.0.is_empty());
@@ -594,6 +706,8 @@ mod tests {
             session_manager: Some(sm),
             index_html: String::new(),
             event_tx: None,
+            traces_html: String::new(),
+            trace_paths: Vec::new(),
         });
         let result = list_chats_handler(State(state)).await;
         assert_eq!(result.0.len(), 1);
@@ -631,6 +745,8 @@ mod tests {
             session_manager: Some(sm),
             index_html: String::new(),
             event_tx: None,
+            traces_html: String::new(),
+            trace_paths: Vec::new(),
         });
         let result = session_history_handler(State(state), Path("abc".to_string())).await;
         assert_eq!(result.0.len(), 2);
@@ -645,6 +761,8 @@ mod tests {
             session_manager: None,
             index_html: String::new(),
             event_tx: None,
+            traces_html: String::new(),
+            trace_paths: Vec::new(),
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { create_chat_handler(State(state)).await });
@@ -737,5 +855,133 @@ mod tests {
         // Drop the handle — server task will keep running until MB closes,
         // which is fine for this test.
         drop(handle);
+    }
+
+    // ── Trace handlers ──
+
+    /// Build a minimal AppState for trace handler tests.
+    fn trace_state(trace_paths: Vec<String>) -> Arc<AppState> {
+        Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: None,
+            index_html: String::new(),
+            traces_html: "<h1>Trace Viewer</h1>".to_string(),
+            event_tx: None,
+            trace_paths,
+        })
+    }
+
+    /// Write a realistic two-span trace to a file and return its path.
+    fn write_trace_file(dir: &std::path::Path, trace_id: &str, status: &str) -> String {
+        let path = dir.join(format!("{}.jsonl", trace_id));
+        let root = serde_json::json!({
+            "trace_id": trace_id,
+            "span_id": "root001",
+            "parent_span_id": null,
+            "name": "invoke_agent slimbot",
+            "start": "2026-08-15T10:00:00.000000Z",
+            "end": "2026-08-15T10:00:01.000000Z",
+            "duration_us": 1000000,
+            "status": status,
+            "attributes": {"gen_ai.conversation.id": "webui:chat1"},
+        });
+        let child = serde_json::json!({
+            "trace_id": trace_id,
+            "span_id": "child01",
+            "parent_span_id": "root001",
+            "name": "chat",
+            "start": "2026-08-15T10:00:00.100000Z",
+            "end": "2026-08-15T10:00:00.500000Z",
+            "duration_us": 400000,
+            "status": "ok",
+            "attributes": {"http.request.body": "{\"model\":\"gpt-4o\"}"},
+        });
+        let content = format!("{}\n{}", root, child);
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_webui_traces_page_returns_html() {
+        let state = trace_state(Vec::new());
+        let (status, headers, body) = traces_page_handler(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0], ("content-type", "text/html"));
+        assert!(body.contains("Trace Viewer"));
+    }
+
+    #[tokio::test]
+    async fn test_webui_traces_list_disabled_when_no_paths() {
+        let state = trace_state(Vec::new());
+        let res = traces_list_handler(State(state)).await;
+        assert!(res.0.disabled);
+        assert!(res.0.traces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_webui_traces_list_returns_sorted_summaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = write_trace_file(tmp.path(), "trace-a", "ok");
+        let newer = write_trace_file(tmp.path(), "trace-b", "error");
+        let state = trace_state(vec![older, newer]);
+        let res = traces_list_handler(State(state)).await;
+        assert!(!res.0.disabled);
+        assert_eq!(res.0.traces.len(), 2);
+        // Newest first.
+        assert_eq!(res.0.traces[0].full_trace_id, "trace-b");
+        assert_eq!(res.0.traces[1].full_trace_id, "trace-a");
+        assert_eq!(res.0.traces[0].status, "error");
+        assert_eq!(res.0.traces[0].span_count, 2);
+        assert_eq!(res.0.traces[0].root_name, "invoke_agent slimbot");
+        assert!(!res.0.traces[0].running);
+    }
+
+    #[tokio::test]
+    async fn test_webui_trace_detail_returns_span_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_trace_file(tmp.path(), "trace-d", "ok");
+        let state = trace_state(vec![path]);
+        let res = trace_detail_handler(State(state), Path("trace-d".to_string())).await;
+        let detail = res.unwrap().0;
+        assert_eq!(detail.trace_id, "trace-d");
+        assert_eq!(detail.span_count, 2);
+        let root = detail.root.unwrap();
+        assert_eq!(root.span.name, "invoke_agent slimbot");
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].span.name, "chat");
+        assert_eq!(
+            root.children[0].span.attributes["http.request.body"],
+            "{\"model\":\"gpt-4o\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webui_trace_detail_404_for_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_trace_file(tmp.path(), "trace-e", "ok");
+        let state = trace_state(vec![path]);
+        let res = trace_detail_handler(State(state), Path("missing".to_string())).await;
+        assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn test_webui_trace_detail_404_when_disabled() {
+        let state = trace_state(Vec::new());
+        let res = trace_detail_handler(State(state), Path("anything".to_string())).await;
+        assert_eq!(res.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn test_embed_get_content_by_dest_finds_webui_traces_and_common_css() {
+        // The trace viewer page and shared CSS must be embedded.
+        let traces = crate::embed::get_content_by_dest("webui/traces.html");
+        assert!(traces.is_some(), "webui/traces.html should be embedded");
+        assert!(traces.unwrap().contains("<!DOCTYPE html>"));
+
+        let css = crate::embed::get_content_by_dest("webui/common.css");
+        assert!(css.is_some(), "webui/common.css should be embedded");
+        assert!(css.unwrap().contains("--accent"));
     }
 }

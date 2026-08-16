@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SlimBot · Traces</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/common.css">
+<style>
+/* Trace-viewer-specific styles. The shared visual language lives in common.css. */
+
+#app {
+  max-width: 1100px;
+}
+
+/* ─ Header ─ */
+.traces-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 1.1rem 1.5rem;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  flex-shrink: 0;
+}
+
+.traces-header .left {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+#back {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+#back:hover {
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+}
+
+.traces-header h1 {
+  font-family: var(--font-mono);
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.traces-header h1 span { color: var(--accent); }
+
+.runtime {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+#refresh {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  font-weight: 500;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  letter-spacing: 0.01em;
+}
+
+#refresh:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#refresh:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ─ Main panel ─ */
+#traces-panel {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem 1.5rem;
+}
+
+/* ─ Statuses ─ */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  padding: 0.18rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+}
+
+.badge .pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.badge.status-ok { color: var(--status-done); border-color: rgba(76, 175, 106, 0.25); background: rgba(76, 175, 106, 0.08); }
+.badge.status-error { color: var(--status-failed); border-color: rgba(217, 79, 85, 0.25); background: rgba(217, 79, 85, 0.08); }
+.badge.status-running { color: var(--status-running); border-color: rgba(200, 164, 94, 0.25); background: rgba(200, 164, 94, 0.08); }
+.badge.status-running .pulse-dot { animation: pulse 1.6s ease-in-out infinite; }
+
+/* ─ Trace list ─ */
+.trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.trace-item {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  overflow: hidden;
+  animation: fadeUp 0.4s ease both;
+  transition: border-color 0.2s ease;
+}
+
+.trace-item:hover { border-color: var(--border-accent); }
+
+:root { --trace-cols: minmax(120px, 1.2fr) minmax(150px, 1.4fr) 90px 70px 90px minmax(150px, 1.6fr) 30px; }
+
+.trace-list-head {
+  display: grid;
+  grid-template-columns: var(--trace-cols);
+  gap: 0.75rem;
+  padding: 0 1rem 0.35rem;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.trace-summary {
+  display: grid;
+  grid-template-columns: var(--trace-cols);
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.8rem 1rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.trace-summary .mono { font-family: var(--font-mono); }
+
+.trace-summary .id { font-size: 0.78rem; color: var(--text-primary); font-weight: 500; letter-spacing: 0.01em; }
+.trace-summary .start { font-size: 0.74rem; color: var(--text-muted); }
+.trace-summary .spans { font-size: 0.8rem; color: var(--text-secondary); text-align: center; }
+.trace-summary .dur { font-size: 0.8rem; color: var(--text-secondary); text-align: right; font-family: var(--font-mono); }
+.trace-summary .root-name {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.trace-summary .chevron {
+  color: var(--text-muted);
+  text-align: right;
+  transition: transform 0.2s ease;
+  font-size: 0.8rem;
+}
+.trace-item.open .trace-summary .chevron { transform: rotate(90deg); }
+
+/* ─ Span tree ─ */
+.trace-detail { display: none; border-top: 1px solid var(--border-subtle); padding: 0.75rem 1rem; }
+.trace-item.open .trace-detail { display: block; }
+
+.span-tree { display: flex; flex-direction: column; }
+
+.span-node { display: flex; flex-direction: column; }
+
+.span-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.4rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.78rem;
+  transition: background 0.15s ease;
+}
+
+.span-row:hover { background: var(--accent-soft); }
+
+.span-row .guide { color: var(--border-accent); font-family: var(--font-mono); font-size: 0.72rem; flex-shrink: 0; }
+.span-row .tgl { color: var(--text-muted); width: 12px; text-align: center; flex-shrink: 0; font-size: 0.72rem; transition: transform 0.2s ease; }
+.span-node.open > .span-row .tgl { transform: rotate(90deg); }
+
+.span-row .name {
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.span-row .dur { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.72rem; flex-shrink: 0; }
+.span-row .status-tag { font-size: 0.66rem; padding: 0.1rem 0.45rem; border-radius: 999px; border: 1px solid var(--border-subtle); flex-shrink: 0; }
+.span-row .status-tag.ok { color: var(--status-done); }
+.span-row .status-tag.error { color: var(--status-failed); border-color: rgba(217, 79, 85, 0.3); }
+
+.span-children { display: none; flex-direction: column; }
+.span-node.open > .span-children { display: flex; }
+
+/* ─ Span detail: attributes table ─ */
+.span-detail {
+  display: none;
+  margin: 0.25rem 0 0.5rem 1.4rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.span-node.open > .span-detail { display: block; }
+
+.span-detail .meta-line {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  margin-bottom: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.2rem;
+}
+
+.span-detail .meta-line b { color: var(--text-secondary); font-weight: 500; }
+
+.attr-table { border-collapse: collapse; width: 100%; font-size: 0.74rem; }
+.attr-table th, .attr-table td {
+  border: 1px solid var(--border-subtle);
+  padding: 0.32rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+.attr-table th {
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  width: 34%;
+}
+.attr-table td {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
+/* Collapsible JSON / long values */
+.json-val { display: block; }
+.json-val .short { white-space: pre-wrap; }
+.json-val .full { display: none; white-space: pre-wrap; }
+.json-val.expanded .short { display: none; }
+.json-val.expanded .full { display: block; }
+.expand-btn {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid rgba(200, 164, 94, 0.3);
+  border-radius: 4px;
+  padding: 0.08rem 0.45rem;
+  margin-top: 0.3rem;
+  cursor: pointer;
+}
+.expand-btn:hover { background: var(--accent-soft); }
+
+.no-attrs {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ─ Empty / disabled states ─ */
+.empty-state, .disabled-state {
+  text-align: center;
+  padding: 4rem 1.5rem;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  line-height: 1.7;
+}
+
+.disabled-state code {
+  font-family: var(--font-mono);
+  font-size: 0.82em;
+  color: var(--accent);
+  background: rgba(200, 164, 94, 0.08);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+}
+
+/* ─ Responsive ─ */
+@media (max-width: 760px) {
+  #app { max-width: 100%; }
+  .traces-header { flex-wrap: wrap; padding: 0.9rem 1rem; }
+  #traces-panel { padding: 1rem; }
+  .trace-summary {
+    grid-template-columns: 1fr 80px 90px 30px;
+    grid-template-areas:
+      "id dur spans chev"
+      "start root root chev";
+    row-gap: 0.3rem;
+  }
+  .trace-summary .id { grid-area: id; }
+  .trace-summary .start { grid-area: start; }
+  .trace-summary .spans { grid-area: spans; }
+  .trace-summary .dur { grid-area: dur; }
+  .trace-summary .root-name { grid-area: root; }
+  .trace-summary .chevron { grid-area: chev; }
+  .span-row .name { font-size: 0.74rem; }
+  .attr-table th { width: 40%; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="traces-header">
+    <div class="left">
+      <a id="back" href="/" aria-label="Back to chat">&#8592;</a>
+      <h1>trace<span>viewer</span></h1>
+    </div>
+    <div class="runtime" id="runtime"></div>
+    <div class="header-actions">
+      <button id="refresh" title="Refresh traces">&#8635; Refresh</button>
+    </div>
+  </header>
+
+  <main id="traces-panel" class="scrollable">
+    <div id="content"></div>
+  </main>
+</div>
+
+<script>
+let traces = [];
+let startupMs = null;
+
+const MAX_JSON_PREVIEW = 400;   // chars of JSON/string preview before collapse
+const MAX_STRING_PREVIEW = 200; // plain string truncation threshold
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+
+function fmtDuration(us) {
+  if (us == null) return '—';
+  if (us < 1000) return us + 'µs';
+  if (us < 1000000) return (us / 1000).toFixed(us < 10000 ? 1 : 0) + 'ms';
+  const s = us / 1000000;
+  if (s < 60) return s.toFixed(2) + 's';
+  return Math.floor(s / 60) + 'm ' + (s % 60).toFixed(0) + 's';
+}
+
+function fmtTime(msOrString) {
+  if (msOrString == null) return '—';
+  let d;
+  if (typeof msOrString === 'number') d = new Date(msOrString);
+  else d = new Date(msOrString);
+  return d.toLocaleString([], { hour12: false, year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function fmtRuntime() {
+  const el = document.getElementById('runtime');
+  if (!startupMs) { el.textContent = ''; return; }
+  const secs = Math.max(0, Math.floor((Date.now() - startupMs) / 1000));
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  const parts = d > 0 ? [d + 'd', h + 'h', m + 'm'] : h > 0 ? [h + 'h', m + 'm', s + 's'] : [m + 'm', s + 's'];
+  el.textContent = 'started ' + fmtTime(startupMs) + ' · running ' + parts.join(' ');
+}
+
+setInterval(fmtRuntime, 1000);
+
+async function loadTraces() {
+  const btn = document.getElementById('refresh');
+  btn.disabled = true;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="empty-state">Loading traces…</div>';
+  try {
+    const res = await fetch('/traces/api/traces');
+    const data = await res.json();
+    startupMs = data.startup_ms != null ? data.startup_ms : null;
+    render(data);
+  } catch (err) {
+    content.innerHTML = '<div class="empty-state">Failed to load traces.<br><code>' + esc(err.message) + '</code></div>';
+  } finally {
+    btn.disabled = false;
+    fmtRuntime();
+  }
+}
+
+function statusBadge(status) {
+  const label = status === 'running' ? 'running' : status;
+  return '<span class="badge status-' + esc(status) + '"><span class="pulse-dot"></span>' + esc(label) + '</span>';
+}
+
+function render(data) {
+  const content = document.getElementById('content');
+  const list = data.traces || [];
+
+  if (data.disabled) {
+    content.innerHTML =
+      '<div class="disabled-state">' +
+      'Tracing is not configured for this Gateway.<br><br>' +
+      'Enable it in <code>~/.slimbot/config.json</code> under ' +
+      '<code>"tracing": {"enabled": true, "backends": [{"type": "file"}]}</code> ' +
+      'and restart the Gateway.<br>Traces are written to ' +
+      '<code>{workspace_dir}/traces.jsonl</code>.' +
+      '</div>';
+    return;
+  }
+
+  let tooLargeHint = '';
+  if (data.too_large) {
+    // The server still read it; show a subtle hint rather than hiding data.
+    tooLargeHint = '<div class="empty-state" style="padding:.8rem">Trace file is very large — data may be slow to load.</div>';
+  }
+
+  if (list.length === 0) {
+    content.innerHTML =
+      tooLargeHint +
+      '<div class="empty-state">No traces yet.<br>Runs happen when you send a message in the chat view ' +
+      '(tracing must be enabled in config).</div>';
+    return;
+  }
+
+  const container = document.createElement('div');
+  container.className = 'trace-list';
+
+  // Column header row (shares the column template via the CSS variable).
+  const head = document.createElement('div');
+  head.className = 'trace-list-head';
+  head.innerHTML =
+    '<span>Trace</span><span>Start</span><span style="text-align:center">Status</span>' +
+    '<span style="text-align:center">Spans</span><span style="text-align:right">Duration</span>' +
+    '<span>Root span</span><span></span>';
+  container.appendChild(head);
+
+  list.forEach((t, i) => {
+    const item = document.createElement('div');
+    item.className = 'trace-item';
+    item.style.animationDelay = (i * 0.04) + 's';
+
+    const summary = document.createElement('div');
+    summary.className = 'trace-summary';
+    summary.innerHTML =
+      '<span class="id mono">' + esc(t.trace_id) + '</span>' +
+      '<span class="start mono">' + esc(t.start) + '</span>' +
+      '<span style="text-align:center">' + statusBadge(t.status) + '</span>' +
+      '<span class="spans">' + t.span_count + '</span>' +
+      '<span class="dur">' + fmtDuration(t.duration_us) + '</span>' +
+      '<span class="root-name" title="' + esc(t.root_name || '') + '">' + esc(t.root_name || '—') + '</span>' +
+      '<span class="chevron">&#9654;</span>';
+
+    const detail = document.createElement('div');
+    detail.className = 'trace-detail';
+    detail.innerHTML = '<div class="empty-state" style="padding:1rem">Loading…</div>';
+
+    summary.addEventListener('click', async () => {
+      const open = item.classList.toggle('open');
+      if (open && !detail.dataset.loaded) {
+        detail.dataset.loaded = '1';
+        try {
+          const res = await fetch('/traces/api/trace/' + encodeURIComponent(t.full_trace_id));
+          if (!res.ok) {
+            detail.innerHTML = '<div class="empty-state">Trace not found (maybe still in progress).</div>';
+            return;
+          }
+          const trace = await res.json();
+          detail.innerHTML = renderDetail(trace);
+        } catch (err) {
+          detail.innerHTML = '<div class="empty-state">Failed to load trace: ' + esc(err.message) + '</div>';
+        }
+      }
+    });
+
+    item.appendChild(summary);
+    item.appendChild(detail);
+    container.appendChild(item);
+  });
+
+  content.innerHTML = '';
+  if (tooLargeHint) content.appendChild(document.createRange().createContextualFragment(tooLargeHint));
+  content.appendChild(container);
+}
+
+// ── Detail rendering ──
+
+function renderDetail(trace) {
+  if (!trace.root) {
+    // In-flight trace with no root yet: render the ended child spans that
+    // have already been written to the file (flat, start-sorted).
+    const spans = trace.spans || [];
+    if (spans.length === 0) {
+      return '<div class="empty-state" style="padding:1rem">This trace is still running — no spans have completed yet.</div>';
+    }
+    return '<div class="span-tree">' +
+      spans.map((s, i) => renderFlatSpan(s, i)).join('') +
+      '</div>';
+  }
+  return '<div class="span-tree">' + renderNode(trace.root, '') + '</div>';
+}
+
+// Render a single span as a flat row (used for in-flight traces without a
+// root, where parent-child nesting is unavailable).
+function renderFlatSpan(span, index) {
+  const attrs = span.attributes || {};
+  let row = '<div class="span-row">';
+  row += '<span class="guide"></span>';
+  row += '<span class="tgl"></span>';
+  row += '<span class="name" title="' + esc(span.span_id) + '">' + esc(span.name) + '</span>';
+  row += '<span class="status-tag ' + esc(span.status) + '">' + esc(span.status) + '</span>';
+  if (span.error) row += '<span class="status-tag error" title="' + esc(span.error) + '">error</span>';
+  row += '<span class="dur">' + fmtDuration(span.duration_us) + '</span>';
+  row += '</div>';
+
+  let detail = '<div class="span-detail" style="margin-left:0">';
+  const meta = [];
+  meta.push('<b>span</b> ' + esc(span.span_id));
+  meta.push('<b>start</b> ' + esc(span.start));
+  if (span.end) meta.push('<b>end</b> ' + esc(span.end));
+  if (span.error) meta.push('<b>error</b> ' + esc(span.error));
+  detail += '<div class="meta-line">' + meta.join('<span></span>') + '</div>';
+
+  const keys = Object.keys(attrs);
+  if (keys.length === 0) {
+    detail += '<div class="no-attrs">No attributes</div>';
+  } else {
+    detail += '<table class="attr-table"><tbody>';
+    keys.forEach(k => {
+      detail += '<tr><th>' + esc(k) + '</th><td>' + renderValue(attrs[k]) + '</td></tr>';
+    });
+    detail += '</tbody></table>';
+  }
+  detail += '</div>';
+
+  return '<div class="span-node">' + row + detail + '</div>';
+}
+
+function renderNode(node, guide) {
+  const span = node.span;
+  const hasChildren = node.children && node.children.length > 0;
+  const attrs = span.attributes || {};
+
+  let row = '<div class="span-row" data-node>';
+  row += '<span class="guide">' + esc(guide) + '</span>';
+  row += '<span class="tgl">' + (hasChildren ? '&#9654;' : '') + '</span>';
+  row += '<span class="name" title="' + esc(span.span_id) + '">' + esc(span.name) + '</span>';
+  row += '<span class="status-tag ' + esc(span.status) + '">' + esc(span.status) + '</span>';
+  if (span.error) row += '<span class="status-tag error" title="' + esc(span.error) + '">error</span>';
+  row += '<span class="dur">' + fmtDuration(span.duration_us) + '</span>';
+  row += '</div>';
+
+  // Detail panel
+  let detail = '<div class="span-detail">';
+  const meta = [];
+  meta.push('<b>span</b> ' + esc(span.span_id));
+  meta.push('<b>start</b> ' + esc(span.start));
+  if (span.end) meta.push('<b>end</b> ' + esc(span.end));
+  if (span.error) meta.push('<b>error</b> ' + esc(span.error));
+  detail += '<div class="meta-line">' + meta.join('<span></span>') + '</div>';
+
+  const keys = Object.keys(attrs);
+  if (keys.length === 0) {
+    detail += '<div class="no-attrs">No attributes</div>';
+  } else {
+    detail += '<table class="attr-table"><tbody>';
+    keys.forEach(k => {
+      detail += '<tr><th>' + esc(k) + '</th><td>' + renderValue(attrs[k]) + '</td></tr>';
+    });
+    detail += '</tbody></table>';
+  }
+  detail += '</div>';
+
+  let children = '';
+  if (hasChildren) {
+    children = '<div class="span-children">' +
+      node.children.map((c, i) => {
+        const g = guide + (i === node.children.length - 1 ? '&nbsp;&nbsp;&nbsp;' : '&#9500;&#9472; ');
+        return renderNode(c, g);
+      }).join('') +
+      '</div>';
+  }
+
+  return '<div class="span-node">' + row + detail + children + '</div>';
+}
+
+function renderValue(value) {
+  if (value === null || value === undefined) return esc(String(value));
+  const isObj = typeof value === 'object';
+  const str = isObj ? JSON.stringify(value) : String(value);
+
+  // A JSON-looking string (e.g. the serialized `http.request.body` attribute)
+  // gets the pretty-printed JSON treatment, not the plain truncation path.
+  let jsonStr = null;
+  if (!isObj) {
+    try {
+      const parsed = JSON.parse(str);
+      if (parsed !== null && typeof parsed === 'object') jsonStr = JSON.stringify(parsed, null, 2);
+    } catch { /* not JSON — leave as plain string */ }
+  }
+  const pretty = isObj ? JSON.stringify(value, null, 2) : jsonStr;
+
+  if (pretty !== null || str.length > MAX_STRING_PREVIEW) {
+    const full = pretty !== null ? pretty : str;
+    const preview = full.slice(0, pretty !== null ? MAX_JSON_PREVIEW : MAX_STRING_PREVIEW);
+    const hint = pretty !== null ? 'JSON' : 'long value';
+    return '<span class="json-val">' +
+      '<span class="short">' + esc(preview) + (full.length > preview.length ? '…' : '') + '</span>' +
+      '<span class="full">' + esc(full) + '</span>' +
+      '<button class="expand-btn">expand ' + hint + ' (' + full.length + ' chars)</button>' +
+      '</span>';
+  }
+  return esc(str);
+}
+
+// ── Events ──
+document.getElementById('refresh').addEventListener('click', loadTraces);
+
+document.getElementById('content').addEventListener('click', (e) => {
+  const expandBtn = e.target.closest('.expand-btn');
+  if (expandBtn) {
+    const wrap = expandBtn.closest('.json-val');
+    wrap.classList.toggle('expanded');
+    expandBtn.textContent = wrap.classList.contains('expanded') ? 'collapse' : 'expand';
+    return;
+  }
+  const row = e.target.closest('.span-row');
+  if (row) {
+    const node = row.closest('.span-node');
+    node.classList.toggle('open');
+    return;
+  }
+});
+
+loadTraces();
+</script>
+</body>
+</html>

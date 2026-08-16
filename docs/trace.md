@@ -133,7 +133,7 @@ pub struct Tracer {
 
 - 每 span 结束（`on_span_end`）时同步 append 一行 JSONL：`{trace_id, span_id, parent_span_id, name, start, end, duration_us, status, attributes}`
 - 写入用 `parking_lot::Mutex<File>` 串行化（已有依赖）
-- 进程崩溃不丢已结束的 span（未结束的本就该丢）
+- **文件生命周期（进程内 append，跨进程截断）**：进程内保持 append-only（append 句柄在截断后仍然有效，O_APPEND 写入落在新末尾）；进程内崩溃只丢未结束的 span。默认在每次 Gateway 启动时截断（`tracing.reset_on_start`，默认 `true`），因此 trace 文件只保留当前进程运行期间的记录；CLI 模式从不截断，不会踩踏 Gateway 的 trace 数据。
 
 ### otel
 
@@ -149,8 +149,9 @@ pub struct Tracer {
 {
   "tracing": {
     "enabled": false,
+    "reset_on_start": true,
     "backends": [
-      { "type": "file", "enabled": true, "path": "~/.slimbot/traces.jsonl" },
+      { "type": "file", "enabled": true, "path": "" },
       { "type": "otel", "enabled": true, "endpoint": "http://localhost:4318", "service_name": "slimbot" }
     ]
   }
@@ -159,7 +160,19 @@ pub struct Tracer {
 
 - `tracing.enabled` 总开关；`backends` 数组天然支持同 type 多实例（fan-out 按顺序逐个构造）
 - 每个 backend 有独立 `enabled`
+- `tracing.reset_on_start`（默认 `true`）：Gateway 启动时截断所有启用 file backend 的 trace 文件；`false` 时保留历史。仅 Gateway 模式读取，CLI 模式从不截断
+- file backend 的 `path` 为空时，在接线层解析为 `{workspace_dir}/traces.jsonl`（默认，与其它 workspace 产物同处）；非空时原样使用（用户可自定义任意路径）。接线层的 `resolve_trace_file_paths` 是唯一解析函数，`build_tracer`（写）与 WebUI 查看器（读）共用，保证写入与读取指向同一文件
 - 走 `define_config!` 宏生成 `TraceConfig` / `TraceBackendEntry`，挂到根 `Config`
+
+## WebUI Trace 查看器
+
+- `GET /traces` 提供独立 HTML 页面（`resources/webui/traces.html`，嵌入 `webui/traces.html`），与聊天页共用 `webui/common.css`（视觉语言单一来源）
+- `GET /traces/api/traces`：解析 trace JSONL，按 trace_id 分组，返回按开始时间降序（新→旧）的 trace 摘要（trace_id 短前缀、开始时间、状态、span 数量、总时长、根 span 名、running 标记）与 `startup_ms`（trace 文件 mtime，即 `reset_on_start` 下的 Gateway 启动时间）
+- `GET /traces/api/trace/{id}`：单个 trace 的完整 span 树（按 `parent_span_id` 嵌套），每个 span 携带 name/start/end/duration_us/status/error/完整 attributes；无此 trace 返回 404
+- 进行中 trace（根 span 未结束 / 无根）标记为 `running`；trace 开始时间取根 span 的 start，无根时取最小 span start
+- 大文件保护：超过 `MAX_TRACE_FILE_BYTES`（50 MiB）的文件仍读取，但通过 `too_large` 提示并告警
+- 解析/分组/排序/建树在 `src/trace_viewer.rs` 纯函数中（可单测），HTTP handler 为薄壳
+- 前端：列表按新→旧、trace 展开为 span 树、span 展开显示 attributes 键值表；大 JSON（如 `http.request.body`）默认折叠点击展开，超长字符串（>200 字符）截断可展开；空态 / 禁用态文案；聊天页 ↔ trace 页双向互链
 
 ## 状态语义
 

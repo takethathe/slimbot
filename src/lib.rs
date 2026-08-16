@@ -28,6 +28,7 @@ pub(crate) mod snip;
 pub(crate) mod tool;
 pub(crate) mod tools;
 pub mod trace;
+pub(crate) mod trace_viewer;
 pub(crate) mod utils;
 pub(crate) mod worker;
 
