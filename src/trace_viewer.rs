@@ -75,7 +75,10 @@ pub struct SpanNode {
 /// Full detail for one trace: the span tree plus summary fields.
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceDetail {
+    /// Short prefix of the full trace id (e.g. 12 hex chars).
     pub trace_id: String,
+    /// Full trace id — the canonical identity for this trace.
+    pub full_trace_id: String,
     pub start: String,
     pub status: String,
     pub span_count: usize,
@@ -130,28 +133,6 @@ pub fn read_trace_files(paths: &[String]) -> TraceFileRead {
         }
     }
     out
-}
-
-/// Earliest modification time (epoch ms) across the enabled trace files.
-///
-/// With `reset_on_start` (the default) the files are truncated at Gateway
-/// startup, so this is the current process's startup time. Returns `None`
-/// when no file exists yet.
-pub fn trace_file_startup_ms(paths: &[String]) -> Option<i64> {
-    paths
-        .iter()
-        .filter_map(|p| {
-            let expanded = crate::path::expand_home(p);
-            std::fs::metadata(&expanded)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_millis() as i64)
-                })
-        })
-        .min()
 }
 
 /// Parse every JSONL line into a [`SpanRecord`], skipping malformed lines.
@@ -269,17 +250,19 @@ fn summarize_trace(spans: &[&SpanRecord]) -> TraceSummary {
 
     let (start_us, status, duration_us, root_name, running) = match roots.first() {
         Some(root) => {
-            // Root ended → completed trace. Duration = root end − root start.
-            let running = root.end.is_none();
+            // The file backend appends a span only when it ends, so a root
+            // present in the file is always completed. Duration = root end −
+            // root start; `end_us` falls back to the max child end for
+            // hand-edited/corrupt files.
             let start_us = root.start_us;
             let end_us = root.end_us.unwrap_or_else(|| max_end_us(spans));
-            let status = if running {
-                "running".to_string()
-            } else {
-                root.status.clone()
-            };
-            let duration_us = (end_us - start_us).max(0) as u64;
-            (start_us, status, duration_us, root.name.clone(), running)
+            (
+                start_us,
+                root.status.clone(),
+                (end_us - start_us).max(0) as u64,
+                root.name.clone(),
+                false,
+            )
         }
         None => {
             // No root span yet → in-flight trace. Start = min span start,
@@ -383,6 +366,7 @@ pub fn build_detail(trace_id: &str, spans: &[SpanRecord]) -> Option<TraceDetail>
     let root = build_tree(&spans);
     Some(TraceDetail {
         trace_id: summary.trace_id,
+        full_trace_id: summary.full_trace_id,
         start: summary.start,
         status: summary.status,
         span_count: summary.span_count,

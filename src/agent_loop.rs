@@ -82,6 +82,18 @@ pub(crate) fn reset_trace_files(paths: &[String], reset_on_start: bool) -> usize
     reset
 }
 
+/// Current wall-clock time as epoch milliseconds.
+///
+/// Used by the gateway to record the instant the trace file(s) were reset, so
+/// the viewer can show a startup time that is stable regardless of later file
+/// appends (file mtime is useless here — it changes on every write).
+pub(crate) fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Build a tracer from the `tracing` config section, or `None` when tracing
 /// is disabled or no backend is enabled. This is the wiring-layer mapping from
 /// config to backends; the trace module itself stays free of config.
@@ -911,6 +923,18 @@ mod tests {
         let count = reset_trace_files(&[path.to_string_lossy().to_string()], true);
         assert_eq!(count, 1);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn test_now_epoch_ms_is_recent_and_positive() {
+        let ms = now_epoch_ms();
+        assert!(ms > 0);
+        // Within the last few seconds of the current wall clock.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(now - ms < 10_000);
     }
 
     #[tokio::test]

@@ -361,6 +361,7 @@ fn test_build_detail_returns_tree_and_attributes() {
     let detail = build_detail("g1", &spans).unwrap();
     assert_eq!(detail.span_count, 2);
     assert_eq!(detail.trace_id, "g1");
+    assert_eq!(detail.full_trace_id, "g1");
     assert!(!detail.running);
     let root_node = detail.root.unwrap();
     assert_eq!(
@@ -431,6 +432,7 @@ fn test_build_detail_serializes_flat_spans() {
     let spans = parse_span_lines(&child);
     let detail = build_detail("m1", &spans).unwrap();
     let json = serde_json::to_value(&detail).unwrap();
+    assert_eq!(json["full_trace_id"], "m1");
     assert!(json.get("spans").is_some());
     assert_eq!(json["spans"].as_array().unwrap().len(), 1);
     assert_eq!(json["spans"][0]["name"], "iteration");
@@ -480,31 +482,6 @@ fn test_exceeds_size_guard_threshold() {
     assert!(!exceeds_size_guard(MAX_TRACE_FILE_BYTES));
     assert!(exceeds_size_guard(MAX_TRACE_FILE_BYTES + 1));
     assert!(!exceeds_size_guard(0));
-}
-
-#[test]
-fn test_trace_file_startup_ms_returns_mtime() {
-    let tmp = tempfile::tempdir().unwrap();
-    let p = tmp.path().join("traces.jsonl");
-    std::fs::write(&p, "x\n").unwrap();
-    let startup = trace_file_startup_ms(&[p.to_string_lossy().to_string()]).unwrap();
-    // Within the last few seconds.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    assert!(startup > 0 && now - startup < 10_000);
-}
-
-#[test]
-fn test_trace_file_startup_ms_none_when_missing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let startup = trace_file_startup_ms(&[tmp
-        .path()
-        .join("missing.jsonl")
-        .to_string_lossy()
-        .to_string()]);
-    assert!(startup.is_none());
 }
 
 // ── Serialization shape ──

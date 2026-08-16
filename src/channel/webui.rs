@@ -29,6 +29,9 @@ struct AppState {
     event_tx: Option<broadcast::Sender<AgentEvent>>,
     /// Enabled file-backend trace file paths (empty when tracing/file backend off).
     trace_paths: Vec<String>,
+    /// Epoch ms when the current process reset its trace file(s); `None` when
+    /// tracing is off or `reset_on_start` is false (no clean startup boundary).
+    trace_startup_ms: Option<i64>,
 }
 
 /// SSE payload with event type discrimination.
@@ -49,6 +52,7 @@ pub struct WebuiChannel {
     shutdown_rx: Option<broadcast::Receiver<()>>,
     event_tx: Option<broadcast::Sender<AgentEvent>>,
     trace_paths: Vec<String>,
+    trace_startup_ms: Option<i64>,
 }
 
 impl WebuiChannel {
@@ -70,6 +74,7 @@ impl WebuiChannel {
             shutdown_rx: None,
             event_tx: None,
             trace_paths: Vec::new(),
+            trace_startup_ms: None,
         })
     }
 
@@ -91,6 +96,10 @@ impl WebuiChannel {
 
     pub fn set_trace_paths(&mut self, paths: Vec<String>) {
         self.trace_paths = paths;
+    }
+
+    pub fn set_trace_startup_ms(&mut self, startup_ms: Option<i64>) {
+        self.trace_startup_ms = startup_ms;
     }
 
     /// Prune disconnected SSE subscribers for a chat and send payload to remaining.
@@ -145,6 +154,7 @@ impl WebuiChannel {
         let shutdown_rx = self.shutdown_rx.as_ref().map(|rx| rx.resubscribe());
         let event_tx = self.event_tx.clone();
         let trace_paths = self.trace_paths.clone();
+        let trace_startup_ms = self.trace_startup_ms;
 
         let handle = tokio::spawn(async move {
             let index_html = embed::get_content_by_dest("webui/index.html")
@@ -163,6 +173,7 @@ impl WebuiChannel {
                 traces_html,
                 event_tx,
                 trace_paths,
+                trace_startup_ms,
             };
 
             let app = axum::Router::new()
@@ -292,7 +303,7 @@ async fn traces_list_handler(State(state): State<Arc<AppState>>) -> axum::Json<T
             traces: Vec::new(),
         });
     }
-    let startup_ms = crate::trace_viewer::trace_file_startup_ms(&state.trace_paths);
+    let startup_ms = state.trace_startup_ms;
     let (spans, too_large) = load_trace_spans(&state.trace_paths);
     let traces = crate::trace_viewer::build_summaries(&spans);
     axum::Json(TracesListResponse {
@@ -475,6 +486,7 @@ pub struct WebuiChannelFactory {
     shutdown_tx: broadcast::Sender<()>,
     event_tx: broadcast::Sender<AgentEvent>,
     trace_paths: Vec<String>,
+    trace_startup_ms: Option<i64>,
 }
 
 impl WebuiChannelFactory {
@@ -484,6 +496,7 @@ impl WebuiChannelFactory {
         shutdown_tx: broadcast::Sender<()>,
         event_tx: broadcast::Sender<AgentEvent>,
         trace_paths: Vec<String>,
+        trace_startup_ms: Option<i64>,
     ) -> Self {
         Self {
             message_bus,
@@ -491,6 +504,7 @@ impl WebuiChannelFactory {
             shutdown_tx,
             event_tx,
             trace_paths,
+            trace_startup_ms,
         }
     }
 }
@@ -507,6 +521,7 @@ impl ChannelFactory for WebuiChannelFactory {
         ch.set_shutdown_rx(self.shutdown_tx.subscribe());
         ch.set_event_tx(self.event_tx.clone());
         ch.set_trace_paths(self.trace_paths.clone());
+        ch.set_trace_startup_ms(self.trace_startup_ms);
         Ok(Box::new(ch))
     }
 }
@@ -573,7 +588,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let (event_tx, _) = broadcast::channel::<AgentEvent>(32);
 
-        let factory = WebuiChannelFactory::new(mb, sm, shutdown_tx, event_tx, Vec::new());
+        let factory = WebuiChannelFactory::new(mb, sm, shutdown_tx, event_tx, Vec::new(), None);
         assert_eq!(factory.channel_type(), "webui");
 
         let config = json!({"host": "127.0.0.1", "port": 9999});
@@ -675,6 +690,7 @@ mod tests {
             event_tx: None,
             traces_html: String::new(),
             trace_paths: Vec::new(),
+            trace_startup_ms: None,
         });
         let result = list_chats_handler(State(state)).await;
         assert!(result.0.is_empty());
@@ -708,6 +724,7 @@ mod tests {
             event_tx: None,
             traces_html: String::new(),
             trace_paths: Vec::new(),
+            trace_startup_ms: None,
         });
         let result = list_chats_handler(State(state)).await;
         assert_eq!(result.0.len(), 1);
@@ -747,6 +764,7 @@ mod tests {
             event_tx: None,
             traces_html: String::new(),
             trace_paths: Vec::new(),
+            trace_startup_ms: None,
         });
         let result = session_history_handler(State(state), Path("abc".to_string())).await;
         assert_eq!(result.0.len(), 2);
@@ -763,6 +781,7 @@ mod tests {
             event_tx: None,
             traces_html: String::new(),
             trace_paths: Vec::new(),
+            trace_startup_ms: None,
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { create_chat_handler(State(state)).await });
@@ -870,6 +889,7 @@ mod tests {
             traces_html: "<h1>Trace Viewer</h1>".to_string(),
             event_tx: None,
             trace_paths,
+            trace_startup_ms: None,
         })
     }
 

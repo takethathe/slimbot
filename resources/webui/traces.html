@@ -405,9 +405,7 @@ function fmtDuration(us) {
 
 function fmtTime(msOrString) {
   if (msOrString == null) return '—';
-  let d;
-  if (typeof msOrString === 'number') d = new Date(msOrString);
-  else d = new Date(msOrString);
+  const d = new Date(msOrString);
   return d.toLocaleString([], { hour12: false, year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
@@ -444,8 +442,7 @@ async function loadTraces() {
 }
 
 function statusBadge(status) {
-  const label = status === 'running' ? 'running' : status;
-  return '<span class="badge status-' + esc(status) + '"><span class="pulse-dot"></span>' + esc(label) + '</span>';
+  return '<span class="badge status-' + esc(status) + '"><span class="pulse-dot"></span>' + esc(status) + '</span>';
 }
 
 function render(data) {
@@ -549,16 +546,42 @@ function renderDetail(trace) {
       return '<div class="empty-state" style="padding:1rem">This trace is still running — no spans have completed yet.</div>';
     }
     return '<div class="span-tree">' +
-      spans.map((s, i) => renderFlatSpan(s, i)).join('') +
+      spans.map((s) => renderFlatSpan(s)).join('') +
       '</div>';
   }
   return '<div class="span-tree">' + renderNode(trace.root, '') + '</div>';
 }
 
+// Shared detail panel (meta-line + attribute table) rendered below a span
+// row in both the tree and the flat in-flight list. `flat` drops the tree's
+// left indent so a bare row aligns with its detail.
+function renderSpanDetail(span, flat) {
+  const attrs = span.attributes || {};
+  let detail = '<div class="span-detail"' + (flat ? ' style="margin-left:0"' : '') + '>';
+  const meta = [];
+  meta.push('<b>span</b> ' + esc(span.span_id));
+  meta.push('<b>start</b> ' + esc(span.start));
+  if (span.end) meta.push('<b>end</b> ' + esc(span.end));
+  if (span.error) meta.push('<b>error</b> ' + esc(span.error));
+  detail += '<div class="meta-line">' + meta.join('<span></span>') + '</div>';
+
+  const keys = Object.keys(attrs);
+  if (keys.length === 0) {
+    detail += '<div class="no-attrs">No attributes</div>';
+  } else {
+    detail += '<table class="attr-table"><tbody>';
+    keys.forEach(k => {
+      detail += '<tr><th>' + esc(k) + '</th><td>' + renderValue(attrs[k]) + '</td></tr>';
+    });
+    detail += '</tbody></table>';
+  }
+  detail += '</div>';
+  return detail;
+}
+
 // Render a single span as a flat row (used for in-flight traces without a
 // root, where parent-child nesting is unavailable).
-function renderFlatSpan(span, index) {
-  const attrs = span.attributes || {};
+function renderFlatSpan(span) {
   let row = '<div class="span-row">';
   row += '<span class="guide"></span>';
   row += '<span class="tgl"></span>';
@@ -568,33 +591,12 @@ function renderFlatSpan(span, index) {
   row += '<span class="dur">' + fmtDuration(span.duration_us) + '</span>';
   row += '</div>';
 
-  let detail = '<div class="span-detail" style="margin-left:0">';
-  const meta = [];
-  meta.push('<b>span</b> ' + esc(span.span_id));
-  meta.push('<b>start</b> ' + esc(span.start));
-  if (span.end) meta.push('<b>end</b> ' + esc(span.end));
-  if (span.error) meta.push('<b>error</b> ' + esc(span.error));
-  detail += '<div class="meta-line">' + meta.join('<span></span>') + '</div>';
-
-  const keys = Object.keys(attrs);
-  if (keys.length === 0) {
-    detail += '<div class="no-attrs">No attributes</div>';
-  } else {
-    detail += '<table class="attr-table"><tbody>';
-    keys.forEach(k => {
-      detail += '<tr><th>' + esc(k) + '</th><td>' + renderValue(attrs[k]) + '</td></tr>';
-    });
-    detail += '</tbody></table>';
-  }
-  detail += '</div>';
-
-  return '<div class="span-node">' + row + detail + '</div>';
+  return '<div class="span-node">' + row + renderSpanDetail(span, true) + '</div>';
 }
 
 function renderNode(node, guide) {
   const span = node.span;
   const hasChildren = node.children && node.children.length > 0;
-  const attrs = span.attributes || {};
 
   let row = '<div class="span-row" data-node>';
   row += '<span class="guide">' + esc(guide) + '</span>';
@@ -604,27 +606,6 @@ function renderNode(node, guide) {
   if (span.error) row += '<span class="status-tag error" title="' + esc(span.error) + '">error</span>';
   row += '<span class="dur">' + fmtDuration(span.duration_us) + '</span>';
   row += '</div>';
-
-  // Detail panel
-  let detail = '<div class="span-detail">';
-  const meta = [];
-  meta.push('<b>span</b> ' + esc(span.span_id));
-  meta.push('<b>start</b> ' + esc(span.start));
-  if (span.end) meta.push('<b>end</b> ' + esc(span.end));
-  if (span.error) meta.push('<b>error</b> ' + esc(span.error));
-  detail += '<div class="meta-line">' + meta.join('<span></span>') + '</div>';
-
-  const keys = Object.keys(attrs);
-  if (keys.length === 0) {
-    detail += '<div class="no-attrs">No attributes</div>';
-  } else {
-    detail += '<table class="attr-table"><tbody>';
-    keys.forEach(k => {
-      detail += '<tr><th>' + esc(k) + '</th><td>' + renderValue(attrs[k]) + '</td></tr>';
-    });
-    detail += '</tbody></table>';
-  }
-  detail += '</div>';
 
   let children = '';
   if (hasChildren) {
@@ -636,7 +617,7 @@ function renderNode(node, guide) {
       '</div>';
   }
 
-  return '<div class="span-node">' + row + detail + children + '</div>';
+  return '<div class="span-node">' + row + renderSpanDetail(span, false) + children + '</div>';
 }
 
 function renderValue(value) {

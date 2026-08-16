@@ -188,6 +188,7 @@ impl ChannelManager {
         shutdown_tx: tokio::sync::broadcast::Sender<()>,
         event_tx: broadcast::Sender<AgentEvent>,
         trace_paths: Vec<String>,
+        trace_startup_ms: Option<i64>,
     ) {
         let factory = WebuiChannelFactory::new(
             self.message_bus.clone(),
@@ -195,6 +196,7 @@ impl ChannelManager {
             shutdown_tx,
             event_tx,
             trace_paths,
+            trace_startup_ms,
         );
         self.factories
             .insert("webui".to_string(), Box::new(factory));

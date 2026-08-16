@@ -32,6 +32,13 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         crate::agent_loop::resolve_trace_file_paths(config.as_ref(), paths.workspace_dir());
     let reset_count =
         crate::agent_loop::reset_trace_files(&trace_paths, config.tracing.reset_on_start);
+    // The startup instant of the current process's trace file. Recorded only
+    // when the file was actually reset (or created) so the viewer can show
+    // "started … · running …" that reflects this process, not the file mtime
+    // (which updates on every span append). None when tracing is off or
+    // `reset_on_start` is false — in those cases there is no clean "startup"
+    // boundary to display.
+    let trace_startup_ms = (reset_count > 0).then(crate::agent_loop::now_epoch_ms);
     if reset_count > 0 {
         info!("[gateway] Reset {} trace file(s) at startup", reset_count);
     }
@@ -231,6 +238,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             channel_shutdown_tx.clone(),
             event_tx.clone(),
             trace_paths.clone(),
+            trace_startup_ms,
         );
     }
 
