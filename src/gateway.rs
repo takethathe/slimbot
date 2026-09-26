@@ -319,7 +319,8 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryStore;
+    use crate::MemoryCategory;
+    use crate::memory::MemoryService;
     use crate::message_bus::BusRequest;
     use crate::session::{Message, SessionManager, SharedSessionManager};
     use std::path::PathBuf;
@@ -375,6 +376,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -496,6 +498,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -630,6 +633,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let mut tool_manager = ToolManager::new(workspace_dir.clone());
@@ -682,6 +686,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -895,6 +900,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -959,31 +965,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_init() {
+    async fn test_gateway_memory_init() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         let result = ms.lock().await.init();
         assert!(result.is_ok());
         assert!(workspace_dir.join("memory").exists());
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_write_read() {
+    async fn test_gateway_memory_set_get() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Write memory
-        ms.lock().await.write_memory("test memory content").unwrap();
+        ms.lock()
+            .await
+            .set(&MemoryCategory::Core, None, "test memory content")
+            .await
+            .unwrap();
 
         // Read memory
-        let content = ms.lock().await.read_memory();
+        let content = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::Core, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(content, "test memory content");
     }
 
@@ -1247,19 +1263,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_sync_all() {
+    async fn test_gateway_memory_sync_all() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Write some data
-        ms.lock().await.write_memory("test").unwrap();
+        ms.lock()
+            .await
+            .set(&MemoryCategory::Core, None, "test")
+            .await
+            .unwrap();
 
         // sync_all should not error
-        let result = ms.lock().await.sync_all();
+        let result = ms.lock().await.sync_all().await;
         assert!(result.is_ok());
     }
 
@@ -1328,6 +1348,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         };
 
         assert_eq!(config.agent.max_iterations, 50);
@@ -1369,12 +1390,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_append_history() {
+    async fn test_gateway_memory_append_history() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Append history entries - should not error
@@ -1388,12 +1409,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_read_recent_history() {
+    async fn test_gateway_memory_read_recent_history() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Append many entries
@@ -1528,12 +1549,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_read_unprocessed_history() {
+    async fn test_gateway_memory_read_unprocessed_history() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Append entries
@@ -1547,25 +1568,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_get_memory_context() {
+    async fn test_gateway_memory_get_effective_core() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
-        // Initially empty context
-        let ctx = ms.lock().await.get_memory_context();
-        assert!(ctx.is_empty());
+        // Initially empty memory → get_effective returns None
+        let content = ms
+            .lock()
+            .await
+            .get_effective(&MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert!(content.is_none());
 
         // Write memory
-        ms.lock().await.write_memory("test memory").unwrap();
+        ms.lock()
+            .await
+            .set(&MemoryCategory::Core, None, "test memory")
+            .await
+            .unwrap();
 
-        // Now context should have content
-        let ctx = ms.lock().await.get_memory_context();
-        assert!(!ctx.is_empty());
-        assert!(ctx.contains("test memory"));
+        // Now get_effective returns the content
+        let content = ms
+            .lock()
+            .await
+            .get_effective(&MemoryCategory::Core, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(content.contains("test memory"));
     }
 
     #[tokio::test]
@@ -1636,42 +1671,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_write_soul() {
+    async fn test_gateway_memory_set_soul() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Write SOUL.md
         ms.lock()
             .await
-            .write_soul("I am a helpful assistant")
+            .set(&MemoryCategory::Soul, None, "I am a helpful assistant")
+            .await
             .unwrap();
 
         // Read it back
-        let soul = ms.lock().await.read_soul();
+        let soul = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::Soul, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(soul, "I am a helpful assistant");
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_write_user() {
+    async fn test_gateway_memory_set_user() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Write USER.md
         ms.lock()
             .await
-            .write_user("Alice, software engineer")
+            .set(&MemoryCategory::User, None, "Alice, software engineer")
+            .await
             .unwrap();
 
         // Read it back
-        let user = ms.lock().await.read_user();
+        let user = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::User, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(user, "Alice, software engineer");
     }
 
@@ -1733,12 +1782,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_init_idempotent() {
+    async fn test_gateway_memory_init_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
 
         // Init multiple times should not error
         ms.lock().await.init().unwrap();
@@ -1773,12 +1822,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_read_unprocessed_history_with_skip() {
+    async fn test_gateway_memory_read_unprocessed_history_with_skip() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Append entries
@@ -1792,12 +1841,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_read_recent_history_cap() {
+    async fn test_gateway_memory_read_recent_history_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Append many entries
@@ -1882,42 +1931,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_write_and_read_soul() {
+    async fn test_gateway_memory_set_and_get_soul() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Write soul
         ms.lock()
             .await
-            .write_soul("You are a helpful AI assistant")
+            .set(
+                &MemoryCategory::Soul,
+                None,
+                "You are a helpful AI assistant",
+            )
+            .await
             .unwrap();
 
         // Read it back
-        let soul = ms.lock().await.read_soul();
+        let soul = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::Soul, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(soul, "You are a helpful AI assistant");
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_write_and_read_user() {
+    async fn test_gateway_memory_set_and_get_user() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Write user
         ms.lock()
             .await
-            .write_user("Bob, a software developer")
+            .set(&MemoryCategory::User, None, "Bob, a software developer")
+            .await
             .unwrap();
 
         // Read it back
-        let user = ms.lock().await.read_user();
+        let user = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::User, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(user, "Bob, a software developer");
     }
 
@@ -2046,12 +2113,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_append_and_read_multiple() {
+    async fn test_gateway_memory_append_and_read_multiple() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Append many entries
@@ -2180,12 +2247,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_init_creates_directory() {
+    async fn test_gateway_memory_init_creates_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
 
         // Memory dir should not exist before init
         assert!(!workspace_dir.join("memory").exists());
@@ -2350,17 +2417,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_read_memory_empty() {
+    async fn test_gateway_memory_get_core_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Read memory before writing should be empty
-        let memory = ms.lock().await.read_memory();
-        assert!(memory.is_empty());
+        let memory = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert!(memory.is_none());
     }
 
     #[tokio::test]
@@ -2449,17 +2521,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_get_memory_context_empty() {
+    async fn test_gateway_memory_get_effective_core_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
-        // Get memory context when empty
-        let ctx = ms.lock().await.get_memory_context();
-        assert!(ctx.is_empty());
+        // Get effective memory when empty
+        let content = ms
+            .lock()
+            .await
+            .get_effective(&MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert!(content.is_none());
     }
 
     #[tokio::test]
@@ -2554,31 +2631,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_read_user_empty() {
+    async fn test_gateway_memory_get_user_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Read user before writing should be empty
-        let user = ms.lock().await.read_user();
-        assert!(user.is_empty());
+        let user = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::User, None)
+            .await
+            .unwrap();
+        assert!(user.is_none());
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_read_soul_empty() {
+    async fn test_gateway_memory_get_soul_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Read soul before writing should be empty
-        let soul = ms.lock().await.read_soul();
-        assert!(soul.is_empty());
+        let soul = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::Soul, None)
+            .await
+            .unwrap();
+        assert!(soul.is_none());
     }
 
     #[tokio::test]
@@ -2666,19 +2753,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gateway_memory_store_write_and_read_memory() {
+    async fn test_gateway_memory_write_and_read_core() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         // Write memory
-        ms.lock().await.write_memory("test memory content").unwrap();
+        ms.lock()
+            .await
+            .set(&MemoryCategory::Core, None, "test memory content")
+            .await
+            .unwrap();
 
         // Read it back
-        let memory = ms.lock().await.read_memory();
+        let memory = ms
+            .lock()
+            .await
+            .get(&MemoryCategory::Core, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(memory, "test memory content");
     }
 

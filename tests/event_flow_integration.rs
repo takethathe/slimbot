@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use tokio::sync::{Mutex, broadcast};
 
 use slimbot::{
-    AgentConfig, AgentEvent, AgentRunner, FinishReason, LLMResponse, MemoryStore, Message,
+    AgentConfig, AgentEvent, AgentRunner, FinishReason, LLMResponse, MemoryService, Message,
     Provider, SessionManager, SharedSessionManager, TaskHook, Tool, ToolCall, ToolDefinition,
     ToolManager, Usage,
 };
@@ -113,7 +113,7 @@ async fn make_test_env(
     SharedSessionManager,
     Arc<ToolManager>,
     PathBuf,
-    Arc<Mutex<MemoryStore>>,
+    Arc<Mutex<MemoryService>>,
 ) {
     let session_dir = tmp.path().join("sessions");
     let workspace_dir = tmp.path().join("workspace");
@@ -125,7 +125,7 @@ async fn make_test_env(
         tm.register(Box::new(MockEchoTool::new(name, ret)));
     }
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     sm.lock().await.get_or_create("test-session").await.unwrap();
@@ -138,7 +138,7 @@ fn make_runner(
     tm: Arc<ToolManager>,
     provider: Arc<dyn Provider>,
     workspace_dir: PathBuf,
-    ms: Arc<Mutex<MemoryStore>>,
+    ms: Arc<Mutex<MemoryService>>,
 ) -> AgentRunner {
     AgentRunner::new(
         tm,

@@ -29,7 +29,7 @@
 | [日志系统](logging.md) | `log.rs`, `macros.rs` | 全局单例日志、级别过滤、彩色终端输出 |
 | [路径管理](path.md) | `path.rs` | 路径解析、默认值、沙箱验证、波浪号展开 |
 | [工具系统](tool.md) | `tool.rs`, `tools/` | Tool trait、ToolManager、工具结果处理 |
-| [内存与历史](memory.md) | `memory.rs` | 长期记忆、历史记录、游标管理 |
+| [记忆模块](memory.md) | `memory/` | category 化长期记忆、可插拔 backend、历史与游标 |
 | [工作池](worker.md) | `worker.rs` | 异步 Worker 与动态 WorkerPool |
 | [I/O 调度器](io_scheduler.md) | `io_scheduler.rs` | 阻塞读取循环、stdin 处理 |
 | [配置编辑 schema](config.md#webui-配置编辑器) | `config_schema.rs` | schema 序列化 + path-patch 引擎（WebUI 配置编辑器后端） |

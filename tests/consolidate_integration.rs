@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 use slimbot::{
-    Consolidator, ContextBuilder, FinishReason, LLMResponse, MemoryStore, Message, Provider,
+    Consolidator, ContextBuilder, FinishReason, LLMResponse, MemoryService, Message, Provider,
     SessionManager, SharedSessionManager, ToolDefinition, ToolManager, Usage,
 };
 
@@ -112,7 +112,7 @@ async fn test_consolidation_summary_appended_to_history() {
     let workspace_dir = tmp.path().join("workspace");
     std::fs::create_dir_all(&workspace_dir).unwrap();
 
-    let mut store = MemoryStore::new(&workspace_dir);
+    let mut store = MemoryService::new(&workspace_dir);
     store.init().unwrap();
 
     store.append_history("first historical event").unwrap();
@@ -146,7 +146,7 @@ async fn test_context_builder_injects_summary() {
 
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
@@ -195,7 +195,7 @@ async fn test_context_builder_skips_empty_summary() {
     sm.get_or_create("s1").await.unwrap();
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
@@ -265,7 +265,7 @@ async fn test_consolidator_archives_summary_to_history() {
 
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let provider = Arc::new(SummaryMockProvider {
@@ -310,7 +310,7 @@ async fn test_consolidator_updates_summary_in_session_meta() {
 
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let summary_text = "- User uses VS Code\n- Discovered that SQLite WAL mode fixes the issue";
@@ -355,7 +355,7 @@ async fn test_consolidator_no_consolidation_when_within_budget() {
 
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     // This provider should never be called since tokens are within budget
@@ -457,7 +457,7 @@ async fn test_context_builder_uses_summary_from_reloaded_session() {
 
         let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-        let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         let tm = Arc::new(ToolManager::new(workspace_dir.clone()));

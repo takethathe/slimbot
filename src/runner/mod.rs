@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::config::AgentConfig;
 use crate::consolidate::Consolidator;
-use crate::memory::SharedMemoryStore;
+use crate::memory::SharedMemory;
 use crate::provider::{Provider, Usage};
 use crate::session::{
     AgentEvent, Message, SharedSessionManager, TaskHook, TaskState, parse_session_origin,
@@ -91,7 +91,7 @@ pub struct AgentRunnerBuilder {
     provider: Option<Arc<dyn Provider>>,
     config: Option<AgentConfig>,
     workspace_dir: Option<PathBuf>,
-    memory_store: Option<SharedMemoryStore>,
+    memory_service: Option<SharedMemory>,
     consolidator: Option<Arc<Consolidator>>,
     tracer: Option<Arc<Tracer>>,
     max_tokens: Option<u32>,
@@ -106,7 +106,7 @@ impl AgentRunnerBuilder {
             provider: None,
             config: None,
             workspace_dir: None,
-            memory_store: None,
+            memory_service: None,
             consolidator: None,
             tracer: None,
             max_tokens: None,
@@ -139,8 +139,8 @@ impl AgentRunnerBuilder {
         self
     }
 
-    pub fn memory_store(mut self, ms: SharedMemoryStore) -> Self {
-        self.memory_store = Some(ms);
+    pub fn memory_service(mut self, ms: SharedMemory) -> Self {
+        self.memory_service = Some(ms);
         self
     }
 
@@ -255,7 +255,7 @@ impl AgentRunnerBuilder {
         let provider = self.provider.expect("provider required");
         let config = self.config.expect("config required");
         let workspace_dir = self.workspace_dir.expect("workspace_dir required");
-        let memory_store = self.memory_store.expect("memory_store required");
+        let memory_service = self.memory_service.expect("memory_service required");
         let max_tokens = self.max_tokens.unwrap_or(4096);
 
         // Builders that never called `with_defaults` (or added no custom hooks)
@@ -274,7 +274,7 @@ impl AgentRunnerBuilder {
             session_manager,
             config,
             workspace_dir,
-            memory_store,
+            memory_service,
             consolidator: self.consolidator,
             tracer: self.tracer,
             max_tokens,
@@ -289,7 +289,7 @@ pub struct AgentRunner {
     session_manager: SharedSessionManager,
     config: AgentConfig,
     workspace_dir: PathBuf,
-    memory_store: SharedMemoryStore,
+    memory_service: SharedMemory,
     consolidator: Option<Arc<Consolidator>>,
     tracer: Option<Arc<Tracer>>,
     max_tokens: u32,
@@ -317,7 +317,7 @@ impl AgentRunner {
         session_manager: SharedSessionManager,
         config: AgentConfig,
         workspace_dir: PathBuf,
-        memory_store: SharedMemoryStore,
+        memory_service: SharedMemory,
         consolidator: Option<Arc<Consolidator>>,
         max_tokens: u32,
         tracer: Option<Arc<Tracer>>,
@@ -328,7 +328,7 @@ impl AgentRunner {
             .provider(provider)
             .config(config)
             .workspace_dir(workspace_dir)
-            .memory_store(memory_store)
+            .memory_service(memory_service)
             .consolidator(consolidator)
             .tracer(tracer)
             .max_tokens(max_tokens)
@@ -411,7 +411,7 @@ impl AgentRunner {
             session_manager: self.session_manager.clone(),
             tool_manager: self.tool_manager.clone(),
             config: self.config.clone(),
-            memory_store: self.memory_store.clone(),
+            memory_service: self.memory_service.clone(),
             consolidator: self.consolidator.clone(),
             tracer: self.tracer.clone(),
             initial_message_count,

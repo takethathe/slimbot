@@ -18,6 +18,7 @@ fn default_config() -> Config {
         gateway: Default::default(),
         web_fetch: None,
         tracing: Default::default(),
+        memory: Default::default(),
     }
 }
 
@@ -115,13 +116,13 @@ fn create_directories_and_bootstrap(paths: &PathManager) -> Result<()> {
     std::fs::create_dir_all(paths.memory_dir())?;
 
     // Write bootstrap files (skip if already exists)
-    for (filename, template) in bootstrap_files() {
-        let path = paths.bootstrap_file(filename);
+    for (dest, template) in bootstrap_files() {
+        let path = paths.bootstrap_file(dest);
         if path.exists() {
-            eprintln!("  {} already exists, skipping.", filename);
+            eprintln!("  {} already exists, skipping.", dest);
         } else {
             std::fs::write(&path, template)?;
-            eprintln!("  Created {}.", filename);
+            eprintln!("  Created {}.", dest);
         }
     }
 
@@ -190,6 +191,10 @@ mod tests {
         assert!(workspace.join("USER.md").exists());
         assert!(workspace.join("SOUL.md").exists());
         assert!(workspace.join("TOOLS.md").exists());
+        assert!(workspace.join("memory").join("MEMORY.md").exists());
+        // identity/dream stay embedded-only — never written to the workspace.
+        assert!(!workspace.join("identity.md").exists());
+        assert!(!workspace.join("dream.md").exists());
     }
 
     #[test]

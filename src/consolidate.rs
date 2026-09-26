@@ -10,7 +10,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::info;
-use crate::memory::SharedMemoryStore;
+use crate::memory::SharedMemory;
 use crate::provider::{FinishReason, Provider};
 use crate::session::{Message, SharedSessionManager, message_content_chars, message_content_str};
 
@@ -30,7 +30,7 @@ const MAX_COMPRESS_RETRIES: usize = 2;
 pub struct Consolidator {
     provider: Arc<dyn Provider>,
     session_manager: SharedSessionManager,
-    memory_store: SharedMemoryStore,
+    memory_service: SharedMemory,
     context_window_tokens: u32,
     cancel_token: CancellationToken,
 }
@@ -39,13 +39,13 @@ impl Consolidator {
     pub fn new(
         provider: Arc<dyn Provider>,
         session_manager: SharedSessionManager,
-        memory_store: SharedMemoryStore,
+        memory_service: SharedMemory,
         context_window_tokens: u32,
     ) -> Self {
         Self {
             provider,
             session_manager,
-            memory_store,
+            memory_service,
             context_window_tokens,
             cancel_token: CancellationToken::new(),
         }
@@ -227,7 +227,7 @@ impl Consolidator {
             summary.truncate(cut);
         }
 
-        let mut ms = self.memory_store.lock().await;
+        let mut ms = self.memory_service.lock().await;
         if let Err(e) = ms.append_history(&summary) {
             info!("[Consolidator] Failed to append summary to history: {e}");
         }
@@ -552,7 +552,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    use crate::memory::MemoryStore;
+    use crate::memory::MemoryService;
     use crate::provider::{LLMResponse, Usage};
     use crate::session::SessionManager;
 
@@ -622,8 +622,8 @@ mod tests {
         }
 
         let sm: SharedSessionManager = Arc::new(tokio::sync::Mutex::new(sm));
-        let ms: SharedMemoryStore =
-            Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms: SharedMemory =
+            Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
         ms.lock().await.init().unwrap();
 
         let consolidator = Consolidator::new(provider, sm, ms, 32768);
@@ -647,7 +647,7 @@ mod tests {
             .unwrap();
 
         let entries = consolidator
-            .memory_store
+            .memory_service
             .lock()
             .await
             .read_recent_history(10);
@@ -672,7 +672,7 @@ mod tests {
             .unwrap();
 
         let entries = consolidator
-            .memory_store
+            .memory_service
             .lock()
             .await
             .read_recent_history(10);
@@ -700,7 +700,7 @@ mod tests {
             .unwrap();
 
         let entries = consolidator
-            .memory_store
+            .memory_service
             .lock()
             .await
             .read_recent_history(10);
@@ -728,7 +728,7 @@ mod tests {
             .unwrap();
 
         let entries = consolidator
-            .memory_store
+            .memory_service
             .lock()
             .await
             .read_recent_history(10);
@@ -753,7 +753,7 @@ mod tests {
             .unwrap();
 
         let entries = consolidator
-            .memory_store
+            .memory_service
             .lock()
             .await
             .read_recent_history(10);
@@ -777,7 +777,7 @@ mod tests {
             .unwrap();
 
         let entries = consolidator
-            .memory_store
+            .memory_service
             .lock()
             .await
             .read_recent_history(10);
@@ -804,7 +804,7 @@ mod tests {
             .unwrap();
 
         let entries = consolidator
-            .memory_store
+            .memory_service
             .lock()
             .await
             .read_recent_history(10);
@@ -830,7 +830,7 @@ mod tests {
             .unwrap();
 
         let entries = consolidator
-            .memory_store
+            .memory_service
             .lock()
             .await
             .read_recent_history(10);
@@ -855,8 +855,8 @@ mod tests {
 
         let sm = SessionManager::new(session_dir).unwrap();
         let sm: SharedSessionManager = Arc::new(tokio::sync::Mutex::new(sm));
-        let ms: SharedMemoryStore =
-            Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+        let ms: SharedMemory =
+            Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
 
         let provider = Arc::new(SequenceMockProvider::new(vec![]));
         let consolidator = Consolidator::new(provider, sm, ms, 32768);

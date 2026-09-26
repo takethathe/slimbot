@@ -50,9 +50,9 @@
 
 ### AgentLoop
 
-顶层编排组件，持有 Provider、ToolManager、SessionManager、MemoryStore、Consolidator 的引用：
+顶层编排组件，持有 Provider、ToolManager、SessionManager、MemoryService、Consolidator 的引用：
 
-1. 从配置加载 Provider、ToolManager、SessionManager、MemoryStore
+1. 从配置加载 Provider、ToolManager、SessionManager、MemoryService
 2. 创建 `Arc<Consolidator>`（基于 context_window_tokens 配置）
 3. 调用 `start_inbound()` 启动后台监听任务
 4. 该任务通过 `SessionTaskBuilder` 构建任务（附带 Consolidator 的 Arc 引用），提交到 SessionRunner 顺序执行
@@ -75,7 +75,7 @@ ReAct 循环的核心。每次处理任务时新建一个 Runner 实例：
 
 ### Consolidator
 
-Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLoop 初始化时创建，传入 AgentRunner。ReAct 循环完成后若 prompt_tokens 超过安全预算，自动选取旧消息进行 LLM 摘要，结果通过 MemoryStore 追加到 `history.jsonl`，并更新会话的 consolidation 游标和 last_summary。
+Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLoop 初始化时创建，传入 AgentRunner。ReAct 循环完成后若 prompt_tokens 超过安全预算，自动选取旧消息进行 LLM 摘要，结果通过 HistoryStore 追加到 `history.jsonl`，并更新会话的 consolidation 游标和 last_summary。
 
 ### ChannelManager
 
@@ -164,7 +164,7 @@ main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   │     │     └── runner.rs ── ReAct 循环
   │     │
   │     ├── message_bus.rs ── 纯异步通道端点
-  │     ├── memory.rs ── 长期记忆、历史记录
+  │     ├── memory/ ── category 化长期记忆、backend、历史记录
   │     ├── worker.rs ── WorkerPool 异步执行池
   │     └── io_scheduler.rs ── I/O 调度、阻塞读取
   │

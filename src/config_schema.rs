@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, ProviderConfig,
-    ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
+    AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, MemoryConfig,
+    ProviderConfig, ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
 };
 use crate::config_macro::FieldMeta;
 
@@ -156,6 +156,12 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
             "Tracing",
             TraceConfig::fields(),
             &to_value_map(&config.tracing),
+        ),
+        scalar_section(
+            "memory",
+            "Memory",
+            MemoryConfig::fields(),
+            &to_value_map(&config.memory),
         ),
         providers_section(config),
         tools_section(config),
@@ -493,6 +499,7 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
             set_gateway(config, sub, field, value)
         }
         ["web_fetch", field] => set_web_fetch(config, field, value),
+        ["memory", field] => set_memory(config, field, value),
         ["tracing", "enabled"] => {
             config.tracing.enabled = value_bool(value, "tracing.enabled")?;
             Ok(())
@@ -645,6 +652,14 @@ fn set_web_fetch(
         "timeout_s" => wf.timeout_s = value_u64(value, "web_fetch.timeout_s")?,
         "user_agent" => wf.user_agent = value_str(value, "web_fetch.user_agent")?,
         _ => return Err(format!("Unknown web_fetch field: {}", field)),
+    }
+    Ok(())
+}
+
+fn set_memory(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
+    match field {
+        "backend" => config.memory.backend = value_str(value, "memory.backend")?,
+        _ => return Err(format!("Unknown memory field: {}", field)),
     }
     Ok(())
 }
@@ -933,6 +948,7 @@ mod tests {
             },
             web_fetch: Some(WebFetchConfig::default()),
             tracing: Default::default(),
+            memory: Default::default(),
         }
     }
 
@@ -965,12 +981,25 @@ mod tests {
                 "gateway.dream",
                 "web_fetch",
                 "tracing",
+                "memory",
                 "providers",
                 "tools",
                 "channels",
                 "tracing.backends",
             ]
         );
+    }
+
+    #[test]
+    fn test_schema_memory_section() {
+        let tree = serialize_schema(&make_config());
+        let memory = section(&tree, "memory");
+        let backend = field(memory, "backend");
+        assert_eq!(backend.kind, "select");
+        assert_eq!(backend.value, json!("markdown"));
+        assert_eq!(backend.allowed, vec!["markdown"]);
+        assert_eq!(backend.path, "memory.backend");
+        assert!(!backend.desc.is_empty());
     }
 
     #[test]
@@ -1198,6 +1227,41 @@ mod tests {
         .unwrap();
         assert!(errors.is_empty());
         assert!(config.tracing.enabled);
+    }
+
+    #[test]
+    fn test_patch_set_memory_backend() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(PatchOpKind::Set, "memory.backend", json!("markdown"))],
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.memory.backend, "markdown");
+    }
+
+    #[test]
+    fn test_patch_set_memory_backend_unknown_field() {
+        let mut config = make_config();
+        let result = apply_config_patch(
+            &mut config,
+            &[op(PatchOpKind::Set, "memory.nope", json!("x"))],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_patch_set_memory_backend_invalid_value_clamps() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(PatchOpKind::Set, "memory.backend", json!("sqlite"))],
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        // `clamp()` inside apply_config_patch falls back to the default.
+        assert_eq!(config.memory.backend, "markdown");
     }
 
     #[test]

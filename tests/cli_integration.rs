@@ -87,6 +87,10 @@ fn test_setup_creates_bootstrap_files() {
     assert!(ws.join("USER.md").exists());
     assert!(ws.join("SOUL.md").exists());
     assert!(ws.join("TOOLS.md").exists());
+    assert!(ws.join("memory").join("MEMORY.md").exists());
+    // identity/dream stay embedded-only.
+    assert!(!ws.join("identity.md").exists());
+    assert!(!ws.join("dream.md").exists());
 }
 
 #[test]

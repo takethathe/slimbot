@@ -495,6 +495,7 @@ mod tests {
             gateway: crate::config::GatewayConfig::default(),
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         }
     }
 

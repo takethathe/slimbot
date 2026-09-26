@@ -52,7 +52,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::memory::MemoryStore;
+    use crate::memory::MemoryService;
     use crate::runner::types::RunSpec;
     use crate::session::{Message, SessionManager, TaskHook};
     use crate::tool::ToolManager;
@@ -73,7 +73,7 @@ mod tests {
             session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
             tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
             config: crate::config::AgentConfig::default(),
-            memory_store: Arc::new(Mutex::new(MemoryStore::new(std::path::Path::new("/tmp")))),
+            memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
             consolidator: None,
             initial_message_count: 0,
             channel: "cli".into(),

@@ -1,5 +1,21 @@
 # TODO
 
+## Memory 模块统一：category 化 + backend 抽象（2026-09-26）
+
+- [x] **类型层** — `MemoryCategory` 全单元枚举（Soul/User/Agent/Tools/Core/Daily/Skill/Custom）+ `MemoryBackend` trait + `EditOutcome`
+- [x] **MarkdownBackend + factory** — 按 category 映射文件路径（保持既有路径契约）、`create_backend` / `backend_from_name`
+- [x] **HistoryStore** — `history.jsonl` + Dream 游标 + 压缩，独立于 backend trait
+- [x] **MemoryService facade** — category 操作委托 backend；`get_effective` 承接「未修改模板不注入」
+- [x] **配置** — 顶层 `memory` section，`memory.backend = "markdown"`（白名单，预留 sqlite）
+- [x] **调用点迁移** — 全仓库改用 `MemoryService` / `SharedMemory` + category API
+- [x] **context 按 category 注入** — Agent→Soul→Tools→User→skills→Core→history（skills 经 `list_skill_names` + get）
+- [x] **bootstrap/setup 收窄** — 只写 5 个记忆文件 + skills；identity/dream 仅嵌入不落盘
+- [x] **Dream 改造** — 工具收敛为 `memory_read` / `memory_write` / `memory_edit`（白名单 soul/user/core/skill），移除全部文件工具；dream.md 重写
+- [x] **删除兼容层** — 移除 `MemoryStore` / `SharedMemoryStore` 别名与旧同步方法
+- [x] **文档 + ADR** — docs/memory.md 重写，bootstrap/context/index 更新，CONTEXT.md 术语，ADR 0003
+- [ ] **后续：sqlite backend** — 实现第二个 `MemoryBackend`，接线 `memory.backend` 白名单
+- [ ] **后续：entry 级 API** — 若出现逐条目去重 / 语义召回需求，在 backend trait 之上叠加 entry 层（见 ADR 0003）
+
 ## Trace chat span 增加 response content attribute（2026-08-16）
 
 - [x] **chat span 记录 response content** — `src/runner/mod.rs` 在收到 provider 响应后为 chat span 设置 `gen_ai.response.content`（string，完整 content 不截断，与 `http.request.body` 的「全量不截断」决策一致）；无 content 的纯工具调用响应不设置该 attribute
@@ -29,7 +45,7 @@
 
 ## Review 修复（2026-08-16，code review 子代理发现）
 
-- [x] **`/stop` sentinel 对已存在会话 panic（既有 bug）** — `handle_agent_loop_command` 的 `/stop` 分支经 `SessionTaskBuilder` 建任务时只传了 session_manager/outbound_tx/cancel_token/max_tokens，`build()` 对缺失字段 `.expect(...)` → 任何已存在会话的 `/stop` 都会 panic（`tool_manager required`）。修复：`handle_agent_loop_command` 增加 tool_manager/provider/config/workspace_dir/memory_store 参数并完整构建 sentinel；回归测试 `test_stop_sentinel_with_existing_session_runs`（修复前 RED：inbound loop 被 panic 杀死，超时）
+- [x] **`/stop` sentinel 对已存在会话 panic（既有 bug）** — `handle_agent_loop_command` 的 `/stop` 分支经 `SessionTaskBuilder` 建任务时只传了 session_manager/outbound_tx/cancel_token/max_tokens，`build()` 对缺失字段 `.expect(...)` → 任何已存在会话的 `/stop` 都会 panic（`tool_manager required`）。修复：`handle_agent_loop_command` 增加 tool_manager/provider/config/workspace_dir/memory_service 参数并完整构建 sentinel；回归测试 `test_stop_sentinel_with_existing_session_runs`（修复前 RED：inbound loop 被 panic 杀死，超时）
 - [x] **全局 WorkerPool 跨 runtime 复用死 worker（既有 bug，测试暴露）** — `WorkerPool` 是进程级 OnceLock 单例，但 worker 的 loop 是 `tokio::spawn` 在创建它的 runtime 上；并行测试中某 runtime 结束 → 其 worker 仍被后续 submit 当作空闲复用 → 任务永久搁浅（生产单 runtime 不受影响，测试多 runtime 触发）。修复：worker 记录 `runtime_id`，submit 只复用当前 runtime 的 worker（否则新建，上限内）；loop 加 `AliveGuard`（future 被取消/退出时置 dead）并在 submit/reap 时剔除死 worker；回归测试 `test_pool_skips_dead_workers_from_finished_runtime`
 - [x] **注释准确性** — `AgentLoop.tracer` 字段注释修正：仅 WebUI 入站请求与 `/stop` sentinel 走 `SessionTaskBuilder`，cron/heartbeat 复用 `self.runner`
 

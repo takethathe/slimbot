@@ -1,22 +1,20 @@
-use std::path::Path;
-
 use crate::embed::{EMBEDDED_FILES, get_content_by_dest};
 
-/// Returns the file content if it exists and differs from the embedded template,
-/// or `None` if the file is missing, unreadable, or matches the template.
-pub fn read_if_modified(path: &Path, template: &str) -> Option<String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) if content.trim() != template.trim() => Some(content),
-        _ => None,
-    }
-}
-
-/// Embedded bootstrap templates (dest is workspace root).
+/// The five memory document templates written into a new workspace.
+/// Returns (workspace-relative dest, content): AGENTS, USER, SOUL, TOOLS in
+/// the workspace root, MEMORY in the memory/ dir.
+/// `identity.md` / `dream.md` are kept embedded-only (never written to disk);
+/// their content is injected directly from the template at build/run time.
 pub fn bootstrap_files() -> impl Iterator<Item = (&'static str, &'static str)> {
-    EMBEDDED_FILES
-        .iter()
-        .filter(|(_, _, dest)| !dest.starts_with("skills/"))
-        .map(|(name, content, _)| (*name, *content))
+    [
+        ("AGENTS.md", "AGENTS.md"),
+        ("USER.md", "USER.md"),
+        ("SOUL.md", "SOUL.md"),
+        ("TOOLS.md", "TOOLS.md"),
+        ("memory/MEMORY.md", "MEMORY.md"),
+    ]
+    .into_iter()
+    .filter_map(|(dest, template)| get_content_by_dest(template).map(|content| (dest, content)))
 }
 
 /// Embedded skill files (dest is workspace/skills/).
@@ -27,59 +25,9 @@ pub fn skill_files() -> impl Iterator<Item = (&'static str, &'static str, &'stat
         .map(|(name, content, dest)| (*name, *content, *dest))
 }
 
-/// Get embedded content by filename.
-#[cfg(test)]
-pub fn get_template(name: &str) -> Option<&'static str> {
-    EMBEDDED_FILES
-        .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|(_, c, _)| *c)
-}
-
-/// Check if file content is identical to the embedded template.
-/// Returns true if content matches the template for the given dest_path.
-pub fn is_template_content(content: &str, dest_path: &str) -> bool {
-    match get_content_by_dest(dest_path) {
-        Some(template) => content.trim() == template.trim(),
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn test_read_if_modified_returns_none_for_missing_file() {
-        assert!(read_if_modified(Path::new("/nonexistent/file.md"), "template").is_none());
-    }
-
-    #[test]
-    fn test_read_if_modified_returns_none_for_identical_content() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        let content = get_template("AGENTS.md").unwrap();
-        tmp.write_all(content.as_bytes()).unwrap();
-        assert!(read_if_modified(tmp.path(), content).is_none());
-    }
-
-    #[test]
-    fn test_read_if_modified_returns_some_for_changed_content() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(b"different content").unwrap();
-        let result = read_if_modified(tmp.path(), "original content");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "different content");
-    }
-
-    #[test]
-    fn test_read_if_modified_ignores_trailing_whitespace() {
-        let content = get_template("AGENTS.md").unwrap();
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(format!("{}\n\n  ", content).as_bytes())
-            .unwrap();
-        assert!(read_if_modified(tmp.path(), content).is_none());
-    }
 
     #[test]
     fn test_templates_are_nonempty() {
@@ -99,6 +47,15 @@ mod tests {
         assert!(names.contains(&"USER.md"));
         assert!(names.contains(&"SOUL.md"));
         assert!(names.contains(&"TOOLS.md"));
+        assert!(names.contains(&"memory/MEMORY.md"));
+    }
+
+    #[test]
+    fn test_bootstrap_excludes_identity_and_dream() {
+        let names: Vec<_> = bootstrap_files().map(|(n, _)| n).collect();
+        assert_eq!(names.len(), 5);
+        assert!(!names.contains(&"identity.md"));
+        assert!(!names.contains(&"dream.md"));
     }
 
     #[test]
@@ -115,25 +72,5 @@ mod tests {
                 .iter()
                 .all(|(_, _, dest)| dest.starts_with("skills/"))
         );
-    }
-
-    #[test]
-    fn test_is_template_content_matches_template() {
-        let template = get_template("AGENTS.md").unwrap();
-        assert!(is_template_content(template, "AGENTS.md"));
-        assert!(is_template_content(
-            &format!("{}\n\n  ", template),
-            "AGENTS.md"
-        ));
-    }
-
-    #[test]
-    fn test_is_template_content_differs() {
-        assert!(!is_template_content("custom content", "AGENTS.md"));
-    }
-
-    #[test]
-    fn test_is_template_content_missing_template() {
-        assert!(!is_template_content("anything", "nonexistent.md"));
     }
 }

@@ -13,7 +13,7 @@ pub struct ContextBuilder {
     session_manager: SharedSessionManager,    // 会话管理器
     tool_manager: Arc<ToolManager>,           // 工具管理器
     workspace_dir: PathBuf,                   // 工作区目录
-    memory_store: SharedMemoryStore,          // 长期记忆存储（Arc<tokio::sync::Mutex<MemoryStore>>）
+    memory_service: SharedMemory,               // 记忆 facade（Arc<tokio::sync::Mutex<MemoryService>>）
 }
 ```
 
@@ -24,35 +24,32 @@ pub struct ContextBuilder {
 ```
 system_parts = []
 
-1. 固定简介
-   "You are SlimBot, an AI assistant. You can call tools to help the user complete tasks."
+1. 固定简介（来自嵌入的 identity.md）
+   替换 <<runtime>> / <<workspace_path>> / <<platform_policy>> / <<channel_format_hint>>
 
-2. 工作区文件（依次读取）
-   agent.md  → [agent.md] <content>
-   user.md   → [user.md] <content>
-   soul.md   → [soul.md] <content>
-   tools.md  → [tools.md] <content>
+2. 记忆文档（按 category 依次读取，经 get_effective）
+   Agent → [AGENTS.md] <content>
+   Soul  → [SOUL.md]  <content>
+   Tools → [TOOLS.md] <content>
+   User  → [USER.md]  <content>
 
-   规则：文件必须存在、非空才会被加入
+   规则：缺失 / 空 / 与模板一致的文档返回 None，静默跳过
 
-3. 技能文件（skills/ 目录下的所有 *.md）
+3. 技能（经 memory backend 枚举，见下）
    区分 always skills（完整加载）和可选 skills（仅显示名称列表）
 
-4. 长期记忆（MEMORY.md）
+4. 长期记忆（category Core）
    ## Long-term Memory
    <MEMORY.md content>
-
-4.5. 会话摘要（可选，来自 Consolidator 的 last_summary）
-   [Resumed Session] <summary bullet points>
-   代替已驱逐的消息，提供会话上下文
 
 5. 近期历史（history.jsonl 最近 50 条）
    # Recent History
    - [timestamp] content
    - ...
 
-6. 通道注入内容（可选）
-   来自 Channel.prepare_inject() 的返回值
+6. 会话摘要（可选，来自 Consolidator 的 last_summary）
+   [Archived Context Summary]
+   <summary>
 
 ↓ 用 "\n\n---\n\n" 拼接所有部分
 ↓
@@ -66,30 +63,30 @@ system_prompt
 RunContext { messages, tools }
 ```
 
-## 工作区文件加载
+## 记忆文档加载
 
-固定加载以下 4 个文件（按顺序）：
+按固定顺序经 `MemoryService::get_effective(category, None)` 读取 4 个 category：
 
-| 文件 | 用途 |
-|------|------|
-| `agent.md` | Agent 行为定义 |
-| `user.md` | 用户画像 |
-| `soul.md` | Agent 人格 |
-| `tools.md` | 工具使用指南 |
+| Category | 标签 | 用途 |
+|----------|------|------|
+| `Agent` | `[AGENTS.md]` | Agent 工作指令 |
+| `Soul` | `[SOUL.md]` | Agent 行为规则与人格 |
+| `Tools` | `[TOOLS.md]` | 工具使用指南 |
+| `User` | `[USER.md]` | 用户画像 |
 
-每个文件必须存在且非空才会被加入 system prompt。不存在的文件会被静默跳过。
+`get_effective` 对缺失、空、或与 bootstrap 模板一致的文档返回 `None`，因此未修改的模板不会占用 system prompt token。
 
-## 技能文件加载
+## 技能加载
 
-扫描 `workspace/skills/` 目录下所有 `.md` 文件：
+技能经 memory backend 枚举（`list_skill_names()` + `get(Skill, name)`），而非直接遍历文件系统：
 
 - **Always skills**（`always: true` YAML frontmatter）：加载完整内容
-- **可选 skills**（`always: false`）：仅显示名称和描述列表，由 Agent 按需读取
-- 无 frontmatter 的遗留文件：视为 always skill，完整加载
+- **可选 skills**（`always: false`）：仅显示名称、描述和可加载路径（`skills/<name>/SKILL.md`）列表，由 Agent 按需读取
+- 无 frontmatter 的文件：视为 always skill，完整加载
 
 ## 会话摘要注入
 
-当 `session_summary` 参数为 `Some` 且非空时，在系统 prompt 中注入 `[Resumed Session]` 段落。该摘要来自 `Consolidator` 的 `last_summary` 字段，代替已被驱逐的旧消息，提供跨轮次的上下文。
+当 `session_summary` 参数为 `Some` 且非空时，在系统 prompt 注入 `[Archived Context Summary]` 段落。该摘要来自 `Consolidator` 的 `last_summary` 字段，代替已被驱逐的旧消息，提供跨轮次的上下文。
 
 ## 工具定义
 

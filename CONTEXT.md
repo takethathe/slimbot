@@ -10,6 +10,24 @@
 一次 `AgentRunner::run()` 的执行 —— 一条用户消息到最终回复（含多轮 ReAct iteration）。对应一条 trace。
 _Avoid_: turn, task, request
 
+### Memory
+
+**Memory category**:
+记忆文档的语义种类（`soul` / `user` / `agent` / `tools` / `core` / `daily` / `skill` / `custom`），每个 category 对应一个文档。
+_Avoid_: memory type, memory kind
+
+**Memory backend**:
+记忆文档的存储实现（当前 markdown，未来 sqlite 等），由 `MemoryBackend` trait 以「文档级」读写描述。
+_Avoid_: memory store, memory driver
+
+**MemoryService**:
+统一的记忆 facade，组合可插拔 backend（category 文档）与 HistoryStore（交互历史），是记忆的对外入口。
+_Avoid_: MemoryStore, MemoryManager
+
+**History store**:
+`history.jsonl` 追加日志 + Dream 游标的独立子系统，刻意不属于 backend trait。
+_Avoid_: history backend, history log
+
 ### Observability
 
 **Trace**:

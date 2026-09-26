@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::config::AgentConfig;
 use crate::consolidate::Consolidator;
-use crate::memory::SharedMemoryStore;
+use crate::memory::SharedMemory;
 use crate::provider::LLMResponse;
 use crate::session::{Message, SharedSessionManager, TaskHook};
 use crate::tool::{ToolCall, ToolDefinition, ToolManager, TurnContext};
@@ -71,7 +71,7 @@ pub struct RunSpec {
     /// Agent configuration snapshot.
     pub config: AgentConfig,
     /// Shared memory store used by the context builder.
-    pub memory_store: SharedMemoryStore,
+    pub memory_service: SharedMemory,
     /// Optional consolidator triggered after a successful turn.
     pub consolidator: Option<Arc<Consolidator>>,
     /// Optional tracer; when `None` (or with no backends) tracing is a no-op.
@@ -209,7 +209,7 @@ mod tests {
             )),
             tool_manager: Arc::new(ToolManager::new(workspace_dir.clone())),
             config: AgentConfig::default(),
-            memory_store: Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryStore::new(
+            memory_service: Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryService::new(
                 &workspace_dir,
             ))),
             consolidator: None,

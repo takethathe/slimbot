@@ -318,7 +318,7 @@ mod tests {
                 "/tmp",
             ))),
             config: crate::config::AgentConfig::default(),
-            memory_store: Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryStore::new(
+            memory_service: Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryService::new(
                 std::path::Path::new("/tmp"),
             ))),
             consolidator: None,

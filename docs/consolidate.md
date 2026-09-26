@@ -4,7 +4,7 @@
 
 ## 概述
 
-`Consolidator` 实现基于 token 预算触发的会话摘要机制。当 LLM 返回的 `prompt_tokens` 超过安全预算时，自动选取旧消息块（按用户轮次边界对齐），调用 LLM 进行摘要，将摘要通过 `MemoryStore::append_history()` 追加到 `history.jsonl`，并更新会话的 consolidation 游标。
+`Consolidator` 实现基于 token 预算触发的会话摘要机制。当 LLM 返回的 `prompt_tokens` 超过安全预算时，自动选取旧消息块（按用户轮次边界对齐），调用 LLM 进行摘要，将摘要通过 `HistoryStore::append_history()` 追加到 `history.jsonl`，并更新会话的 consolidation 游标。
 
 ## 核心类型
 
@@ -12,13 +12,13 @@
 pub struct Consolidator {
     provider: Arc<dyn Provider>,
     session_manager: SharedSessionManager,
-    memory_store: SharedMemoryStore,
+    memory_service: SharedMemory,
     context_window_tokens: u32,
     max_completion_tokens: u32,
 }
 ```
 
-构造函数：`new(provider, session_manager, memory_store, context_window_tokens, max_completion_tokens)`
+构造函数：`new(provider, session_manager, memory_service, context_window_tokens, max_completion_tokens)`
 
 ## 预算计算
 
@@ -80,7 +80,7 @@ User msg → Assistant reply → Tool result → User msg (boundary)
 
 摘要硬限制 512 字节，通过三层保障（指令约束 → 最多 2 次 LLM 压缩重试 → 强制 UTF-8 安全截断）。
 
-摘要通过 `MemoryStore::append_history()` 追加，使用统一的游标管理。
+摘要通过 `HistoryStore::append_history()` 追加，使用统一的游标管理。
 
 ## 数据流
 
@@ -98,7 +98,7 @@ ReAct turn 完成
   │   │   ├─ archive() → LLM 摘要
   │   │   │   ├─ 格式化消息为 "[ROLE] content" 文本
   │   │   │   ├─ provider.chat([system_prompt, formatted_messages])
-  │   │   │   ├─ 摘要通过 MemoryStore::append_history() 追加到 history.jsonl
+  │   │   │   ├─ 摘要通过 HistoryStore::append_history() 追加到 history.jsonl
   │   │   │   └─ 返回摘要文本
   │   │   ├─ update_consolidation_cursor(session_id, end_msg_id)
   │   │   │   └─ 移除 id <= cursor 的消息，更新 last_persisted_idx
@@ -142,5 +142,5 @@ ReAct turn 完成
 ## 设计考量
 
 - 每次 ReAct turn 完成后触发一次摘要检查（非循环重试），下一轮 LLM 调用时重新测量
-- 摘要通过 `MemoryStore` 统一管理，使用游标机制追加到 `history.jsonl`
+- 摘要通过 `HistoryStore` 统一管理，使用游标机制追加到 `history.jsonl`
 - 失败时静默跳过（`.ok().flatten()`），不中断主循环

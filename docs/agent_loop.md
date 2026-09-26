@@ -4,7 +4,7 @@
 
 ## 概述
 
-`AgentLoop` 是 SlimBot 的顶层编排组件，负责初始化管理所有核心子系统的实例，包括 Provider、ToolManager、SessionManager、MemoryStore 和 Consolidator。通过 `start_inbound()` 启动后台入站监听任务。
+`AgentLoop` 是 SlimBot 的顶层编排组件，负责初始化管理所有核心子系统的实例，包括 Provider、ToolManager、SessionManager、MemoryService 和 Consolidator。通过 `start_inbound()` 启动后台入站监听任务。
 
 ## 结构
 
@@ -15,7 +15,7 @@ pub struct AgentLoop {
     provider: Arc<dyn Provider>,
     tool_manager: Arc<ToolManager>,
     session_manager: SharedSessionManager,
-    memory_store: SharedMemoryStore,  // Arc<tokio::sync::Mutex<MemoryStore>>
+    memory_service: SharedMemory,  // Arc<tokio::sync::Mutex<MemoryService>>
     message_bus: Arc<MessageBus>,
     consolidator: Arc<Consolidator>,
 }
@@ -28,8 +28,8 @@ pub struct AgentLoop {
 1. **创建 Provider**：从 `config.providers` 中查找 agent 引用的 provider，创建 `OpenAIProvider`
 2. **创建 ToolManager**：以 `workspace_dir` 为根目录，调用 `init_from_config()` 注册内置工具
 3. **创建 SessionManager**：指向 session 目录，由 `Arc<Mutex<>>` 包装
-4. **创建 MemoryStore**：指向 workspace 目录，由 `Arc<tokio::sync::Mutex<>>` 包装，调用 `init()`
-5. **创建 Consolidator**：传入 provider、session_manager、memory_store、`context_window_tokens`、`max_completion_tokens`
+4. **创建 MemoryService**：经 `MemoryService::with_backend`（按 `memory.backend` 配置选择 backend）指向 workspace 目录，由 `Arc<tokio::sync::Mutex<>>` 包装，调用 `init()`
+5. **创建 Consolidator**：传入 provider、session_manager、memory_service、`context_window_tokens`、`max_completion_tokens`
 
 ## 公共方法
 
@@ -63,7 +63,7 @@ pub async fn run_task(
 ) -> AgentResult
 ```
 
-每次调用时**新建**一个 `AgentRunner` 实例，传入 tool_manager、provider、session_manager、agent_config、workspace_dir、memory_store、consolidator（`Some`），然后执行 ReAct 循环。`ContextBuilder` 在 runner 的 `run()` 内部创建。返回 `AgentResult`（包含 `success`、`content` 字段）。
+每次调用时**新建**一个 `AgentRunner` 实例，传入 tool_manager、provider、session_manager、agent_config、workspace_dir、memory_service、consolidator（`Some`），然后执行 ReAct 循环。`ContextBuilder` 在 runner 的 `run()` 内部创建。返回 `AgentResult`（包含 `success`、`content` 字段）。
 
 ### `session_manager`
 

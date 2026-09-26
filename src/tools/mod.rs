@@ -6,6 +6,7 @@ pub mod find_files;
 pub mod grep;
 pub mod list_dir;
 pub mod make_dir;
+pub mod memory_tools;
 pub mod message;
 pub mod shell;
 pub mod web_fetch;

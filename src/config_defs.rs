@@ -79,3 +79,9 @@ define_config! {
         user_agent: String = crate::config::default_user_agent(), none, desc: "User-Agent header used for fetches",
     }
 }
+
+define_config! {
+    "memory" => MemoryConfig {
+        backend: String = "markdown".to_string(), allowed(["markdown"]), desc: "Memory backend type (markdown | future: sqlite)",
+    }
+}

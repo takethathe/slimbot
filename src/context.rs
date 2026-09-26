@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::bootstrap::{bootstrap_files, read_if_modified};
+use crate::MemoryCategory;
 use crate::debug;
-use crate::memory::SharedMemoryStore;
+use crate::memory::SharedMemory;
 use crate::session::{Content, ContentBlock, Message, MessageMeta, SharedSessionManager};
 use crate::tool::{ToolDefinition, ToolManager};
 
@@ -130,7 +130,7 @@ pub struct ContextBuilder {
     session_manager: SharedSessionManager,
     tool_manager: Arc<ToolManager>,
     workspace_dir: PathBuf,
-    memory_store: SharedMemoryStore,
+    memory_service: SharedMemory,
 }
 
 impl ContextBuilder {
@@ -138,13 +138,13 @@ impl ContextBuilder {
         session_manager: SharedSessionManager,
         tool_manager: Arc<ToolManager>,
         workspace_dir: PathBuf,
-        memory_store: SharedMemoryStore,
+        memory_service: SharedMemory,
     ) -> Self {
         Self {
             session_manager,
             tool_manager,
             workspace_dir,
-            memory_store,
+            memory_service,
         }
     }
 
@@ -160,32 +160,39 @@ impl ContextBuilder {
         let workspace_path = self.workspace_dir.to_string_lossy().to_string();
         parts.push(Self::build_identity(&workspace_path, channel));
 
-        // 2. Bootstrap workspace files
-        for (filename, template) in bootstrap_files() {
-            let path = self.workspace_dir.join(filename);
-            if let Some(content) = read_if_modified(&path, template)
-                && !content.is_empty()
-            {
-                parts.push(format!("[{}] {}", filename, content));
+        // 2. Memory documents by category (fixed order, unmodified templates skipped)
+        let (doc_parts, core_memory, recent_entries) = {
+            let ms = self.memory_service.lock().await;
+            let mut doc_parts = Vec::new();
+            for (category, filename) in [
+                (MemoryCategory::Agent, "AGENTS.md"),
+                (MemoryCategory::Soul, "SOUL.md"),
+                (MemoryCategory::Tools, "TOOLS.md"),
+                (MemoryCategory::User, "USER.md"),
+            ] {
+                if let Ok(Some(content)) = ms.get_effective(&category, None).await {
+                    doc_parts.push(format!("[{}] {}", filename, content));
+                }
             }
-        }
+            let core_memory = ms
+                .get_effective(&MemoryCategory::Core, None)
+                .await
+                .ok()
+                .flatten();
+            let recent_entries = ms.read_recent_history(50);
+            (doc_parts, core_memory, recent_entries)
+        };
+        parts.extend(doc_parts);
 
         // 3. Skills
-        self.load_skills_into_parts(&mut parts);
+        self.load_skills_into_parts(&mut parts).await;
 
-        // 4. Memory (skip if matches template)
-        let ms = self.memory_store.lock().await;
-        let memory_content = ms.get_memory_context();
-        if !memory_content.is_empty() {
-            let raw_memory = ms.read_memory();
-            if !crate::bootstrap::is_template_content(&raw_memory, "memory/MEMORY.md") {
-                parts.push(memory_content);
-            }
+        // 4. Core long-term memory
+        if let Some(content) = core_memory {
+            parts.push(format!("## Long-term Memory\n{}", content));
         }
 
         // 5. Recent history
-        let recent_entries = ms.read_recent_history(50);
-        drop(ms);
         if !recent_entries.is_empty() {
             let history_text = recent_entries
                 .iter()
@@ -206,44 +213,41 @@ impl ContextBuilder {
         parts.join("\n\n---\n\n")
     }
 
-    /// Load skills into system prompt parts (helper for build_system_prompt).
-    fn load_skills_into_parts(&self, parts: &mut Vec<String>) {
-        let skills_dir = self.workspace_dir.join("skills");
-        if !skills_dir.exists() {
-            return;
-        }
+    /// Load skills into system prompt parts via the memory backend
+    /// (helper for build_system_prompt). Skills live at `skills/<name>/SKILL.md`
+    /// and are enumerated through the backend, not by walking the filesystem.
+    async fn load_skills_into_parts(&self, parts: &mut Vec<String>) {
         let mut always_skills: Vec<String> = Vec::new();
         let mut available_skills: Vec<String> = Vec::new();
 
-        if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "md")
-                    && let Ok(content) = std::fs::read_to_string(&path)
-                {
-                    if content.is_empty() {
-                        continue;
-                    }
-                    if let Some(meta) = parse_skill_frontmatter(&content) {
-                        if meta.always {
-                            always_skills
-                                .push(format!("### Skill: {}\n\n{}", meta.name, meta.content));
-                        } else {
-                            available_skills.push(format!(
-                                "- **{}** — {}  `{}`",
-                                meta.name,
-                                meta.description,
-                                path.display()
-                            ));
-                        }
-                    } else {
-                        let name = path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        always_skills.push(format!("### Skill: {}\n\n{}", name, content));
-                    }
+        let names = match self.memory_service.lock().await.list_skill_names().await {
+            Ok(names) => names,
+            Err(e) => {
+                crate::error!("[ContextBuilder] Failed to list skills: {}", e);
+                return;
+            }
+        };
+
+        let ms = self.memory_service.lock().await;
+        for name in names {
+            let content = match ms.get(&MemoryCategory::Skill, Some(&name)).await {
+                Ok(Some(content)) => content,
+                Ok(None) | Err(_) => continue,
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            if let Some(meta) = parse_skill_frontmatter(&content) {
+                if meta.always {
+                    always_skills.push(format!("### Skill: {}\n\n{}", meta.name, meta.content));
+                } else {
+                    available_skills.push(format!(
+                        "- **{}** — {}  `skills/{}/SKILL.md`",
+                        meta.name, meta.description, name
+                    ));
                 }
+            } else {
+                always_skills.push(format!("### Skill: {}\n\n{}", name, content));
             }
         }
 

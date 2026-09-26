@@ -2,19 +2,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
-use async_trait::async_trait;
-
 use crate::config::DreamConfig;
-use crate::memory::SharedMemoryStore;
+use crate::memory::SharedMemory;
 use crate::provider::Provider;
 use crate::session::SharedSessionManager;
-use crate::tool::{Tool, ToolManager};
-use crate::tools::resolve_workspace_path;
+use crate::tool::ToolManager;
+use crate::tools::memory_tools::{MemoryEditTool, MemoryReadTool, MemoryWriteTool};
 
 pub struct DreamService {
     workspace_dir: PathBuf,
-    memory_store: SharedMemoryStore,
+    memory_service: SharedMemory,
     session_manager: SharedSessionManager,
     config: DreamConfig,
     providers: Arc<HashMap<String, Arc<dyn Provider>>>,
@@ -27,153 +24,10 @@ pub struct DreamResult {
     pub message: String,
 }
 
-/// Restricted file writer that only allows writing to a specific directory.
-struct DreamFileWriterTool {
-    workspace_dir: PathBuf,
-    allowed_dir: PathBuf,
-}
-
-#[async_trait]
-impl Tool for DreamFileWriterTool {
-    fn name(&self) -> &str {
-        "file_writer"
-    }
-
-    fn description(&self) -> &str {
-        "Write content to a file within the skills directory. Path must be within skills/."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to write (must be within skills/ directory)"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
-            },
-            "required": ["path", "content"]
-        })
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
-        let path_str = args["path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing required argument: path"))?;
-        let content = args["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing required argument: content"))?;
-
-        let path = resolve_workspace_path(path_str, &self.workspace_dir)?;
-
-        // Check if path is within allowed directory
-        if !path.starts_with(&self.allowed_dir) {
-            anyhow::bail!(
-                "Dream file_writer can only write to skills/ directory. Got: {}",
-                path_str
-            );
-        }
-
-        // Create parent directories if needed
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        std::fs::write(&path, content)?;
-        Ok(format!("Successfully wrote to {}", path_str))
-    }
-}
-
-/// Restricted file editor that only allows editing specific files or directories.
-struct DreamFileEditorTool {
-    workspace_dir: PathBuf,
-    allowed_files: Vec<PathBuf>,
-    allowed_dir: PathBuf,
-}
-
-#[async_trait]
-impl Tool for DreamFileEditorTool {
-    fn name(&self) -> &str {
-        "file_editor"
-    }
-
-    fn description(&self) -> &str {
-        "Edit memory files (SOUL.md, USER.md, memory/MEMORY.md) or files in skills/ directory by replacing exact text."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to edit"
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "The exact text to search for and replace (must appear exactly once)"
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "The replacement text"
-                }
-            },
-            "required": ["path", "old_string", "new_string"]
-        })
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> Result<String> {
-        let path_str = args["path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing required argument: path"))?;
-        let old_string = args["old_string"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing required argument: old_string"))?;
-        let new_string = args["new_string"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing required argument: new_string"))?;
-
-        let path = resolve_workspace_path(path_str, &self.workspace_dir)?;
-
-        // Check if path is allowed
-        let is_allowed_file = self.allowed_files.contains(&path);
-        let is_in_allowed_dir = path.starts_with(&self.allowed_dir);
-
-        if !is_allowed_file && !is_in_allowed_dir {
-            anyhow::bail!(
-                "Dream file_editor can only edit SOUL.md, USER.md, memory/MEMORY.md, or files in skills/. Got: {}",
-                path_str
-            );
-        }
-
-        let content = std::fs::read_to_string(&path)?;
-        let matches = content.matches(old_string).count();
-
-        if matches == 0 {
-            anyhow::bail!("old_string not found in file");
-        }
-        if matches > 1 {
-            anyhow::bail!(
-                "old_string appears {} times, must appear exactly once",
-                matches
-            );
-        }
-
-        let new_content = content.replacen(old_string, new_string, 1);
-        std::fs::write(&path, &new_content)?;
-
-        Ok(format!("Successfully edited {}", path_str))
-    }
-}
-
 impl DreamService {
     pub fn new(
         workspace_dir: PathBuf,
-        memory_store: SharedMemoryStore,
+        memory_service: SharedMemory,
         session_manager: SharedSessionManager,
         config: DreamConfig,
         providers: Arc<HashMap<String, Arc<dyn Provider>>>,
@@ -181,7 +35,7 @@ impl DreamService {
     ) -> Self {
         Self {
             workspace_dir,
-            memory_store,
+            memory_service,
             session_manager,
             config,
             providers,
@@ -190,7 +44,7 @@ impl DreamService {
     }
 
     pub async fn build_prompt(&self) -> Option<(String, usize)> {
-        let mut ms = self.memory_store.lock().await;
+        let mut ms = self.memory_service.lock().await;
         let dream_cursor = ms.get_last_dream_cursor();
         let entries = ms.read_unprocessed_history(dream_cursor);
 
@@ -227,30 +81,32 @@ impl DreamService {
         Some((prompt, lines_processed))
     }
 
-    pub fn build_tools(&self) -> ToolManager {
+    /// Build the Dream sandbox tool set: only the memory tools, so Dream can
+    /// touch long-term memory exclusively through the `MemoryService` facade.
+    /// Existing skill names are injected into each tool description.
+    pub async fn build_tools(&self) -> ToolManager {
         let mut tm = ToolManager::new(self.workspace_dir.clone());
 
-        // file_reader: can read any file in workspace
-        tm.register(Box::new(crate::tools::file_reader::FileReaderTool::new(
-            self.workspace_dir.clone(),
+        let skill_names = self
+            .memory_service
+            .lock()
+            .await
+            .list_skill_names()
+            .await
+            .unwrap_or_default();
+
+        tm.register(Box::new(MemoryReadTool::new(
+            self.memory_service.clone(),
+            &skill_names,
         )));
-
-        // file_writer: restricted to skills/ directory only
-        tm.register(Box::new(DreamFileWriterTool {
-            workspace_dir: self.workspace_dir.clone(),
-            allowed_dir: self.workspace_dir.join("skills"),
-        }));
-
-        // file_editor: restricted to memory files and skills/
-        tm.register(Box::new(DreamFileEditorTool {
-            workspace_dir: self.workspace_dir.clone(),
-            allowed_files: vec![
-                self.workspace_dir.join("SOUL.md"),
-                self.workspace_dir.join("USER.md"),
-                self.workspace_dir.join("memory").join("MEMORY.md"),
-            ],
-            allowed_dir: self.workspace_dir.join("skills"),
-        }));
+        tm.register(Box::new(MemoryWriteTool::new(
+            self.memory_service.clone(),
+            &skill_names,
+        )));
+        tm.register(Box::new(MemoryEditTool::new(
+            self.memory_service.clone(),
+            &skill_names,
+        )));
 
         tm
     }
@@ -283,7 +139,7 @@ impl DreamService {
         };
 
         let provider = self.build_provider();
-        let tools = self.build_tools();
+        let tools = self.build_tools().await;
         let tool_manager = Arc::new(tools);
 
         // Use the same agent config as the main agent
@@ -295,7 +151,7 @@ impl DreamService {
             self.session_manager.clone(),
             agent_config,
             self.workspace_dir.clone(),
-            self.memory_store.clone(),
+            self.memory_service.clone(),
             None, // No consolidator for dream
             4096,
             None, // Dream runs are not traced (out of scope)
@@ -324,7 +180,7 @@ impl DreamService {
 
         if success {
             // Advance dream cursor
-            let mut ms = self.memory_store.lock().await;
+            let mut ms = self.memory_service.lock().await;
             if let Err(e) = ms.set_last_dream_cursor(lines_processed) {
                 crate::error!("[DreamService] Failed to set dream cursor: {}", e);
             }
@@ -348,7 +204,7 @@ impl DreamService {
     }
 
     async fn compact_history_after_dream(&self) {
-        let mut ms = self.memory_store.lock().await;
+        let mut ms = self.memory_service.lock().await;
         if let Err(e) = ms.compact_history_after_dream() {
             crate::error!("[DreamService] Failed to compact history: {}", e);
         }
@@ -361,19 +217,19 @@ mod tests {
     use std::fs;
     use tempfile::{TempDir, tempdir};
 
-    use crate::memory::MemoryStore;
+    use crate::memory::MemoryService;
 
     /// Map of provider name to provider instance.
     type ProviderMap = Arc<HashMap<String, Arc<dyn Provider>>>;
 
-    async fn make_memory_store(workspace_dir: &std::path::Path) -> SharedMemoryStore {
-        let memory_store = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(workspace_dir)));
-        memory_store
+    async fn make_memory_service(workspace_dir: &std::path::Path) -> SharedMemory {
+        let memory_service = Arc::new(tokio::sync::Mutex::new(MemoryService::new(workspace_dir)));
+        memory_service
             .lock()
             .await
             .init()
             .expect("Failed to init memory store");
-        memory_store
+        memory_service
     }
 
     fn make_session_manager(workspace_dir: &std::path::Path) -> SharedSessionManager {
@@ -402,7 +258,7 @@ mod tests {
         let workspace_dir = tmp_dir.path().join("workspace");
         fs::create_dir_all(&workspace_dir).unwrap();
 
-        let memory_store = make_memory_store(&workspace_dir).await;
+        let memory_service = make_memory_service(&workspace_dir).await;
         let session_manager = make_session_manager(&workspace_dir);
         let (providers, default_provider) = make_providers();
 
@@ -410,7 +266,7 @@ mod tests {
 
         let service = DreamService::new(
             workspace_dir,
-            memory_store,
+            memory_service,
             session_manager,
             config,
             providers,
@@ -435,14 +291,14 @@ mod tests {
 
         // Set dream cursor to 0 so we can process new entries
         service
-            .memory_store
+            .memory_service
             .lock()
             .await
             .set_last_dream_cursor(0)
             .unwrap();
 
         // Append entries directly using the memory store
-        let mut ms = service.memory_store.lock().await;
+        let mut ms = service.memory_service.lock().await;
         ms.append_history("First entry content").unwrap();
         ms.append_history("Second entry content").unwrap();
         drop(ms);
@@ -463,7 +319,7 @@ mod tests {
 
         // Set dream cursor to 0 so we can process new entries
         service
-            .memory_store
+            .memory_service
             .lock()
             .await
             .set_last_dream_cursor(0)
@@ -471,7 +327,7 @@ mod tests {
 
         let long_content = "a".repeat(600);
         service
-            .memory_store
+            .memory_service
             .lock()
             .await
             .append_history(&long_content)
@@ -496,7 +352,7 @@ mod tests {
 
         // Set dream cursor to 0 so we can process new entries
         service
-            .memory_store
+            .memory_service
             .lock()
             .await
             .set_last_dream_cursor(0)
@@ -504,7 +360,7 @@ mod tests {
 
         for i in 1..=5 {
             service
-                .memory_store
+                .memory_service
                 .lock()
                 .await
                 .append_history(&format!("Entry {}", i))
@@ -522,18 +378,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_tools_restricted_file_set() {
+    async fn test_build_tools_memory_only() {
         let (service, _tmp_dir) = make_service().await;
 
-        let tools = service.build_tools();
+        let tools = service.build_tools().await;
         let tool_defs = tools.to_openai_functions();
         let tool_names: Vec<_> = tool_defs.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(tool_names.contains(&"file_reader"));
-        assert!(tool_names.contains(&"file_writer"));
-        assert!(tool_names.contains(&"file_editor"));
+        assert!(tool_names.contains(&"memory_read"));
+        assert!(tool_names.contains(&"memory_write"));
+        assert!(tool_names.contains(&"memory_edit"));
+        // No filesystem tools in the Dream sandbox.
+        assert!(!tool_names.contains(&"file_reader"));
+        assert!(!tool_names.contains(&"file_writer"));
+        assert!(!tool_names.contains(&"file_editor"));
         assert!(!tool_names.contains(&"shell"));
         assert!(!tool_names.contains(&"grep"));
+        assert_eq!(tool_names.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_build_tools_lists_existing_skills_in_description() {
+        let (service, _tmp_dir) = make_service().await;
+        service
+            .memory_service
+            .lock()
+            .await
+            .set(
+                &crate::MemoryCategory::Skill,
+                Some("alpha"),
+                "---\nname: alpha\ndescription: a\nalways: false\n---\nbody",
+            )
+            .await
+            .unwrap();
+
+        let tools = service.build_tools().await;
+        let tool_defs = tools.to_openai_functions();
+        let read = tool_defs.iter().find(|t| t.name == "memory_read").unwrap();
+        assert!(read.description.contains("Existing skills: alpha."));
     }
 
     #[tokio::test]
@@ -550,7 +432,7 @@ mod tests {
         let workspace_dir = tmp_dir.path().join("workspace");
         fs::create_dir_all(&workspace_dir).unwrap();
 
-        let memory_store = make_memory_store(&workspace_dir).await;
+        let memory_service = make_memory_service(&workspace_dir).await;
         let session_manager = make_session_manager(&workspace_dir);
 
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
@@ -575,7 +457,7 @@ mod tests {
 
         let service = DreamService::new(
             workspace_dir,
-            memory_store,
+            memory_service,
             session_manager,
             config,
             Arc::new(providers),
@@ -592,7 +474,7 @@ mod tests {
         let (service, _tmp_dir) = make_service().await;
 
         {
-            let mut ms = service.memory_store.lock().await;
+            let mut ms = service.memory_service.lock().await;
             ms.set_last_dream_cursor(0).unwrap();
             // Create 2100 entries (over HISTORY_MAX_ENTRIES limit of 2000)
             for i in 1..=2100 {
@@ -603,7 +485,7 @@ mod tests {
 
         service.compact_history_after_dream().await;
 
-        let mut ms = service.memory_store.lock().await;
+        let mut ms = service.memory_service.lock().await;
         let entries = ms.read_entries();
         // Should compact to DREAM_KEEP_MINIMUM (50)
         assert_eq!(entries.len(), 50);

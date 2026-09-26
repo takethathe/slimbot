@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
 use crate::consolidate::Consolidator;
-use crate::memory::SharedMemoryStore;
+use crate::memory::SharedMemory;
 use crate::message_bus::BusResult;
 use crate::provider::Provider;
 use crate::runner::AgentRunner;
@@ -448,7 +448,7 @@ pub struct SessionTaskBuilder {
     provider: Option<Arc<dyn Provider>>,
     config: Option<AgentConfig>,
     workspace_dir: Option<PathBuf>,
-    memory_store: Option<SharedMemoryStore>,
+    memory_service: Option<SharedMemory>,
     outbound_tx: Option<tokio::sync::mpsc::Sender<BusResult>>,
     channel_inject: Option<String>,
     consolidator: Option<Arc<Consolidator>>,
@@ -468,7 +468,7 @@ impl SessionTaskBuilder {
             provider: None,
             config: None,
             workspace_dir: None,
-            memory_store: None,
+            memory_service: None,
             outbound_tx: None,
             channel_inject: None,
             consolidator: None,
@@ -503,8 +503,8 @@ impl SessionTaskBuilder {
         self
     }
 
-    pub fn memory_store(mut self, ms: SharedMemoryStore) -> Self {
-        self.memory_store = Some(ms);
+    pub fn memory_service(mut self, ms: SharedMemory) -> Self {
+        self.memory_service = Some(ms);
         self
     }
 
@@ -545,7 +545,7 @@ impl SessionTaskBuilder {
         let provider = self.provider.expect("provider required");
         let config = self.config.expect("config required");
         let workspace_dir = self.workspace_dir.expect("workspace_dir required");
-        let memory_store = self.memory_store.expect("memory_store required");
+        let memory_service = self.memory_service.expect("memory_service required");
         let outbound_tx = self.outbound_tx.expect("outbound_tx required");
         let max_tokens = self.max_tokens.unwrap_or(4096);
 
@@ -568,7 +568,7 @@ impl SessionTaskBuilder {
                     .provider(provider)
                     .config(config)
                     .workspace_dir(workspace_dir)
-                    .memory_store(memory_store)
+                    .memory_service(memory_service)
                     .consolidator(consolidator)
                     .tracer(tracer)
                     .max_tokens(max_tokens)

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use super::*;
-use crate::memory::MemoryStore;
+use crate::memory::MemoryService;
 use crate::provider::{FinishReason, LLMResponse, Provider, Usage};
 use crate::session::AgentEvent;
 use crate::session::Content;
@@ -131,7 +131,7 @@ async fn test_runner_wires_turn_context_to_tools() {
     let tm = Arc::new(tm);
     sm.lock().await.get_or_create("webui:chat-7").await.unwrap();
 
-    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let provider = Arc::new(MockProvider::new(vec![
@@ -209,7 +209,7 @@ async fn test_runner_message_sent_on_max_iterations_exit() {
     let mut tm = ToolManager::new(workspace_dir.clone());
     tm.register(Box::new(MarkingTool));
     let tm = Arc::new(tm);
-    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
     sm.lock().await.get_or_create("webui:chat-7").await.unwrap();
 
@@ -337,7 +337,7 @@ async fn make_test_env(
     SharedSessionManager,
     Arc<ToolManager>,
     PathBuf,
-    Arc<tokio::sync::Mutex<MemoryStore>>,
+    Arc<tokio::sync::Mutex<MemoryService>>,
 ) {
     let path = tmp_dir.path();
     let session_dir = path.join("sessions");
@@ -350,7 +350,7 @@ async fn make_test_env(
         tm.register(Box::new(MockEchoTool::new(name, ret)));
     }
 
-    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     // Pre-create the default test session
@@ -375,7 +375,7 @@ fn make_runner(
     tm: Arc<ToolManager>,
     provider: Arc<dyn Provider>,
     workspace_dir: PathBuf,
-    ms: Arc<tokio::sync::Mutex<MemoryStore>>,
+    ms: Arc<tokio::sync::Mutex<MemoryService>>,
 ) -> AgentRunner {
     make_runner_with_tracer(sm, tm, provider, workspace_dir, ms, None)
 }
@@ -386,7 +386,7 @@ fn make_runner_with_tracer(
     tm: Arc<ToolManager>,
     provider: Arc<dyn Provider>,
     workspace_dir: PathBuf,
-    ms: Arc<tokio::sync::Mutex<MemoryStore>>,
+    ms: Arc<tokio::sync::Mutex<MemoryService>>,
     tracer: Option<Arc<crate::trace::Tracer>>,
 ) -> AgentRunner {
     AgentRunner::new(
@@ -844,7 +844,7 @@ async fn test_tool_error_continues_loop() {
     let tm = Arc::new(tm);
     sm.lock().await.get_or_create("test-session").await.unwrap();
 
-    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     // Provider returns tool_error first, then a final reply after seeing the error
@@ -1111,7 +1111,7 @@ async fn test_runner_persist_long_output() {
     let tm = Arc::new(tm);
     sm.lock().await.get_or_create("test-session").await.unwrap();
 
-    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let provider = Arc::new(MockProvider::new(vec![
@@ -1276,7 +1276,7 @@ async fn test_cancel_in_loop_rolls_back_messages() {
     let tm = Arc::new(tm);
     sm.lock().await.get_or_create("test-session").await.unwrap();
 
-    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     // Pre-existing messages in session
@@ -1524,7 +1524,7 @@ async fn test_llm_error_rolls_back_messages() {
     let tm = Arc::new(tm);
     sm.lock().await.get_or_create("test-session").await.unwrap();
 
-    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     // Pre-existing messages
@@ -1923,7 +1923,7 @@ fn make_runner_with<F>(
     tm: Arc<ToolManager>,
     provider: Arc<dyn Provider>,
     workspace_dir: PathBuf,
-    ms: Arc<tokio::sync::Mutex<MemoryStore>>,
+    ms: Arc<tokio::sync::Mutex<MemoryService>>,
     configure: F,
 ) -> AgentRunner
 where
@@ -1943,7 +1943,7 @@ where
             unknown: Default::default(),
         })
         .workspace_dir(workspace_dir)
-        .memory_store(ms)
+        .memory_service(ms)
         .max_tokens(4096)
         .with_defaults();
     configure(builder).build()
@@ -2924,7 +2924,7 @@ async fn test_runner_tool_span_records_error_and_truncates_args() {
     tool_manager.register(Box::new(FailingTool));
     let tm = Arc::new(tool_manager);
     sm.lock().await.get_or_create("webui:chat-7").await.unwrap();
-    let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     // A tool call with oversized args exercises the 200-char truncation.

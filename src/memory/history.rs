@@ -1,9 +1,10 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use super::fs::sync_if_exists;
 
 /// History entry in history.jsonl.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,99 +13,27 @@ pub struct HistoryEntry {
     pub content: String,
 }
 
-/// Shared access to the memory store.
-pub type SharedMemoryStore = Arc<tokio::sync::Mutex<MemoryStore>>;
-
-/// Pure file I/O layer for memory files.
-pub struct MemoryStore {
-    workspace_dir: PathBuf,
-    memory_dir: PathBuf,
-    memory_file: PathBuf,
+/// Episodic history subsystem: append-only JSONL + Dream processing cursor.
+///
+/// Deliberately separate from the [`MemoryBackend`](super::backend::MemoryBackend)
+/// trait: append-only logs with a processing cursor have little in common with
+/// category document reads/writes, and forcing them into one interface would
+/// complicate both. Kept as a concrete store inside the memory module.
+pub struct HistoryStore {
     history_file: PathBuf,
     dream_cursor_file: PathBuf,
     // In-memory cache for dream cursor, lazily initialized.
     dream_cursor_cache: Option<usize>,
 }
 
-impl MemoryStore {
-    pub fn new(workspace_dir: &Path) -> Self {
-        let memory_dir = workspace_dir.join("memory");
+impl HistoryStore {
+    pub fn new(history_file: PathBuf, dream_cursor_file: PathBuf) -> Self {
         Self {
-            workspace_dir: workspace_dir.to_path_buf(),
-            memory_dir: memory_dir.clone(),
-            memory_file: memory_dir.join("MEMORY.md"),
-            history_file: memory_dir.join("history.jsonl"),
-            dream_cursor_file: memory_dir.join(".dream_cursor"),
+            history_file,
+            dream_cursor_file,
             dream_cursor_cache: None,
         }
     }
-
-    /// Ensure the memory directory exists.
-    pub fn init(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.memory_dir).context("Failed to create memory directory")
-    }
-
-    // -- MEMORY.md (long-term facts) ----------------------------------------
-
-    pub fn read_memory(&self) -> String {
-        read_file_or_empty(&self.memory_file)
-    }
-
-    pub fn write_memory(&self, content: &str) -> Result<()> {
-        std::fs::write(&self.memory_file, content).context("Failed to write MEMORY.md")
-    }
-
-    // -- SOUL.md and USER.md (workspace root) --------------------------------
-
-    pub fn read_soul(&self) -> String {
-        read_file_or_empty(&self.workspace_dir.join("SOUL.md"))
-    }
-
-    pub fn write_soul(&self, content: &str) -> Result<()> {
-        std::fs::write(self.workspace_dir.join("SOUL.md"), content)
-            .context("Failed to write SOUL.md")
-    }
-
-    pub fn read_user(&self) -> String {
-        read_file_or_empty(&self.workspace_dir.join("USER.md"))
-    }
-
-    pub fn write_user(&self, content: &str) -> Result<()> {
-        std::fs::write(self.workspace_dir.join("USER.md"), content)
-            .context("Failed to write USER.md")
-    }
-
-    // -- context injection helper -------------------------------------------
-
-    /// Returns the memory content formatted for system prompt injection,
-    /// or empty string if the memory is empty.
-    pub fn get_memory_context(&self) -> String {
-        let long_term = self.read_memory();
-        if long_term.is_empty() {
-            String::new()
-        } else {
-            format!("## Long-term Memory\n{long_term}")
-        }
-    }
-
-    // -- shutdown sync ------------------------------------------------------
-
-    /// Sync all memory files to disk (fsync). Called during shutdown.
-    pub fn sync_all(&self) -> Result<()> {
-        sync_if_exists(&self.history_file, true)?;
-        sync_if_exists(&self.dream_cursor_file, false)?;
-        sync_if_exists(&self.memory_file, false)?;
-        // Sync the memory directory
-        if let Ok(dir) = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&self.memory_dir)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    }
-
-    // -- history.jsonl (append-only JSONL) -----------------------------------
 
     /// Append an entry to history.jsonl.
     pub fn append_history(&mut self, entry: &str) -> Result<()> {
@@ -114,7 +43,6 @@ impl MemoryStore {
             content: entry.to_string(),
         };
         let line = serde_json::to_string(&record).context("Failed to serialize history entry")?;
-        use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -139,8 +67,6 @@ impl MemoryStore {
         }
     }
 
-    // -- dream cursor management --------------------------------------------
-
     pub fn get_last_dream_cursor(&mut self) -> usize {
         if let Some(cached) = self.dream_cursor_cache {
             return cached;
@@ -162,8 +88,7 @@ impl MemoryStore {
             .context("Failed to write dream cursor")
     }
 
-    // -- internal helpers ----------------------------------------------------
-
+    /// Read all entries from history.jsonl.
     pub fn read_entries(&self) -> Vec<HistoryEntry> {
         let mut entries = Vec::new();
         if let Ok(file) = std::fs::File::open(&self.history_file) {
@@ -180,8 +105,6 @@ impl MemoryStore {
         }
         entries
     }
-
-    // -- history compaction --------------------------------------------------
 
     /// Minimum number of recent entries to keep during compaction.
     const DREAM_KEEP_MINIMUM: usize = 50;
@@ -239,42 +162,21 @@ impl MemoryStore {
 
         self.write_entries(filtered)
     }
-}
 
-/// Open a file if it exists and call fsync.
-fn sync_if_exists(path: &Path, append: bool) -> std::io::Result<()> {
-    if path.exists() {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .append(append)
-            .open(path)?;
-        let _ = file.sync_all();
+    /// fsync history and cursor files if they exist.
+    pub fn sync(&self) -> Result<()> {
+        sync_if_exists(&self.history_file, true)?;
+        sync_if_exists(&self.dream_cursor_file, false)?;
+        Ok(())
     }
-    Ok(())
-}
-
-fn read_file_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_store(tmp_dir: &Path) -> MemoryStore {
-        let store = MemoryStore::new(tmp_dir);
-        store.init().unwrap();
-        store
-    }
-
-    #[test]
-    fn test_memory_read_write() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
-
-        assert!(store.read_memory().is_empty());
-        store.write_memory("test memory").unwrap();
-        assert_eq!(store.read_memory(), "test memory");
+    fn make_store(tmp_dir: &std::path::Path) -> HistoryStore {
+        HistoryStore::new(tmp_dir.join("history.jsonl"), tmp_dir.join(".dream_cursor"))
     }
 
     #[test]
@@ -328,58 +230,6 @@ mod tests {
         assert_eq!(store.get_last_dream_cursor(), 0usize);
         store.set_last_dream_cursor(42usize).unwrap();
         assert_eq!(store.get_last_dream_cursor(), 42usize);
-    }
-
-    #[test]
-    fn test_get_memory_context_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
-
-        assert!(store.get_memory_context().is_empty());
-    }
-
-    #[test]
-    fn test_get_memory_context_formatted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
-
-        store.write_memory("User prefers Rust").unwrap();
-        let ctx = store.get_memory_context();
-        assert!(ctx.contains("## Long-term Memory"));
-        assert!(ctx.contains("User prefers Rust"));
-    }
-
-    #[test]
-    fn test_soul_read_write() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
-
-        assert!(store.read_soul().is_empty());
-        store.write_soul("You are a helpful assistant").unwrap();
-        assert_eq!(store.read_soul(), "You are a helpful assistant");
-    }
-
-    #[test]
-    fn test_user_read_write() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = make_store(tmp.path());
-
-        assert!(store.read_user().is_empty());
-        store.write_user("Alice, software engineer").unwrap();
-        assert_eq!(store.read_user(), "Alice, software engineer");
-    }
-
-    #[test]
-    fn test_sync_all() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut store = make_store(tmp.path());
-
-        store.write_memory("test").unwrap();
-        store.append_history("entry").unwrap();
-
-        // sync_all should not panic or error
-        let result = store.sync_all();
-        assert!(result.is_ok());
     }
 
     #[test]
@@ -451,19 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_init_creates_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-
-        let store = MemoryStore::new(&workspace_dir);
-        assert!(!workspace_dir.join("memory").exists());
-
-        store.init().unwrap();
-        assert!(workspace_dir.join("memory").exists());
-    }
-
-    #[test]
     fn test_compact_history_after_dream_no_compaction_under_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = make_store(tmp.path());
@@ -519,5 +356,17 @@ mod tests {
         // First entry should be "entry 2051"
         assert_eq!(entries[0].content, "entry 2051");
         assert_eq!(entries[49].content, "entry 2100");
+    }
+
+    #[test]
+    fn test_sync_writes_without_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        store.append_history("entry").unwrap();
+
+        // sync should not panic or error
+        let result = store.sync();
+        assert!(result.is_ok());
     }
 }

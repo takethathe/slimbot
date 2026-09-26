@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use slimbot::{
-    ContextBuilder, MemoryStore, Message, SessionManager, SharedSessionManager, ToolCall,
+    ContextBuilder, MemoryService, Message, SessionManager, SharedSessionManager, ToolCall,
     ToolManager, build_runtime_context,
 };
 use tempfile::TempDir;
@@ -50,7 +50,7 @@ async fn test_runtime_context_stable_across_iterations() {
     .unwrap();
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
@@ -152,7 +152,7 @@ async fn test_runtime_context_changes_without_pregeneration() {
         .unwrap();
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
@@ -193,7 +193,7 @@ async fn test_runtime_context_uses_pregenerated_timestamp() {
         .unwrap();
     let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
 
-    let ms = Arc::new(Mutex::new(MemoryStore::new(&workspace_dir)));
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
@@ -226,5 +226,191 @@ async fn test_runtime_context_uses_pregenerated_timestamp() {
     assert_eq!(
         timestamp, extracted_timestamp,
         "timestamp should be preserved from pre-generated runtime_ctx"
+    );
+}
+
+/// Test that build_system_prompt injects memory documents by category in the
+/// fixed order Agent → Soul → Tools → User, then skills, then Core long-term
+/// memory with its header, skipping unmodified templates.
+#[tokio::test]
+async fn test_system_prompt_injects_categories_in_order() {
+    let tmp = TempDir::new().unwrap();
+    let workspace_dir = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
+    ms.lock().await.init().unwrap();
+
+    // Modified content for the four root documents (differs from templates).
+    ms.lock()
+        .await
+        .set(&slimbot::MemoryCategory::Agent, None, "CUSTOM AGENTS")
+        .await
+        .unwrap();
+    ms.lock()
+        .await
+        .set(&slimbot::MemoryCategory::Soul, None, "CUSTOM SOUL")
+        .await
+        .unwrap();
+    ms.lock()
+        .await
+        .set(&slimbot::MemoryCategory::Tools, None, "CUSTOM TOOLS")
+        .await
+        .unwrap();
+    ms.lock()
+        .await
+        .set(&slimbot::MemoryCategory::User, None, "CUSTOM USER")
+        .await
+        .unwrap();
+    // Core long-term memory.
+    ms.lock()
+        .await
+        .set(&slimbot::MemoryCategory::Core, None, "CUSTOM LONG TERM")
+        .await
+        .unwrap();
+    // A skill with frontmatter.
+    ms.lock()
+        .await
+        .set(
+            &slimbot::MemoryCategory::Skill,
+            Some("helper"),
+            "---\nname: helper\ndescription: A helper skill.\nalways: true\n---\n\nHelper body",
+        )
+        .await
+        .unwrap();
+
+    let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
+    let cb = ContextBuilder::new(
+        Arc::new(Mutex::new(
+            SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        )),
+        tm,
+        workspace_dir.clone(),
+        ms.clone(),
+    );
+
+    let prompt = cb.build_system_prompt("cli", None).await;
+
+    let pos_agents = prompt.find("[AGENTS.md] CUSTOM AGENTS").unwrap();
+    let pos_soul = prompt.find("[SOUL.md] CUSTOM SOUL").unwrap();
+    let pos_tools = prompt.find("[TOOLS.md] CUSTOM TOOLS").unwrap();
+    let pos_user = prompt.find("[USER.md] CUSTOM USER").unwrap();
+    let pos_skill = prompt.find("### Skill: helper").unwrap();
+    let pos_core = prompt
+        .find("## Long-term Memory\nCUSTOM LONG TERM")
+        .unwrap();
+
+    assert!(pos_agents < pos_soul, "Agent must come before Soul");
+    assert!(pos_soul < pos_tools, "Soul must come before Tools");
+    assert!(pos_tools < pos_user, "Tools must come before User");
+    assert!(pos_user < pos_skill, "User must come before skills");
+    assert!(pos_skill < pos_core, "skills must come before Core memory");
+    if let Some(pos_history) = prompt.find("# Recent History") {
+        assert!(
+            pos_core < pos_history,
+            "Core memory must come before history"
+        );
+    }
+}
+
+/// Unmodified template documents are skipped by get_effective: a fresh
+/// workspace (setup templates) produces no [SOUL.md] etc. blocks.
+#[tokio::test]
+async fn test_system_prompt_skips_unmodified_templates() {
+    let tmp = TempDir::new().unwrap();
+    let workspace_dir = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
+    ms.lock().await.init().unwrap();
+
+    let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
+    let cb = ContextBuilder::new(
+        Arc::new(Mutex::new(
+            SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        )),
+        tm,
+        workspace_dir.clone(),
+        ms.clone(),
+    );
+
+    // Write the exact SOUL and Core template content — both must be treated
+    // as unmodified.
+    let backend = slimbot::MemoryService::new(&workspace_dir);
+    let soul_template = backend
+        .backend()
+        .template(&slimbot::MemoryCategory::Soul)
+        .unwrap();
+    let core_template = backend
+        .backend()
+        .template(&slimbot::MemoryCategory::Core)
+        .unwrap();
+    ms.lock()
+        .await
+        .set(&slimbot::MemoryCategory::Soul, None, &soul_template)
+        .await
+        .unwrap();
+    ms.lock()
+        .await
+        .set(&slimbot::MemoryCategory::Core, None, &core_template)
+        .await
+        .unwrap();
+
+    let prompt = cb.build_system_prompt("cli", None).await;
+    assert!(
+        !prompt.contains("[SOUL.md]"),
+        "unmodified SOUL template must not be injected"
+    );
+    assert!(
+        !prompt.contains("## Long-term Memory"),
+        "unmodified MEMORY.md template must not be injected"
+    );
+    assert!(
+        !prompt.contains("Managed by Dream"),
+        "no MEMORY.md template body may leak into the prompt"
+    );
+}
+
+/// Skills with `always: false` frontmatter land in the available list.
+#[tokio::test]
+async fn test_system_prompt_available_skill_listed() {
+    let tmp = TempDir::new().unwrap();
+    let workspace_dir = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
+    ms.lock().await.init().unwrap();
+    ms.lock()
+        .await
+        .set(
+            &slimbot::MemoryCategory::Skill,
+            Some("optional"),
+            "---\nname: optional\ndescription: An optional skill.\nalways: false\n---\n\nOptional body",
+        )
+        .await
+        .unwrap();
+
+    let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
+    let cb = ContextBuilder::new(
+        Arc::new(Mutex::new(
+            SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        )),
+        tm,
+        workspace_dir.clone(),
+        ms.clone(),
+    );
+
+    let prompt = cb.build_system_prompt("cli", None).await;
+    assert!(
+        prompt.contains("# Available Skills"),
+        "available skills header"
+    );
+    assert!(
+        prompt.contains("- **optional** — An optional skill.  `skills/optional/SKILL.md`"),
+        "available skill entry"
+    );
+    assert!(
+        !prompt.contains("### Skill: optional"),
+        "non-always skill must not be injected as active"
     );
 }

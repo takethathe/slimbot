@@ -11,8 +11,8 @@ use crate::config_normalize::apply_normalize;
 
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
-    AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, ProviderConfig, TraceBackendEntry,
-    TraceConfig, WebFetchConfig,
+    AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, MemoryConfig, ProviderConfig,
+    TraceBackendEntry, TraceConfig, WebFetchConfig,
 };
 
 // ── Root Config ──
@@ -31,6 +31,8 @@ pub struct Config {
     pub web_fetch: Option<WebFetchConfig>,
     #[serde(default)]
     pub tracing: TraceConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -183,6 +185,7 @@ impl Config {
         self.gateway.cron.clamp();
         self.gateway.heartbeat.clamp();
         self.gateway.dream.clamp();
+        self.memory.clamp();
         if let Some(wf) = &mut self.web_fetch {
             wf.clamp();
         }
@@ -545,6 +548,7 @@ mod tests {
             gateway: GatewayConfig::default(),
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         }
     }
 
@@ -630,6 +634,49 @@ mod tests {
         cfg.clamp();
         assert_eq!(cfg.agent.max_iterations, 200);
         assert!((cfg.providers["default"].temperature - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_memory_config_default_backend_is_markdown() {
+        let cfg = make_test_config();
+        assert_eq!(cfg.memory.backend, "markdown");
+    }
+
+    #[test]
+    fn test_memory_config_invalid_backend_falls_back_to_default() {
+        let mut cfg = make_test_config();
+        cfg.memory.backend = "sqlite".to_string();
+        cfg.clamp();
+        assert_eq!(cfg.memory.backend, "markdown");
+    }
+
+    #[test]
+    fn test_memory_config_valid_backend_kept() {
+        let mut cfg = make_test_config();
+        cfg.memory.backend = "markdown".to_string();
+        cfg.clamp();
+        assert_eq!(cfg.memory.backend, "markdown");
+    }
+
+    #[test]
+    fn test_memory_config_load_missing_field_defaults() {
+        let config_str = r#"{
+            "agent": {"provider": "default"},
+            "providers": {"default": {"api_key": "sk", "model": "m"}}
+        }"#;
+        let cfg: Config = serde_json::from_str(config_str).unwrap();
+        assert_eq!(cfg.memory.backend, "markdown");
+    }
+
+    #[test]
+    fn test_memory_config_load_custom_backend() {
+        let config_str = r#"{
+            "agent": {"provider": "default"},
+            "providers": {"default": {"api_key": "sk", "model": "m"}},
+            "memory": {"backend": "markdown"}
+        }"#;
+        let cfg: Config = serde_json::from_str(config_str).unwrap();
+        assert_eq!(cfg.memory.backend, "markdown");
     }
 
     #[test]

@@ -56,7 +56,7 @@ PreTool hook 特有：
 
 ### 上下文对象
 
-- **`RunSpec`**（不可变）：session_id、content、task_hook、max_iterations、max_tokens、cancel_token、workspace_dir、session_manager、tool_manager、config、memory_store、consolidator、initial_message_count、channel/chat_id、runtime_ctx
+- **`RunSpec`**（不可变）：session_id、content、task_hook、max_iterations、max_tokens、cancel_token、workspace_dir、session_manager、tool_manager、config、memory_service、consolidator、initial_message_count、channel/chat_id、runtime_ctx
 - **`RunState`**（可变）：iterations、result、messages、tools、response、tool_results、turn_context、should_exit、rollback_to、extensions
 
 `RunState` 提供类型安全的扩展存储：`set_extension::<T>(key, value)` / `get_extension::<T>(key)`，用于跨 phase 传递自定义数据。
@@ -70,7 +70,7 @@ AgentRunner::builder()
     .provider(provider)
     .config(agent_config)
     .workspace_dir(workspace)
-    .memory_store(ms)
+    .memory_service(ms)
     .consolidator(Some(consolidator))  // 可选
     .max_tokens(4096)
     .with_defaults()                        // 注册全部默认 hook

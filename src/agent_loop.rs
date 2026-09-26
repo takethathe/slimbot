@@ -9,7 +9,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use crate::commands::{CommandTier, classify_command};
 use crate::config::Config;
 use crate::consolidate::Consolidator;
-use crate::memory::{MemoryStore, SharedMemoryStore};
+use crate::memory::{MemoryService, SharedMemory};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::path::PathManager;
 use crate::provider::{OpenAIProvider, Provider};
@@ -141,11 +141,11 @@ async fn graceful_shutdown(
     channel_manager: &crate::channel::ChannelManager,
     session_manager: &SharedSessionManager,
     consolidator: &Consolidator,
-    memory_store: &SharedMemoryStore,
+    memory_service: &SharedMemory,
 ) {
     // Phase 1: Stop all channel I/O threads — no more user input.
     channel_manager.shutdown().await;
-    shutdown_session_memory(session_manager, consolidator, memory_store).await;
+    shutdown_session_memory(session_manager, consolidator, memory_service).await;
     info!("[AgentLoop] Graceful shutdown complete");
 }
 
@@ -154,13 +154,15 @@ async fn graceful_shutdown(
 async fn shutdown_session_memory(
     session_manager: &SharedSessionManager,
     consolidator: &Consolidator,
-    memory_store: &SharedMemoryStore,
+    memory_service: &SharedMemory,
 ) {
     consolidator.shutdown();
     session_manager.lock().await.graceful_shutdown().await;
     {
-        let guard = memory_store.lock().await;
-        let _ = guard.sync_all();
+        let guard = memory_service.lock().await;
+        if let Err(e) = guard.sync_all().await {
+            crate::warn_log!("[AgentLoop] Failed to sync memory during shutdown: {}", e);
+        }
         drop(guard);
     }
 }
@@ -171,7 +173,7 @@ pub struct AgentLoop {
     provider: Arc<dyn Provider>,
     tool_manager: Arc<ToolManager>,
     session_manager: SharedSessionManager,
-    memory_store: SharedMemoryStore,
+    memory_service: SharedMemory,
     message_bus: Arc<MessageBus>,
     /// Owned inbound receiver, consumed once by `start_inbound`.
     inbound_rx: Mutex<Option<mpsc::Receiver<BusRequest>>>,
@@ -323,10 +325,14 @@ impl AgentLoop {
         let session_manager = SessionManager::new(paths.session_dir())?;
         let session_manager_arc = Arc::new(tokio::sync::Mutex::new(session_manager));
 
-        let memory_store = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(
+        let memory_service = Arc::new(tokio::sync::Mutex::new(MemoryService::with_backend(
             paths.workspace_dir(),
+            crate::memory::factory::backend_from_name(
+                &config.memory.backend,
+                paths.workspace_dir(),
+            )?,
         )));
-        memory_store.lock().await.init()?;
+        memory_service.lock().await.init()?;
 
         // Build providers map from config for DreamService
         let mut providers_map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
@@ -339,7 +345,7 @@ impl AgentLoop {
         let consolidator = Arc::new(Consolidator::new(
             provider.clone(),
             session_manager_arc.clone(),
-            memory_store.clone(),
+            memory_service.clone(),
             config.agent.context_window_tokens,
         ));
 
@@ -350,7 +356,7 @@ impl AgentLoop {
         // Build DreamService
         let dream_service = Arc::new(crate::dream::DreamService::new(
             paths.workspace_dir().to_path_buf(),
-            memory_store.clone(),
+            memory_service.clone(),
             session_manager_arc.clone(),
             config.gateway.dream.clone(),
             providers.clone(),
@@ -372,7 +378,7 @@ impl AgentLoop {
             session_manager_arc.clone(),
             config.agent.clone(),
             paths.workspace_dir().to_path_buf(),
-            memory_store.clone(),
+            memory_service.clone(),
             Some(consolidator.clone()),
             max_tokens,
             tracer.clone(),
@@ -384,7 +390,7 @@ impl AgentLoop {
             provider,
             tool_manager: tool_manager_arc,
             session_manager: session_manager_arc,
-            memory_store,
+            memory_service,
             message_bus,
             inbound_rx: Mutex::new(Some(inbound_rx)),
             consolidator,
@@ -500,7 +506,7 @@ impl AgentLoop {
         let config = self.config.agent.clone();
         let full_config = self.config.clone();
         let workspace_dir = self.workspace_dir.clone();
-        let memory_store = self.memory_store.clone();
+        let memory_service = self.memory_service.clone();
         let outbound_tx = self.message_bus.outbound_tx();
         let consolidator = self.consolidator.clone();
         let tracer = self.tracer.clone();
@@ -571,7 +577,7 @@ impl AgentLoop {
                                 provider.clone(),
                                 config.clone(),
                                 workspace_dir.clone(),
-                                memory_store.clone(),
+                                memory_service.clone(),
                             ).await;
                             if !msg.is_empty() {
                                 message_bus.publish_outbound(BusResult {
@@ -604,7 +610,7 @@ impl AgentLoop {
                         .provider(provider.clone())
                         .config(config.clone())
                         .workspace_dir(workspace_dir.clone())
-                        .memory_store(memory_store.clone())
+                        .memory_service(memory_service.clone())
                         .outbound_tx(outbound_tx.clone())
                         .channel_inject(request.channel_inject)
                         .consolidator(Some(consolidator.clone()))
@@ -644,7 +650,7 @@ impl AgentLoop {
         provider: Arc<dyn Provider>,
         config: crate::config::AgentConfig,
         workspace_dir: std::path::PathBuf,
-        memory_store: SharedMemoryStore,
+        memory_service: SharedMemory,
     ) -> (String, bool) {
         match command {
             "/stop" => {
@@ -667,7 +673,7 @@ impl AgentLoop {
                     .provider(provider)
                     .config(config)
                     .workspace_dir(workspace_dir)
-                    .memory_store(memory_store)
+                    .memory_service(memory_service)
                     .outbound_tx(outbound_tx.clone())
                     .cancel_token(Some(ct))
                     .max_tokens(max_tokens)
@@ -737,7 +743,7 @@ impl AgentLoop {
             channel_manager,
             &self.session_manager,
             &self.consolidator,
-            &self.memory_store,
+            &self.memory_service,
         )
         .await;
     }
@@ -748,7 +754,7 @@ impl AgentLoop {
         shutdown_session_memory(
             &self.session_manager,
             &self.consolidator,
-            &self.memory_store,
+            &self.memory_service,
         )
         .await;
         info!("[AgentLoop] CLI session shutdown complete");
@@ -811,6 +817,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -1019,6 +1026,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
@@ -1074,6 +1082,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1137,6 +1146,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let agent_loop = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
@@ -1195,6 +1205,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let agent_loop =
@@ -1253,6 +1264,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let mut agent_loop =
@@ -1288,14 +1300,14 @@ mod tests {
         Arc<dyn Provider>,
         crate::config::AgentConfig,
         std::path::PathBuf,
-        SharedMemoryStore,
+        SharedMemory,
     ) {
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let tm = Arc::new(ToolManager::new(workspace.clone()));
         let provider: Arc<dyn Provider> = Arc::new(MockProvider::new());
         let config = crate::config::AgentConfig::default();
-        let ms = Arc::new(tokio::sync::Mutex::new(MemoryStore::new(&workspace)));
+        let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace)));
         ms.lock().await.init().unwrap();
         (tm, provider, config, workspace, ms)
     }
@@ -1347,6 +1359,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1409,6 +1422,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
         AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
             .await
@@ -1483,6 +1497,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
         let (event_tx, _) = broadcast::channel::<crate::session::AgentEvent>(256);
         let channel_manager = Arc::new(crate::channel::ChannelManager::new(
@@ -1569,6 +1584,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: Default::default(),
+            memory: Default::default(),
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
@@ -1621,7 +1637,7 @@ mod tests {
 
     // ── /stop sentinel with an existing session must run (regression: builder
     //    previously omitted tool_manager/provider/config/workspace_dir/
-    //    memory_store → `.expect()` panicked in `SessionTaskBuilder::build`) ──
+    //    memory_service → `.expect()` panicked in `SessionTaskBuilder::build`) ──
     #[tokio::test]
     async fn test_stop_sentinel_with_existing_session_runs() {
         crate::WorkerPool::init_global(64);
@@ -1672,6 +1688,7 @@ mod tests {
             },
             web_fetch: None,
             tracing: crate::config::TraceConfig::default(),
+            memory: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1897,6 +1914,7 @@ mod tests {
                 }],
                 unknown: Default::default(),
             },
+            memory: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
