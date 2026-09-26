@@ -414,3 +414,60 @@ async fn test_system_prompt_available_skill_listed() {
         "non-always skill must not be injected as active"
     );
 }
+
+/// The derived entry-search layer must not perturb the system prompt layout:
+/// `memory_search` is a registered tool, never prompt content, and the
+/// frontmatter prefactor keeps the available/active skill formatting exact.
+#[tokio::test]
+async fn test_system_prompt_layout_unaffected_by_memory_search() {
+    let tmp = TempDir::new().unwrap();
+    let workspace_dir = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let ms = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
+    ms.lock().await.init().unwrap();
+    ms.lock()
+        .await
+        .set(
+            &slimbot::MemoryCategory::Skill,
+            Some("required"),
+            "---\nname: required\ndescription: Required skill.\nalways: true\n---\n\nRequired body",
+        )
+        .await
+        .unwrap();
+    ms.lock()
+        .await
+        .set(
+            &slimbot::MemoryCategory::Skill,
+            Some("optional"),
+            "---\nname: optional\ndescription: An optional skill.\nalways: false\n---\n\nOptional body",
+        )
+        .await
+        .unwrap();
+
+    let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
+    let cb = ContextBuilder::new(
+        Arc::new(Mutex::new(
+            SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        )),
+        tm,
+        workspace_dir.clone(),
+        ms.clone(),
+    );
+
+    let prompt = cb.build_system_prompt("cli", None).await;
+    assert!(
+        prompt.contains("# Active Skills\n\n### Skill: required\n\nRequired body"),
+        "active skill injection must be byte-identical"
+    );
+    assert!(
+        prompt.contains(
+            "# Available Skills\n\nThe following skills are available. Use file_reader to load them when needed.\n- **optional** — An optional skill.  `skills/optional/SKILL.md`"
+        ),
+        "available skill injection must be byte-identical"
+    );
+    assert!(
+        !prompt.contains("memory_search"),
+        "the search tool must never leak into the system prompt"
+    );
+}

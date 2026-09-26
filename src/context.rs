@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::MemoryCategory;
 use crate::debug;
 use crate::memory::SharedMemory;
+use crate::memory::frontmatter::parse_skill_frontmatter;
 use crate::session::{Content, ContentBlock, Message, MessageMeta, SharedSessionManager};
 use crate::tool::{ToolDefinition, ToolManager};
 
@@ -38,53 +39,6 @@ pub struct RunContext {
     pub current_turn: Vec<Message>,
     pub system_message: Message,
     pub tools: Option<Vec<ToolDefinition>>,
-}
-
-/// Parsed YAML frontmatter from a skill file.
-#[derive(Debug, Clone)]
-struct SkillMeta {
-    name: String,
-    description: String,
-    always: bool,
-    content: String,
-}
-
-/// Parse YAML frontmatter from a skill file.
-/// Returns None if the file has no valid `---` delimiters.
-fn parse_skill_frontmatter(content: &str) -> Option<SkillMeta> {
-    if !content.starts_with("---\n") {
-        return None;
-    }
-    let rest = &content[4..];
-    let end = rest.find("\n---\n")?;
-    let front = &rest[..end];
-    let body = &rest[end + 5..];
-
-    let mut name = String::new();
-    let mut description = String::new();
-    let mut always = false;
-
-    for line in front.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("name:") {
-            name = rest.trim().to_string();
-        } else if let Some(rest) = line.strip_prefix("description:") {
-            description = rest.trim().to_string();
-        } else if let Some(rest) = line.strip_prefix("always:") {
-            always = rest.trim() == "true";
-        }
-    }
-
-    Some(SkillMeta {
-        name: if name.is_empty() {
-            "unknown".to_string()
-        } else {
-            name
-        },
-        description,
-        always,
-        content: body.trim().to_string(),
-    })
 }
 
 /// Maximum tokens allowed for recent history section in system prompt.
@@ -459,47 +413,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_frontmatter_full() {
-        let input = r#"---
-name: memory
-description: Two-layer memory system.
-always: true
----
-
-# Memory content here
-"#;
-        let meta = parse_skill_frontmatter(input).unwrap();
-        assert_eq!(meta.name, "memory");
-        assert_eq!(meta.description, "Two-layer memory system.");
-        assert!(meta.always);
-        assert_eq!(meta.content, "# Memory content here");
-    }
-
-    #[test]
-    fn test_parse_frontmatter_no_always() {
-        let input = r#"---
-name: custom
-description: A custom skill.
----
-
-Skill body.
-"#;
-        let meta = parse_skill_frontmatter(input).unwrap();
-        assert_eq!(meta.name, "custom");
-        assert!(!meta.always);
-    }
-
-    #[test]
-    fn test_parse_no_frontmatter_returns_none() {
-        assert!(parse_skill_frontmatter("# Just a markdown file").is_none());
-    }
-
-    #[test]
-    fn test_parse_no_closing_delimiter_returns_none() {
-        assert!(parse_skill_frontmatter("---\nname: test\nno closing").is_none());
-    }
-
-    #[test]
     fn test_build_runtime_context_basic() {
         let ctx = build_runtime_context("cli", "default");
         assert!(ctx.starts_with(RUNTIME_CONTEXT_TAG));
@@ -780,82 +693,6 @@ Skill body.
         } else {
             panic!("expected user message");
         }
-    }
-
-    #[test]
-    fn test_parse_skill_frontmatter_empty_name_falls_back() {
-        let input = r#"---
-name:
-description: A skill.
----
-
-Body
-"#;
-        let meta = parse_skill_frontmatter(input).unwrap();
-        assert_eq!(meta.name, "unknown");
-    }
-
-    #[test]
-    fn test_parse_skill_frontmatter_empty_content_skipped() {
-        let input = "---\nname: test\ndescription: desc\n---\n";
-        let meta = parse_skill_frontmatter(input).unwrap();
-        assert_eq!(meta.content, "");
-    }
-
-    #[test]
-    fn test_parse_skill_frontmatter_with_always_false() {
-        let input = r#"---
-name: optional-skill
-description: An optional skill.
-always: false
----
-
-Skill content here.
-"#;
-        let meta = parse_skill_frontmatter(input).unwrap();
-        assert_eq!(meta.name, "optional-skill");
-        assert!(!meta.always);
-        assert_eq!(meta.content, "Skill content here.");
-    }
-
-    #[test]
-    fn test_parse_skill_frontmatter_with_always_true() {
-        let input = r#"---
-name: required-skill
-description: A required skill.
-always: true
----
-
-Required skill content.
-"#;
-        let meta = parse_skill_frontmatter(input).unwrap();
-        assert_eq!(meta.name, "required-skill");
-        assert!(meta.always);
-        assert_eq!(meta.content, "Required skill content.");
-    }
-
-    #[test]
-    fn test_parse_skill_frontmatter_multiline_content() {
-        let input = r#"---
-name: multi
-description: Multi-line content.
----
-
-# Heading
-
-Paragraph 1.
-
-Paragraph 2.
-
-```rust
-let x = 42;
-```
-"#;
-        let meta = parse_skill_frontmatter(input).unwrap();
-        assert!(meta.content.contains("# Heading"));
-        assert!(meta.content.contains("Paragraph 1."));
-        assert!(meta.content.contains("Paragraph 2."));
-        assert!(meta.content.contains("```rust"));
     }
 
     #[test]

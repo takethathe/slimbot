@@ -1,8 +1,10 @@
 pub mod backend;
 pub mod category;
 pub mod factory;
+pub(crate) mod frontmatter;
 mod fs;
 pub mod history;
+mod index;
 pub mod markdown;
 
 use std::path::{Path, PathBuf};
@@ -14,6 +16,8 @@ use backend::{EditOutcome, MemoryBackend, MemoryBackendKind};
 use category::MemoryCategory;
 use factory::create_backend;
 pub use history::{HistoryEntry, HistoryStore};
+pub use index::{DEFAULT_LIMIT, MAX_LIMIT, ScoredEntry};
+use index::{DocumentSnapshot, KeywordIndex, MemoryIndex, SEARCH_CATEGORIES, source_path};
 
 /// Shared access to the memory facade.
 pub type SharedMemory = Arc<tokio::sync::Mutex<MemoryService>>;
@@ -28,6 +32,16 @@ pub struct MemoryService {
     memory_dir: PathBuf,
     backend: Arc<dyn MemoryBackend>,
     history: HistoryStore,
+    /// Lazily built derived entry index; `None` until the first search.
+    index: Option<KeywordIndex>,
+    /// Content fingerprint of the documents the cached index was built from.
+    index_fingerprint: Option<u64>,
+    /// How many times the index has been (re)built. Test-only observation
+    /// hook used to prove that unchanged documents are not re-parsed; it is
+    /// deliberately not part of the public API and not present in release
+    /// builds.
+    #[cfg(test)]
+    index_build_count: usize,
 }
 
 impl MemoryService {
@@ -49,6 +63,10 @@ impl MemoryService {
                 memory_dir.join("history.jsonl"),
                 memory_dir.join(".dream_cursor"),
             ),
+            index: None,
+            index_fingerprint: None,
+            #[cfg(test)]
+            index_build_count: 0,
         }
     }
 
@@ -124,6 +142,98 @@ impl MemoryService {
             return Ok(None);
         }
         Ok(Some(content))
+    }
+
+    // -- derived entry search (read-only) -----------------------------------
+
+    /// Search memory documents for entries relevant to `query`.
+    ///
+    /// The index is built lazily on first use and rebuilt whenever the
+    /// fingerprint of the enumerable documents changes, so search never
+    /// returns stale content. Takes `&mut self` because of that in-memory
+    /// index cache, matching the `&mut self` precedent of the history API;
+    /// callers hold an `Arc<Mutex<MemoryService>>`, so a mutable borrow is
+    /// always available.
+    pub async fn search(
+        &mut self,
+        query: &str,
+        limit: Option<usize>,
+        category: Option<&MemoryCategory>,
+    ) -> Result<Vec<ScoredEntry>> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        let documents = self.enumerable_documents().await?;
+        let fingerprint = index::fingerprint(&documents);
+
+        if self.index.is_none() || self.index_fingerprint != Some(fingerprint) {
+            let mut index = KeywordIndex::new();
+            index.rebuild(&documents).await?;
+            self.index = Some(index);
+            self.index_fingerprint = Some(fingerprint);
+            #[cfg(test)]
+            {
+                self.index_build_count += 1;
+            }
+        }
+
+        let index = self
+            .index
+            .as_ref()
+            .expect("index was built in the branch above");
+        Ok(index.search(query, limit, category))
+    }
+
+    /// Documents that make up the search corpus: the five fixed documents plus
+    /// every enumerated skill and custom document. `Daily` has no writer yet,
+    /// so it is naturally absent. Everything is read through the backend, so a
+    /// future sqlite backend needs no changes here.
+    async fn enumerable_documents(&self) -> Result<Vec<DocumentSnapshot>> {
+        let mut documents = Vec::new();
+
+        for category in SEARCH_CATEGORIES {
+            if let Some(content) = self.backend.get(&category, None).await? {
+                documents.push(DocumentSnapshot {
+                    source: source_path(&category, None),
+                    category,
+                    name: None,
+                    content,
+                });
+            }
+        }
+
+        self.push_named_documents(
+            MemoryCategory::Skill,
+            self.backend.list_skill_names().await?,
+            &mut documents,
+        )
+        .await?;
+        self.push_named_documents(
+            MemoryCategory::Custom,
+            self.backend.list_custom_names().await?,
+            &mut documents,
+        )
+        .await?;
+
+        Ok(documents)
+    }
+
+    /// Append one snapshot per existing named document of `category`.
+    async fn push_named_documents(
+        &self,
+        category: MemoryCategory,
+        names: Vec<String>,
+        documents: &mut Vec<DocumentSnapshot>,
+    ) -> Result<()> {
+        for name in names {
+            if let Some(content) = self.backend.get(&category, Some(&name)).await? {
+                documents.push(DocumentSnapshot {
+                    source: source_path(&category, Some(&name)),
+                    category,
+                    name: Some(name),
+                    content,
+                });
+            }
+        }
+        Ok(())
     }
 
     // -- history operations (through HistoryStore) --------------------------
@@ -376,6 +486,291 @@ mod tests {
         assert_eq!(
             store.get(&MemoryCategory::Core, None).await.unwrap(),
             Some("alpha gamma".to_string())
+        );
+    }
+
+    // -- derived entry search (main seam) -----------------------------------
+
+    /// Sorted list of every file path under `root`, for read-only assertions.
+    fn snapshot(root: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                }
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test]
+    async fn test_search_returns_entries_with_source_and_category() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(
+                &MemoryCategory::Core,
+                None,
+                "# Deployment\n\nThe nightly deploy runs at 02:00.\n\nUnrelated fact.\n",
+            )
+            .await
+            .unwrap();
+
+        let hits = store.search("deploy", None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.category, MemoryCategory::Core);
+        assert_eq!(hits[0].entry.source, "memory/MEMORY.md");
+        assert_eq!(hits[0].entry.heading.as_deref(), Some("Deployment"));
+    }
+
+    #[tokio::test]
+    async fn test_search_enumerates_skills_and_customs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(
+                &MemoryCategory::Skill,
+                Some("release"),
+                "---\nname: release\ndescription: Ship it.\n---\n\nTag and push the release.\n",
+            )
+            .await
+            .unwrap();
+        store
+            .set(
+                &MemoryCategory::Custom,
+                Some("glossary"),
+                "Widget means a UI part.",
+            )
+            .await
+            .unwrap();
+
+        let skill = store.search("release", None, None).await.unwrap();
+        assert_eq!(skill.len(), 1);
+        assert_eq!(skill[0].entry.category, MemoryCategory::Skill);
+        assert_eq!(skill[0].entry.source, "skills/release/SKILL.md");
+
+        let custom = store.search("widget", None, None).await.unwrap();
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].entry.source, "memory/glossary.md");
+    }
+
+    #[tokio::test]
+    async fn test_search_category_filter_narrows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(&MemoryCategory::Core, None, "shared keyword")
+            .await
+            .unwrap();
+        store
+            .set(&MemoryCategory::User, None, "shared keyword")
+            .await
+            .unwrap();
+
+        let hits = store
+            .search("shared", None, Some(&MemoryCategory::User))
+            .await
+            .unwrap();
+        assert!(
+            hits.iter()
+                .all(|h| h.entry.category == MemoryCategory::User)
+        );
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_chinese_query_matches_chinese_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(
+                &MemoryCategory::User,
+                None,
+                "部署流程需要先构建镜像。\n\n无关内容。",
+            )
+            .await
+            .unwrap();
+
+        let hits = store.search("部署", None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.content.contains("部署"));
+    }
+
+    #[tokio::test]
+    async fn test_search_limit_defaults_and_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        let body: String = (0..60).map(|i| format!("keyword {i}\n\n")).collect();
+        store.set(&MemoryCategory::Core, None, &body).await.unwrap();
+
+        assert_eq!(
+            store.search("keyword", None, None).await.unwrap().len(),
+            DEFAULT_LIMIT
+        );
+        assert_eq!(
+            store
+                .search("keyword", Some(1000), None)
+                .await
+                .unwrap()
+                .len(),
+            MAX_LIMIT
+        );
+        assert_eq!(
+            store.search("keyword", Some(3), None).await.unwrap().len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_reflects_document_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(&MemoryCategory::Core, None, "alpha fact")
+            .await
+            .unwrap();
+        assert_eq!(store.search("alpha", None, None).await.unwrap().len(), 1);
+
+        store
+            .set(&MemoryCategory::Core, None, "bravo fact")
+            .await
+            .unwrap();
+        assert!(
+            store.search("alpha", None, None).await.unwrap().is_empty(),
+            "edited-away content must disappear"
+        );
+        assert_eq!(store.search("bravo", None, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_reflects_document_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(&MemoryCategory::Custom, Some("notes"), "obsolete keyword")
+            .await
+            .unwrap();
+        assert_eq!(store.search("obsolete", None, None).await.unwrap().len(), 1);
+
+        assert!(
+            store
+                .remove(&MemoryCategory::Custom, Some("notes"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .search("obsolete", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_sees_newly_created_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        assert!(
+            store
+                .search("freshly", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .set(
+                &MemoryCategory::Skill,
+                Some("newskill"),
+                "freshly added workflow",
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.search("freshly", None, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_reuses_index_when_documents_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(&MemoryCategory::Core, None, "stable content")
+            .await
+            .unwrap();
+
+        store.search("stable", None, None).await.unwrap();
+        assert_eq!(store.index_build_count, 1, "first search builds the index");
+        store.search("stable", None, None).await.unwrap();
+        store.search("content", None, None).await.unwrap();
+        assert_eq!(
+            store.index_build_count, 1,
+            "unchanged documents must not be re-parsed"
+        );
+
+        store
+            .set(&MemoryCategory::Core, None, "changed content")
+            .await
+            .unwrap();
+        store.search("changed", None, None).await.unwrap();
+        assert_eq!(store.index_build_count, 2, "a change triggers one rebuild");
+    }
+
+    #[tokio::test]
+    async fn test_search_does_not_write_any_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(&MemoryCategory::Core, None, "read only searchable")
+            .await
+            .unwrap();
+        let before = snapshot(tmp.path());
+
+        store.search("searchable", None, None).await.unwrap();
+        store.search("nonexistent", None, None).await.unwrap();
+
+        assert_eq!(
+            before,
+            snapshot(tmp.path()),
+            "search must not create an index file or any other artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_query_and_no_match_are_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(&MemoryCategory::Core, None, "some content")
+            .await
+            .unwrap();
+        assert!(store.search("", None, None).await.unwrap().is_empty());
+        assert!(store.search("   ", None, None).await.unwrap().is_empty());
+        assert!(store.search("absent", None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_and_heading_only_documents_do_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store.set(&MemoryCategory::Core, None, "").await.unwrap();
+        store
+            .set(&MemoryCategory::User, None, "# Only a heading\n")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .search("anything", None, None)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

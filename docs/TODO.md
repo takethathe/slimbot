@@ -1,5 +1,24 @@
 # TODO
 
+## Memory entry 索引与检索（只读切片，2026-09-26 完成）
+
+- [x] **ADR 0004** — 记录 entry 层是文档的派生视图、有意偏离 zeroclaw 的 entry 权威模型、关键词优先、只读、ADR 0003 继续有效（叠加关系）
+- [x] **prefactor** — `SkillMeta` / `parse_skill_frontmatter` 从 `context.rs` 下沉到 `src/memory/frontmatter.rs`，available-skills / active-skills 注入行为逐字不变（由既有 context 集成测试锁定）
+- [x] **MemoryIndex trait + KeywordIndex** — `src/memory/index.rs`：段落解析（空行边界、ATX heading、fence、frontmatter 剥除）、分词（拉丁 + CJK bigram + 单字 unigram 回退）、BM25-lite 打分（k1=1.2、b=0.75、heading ×2）、确定性 tie-break（分数→category→source→heading→hash）
+- [x] **MemoryService::search** — `&mut self` 惰性索引 + 内容指纹失效重建；覆盖 5 个固定文档 + skills + customs，全部经 backend 读取；索引永不落盘
+- [x] **memory_search 工具** — `query` 必填、`category` 过滤器、`limit` 缺省 10 / 上限 50 / 非法值报错；输出带 category、heading、source；无匹配明确文案；只读
+- [x] **注册** — `AgentLoop::from_parts` 注册，CLI 与 gateway 两种模式都可用（与 `message` / `cron` 一样不进 `config.tools`）
+- [x] **测试** — index 单测（分词 / 解析 / 排序 / 稳定性 / CJK）+ facade 主缝（重建、编辑、删除、新增、指纹复用计数、不落盘、过滤、上限）+ 工具契约（schema / 过滤 / 钳制 / 非法值 / 无匹配 / 只读）+ agent_loop 注册
+- [x] **文档** — `docs/memory.md` 增补 Memory entry / Memory index / 分词与打分 / `memory_search` 小节，并指向 ADR 0004
+
+Spec 见 `.scratch/memory-entry-index/spec.md`。
+
+**后续切片：**
+
+- [ ] **切片 2：配置与查询增强** — `memory.search.*` 开关（如需）、`Daily` category 语义与每日日志写入方、前缀与短语查询
+- [ ] **切片 3：embedding / hybrid** — 引入 `SearchMode`，以 embedding provider 替换或融合 `KeywordIndex`
+- [ ] **切片 4：写侧** — `store` / `forget` / `supersede` / dedup gate / 冲突取代 / 时间衰减 / retention（独立立项 + 新 ADR）；前置：把 `hash` 换成稳定哈希（如 sha2）以支持跨运行去重
+
 ## Memory 模块统一：category 化 + backend 抽象（2026-09-26）
 
 - [x] **类型层** — `MemoryCategory` 全单元枚举（Soul/User/Agent/Tools/Core/Daily/Skill/Custom）+ `MemoryBackend` trait + `EditOutcome`
@@ -14,7 +33,8 @@
 - [x] **删除兼容层** — 移除 `MemoryStore` / `SharedMemoryStore` 别名与旧同步方法
 - [x] **文档 + ADR** — docs/memory.md 重写，bootstrap/context/index 更新，CONTEXT.md 术语，ADR 0003
 - [ ] **后续：sqlite backend** — 实现第二个 `MemoryBackend`，接线 `memory.backend` 白名单
-- [ ] **后续：entry 级 API** — 若出现逐条目去重 / 语义召回需求，在 backend trait 之上叠加 entry 层（见 ADR 0003）
+- [x] **entry 级只读检索** — 在 backend trait 之上叠加派生 entry 层（见 ADR 0004；写侧仍待切片 4）
+- [ ] **后续：entry 写侧 API** — 若出现逐条目去重 / 语义召回需求，在 entry 层之上增加写侧（见上方切片 4）
 
 ## Trace chat span 增加 response content attribute（2026-08-16）
 

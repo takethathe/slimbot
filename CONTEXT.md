@@ -28,6 +28,18 @@ _Avoid_: MemoryStore, MemoryManager
 `history.jsonl` 追加日志 + Dream 游标的独立子系统，刻意不属于 backend trait。
 _Avoid_: history backend, history log
 
+**Memory entry**:
+记忆文档中可独立检索的最小单元（一条事实、一条行为规则或一个工作流步骤）。它是文档的**派生视图**，不是独立存储的权威数据；权威始终是记忆文档本身。
+_Avoid_: memory record, memory fact, memory item；与 History store 的 `HistoryEntry`（`history.jsonl` 的一行）混称
+
+**Memory index**:
+从记忆文档派生出的可检索视图，用于按查询取回相关的 Memory entry。它不持有权威数据，可从文档重建。
+_Avoid_: vector store, memory db, cache
+
+**Embedded resource**:
+构建期经 `include!` 编进二进制的模板与静态文件（`src/embed.rs`、`resources/`）。
+_Avoid_: embed（当意指向量 embedding 时，须写全 `embedding`）
+
 ### Observability
 
 **Trace**:

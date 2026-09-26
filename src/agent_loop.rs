@@ -320,7 +320,7 @@ impl AgentLoop {
         inbound_rx: mpsc::Receiver<BusRequest>,
         config: Arc<Config>,
         provider: Arc<dyn Provider>,
-        tool_manager: ToolManager,
+        mut tool_manager: ToolManager,
     ) -> Result<Self> {
         let session_manager = SessionManager::new(paths.session_dir())?;
         let session_manager_arc = Arc::new(tokio::sync::Mutex::new(session_manager));
@@ -333,6 +333,14 @@ impl AgentLoop {
             )?,
         )));
         memory_service.lock().await.init()?;
+
+        // The main loop always gets read-only memory search, in CLI and gateway
+        // mode alike. Like `message` / `cron`, it is registered here rather
+        // than through `config.tools`, which can only construct tools that
+        // need just the workspace directory.
+        tool_manager.register(Box::new(
+            crate::tools::memory_search::MemorySearchTool::new(memory_service.clone()),
+        ));
 
         // Build providers map from config for DreamService
         let mut providers_map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
@@ -1030,7 +1038,11 @@ mod tests {
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
-        assert!(result.is_ok());
+        let agent_loop = result.expect("CLI AgentLoop must build");
+        assert!(
+            registered_tool_names(&agent_loop).contains(&"memory_search".to_string()),
+            "CLI mode must expose memory_search"
+        );
     }
 
     #[tokio::test]
@@ -1094,7 +1106,21 @@ mod tests {
             tool_manager,
         )
         .await;
-        assert!(result.is_ok());
+        let agent_loop = result.expect("gateway AgentLoop must build");
+        assert!(
+            registered_tool_names(&agent_loop).contains(&"memory_search".to_string()),
+            "gateway mode must expose memory_search"
+        );
+    }
+
+    /// Names of every tool registered on an `AgentLoop`.
+    fn registered_tool_names(agent_loop: &AgentLoop) -> Vec<String> {
+        agent_loop
+            .tool_manager
+            .to_openai_functions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
     }
 
     #[tokio::test]
