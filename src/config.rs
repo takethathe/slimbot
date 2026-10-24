@@ -11,13 +11,13 @@ use crate::config_normalize::apply_normalize;
 
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
-    AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, MemoryConfig, ProviderConfig,
-    TraceBackendEntry, TraceConfig, WebFetchConfig,
+    AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig, MemoryConfig,
+    ProviderConfig, TraceBackendEntry, TraceConfig, WebFetchConfig,
 };
 
 // ── Root Config ──
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub agent: AgentConfig,
     pub providers: HashMap<String, ProviderConfig>,
@@ -33,6 +33,10 @@ pub struct Config {
     pub tracing: TraceConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// WebUI card generation guardrails. Top-level section: ops can toggle
+    /// it independently of the WebUI channel entry itself.
+    #[serde(default)]
+    pub json_render: JsonRenderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -185,6 +189,7 @@ impl Config {
         self.gateway.cron.clamp();
         self.gateway.heartbeat.clamp();
         self.gateway.dream.clamp();
+        self.json_render.clamp();
         self.memory.clamp();
         if let Some(wf) = &mut self.web_fetch {
             wf.clamp();
@@ -529,6 +534,7 @@ mod tests {
                 temperature: 0.7,
                 max_tokens: 4096,
                 prompt_cache_enabled: true,
+                disable_thinking: false,
                 unknown: Default::default(),
             },
         );
@@ -549,6 +555,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         }
     }
 
@@ -851,6 +858,7 @@ mod tests {
                 temperature: 0.5,
                 max_tokens: 2048,
                 prompt_cache_enabled: false,
+                disable_thinking: false,
                 unknown: Default::default(),
             },
         );
@@ -979,6 +987,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: 4096,
             prompt_cache_enabled: true,
+            disable_thinking: false,
             unknown: Default::default(),
         };
         let json = serde_json::to_string(&provider).unwrap();
@@ -1168,6 +1177,7 @@ mod tests {
             temperature: 0.3,
             max_tokens: 8192,
             prompt_cache_enabled: true,
+            disable_thinking: false,
             unknown: Default::default(),
         };
         assert_eq!(provider.r#type, "openai");
@@ -1217,6 +1227,7 @@ mod tests {
                 temperature: 0.9,
                 max_tokens: 2048,
                 prompt_cache_enabled: false,
+                disable_thinking: false,
                 unknown: Default::default(),
             },
         );
@@ -1427,6 +1438,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: 4096,
             prompt_cache_enabled: true,
+            disable_thinking: false,
             unknown: Default::default(),
         };
         // Verify unknown fields are empty by default
@@ -1559,5 +1571,39 @@ mod tests {
         assert_eq!(dream_config.interval_ms, 7200000);
         assert!(dream_config.model_override.is_none());
         assert_eq!(dream_config.max_entries, 20);
+    }
+
+    #[test]
+    fn test_json_render_config_defaults() {
+        let c = crate::config::JsonRenderConfig::default();
+        assert!(
+            c.enabled,
+            "default on — the real switch is catalog registration"
+        );
+        assert!(c.model_override.is_none());
+        assert_eq!(c.max_tokens, 2048);
+        assert_eq!(c.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_json_render_config_deserialization_partial() {
+        let json = r#"{"timeout_seconds": 10}"#;
+        let c: crate::config::JsonRenderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.timeout_seconds, 10);
+        assert!(c.enabled);
+        assert_eq!(c.max_tokens, 2048);
+    }
+
+    #[test]
+    fn test_config_json_render_section_absent_uses_defaults() {
+        // A config that predates the section must load with the defaults.
+        let json = r#"{
+            "agent": {"provider": "default"},
+            "providers": {"default": {"api_key": "k", "model": "m"}}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.json_render.enabled);
+        assert_eq!(cfg.json_render.max_tokens, 2048);
+        assert_eq!(cfg.json_render.timeout_seconds, 30);
     }
 }

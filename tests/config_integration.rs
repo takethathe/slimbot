@@ -179,6 +179,7 @@ fn test_save_and_reload_round_trip() {
             temperature: 0.5,
             max_tokens: 2048,
             prompt_cache_enabled: true,
+            disable_thinking: false,
             unknown: Default::default(),
         },
     );
@@ -216,6 +217,7 @@ fn test_save_and_reload_round_trip() {
         web_fetch: None,
         tracing: Default::default(),
         memory: Default::default(),
+        json_render: Default::default(),
     };
 
     config.save(path).unwrap();

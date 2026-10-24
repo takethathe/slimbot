@@ -19,6 +19,7 @@ fn default_config() -> Config {
         web_fetch: None,
         tracing: Default::default(),
         memory: Default::default(),
+        json_render: Default::default(),
     }
 }
 

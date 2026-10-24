@@ -781,6 +781,7 @@ impl AgentRunner {
         hook.notify_status_change(&failed_state);
         hook.fire_event(AgentEvent::TaskFailed {
             session_id: hook.session_id().to_string(),
+            run_id: hook.run_id().to_string(),
             error: msg.clone(),
         });
         result

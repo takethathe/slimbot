@@ -13,11 +13,12 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 
 use super::{Channel, ChannelFactory};
+use crate::card::{CardEvent, CardService};
 use crate::embed;
 use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::{AgentEvent, SharedSessionManager, TaskHook, TaskState};
-use crate::{error, info};
+use crate::{debug, error, info};
 
 struct AppState {
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<SsePayload>>>>>,
@@ -34,13 +35,16 @@ struct AppState {
     /// Epoch ms when the current process reset its trace file(s); `None` when
     /// tracing is off or `reset_on_start` is false (no clean startup boundary).
     trace_startup_ms: Option<i64>,
+    /// Card generation service (None when cards are not wired).
+    card: Option<Arc<CardService>>,
 }
 
 /// SSE payload with event type discrimination.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum SsePayload {
     Message(String),
     AgentEvent(String),
+    Card(String),
 }
 
 pub struct WebuiChannel {
@@ -56,6 +60,7 @@ pub struct WebuiChannel {
     trace_paths: Vec<String>,
     trace_startup_ms: Option<i64>,
     config_path: String,
+    card: Option<Arc<CardService>>,
 }
 
 impl WebuiChannel {
@@ -79,6 +84,7 @@ impl WebuiChannel {
             trace_paths: Vec::new(),
             trace_startup_ms: None,
             config_path: String::new(),
+            card: None,
         })
     }
 
@@ -110,6 +116,10 @@ impl WebuiChannel {
         self.config_path = path;
     }
 
+    pub fn set_card(&mut self, card: Arc<CardService>) {
+        self.card = Some(card);
+    }
+
     /// Prune disconnected SSE subscribers for a chat and send payload to remaining.
     async fn prune_and_send(&mut self, chat_id: &str, payload: SsePayload) -> Result<()> {
         let senders = {
@@ -117,6 +127,19 @@ impl WebuiChannel {
             guard.remove(chat_id)
         };
         let Some(senders) = senders else {
+            // Nobody is listening on this chat's SSE lane: the payload (e.g. a
+            // card Completed event) is dropped. Debug-traceable so "the card
+            // generated but never appeared" can be told apart from "no card
+            // was generated".
+            let kind = match payload {
+                SsePayload::Message(_) => "message",
+                SsePayload::AgentEvent(_) => "agent_event",
+                SsePayload::Card(_) => "card",
+            };
+            debug!(
+                "[webui] no live SSE subscribers for chat {}, dropping {} payload",
+                chat_id, kind
+            );
             return Ok(());
         };
 
@@ -164,6 +187,7 @@ impl WebuiChannel {
         let trace_paths = self.trace_paths.clone();
         let trace_startup_ms = self.trace_startup_ms;
         let config_path = self.config_path.clone();
+        let card = self.card.clone();
 
         let handle = tokio::spawn(async move {
             let state = AppState {
@@ -184,6 +208,7 @@ impl WebuiChannel {
                 event_tx,
                 trace_paths,
                 trace_startup_ms,
+                card,
             };
 
             let app = build_router(Arc::new(state));
@@ -243,6 +268,7 @@ fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/config", get(config_page_handler))
         .route("/config/api/state", get(config_state_handler))
         .route("/config/api/update", post(config_update_handler))
+        .route("/json-render/catalog", post(catalog_register_handler))
         .route("/common.css", get(common_css_handler))
         .with_state(state)
 }
@@ -439,6 +465,26 @@ async fn session_history_handler(
             messages = msgs;
         }
     }
+    // Replay: attach sidecar cards by exact anchor match. A card whose
+    // anchor no longer exists (consolidation rewrote it away) simply does
+    // not attach — never guessed by index, never appended to the end.
+    if let Some(card) = &state.card {
+        let records = card.store().load(&chat_id);
+        if !records.is_empty() {
+            let by_ts: std::collections::HashMap<&str, &serde_json::Value> = records
+                .iter()
+                .filter(|r| !r.ts.is_empty())
+                .map(|r| (r.ts.as_str(), &r.spec))
+                .collect();
+            for m in messages.iter_mut() {
+                if let crate::session::FrontendMessage::Assistant { ts, card, .. } = m
+                    && let Some(spec) = by_ts.get(ts.as_str())
+                {
+                    *card = Some((*spec).clone());
+                }
+            }
+        }
+    }
     axum::Json(messages)
 }
 
@@ -468,8 +514,9 @@ async fn sse_handler(
     let stream = async_stream::stream! {
         while let Some(payload) = rx.recv().await {
             let event = match payload {
-                SsePayload::Message(content) => Event::default().data(content),
+                SsePayload::Message(content) => Event::default().event("message").data(content),
                 SsePayload::AgentEvent(json) => Event::default().event("agent_event").data(json),
+                SsePayload::Card(json) => Event::default().event("card").data(json),
             };
             yield Ok(event);
         }
@@ -493,6 +540,13 @@ async fn message_handler(
     if let Some(ref tx) = state.event_tx {
         hook = hook.with_events(tx.clone());
     }
+    // Mark this Run as WebUI-originated so the card service may generate a card
+    // for it. cron / heartbeat mint their Run ids elsewhere and never appear
+    // here, so their runs produce no card even when their events reuse a WebUI
+    // session id. Registration is fail-closed: no id here means no card.
+    if let Some(card) = &state.card {
+        card.register_run(hook.run_id(), &session_id, &chat_id);
+    }
     let request = BusRequest {
         session_id,
         content: body,
@@ -503,6 +557,33 @@ async fn message_handler(
     match state.inbound_tx.send(request).await {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Body of a Catalog registration upload. The `prompt` is untrusted: it is
+/// length-checked by the registry and must never be logged in full.
+#[derive(serde::Deserialize)]
+struct CatalogRegistration {
+    chat_id: String,
+    prompt: String,
+    #[serde(default)]
+    catalog_hash: String,
+}
+
+/// `POST /json-render/catalog`: register a chat's Catalog prompt (which also
+/// declares the client can render cards). 204 on success, 400 on empty or
+/// oversized prompt, 503 when cards are not wired.
+async fn catalog_register_handler(State(state): State<Arc<AppState>>, body: String) -> StatusCode {
+    let Some(card) = &state.card else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    let reg: CatalogRegistration = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    match card.register_catalog(&reg.chat_id, reg.prompt, reg.catalog_hash) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -530,8 +611,20 @@ impl Channel for WebuiChannel {
             return Ok(());
         }
         let chat_id = self.chat_id_from(&result.session_id);
-        self.prune_and_send(&chat_id, SsePayload::Message(result.content.clone()))
+        // Body payload is JSON so the frontend can attribute the text to a Run
+        // and match a later card event to it by the shared `run_id`.
+        let payload = serde_json::json!({
+            "run_id": result.run_id,
+            "content": result.content,
+        });
+        self.prune_and_send(&chat_id, SsePayload::Message(payload.to_string()))
             .await
+    }
+
+    async fn write_card(&mut self, event: &CardEvent) -> Result<()> {
+        let chat_id = self.chat_id_from(event.session_id());
+        let json = serde_json::to_string(event)?;
+        self.prune_and_send(&chat_id, SsePayload::Card(json)).await
     }
 
     async fn write_status(&mut self, _session_id: &str, _state: &TaskState) -> Result<()> {
@@ -566,9 +659,11 @@ pub struct WebuiChannelFactory {
     trace_paths: Vec<String>,
     trace_startup_ms: Option<i64>,
     config_path: String,
+    card: Option<Arc<CardService>>,
 }
 
 impl WebuiChannelFactory {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         message_bus: Arc<MessageBus>,
         session_manager: SharedSessionManager,
@@ -577,6 +672,7 @@ impl WebuiChannelFactory {
         trace_paths: Vec<String>,
         trace_startup_ms: Option<i64>,
         config_path: String,
+        card: Option<Arc<CardService>>,
     ) -> Self {
         Self {
             message_bus,
@@ -586,6 +682,7 @@ impl WebuiChannelFactory {
             trace_paths,
             trace_startup_ms,
             config_path,
+            card,
         }
     }
 }
@@ -604,6 +701,9 @@ impl ChannelFactory for WebuiChannelFactory {
         ch.set_trace_paths(self.trace_paths.clone());
         ch.set_trace_startup_ms(self.trace_startup_ms);
         ch.set_config_path(self.config_path.clone());
+        if let Some(card) = &self.card {
+            ch.set_card(card.clone());
+        }
         Ok(Box::new(ch))
     }
 }
@@ -678,6 +778,7 @@ mod tests {
             Vec::new(),
             None,
             String::new(),
+            None,
         );
         assert_eq!(factory.channel_type(), "webui");
 
@@ -693,20 +794,62 @@ mod tests {
         let mut ch = WebuiChannel::from_config(&config).unwrap();
 
         // Register an SSE subscriber for chat "abc123"
-        {
+        let mut rx = {
             let mut guard = ch.chats.lock().await;
-            let (tx, _rx) = mpsc::channel::<SsePayload>(32);
+            let (tx, rx) = mpsc::channel::<SsePayload>(32);
             guard.entry("abc123".to_string()).or_default().push(tx);
-        }
+            rx
+        };
 
         let result = BusResult {
             session_id: "webui:abc123".to_string(),
-            task_id: "t1".to_string(),
+            run_id: "t1".to_string(),
             content: "hello from agent".to_string(),
         };
 
         ch.write_output(&result).await.unwrap();
-        // No panic — output was sent to registered SSE subscribers
+
+        // Body payload is JSON carrying the run_id so the frontend can match a
+        // later card event to this turn.
+        let payload = rx.recv().await.expect("one SSE payload");
+        match payload {
+            SsePayload::Message(json) => {
+                let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(v["run_id"], json!("t1"));
+                assert_eq!(v["content"], json!("hello from agent"));
+            }
+            other => panic!("expected Message payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webui_write_card_broadcasts_card_event() {
+        let config = json!({});
+        let mut ch = WebuiChannel::from_config(&config).unwrap();
+        let mut rx = {
+            let mut guard = ch.chats.lock().await;
+            let (tx, rx) = mpsc::channel::<SsePayload>(32);
+            guard.entry("abc123".to_string()).or_default().push(tx);
+            rx
+        };
+
+        let event = CardEvent::Completed {
+            session_id: "webui:abc123".to_string(),
+            run_id: "r7".to_string(),
+            spec: json!({"root": "c", "elements": {"c": {"type": "Card"}}}),
+        };
+        ch.write_card(&event).await.unwrap();
+
+        let payload = rx.recv().await.expect("card delivered to the chat lane");
+        match payload {
+            SsePayload::Card(json) => {
+                let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(v["type"], json!("completed"));
+                assert_eq!(v["run_id"], json!("r7"));
+                assert_eq!(v["spec"]["root"], json!("c"));
+            }
+            other => panic!("expected Card payload, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -716,7 +859,7 @@ mod tests {
 
         let result = BusResult {
             session_id: "webui:nobody".to_string(),
-            task_id: "t2".to_string(),
+            run_id: "t2".to_string(),
             content: "no one listening".to_string(),
         };
 
@@ -739,7 +882,7 @@ mod tests {
         // Empty content should be skipped
         let empty_result = BusResult {
             session_id: "webui:abc123".to_string(),
-            task_id: "t3".to_string(),
+            run_id: "t3".to_string(),
             content: "".to_string(),
         };
         ch.write_output(&empty_result).await.unwrap();
@@ -747,7 +890,7 @@ mod tests {
         // Whitespace-only content should also be skipped
         let whitespace_result = BusResult {
             session_id: "webui:abc123".to_string(),
-            task_id: "t4".to_string(),
+            run_id: "t4".to_string(),
             content: "   \n\t  ".to_string(),
         };
         ch.write_output(&whitespace_result).await.unwrap();
@@ -783,6 +926,7 @@ mod tests {
             config_path: String::new(),
             trace_paths: Vec::new(),
             trace_startup_ms: None,
+            card: None,
         });
         let result = list_chats_handler(State(state)).await;
         assert!(result.0.is_empty());
@@ -819,6 +963,7 @@ mod tests {
             config_path: String::new(),
             trace_paths: Vec::new(),
             trace_startup_ms: None,
+            card: None,
         });
         let result = list_chats_handler(State(state)).await;
         assert_eq!(result.0.len(), 1);
@@ -861,6 +1006,7 @@ mod tests {
             config_path: String::new(),
             trace_paths: Vec::new(),
             trace_startup_ms: None,
+            card: None,
         });
         let result = session_history_handler(State(state), Path("abc".to_string())).await;
         assert_eq!(result.0.len(), 2);
@@ -880,6 +1026,7 @@ mod tests {
             config_path: String::new(),
             trace_paths: Vec::new(),
             trace_startup_ms: None,
+            card: None,
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { create_chat_handler(State(state)).await });
@@ -990,6 +1137,7 @@ mod tests {
             event_tx: None,
             trace_paths,
             trace_startup_ms: None,
+            card: None,
         })
     }
 
@@ -1150,6 +1298,7 @@ mod tests {
             event_tx: None,
             trace_paths: Vec::new(),
             trace_startup_ms: None,
+            card: None,
         })
     }
 
@@ -1312,5 +1461,228 @@ mod tests {
                 && !traces.contains("&#9472;"),
             "span-tree guide must be plain nbsp indentation only"
         );
+    }
+
+    // ── Catalog registration endpoint (seam 1: WebUI HTTP) ──
+
+    /// AppState wired with a live CardService, for catalog handler tests.
+    fn catalog_state() -> (Arc<AppState>, Arc<CardService>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        let sm = Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(session_dir.clone()).unwrap(),
+        ));
+        let (card_tx, _card_rx) = mpsc::channel::<CardEvent>(8);
+        let service = Arc::new(CardService::new(
+            Arc::new(crate::provider::MockProvider::new()),
+            sm,
+            crate::card::CardStore::new(session_dir),
+            card_tx,
+        ));
+        let state = Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: None,
+            index_html: String::new(),
+            traces_html: String::new(),
+            config_html: String::new(),
+            config_path: String::new(),
+            event_tx: None,
+            trace_paths: Vec::new(),
+            trace_startup_ms: None,
+            card: Some(service.clone()),
+        });
+        (state, service, dir)
+    }
+
+    #[tokio::test]
+    async fn test_catalog_registration_returns_204() {
+        let (state, service, _dir) = catalog_state();
+        let body =
+            json!({ "chat_id": "c1", "prompt": "use Card/Text", "catalog_hash": "h" }).to_string();
+        let status = catalog_register_handler(State(state), body).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(service.registry().get("c1").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_catalog_rejects_empty_prompt() {
+        let (state, _service, _dir) = catalog_state();
+        let body = json!({ "chat_id": "c1", "prompt": "   ", "catalog_hash": "h" }).to_string();
+        assert_eq!(
+            catalog_register_handler(State(state), body).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_rejects_oversize_prompt() {
+        let (state, _service, _dir) = catalog_state();
+        let big = "x".repeat(crate::card::MAX_PROMPT_BYTES + 1);
+        let body = json!({ "chat_id": "c1", "prompt": big, "catalog_hash": "h" }).to_string();
+        assert_eq!(
+            catalog_register_handler(State(state), body).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_rejects_malformed_body() {
+        let (state, _service, _dir) = catalog_state();
+        assert_eq!(
+            catalog_register_handler(State(state), "not json".to_string()).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_overwrites_same_chat() {
+        let (state, service, _dir) = catalog_state();
+        let b1 = json!({ "chat_id": "c1", "prompt": "first", "catalog_hash": "h1" }).to_string();
+        let b2 = json!({ "chat_id": "c1", "prompt": "second", "catalog_hash": "h2" }).to_string();
+        assert_eq!(
+            catalog_register_handler(State(state.clone()), b1).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            catalog_register_handler(State(state), b2).await,
+            StatusCode::NO_CONTENT
+        );
+        let reg = service.registry().get("c1").unwrap();
+        assert_eq!(reg.prompt, "second");
+        assert_eq!(reg.catalog_hash, "h2");
+    }
+
+    #[tokio::test]
+    async fn test_catalog_503_when_cards_not_wired() {
+        // `config_state` builds an AppState with `card: None`.
+        let state = config_state(String::new());
+        let body = json!({ "chat_id": "c1", "prompt": "p", "catalog_hash": "h" }).to_string();
+        assert_eq!(
+            catalog_register_handler(State(state), body).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    // ── Card replay via session history (seam 1) ──
+
+    /// AppState wired with both a SessionManager and a CardService, so the
+    /// history handler can attach sidecar cards to persisted messages.
+    fn replay_state() -> (
+        Arc<AppState>,
+        Arc<CardService>,
+        Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        let sm = Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(session_dir.clone()).unwrap(),
+        ));
+        let (card_tx, _card_rx) = mpsc::channel::<CardEvent>(8);
+        let service = Arc::new(CardService::new(
+            Arc::new(crate::provider::MockProvider::new()),
+            sm.clone(),
+            crate::card::CardStore::new(session_dir),
+            card_tx,
+        ));
+        let state = Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: Some(sm.clone()),
+            index_html: String::new(),
+            event_tx: None,
+            traces_html: String::new(),
+            config_html: String::new(),
+            config_path: String::new(),
+            trace_paths: Vec::new(),
+            trace_startup_ms: None,
+            card: Some(service.clone()),
+        });
+        (state, service, sm, dir)
+    }
+
+    #[tokio::test]
+    async fn test_session_history_attaches_cards_by_exact_timestamp() {
+        let (state, service, sm, _dir) = replay_state();
+        let anchor_ts;
+        {
+            let mut guard = sm.lock().await;
+            guard.get_or_create("webui:replay1").await.unwrap();
+            guard
+                .add_message(
+                    "webui:replay1",
+                    crate::session::Message::user("q?".to_string()),
+                )
+                .await
+                .unwrap();
+            guard
+                .add_message(
+                    "webui:replay1",
+                    crate::session::Message::assistant(
+                        Some("answer.".to_string()),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .unwrap();
+            let msgs = guard.get_messages("webui:replay1").await;
+            anchor_ts = msgs.last().unwrap().timestamp().to_string();
+            guard.persist("webui:replay1").await.unwrap();
+        }
+        assert!(!anchor_ts.is_empty(), "add_message must stamp the anchor");
+
+        let spec = json!({"root": "r", "elements": {"r": {"type": "Card", "props": {}}}});
+        service
+            .store()
+            .append(
+                "replay1",
+                &crate::card::CardRecord {
+                    ts: anchor_ts.clone(),
+                    created_at_ms: 1,
+                    spec: spec.clone(),
+                },
+            )
+            .unwrap();
+        // Orphan record whose anchor matches no message: must not attach.
+        service
+            .store()
+            .append(
+                "replay1",
+                &crate::card::CardRecord {
+                    ts: "ghost".to_string(),
+                    created_at_ms: 2,
+                    spec: json!({"root": "g", "elements": {}}),
+                },
+            )
+            .unwrap();
+
+        let out = session_history_handler(State(state), Path("replay1".to_string())).await;
+        assert_eq!(out.0.len(), 2);
+        match &out.0[0] {
+            crate::session::FrontendMessage::User { ts, .. } => {
+                assert!(!ts.is_empty(), "every message exposes its anchor")
+            }
+            other => panic!("expected user first, got {other:?}"),
+        }
+        match &out.0[1] {
+            crate::session::FrontendMessage::Assistant { content, ts, card } => {
+                assert_eq!(content, "answer.");
+                assert_eq!(ts, &anchor_ts);
+                assert_eq!(card.as_ref().unwrap(), &spec);
+            }
+            other => panic!("expected assistant carrying the card, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_history_unknown_chat_is_empty_not_error() {
+        let (state, _service, _sm, _dir) = replay_state();
+        let out = session_history_handler(State(state), Path("nope".to_string())).await;
+        assert!(out.0.is_empty());
     }
 }

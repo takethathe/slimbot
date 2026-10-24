@@ -10,6 +10,44 @@
 一次 `AgentRunner::run()` 的执行 —— 一条用户消息到最终回复（含多轮 ReAct iteration）。对应一条 trace。
 _Avoid_: turn, task, request
 
+**Run id**:
+一次 Run 的唯一标识，在请求进入消息总线时分配，贯穿该 Run 的生命周期事件、结果与卡片事件。
+_Avoid_: task id, request id, turn id（代码历史字段名为 `task_id`，已统一为 `run_id`）
+
+### Card (Generative UI)
+
+**Card**:
+WebUI 会话气泡下方渲染出的一块生成式 UI，是一次模型调用的产物，不是会话消息的一部分。
+_Avoid_: widget, panel, block
+
+**Card spec**:
+卡片的扁平描述（`root` + `elements` + `state`），由模型输出的 JSONL patch 编译而成；它只含词表内的组件名，不含任何组件实现。
+_Avoid_: UI JSON, layout tree
+
+**Catalog**:
+前端提供的卡片组件与动作词表（名称、props schema、描述），是 Card spec 的合法词汇边界。它归前端所有，服务端只消费其派生物。
+_Avoid_: component list, schema（`schema` 一词在 json-render 中另指 spec 的结构定义）
+
+**Catalog prompt**:
+由 Catalog 生成的系统提示词，唯一用途是让模型产出合法的 Card spec。
+_Avoid_: card prompt, system prompt（后者已指 agent 的上下文构建产物）
+
+**Catalog registration**:
+WebUI 客户端在连接后把 Catalog prompt 上报给服务端的行为，同时声明「本客户端能渲染卡片」。未注册的会话不产生卡片。
+_Avoid_: catalog upload, schema sync
+
+**Card generation**:
+一次 Run 结束后发起的独立模型调用：以该 Run 的 Run transcript 为输入、Catalog prompt 为系统提示词，产出 Card spec。
+_Avoid_: card render（渲染只发生在客户端）, genui call
+
+**Run transcript**:
+一次 Run 期间新增的会话消息（user / assistant / tool），经裁剪后作为 Card generation 的输入。
+_Avoid_: history, context, messages
+
+**Card sidecar**:
+按 chat 存放 Card spec 的追加文件（`sessions/{chat_id}.cards.jsonl`），以该 Run 末条 assistant 消息的 timestamp 为锚。它刻意不进入会话 JSONL，避免 patch 文本污染 agent 上下文。
+_Avoid_: card cache, card db
+
 ### Memory
 
 **Memory category**:

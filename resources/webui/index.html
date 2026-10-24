@@ -580,6 +580,177 @@
   border-left: 2px solid var(--status-failed);
 }
 
+/* ── Cards (json-render) ── */
+.card {
+  align-self: flex-start;
+  max-width: 82%;
+  margin-top: 0.15rem;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-lg);
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  padding: 1rem 1.15rem;
+  animation: msgIn 0.35s ease both;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+
+.card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  width: 100%;
+}
+
+.card-heading {
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+.card-heading.level-1 { font-size: 1.05rem; }
+.card-heading.level-2 { font-size: 0.95rem; }
+.card-heading.level-3 { font-size: 0.88rem; color: var(--text-secondary); }
+
+.card-text {
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.card-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+}
+.card-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.card-metric .metric-value {
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--accent);
+  line-height: 1.1;
+}
+.card-metric .metric-value .metric-unit {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-left: 0.2rem;
+}
+.card-metric .metric-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.card-metric .metric-trend.up { color: var(--status-done); }
+.card-metric .metric-trend.down { color: var(--status-failed); }
+
+.card-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.8rem;
+}
+.card-table th, .card-table td {
+  border: 1px solid var(--border-subtle);
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+}
+.card-table th {
+  background: rgba(0,0,0,0.3);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.card-list {
+  padding-left: 1.15rem;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.card-list li { margin: 0; }
+.card-list .item-note { color: var(--text-muted); font-size: 0.75rem; margin-left: 0.3rem; }
+
+.card-unknown {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.5rem;
+}
+
+.card-badge {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  width: fit-content;
+}
+.card-badge.tone-info { border-color: var(--border-accent); color: var(--accent); }
+.card-badge.tone-success { border-color: rgba(76, 175, 106, 0.4); color: var(--status-done); }
+.card-badge.tone-warning { border-color: rgba(200, 164, 94, 0.4); color: var(--status-running); }
+.card-badge.tone-danger { border-color: rgba(217, 79, 85, 0.4); color: var(--status-failed); }
+
+.card-alert {
+  border-left: 2px solid var(--accent);
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.card-alert .alert-title { font-weight: 600; color: var(--text-primary); margin-bottom: 0.15rem; }
+.card-alert.severity-warning { border-left-color: var(--status-running); }
+.card-alert.severity-danger { border-left-color: var(--status-failed); }
+.card-alert.severity-success { border-left-color: var(--status-done); }
+
+.card-divider { border-top: 1px solid var(--border-subtle); margin: 0.3rem 0; }
+
+.card-keyvalue {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.2rem 0.8rem;
+  font-size: 0.8rem;
+}
+.card-keyvalue .kv-key { color: var(--text-muted); }
+.card-keyvalue .kv-value { color: var(--text-primary); font-family: var(--font-mono); word-break: break-all; }
+
+.card-progress { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.78rem; color: var(--text-secondary); }
+.card-progress .progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+.card-progress .progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.25s ease;
+}
+
+.card-tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.card-tabs button {
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  padding: 0.3rem 0.7rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.card-tabs button.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+.card-pressable { cursor: pointer; }
+.card-pressable:hover { filter: brightness(1.15); }
+
 /* ─ Animations ── */
 /* fadeUp + pulse live in common.css (shared). */
 @keyframes msgIn {
@@ -649,12 +820,481 @@ let currentChat = null;
 let evtSource = null;
 let isProcessing = false;
 let activeUserDot = null;
-
-// SSE message accumulation state (per-request, reset on each new message)
-let currentMsgEl = null;
-let accumulated = '';
 let responseReceived = false;
-let streamClosed = false;
+
+// Body SSE payloads now carry a run_id; assistant bubbles are keyed by it so a
+// later card event can be attached to exactly the turn that produced it.
+let runBubbles = {}; // run_id -> { el, acc }
+let cardStates = {}; // run_id -> { doc, queue, el, scheduled, done, final }
+
+// ── Card catalog (json-render) ──
+// The vocabulary is declared *here* and uploaded to the server on chat entry;
+// the server uses it verbatim as the model's system prompt, so front-end and
+// generation never drift. v2: twelve presentational components plus local
+// setState interaction (expand/collapse, tabs) — nothing flows back to the run.
+const CARD_CATALOG_VERSION = 'card-catalog-v2';
+const CARD_CATALOG_PROMPT = [
+  'You turn a coding-agent exchange into a single presentational "card".',
+  'Output ONLY a stream of JSON patch operations, one per line (JSONL). No prose, no markdown fences, no blank commentary.',
+  'Each line is an RFC 6902-style object: {"op":"add","path":"...","value":...}.',
+  'Build a document of shape: {"root": "<elementId>", "elements": { "<id>": {"type": "<Component>", "props": {...}, "children": ["<id>", ...]} } }.',
+  'First emit {"op":"add","path":"/root","value":"rootId"}. Then add an element for every id you reference, via {"op":"add","path":"/elements/<id>","value":{...}}.',
+  'The root element must have type "Card". Only these twelve components exist:',
+  '- Card: container. props: {}. Put all other elements in its children.',
+  '- Heading: props: { "text": string, "level": 1|2|3 }.',
+  '- Text: props: { "text": string } (a short sentence or note).',
+  '- Metric: props: { "label": string, "value": string|number, "unit": string (optional), "trend": "up"|"down" (optional) }. A single KPI number.',
+  '- Table: props: { "columns": ["Header", ...], "rows": [["cell", "cell", ...], ...] }.',
+  '- List: props: { "items": [ {"text": string, "note": string (optional)}, ... ], "ordered": boolean (optional) }.',
+  '- Badge: props: { "text": string, "tone": "neutral"|"info"|"success"|"warning"|"danger" (optional) }. A small status chip.',
+  '- Alert: props: { "severity": "info"|"warning"|"danger"|"success", "title": string (optional), "text": string }. A banner.',
+  '- Divider: props: {}. A thin horizontal rule.',
+  '- KeyValue: props: { "pairs": [ {"key": string, "value": string}, ... ] }. A definition-list grid.',
+  '- Progress: props: { "value": number, "max": number (optional, default 100), "label": string (optional) }.',
+  '- Tabs: props: { "stateKey": string, "tabs": [ {"label": string, "value": string}, ... ] }. Renders tab buttons; pressing one only updates card state (the first tab starts active).',
+  'Interaction is purely local to the card and must never invent components or actions:',
+  '- Any element may carry "on": { "press": { "action": "setState", "key": "<stateKey>", "value": <string|number|boolean> } } or { "action": "toggle", "key": "<stateKey>" }. Pressing it updates card state and re-renders the card only.',
+  '- Any element may carry "visible": { "key": "<stateKey>", "equals": <value> }. It renders only while that state key equals the value.',
+  '- Expand/collapse details: give a Heading or Text a toggle press, then put the detail element(s) in children with visible { "key": "<thatKey>", "equals": true }.',
+  '- Tabbed panels: put the Tabs element first in Card children, then one panel element per tab value with visible { "key": "<stateKey>", "equals": "<tabValue>" }.',
+  'Every element id must be a short unique string. Only use the twelve types above; never invent components.',
+  'Base every value strictly on the transcript. If nothing is worth visualizing, emit only /root and a single empty Card with no children.',
+].join('\n');
+
+function hashPrompt(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return CARD_CATALOG_VERSION + ':' + h.toString(16);
+}
+
+async function registerCatalog(chatId) {
+  try {
+    await fetch('/json-render/catalog', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        prompt: CARD_CATALOG_PROMPT,
+        catalog_hash: hashPrompt(CARD_CATALOG_PROMPT),
+      }),
+    });
+  } catch (err) {
+    console.warn('catalog registration failed (cards stay off):', err);
+  }
+}
+
+// ── Card renderer ──
+// Minimal hand-written renderer for the twelve presentational components.
+// The compiled spec is a {root, elements} tree; unknown types degrade to a
+// readable stub instead of blanking the whole card. Interaction is local:
+// on.press setState/toggle mutate a per-card state object and re-render the
+// card only — no fetch, no new run.
+const CARD_COMPONENTS = {
+  Card(props) {
+    const el = document.createElement('div');
+    el.className = 'card-body';
+    return el;
+  },
+  Heading(props) {
+    const el = document.createElement('div');
+    const level = [1, 2, 3].includes(props.level) ? props.level : 2;
+    el.className = 'card-heading level-' + level;
+    el.textContent = String(props.text ?? '');
+    return el;
+  },
+  Text(props) {
+    const el = document.createElement('div');
+    el.className = 'card-text';
+    el.textContent = String(props.text ?? '');
+    return el;
+  },
+  Metric(props) {
+    const wrap = document.createElement('div');
+    wrap.className = 'card-metric';
+    const value = document.createElement('div');
+    value.className = 'metric-value';
+    value.textContent = String(props.value ?? '');
+    if (props.unit) {
+      const u = document.createElement('span');
+      u.className = 'metric-unit';
+      u.textContent = String(props.unit);
+      value.appendChild(u);
+    }
+    if (props.trend === 'up' || props.trend === 'down') {
+      const t = document.createElement('span');
+      t.className = 'metric-trend ' + props.trend;
+      t.textContent = props.trend === 'up' ? ' \u25B2' : ' \u25BC';
+      value.appendChild(t);
+    }
+    const label = document.createElement('div');
+    label.className = 'metric-label';
+    label.textContent = String(props.label ?? '');
+    wrap.appendChild(value);
+    wrap.appendChild(label);
+    return wrap;
+  },
+  Table(props) {
+    const table = document.createElement('table');
+    table.className = 'card-table';
+    const columns = Array.isArray(props.columns) ? props.columns : [];
+    if (columns.length) {
+      const thead = document.createElement('thead');
+      const tr = document.createElement('tr');
+      columns.forEach((c) => {
+        const th = document.createElement('th');
+        th.textContent = String(c && c.label !== undefined ? c.label : c);
+        tr.appendChild(th);
+      });
+      thead.appendChild(tr);
+      table.appendChild(thead);
+    }
+    const tbody = document.createElement('tbody');
+    (Array.isArray(props.rows) ? props.rows : []).forEach((row) => {
+      const tr = document.createElement('tr');
+      (Array.isArray(row) ? row : []).forEach((cell) => {
+        const td = document.createElement('td');
+        td.textContent = String(cell ?? '');
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    return table;
+  },
+  List(props) {
+    const el = document.createElement(props.ordered ? 'ol' : 'ul');
+    el.className = 'card-list';
+    (Array.isArray(props.items) ? props.items : []).forEach((item) => {
+      const li = document.createElement('li');
+      if (item && typeof item === 'object') {
+        li.textContent = String(item.text ?? '');
+        if (item.note) {
+          const note = document.createElement('span');
+          note.className = 'item-note';
+          note.textContent = String(item.note);
+          li.appendChild(note);
+        }
+      } else {
+        li.textContent = String(item ?? '');
+      }
+      el.appendChild(li);
+    });
+    return el;
+  },
+  Badge(props) {
+    const el = document.createElement('span');
+    const tone = ['info', 'success', 'warning', 'danger'].includes(props.tone) ? props.tone : 'neutral';
+    el.className = 'card-badge tone-' + tone;
+    el.textContent = String(props.text ?? '');
+    return el;
+  },
+  Alert(props) {
+    const el = document.createElement('div');
+    const sev = ['warning', 'danger', 'success'].includes(props.severity) ? props.severity : 'info';
+    el.className = 'card-alert severity-' + sev;
+    if (props.title) {
+      const t = document.createElement('div');
+      t.className = 'alert-title';
+      t.textContent = String(props.title);
+      el.appendChild(t);
+    }
+    const body = document.createElement('div');
+    body.textContent = String(props.text ?? '');
+    el.appendChild(body);
+    return el;
+  },
+  Divider() {
+    const el = document.createElement('div');
+    el.className = 'card-divider';
+    return el;
+  },
+  KeyValue(props) {
+    const el = document.createElement('div');
+    el.className = 'card-keyvalue';
+    (Array.isArray(props.pairs) ? props.pairs : []).forEach((p) => {
+      const k = document.createElement('div');
+      k.className = 'kv-key';
+      k.textContent = String((p && p.key) ?? '');
+      const v = document.createElement('div');
+      v.className = 'kv-value';
+      v.textContent = String((p && p.value) ?? '');
+      el.appendChild(k);
+      el.appendChild(v);
+    });
+    return el;
+  },
+  Progress(props) {
+    const wrap = document.createElement('div');
+    wrap.className = 'card-progress';
+    const max = Number(props.max) > 0 ? Number(props.max) : 100;
+    const val = Math.max(0, Math.min(max, Number(props.value) || 0));
+    if (props.label) {
+      const l = document.createElement('div');
+      l.textContent = String(props.label);
+      wrap.appendChild(l);
+    }
+    const track = document.createElement('div');
+    track.className = 'progress-track';
+    const bar = document.createElement('div');
+    bar.className = 'progress-bar';
+    bar.style.width = ((val / max) * 100).toFixed(1) + '%';
+    track.appendChild(bar);
+    wrap.appendChild(track);
+    return wrap;
+  },
+  Tabs(props, ctx) {
+    const wrap = document.createElement('div');
+    wrap.className = 'card-tabs';
+    const tabs = Array.isArray(props.tabs) ? props.tabs : [];
+    const key = String(props.stateKey || 'tab');
+    // The first tab starts active; panels compare against these values via
+    // visible {key, equals}.
+    if (ctx && ctx.state[key] === undefined && tabs.length) {
+      ctx.state[key] = String((tabs[0] && tabs[0].value) ?? 0);
+    }
+    tabs.forEach((t) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = String((t && t.label) ?? '');
+      if (ctx && String((t && t.value) ?? 0) === ctx.state[key]) b.className = 'active';
+      b.onclick = () => {
+        if (!ctx) return;
+        ctx.state[key] = String((t && t.value) ?? 0);
+        ctx.rerender();
+      };
+      wrap.appendChild(b);
+    });
+    return wrap;
+  },
+};
+
+function isCardVisible(node, ctx) {
+  const v = node && node.visible;
+  if (!v || typeof v.key !== 'string') return true;
+  const actual = ctx.state[v.key];
+  return actual !== undefined && actual === v.equals;
+}
+
+function renderCardElement(node, elements, ancestors, ctx) {
+  const type = node && node.type;
+  const props = (node && node.props) || {};
+  let el;
+  const comp = CARD_COMPONENTS[type];
+  if (comp) {
+    el = comp(props, ctx);
+  } else {
+    el = document.createElement('div');
+    el.className = 'card-unknown';
+    el.textContent = 'Unsupported component: ' + String(type);
+  }
+  // Built-in press actions: local state mutation + card-only re-render.
+  const press = node && node.on && node.on.press;
+  if (press && (press.action === 'setState' || press.action === 'toggle') && typeof press.key === 'string') {
+    el.classList.add('card-pressable');
+    el.addEventListener('click', () => {
+      if (press.action === 'setState') ctx.state[press.key] = press.value;
+      else ctx.state[press.key] = !ctx.state[press.key];
+      ctx.rerender();
+    });
+  }
+  const children = Array.isArray(node && node.children) ? node.children : [];
+  children.forEach((cid) => {
+    if (ancestors.has(cid)) return; // cycle guard
+    const child = elements[cid];
+    if (!child || !isCardVisible(child, ctx)) return;
+    const next = new Set(ancestors);
+    next.add(cid);
+    el.appendChild(renderCardElement(child, elements, next, ctx));
+  });
+  return el;
+}
+
+function buildCardTree(spec, ctx) {
+  const elements = spec && spec.elements;
+  if (!elements || typeof elements !== 'object') return null;
+  const rootId = typeof spec.root === 'string' ? spec.root : null;
+  const rootNode = rootId ? elements[rootId] : null;
+  if (!rootNode) return null;
+  return renderCardElement(rootNode, elements, new Set([rootId]), ctx);
+}
+
+function renderCardSpec(spec) {
+  const wrap = document.createElement('div');
+  wrap.className = 'card';
+  const ctx = { state: {} };
+  ctx.rerender = () => {
+    wrap.innerHTML = '';
+    const body = buildCardTree(spec, ctx);
+    if (body) wrap.appendChild(body);
+  };
+  ctx.rerender();
+  return wrap;
+}
+
+function handleCardEvent(event) {
+  if (!event || !event.run_id) return;
+  const runId = event.run_id;
+  const entry = runBubbles[runId];
+  if (!entry) return; // card for a turn we are not showing (e.g. another tab)
+  if (event.type === 'started') {
+    ensureCardState(runId);
+    return;
+  }
+  if (event.type === 'failed') {
+    const st = ensureCardState(runId);
+    st.done = true;
+    if (st.el) { st.el.remove(); st.el = null; }
+    return;
+  }
+  if (event.type === 'delta') {
+    const st = ensureCardState(runId);
+    if (st.done) return;
+    if (Array.isArray(event.ops)) st.queue.push(...event.ops);
+    scheduleCardRender(runId);
+    return;
+  }
+  if (event.type === 'completed') {
+    const st = ensureCardState(runId);
+    if (st.final) return; // one card per run
+    st.done = true;
+    st.final = true;
+    if (st.el) st.el.remove(); // drop the progressive render
+    entry.el.after(renderCardSpec(event.spec)); // authoritative spec
+    scrollToBottom();
+  }
+}
+
+function ensureCardState(runId) {
+  let st = cardStates[runId];
+  if (!st) {
+    st = cardStates[runId] = { doc: {}, queue: [], el: null, scheduled: false, done: false, final: false };
+  }
+  return st;
+}
+
+// Deltas are queued and flushed once per animation frame: applying several
+// patches in one frame must not trigger one reflow per patch.
+function scheduleCardRender(runId) {
+  const st = cardStates[runId];
+  if (!st || st.done || st.scheduled) return;
+  st.scheduled = true;
+  requestAnimationFrame(() => {
+    st.scheduled = false;
+    if (st.done || !st.queue.length) return;
+    st.queue.splice(0).forEach((op) => applyCardOp(st.doc, op));
+    if (!cardDocRenderable(st.doc)) return; // not enough assembled yet
+    const entry = runBubbles[runId];
+    if (!entry) return;
+    if (st.el) st.el.remove();
+    st.el = renderCardSpec(st.doc);
+    entry.el.after(st.el);
+    scrollToBottom();
+  });
+}
+
+function cardDocRenderable(doc) {
+  return typeof doc.root === 'string'
+    && doc.elements && typeof doc.elements === 'object'
+    && Object.keys(doc.elements).length > 0;
+}
+
+function pointerTokens(path) {
+  return String(path).split('/').slice(1).map((t) => t.replace(/~1/g, '/').replace(/~0/g, '~'));
+}
+
+// Minimal RFC 6902-style apply, mirroring the server-side SpecCompiler:
+// missing paths are created, '-' on arrays appends, replace-set is forgiving
+// so out-of-order streaming only costs smoothness, never correctness.
+function applyCardOp(doc, op) {
+  if (!op || typeof op.path !== 'string') return;
+  const path = pointerTokens(op.path);
+  switch (op.op) {
+    case 'add':
+    case 'replace':
+      setCardAt(doc, path, op.value);
+      break;
+    case 'remove':
+      removeCardAt(doc, path);
+      break;
+    case 'move': {
+      const v = getCardAt(doc, pointerTokens(op.from));
+      removeCardAt(doc, pointerTokens(op.from));
+      if (v !== undefined) setCardAt(doc, path, v);
+      break;
+    }
+    case 'copy': {
+      const v = getCardAt(doc, pointerTokens(op.from));
+      if (v !== undefined) setCardAt(doc, path, v);
+      break;
+    }
+    default:
+      break; // 'test' validates but never mutates; unknown ops are ignored
+  }
+}
+
+function setCardAt(root, tokens, value) {
+  if (!tokens.length) return;
+  let node = root;
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const key = tokens[i];
+    const nextKey = tokens[i + 1];
+    const nextIsIndex = nextKey === '-' || /^\d+$/.test(nextKey);
+    if (Array.isArray(node)) {
+      const idx = key === '-' ? node.length : parseInt(key, 10);
+      if (isNaN(idx) || idx < 0 || idx > node.length) return;
+      if (idx === node.length) node.push(nextIsIndex ? [] : {});
+      node = node[idx];
+    } else if (node && typeof node === 'object') {
+      if (!(key in node)) node[key] = nextIsIndex ? [] : {};
+      node = node[key];
+    } else {
+      return;
+    }
+  }
+  const key = tokens[tokens.length - 1];
+  if (Array.isArray(node)) {
+    if (key === '-') node.push(value);
+    else {
+      const idx = parseInt(key, 10);
+      if (!isNaN(idx)) {
+        if (idx >= node.length) node.push(value);
+        else node[idx] = value;
+      }
+    }
+  } else if (node && typeof node === 'object') {
+    node[key] = value;
+  }
+}
+
+function getCardAt(root, tokens) {
+  let node = root;
+  for (const key of tokens) {
+    if (node === null || typeof node !== 'object') return undefined;
+    node = key === '-' && Array.isArray(node) ? node[node.length - 1] : node[key];
+    if (node === undefined) return undefined;
+  }
+  return node;
+}
+
+function removeCardAt(root, tokens) {
+  if (!tokens.length) return;
+  let node = root;
+  for (let i = 0; i < tokens.length - 1; i++) {
+    if (node === null || typeof node !== 'object') return;
+    node = node[tokens[i]];
+  }
+  if (node === null || typeof node !== 'object') return;
+  const key = tokens[tokens.length - 1];
+  if (Array.isArray(node)) {
+    if (key === '-') node.pop();
+    else {
+      const idx = parseInt(key, 10);
+      if (!isNaN(idx) && idx < node.length) node.splice(idx, 1);
+    }
+  } else {
+    delete node[key];
+  }
+}
 
 function formatTimestamp(ms) {
   const d = new Date(ms);
@@ -790,6 +1430,11 @@ async function loadHistory(chatId) {
       const result = appendMessage(m.role, m.content, false);
       result.el.style.animationDelay = `${Math.min(i * 0.06, 0.5)}s`;
       result.el.style.animation = 'msgIn 0.35s ease both';
+      // Replay: history messages carry their card inline (exact anchor match
+      // server-side); a message without one simply renders no card.
+      if (m.role === 'assistant' && m.card) {
+        result.el.after(renderCardSpec(m.card));
+      }
     });
     scrollToBottom();
   } catch (err) {
@@ -799,18 +1444,15 @@ async function loadHistory(chatId) {
 
 function setupSSE(chatId) {
   // Reset per-request state
-  currentMsgEl = null;
-  accumulated = '';
+  runBubbles = {};
+  cardStates = {};
   responseReceived = false;
-  streamClosed = false;
 
   if (evtSource) evtSource.close();
 
   evtSource = new EventSource('/sse?chat_id=' + encodeURIComponent(chatId));
 
   function onStreamDone() {
-    if (streamClosed) return;
-    streamClosed = true;
     hideTyping();
     isProcessing = false;
     updateSendButton();
@@ -821,21 +1463,33 @@ function setupSSE(chatId) {
 
   evtSource.onmessage = (e) => {
     hideTyping();
-    const data = e.data;
-    if (data.startsWith('<thinking>') || data.includes('[AgentRunner]')) return;
+    let runId = null;
+    let content = e.data;
+    // Body payloads are JSON {run_id, content}; tolerate legacy raw text.
+    try {
+      const parsed = JSON.parse(e.data);
+      if (parsed && typeof parsed === 'object' && 'content' in parsed) {
+        runId = parsed.run_id || null;
+        content = parsed.content;
+      }
+    } catch (err) {
+      /* raw text from an older server — use as-is */
+    }
+    if (typeof content !== 'string') content = String(content ?? '');
+    if (content.startsWith('<thinking>') || content.includes('[AgentRunner]')) return;
 
     responseReceived = true;
 
-    // Always create a new message bubble for each SSE message
-    // This ensures cron job messages appear as separate bubbles
-    if (!currentMsgEl || streamClosed) {
-      currentMsgEl = appendMessage('assistant', '', false);
-      accumulated = '';
-      streamClosed = false;
+    // Key the assistant bubble by run_id so a later card event attaches to
+    // exactly this turn; distinct runs (e.g. cron messages) get distinct bubbles.
+    let entry = runId != null ? runBubbles[runId] : null;
+    if (!entry) {
+      const m = appendMessage('assistant', '', false);
+      entry = { el: m.el, acc: '' };
+      if (runId != null) runBubbles[runId] = entry;
     }
-
-    accumulated += data;
-    currentMsgEl.el.innerHTML = renderMarkdown(accumulated);
+    entry.acc += content;
+    entry.el.innerHTML = renderMarkdown(entry.acc);
     scrollToBottom();
   };
 
@@ -851,6 +1505,14 @@ function setupSSE(chatId) {
       console.warn('Failed to parse agent_event:', err);
     }
   });
+
+  evtSource.addEventListener('card', (e) => {
+    try {
+      handleCardEvent(JSON.parse(e.data));
+    } catch (err) {
+      console.warn('Failed to parse card event:', err);
+    }
+  });
 }
 
 function enterChat(chatId) {
@@ -864,6 +1526,8 @@ function enterChat(chatId) {
   view.classList.add('active');
   document.getElementById('chat-title').innerHTML = '<span class="dot"></span>' + chatId;
 
+  // Declare card capability + register the catalog before any run can finish.
+  registerCatalog(chatId);
   setupSSE(chatId);
   loadHistory(chatId);
   document.getElementById('input').focus();
@@ -873,11 +1537,7 @@ function handleAgentEvent(event) {
   switch (event.type) {
     case 'task_started':
       setUserDotState('running');
-      // Reset message state for new task (so cron job messages create new bubbles)
-      currentMsgEl = null;
-      accumulated = '';
       responseReceived = false;
-      streamClosed = false;
       break;
 
     case 'task_completed':
@@ -886,8 +1546,6 @@ function handleAgentEvent(event) {
       isProcessing = false;
       updateSendButton();
       activeUserDot = null;
-      // Mark stream as done so next onmessage creates new bubble
-      streamClosed = true;
       break;
 
     case 'task_failed':
@@ -896,8 +1554,6 @@ function handleAgentEvent(event) {
       isProcessing = false;
       updateSendButton();
       activeUserDot = null;
-      // Mark stream as done so next onmessage creates new bubble
-      streamClosed = true;
       appendEventCard('task-failed', 'Task failed', event.error || '');
       break;
 

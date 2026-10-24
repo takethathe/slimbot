@@ -22,6 +22,7 @@ define_config! {
         temperature: f32 = 0.7, range(0.0, 2.0), desc: "LLM sampling temperature",
         max_tokens: u32 = 4096, range(1, 100_000), desc: "Max response tokens",
         prompt_cache_enabled: bool = true, none, desc: "Enable prompt caching via cache_control",
+        disable_thinking: bool = false, none, desc: "Force-disable model thinking/reasoning mode for calls on this provider (injects enable_thinking=false)",
     }
 }
 
@@ -77,6 +78,15 @@ define_config! {
         max_chars: usize = crate::config::default_max_chars(), none, desc: "Max characters fetched per URL before truncation",
         timeout_s: u64 = crate::config::default_timeout(), none, desc: "Fetch timeout in seconds",
         user_agent: String = crate::config::default_user_agent(), none, desc: "User-Agent header used for fetches",
+    }
+}
+
+define_config! {
+    "json_render" => JsonRenderConfig {
+        enabled: bool = true, none, desc: "Master switch for WebUI card generation (default on; the real gate is Catalog registration)",
+        model_override: Option<String> = None::<String>, none, desc: "Optional provider name override for card generation (defaults to the main agent provider)",
+        max_tokens: u32 = 2048, range(64, 32768), desc: "Max output tokens per card generation call",
+        timeout_seconds: u64 = 30, range(1, 300), desc: "No-progress window for one card generation call in seconds (a living stream is never cut off)",
     }
 }
 

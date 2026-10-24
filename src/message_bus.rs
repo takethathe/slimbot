@@ -21,7 +21,10 @@ pub struct BusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusResult {
     pub session_id: String,
-    pub task_id: String,
+    /// Unique identifier for the Run that produced this result. Assigned on the
+    /// inbound `TaskHook` and threaded through lifecycle events, this result,
+    /// and card events so the WebUI can attribute a card to a specific Run.
+    pub run_id: String,
     pub content: String,
 }
 
@@ -103,7 +106,7 @@ mod tests {
         .await;
         bus.publish_outbound(BusResult {
             session_id: "s1".to_string(),
-            task_id: "t1".to_string(),
+            run_id: "r1".to_string(),
             content: "reply".to_string(),
         })
         .await;

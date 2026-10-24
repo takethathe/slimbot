@@ -64,8 +64,11 @@ Gateway 模式**不启动 CLI 通道**。
 | `/` | GET | 对话界面（内置 index.html） |
 | `/chats` | GET | 列出所有会话 ID |
 | `/chats` | POST | 创建新会话，返回 chat_id |
-| `/sse?chat_id=xxx` | GET | SSE 流式输出，接收 Agent 回复 |
+| `/sse?chat_id=xxx` | GET | SSE 流式输出，接收 Agent 回复、生命周期事件与卡片事件 |
 | `/message?chat_id=xxx` | POST | 发送消息到 Agent |
+| `/session/{chat_id}` | GET | 会话历史（user/assistant 消息，每条带 `ts` 锚点；assistant 可带 `card` 卡片回放） |
+| `/json-render/catalog` | POST | 注册该 chat 的 Catalog prompt（上报即声明「本客户端能渲染卡片」），见「卡片下发」 |
+| `/config`、`/traces` | GET | 配置编辑器与 Trace 查看器页面（见 `docs/config.md`、`docs/trace.md`） |
 
 **配置字段：**
 
@@ -96,7 +99,34 @@ cargo run -- gateway
 **SSE 消息流：**
 1. 客户端访问 `/sse?chat_id=xxx` 建立 SSE 连接
 2. Agent 通过 `/message?chat_id=xxx` 端点接收用户消息
-3. Agent 回复通过 SSE 连接实时推送到客户端
+3. 服务端经 SSE 连接实时推送，按 `event:` 字段区分三类事件：
+
+| 事件 | data 载荷 | 说明 |
+|------|-----------|------|
+| `message` | 文本内容 | Agent 最终回复 |
+| `agent_event` | `AgentEvent` JSON（`type` 判别） | 生命周期事件（task started/completed 等） |
+| `card` | `CardEvent` JSON（`type` 判别） | 卡片生成事件，见「卡片下发」 |
+
+## 卡片下发（Card）
+
+WebUI 在会话气泡下方渲染生成式 UI 卡片（json-render Card spec）。卡片**不是主 agent 的产出**：一次 Run 结束后，channel 层的 `CardService` 以该 Run 的 transcript 为输入、以客户端上报的 Catalog prompt 为系统提示词，另发起一次独立的流式模型调用（决策见 `docs/adr/0005-post-run-card-generation.md`）。
+
+**Catalog 注册（能力握手）：** 前端连接后 `POST /json-render/catalog`，body 为 `{"chat_id", "prompt", "catalog_hash"}`。注册同时声明该 chat 能渲染卡片——**未注册的会话不产生卡片**（fail-closed）。prompt 超长或为空返回 400；卡片服务未接线返回 503。
+
+**卡片事件（SSE `event: card`）：** `CardEvent` 按 `type` 判别（snake_case），均携带 `session_id` 与 `run_id`：
+
+| type | 附加字段 | 语义 |
+|------|----------|------|
+| `started` | — | 生成开始，前端可展示占位 |
+| `delta` | `ops: [...]` | 增量 patch（流式编译产物，前端逐帧合并渲染） |
+| `completed` | `spec: {...}` | 权威完整 Card spec，前端以此渲染为最终态 |
+| `failed` | — | 生成失败/流停滞/空 spec，前端忽略即可（静默降级） |
+
+**回放：** 完成的 spec 追加到 Card sidecar（`sessions/{chat_id}.cards.jsonl`），以该 Run 末条 assistant 消息的 `timestamp` 为锚，**不写进会话 JSONL**（避免 patch 文本污染 agent 上下文）。`/session/{chat_id}` 读取时按锚点精确挂回 assistant 消息的 `card` 字段；锚点已不存在（被 consolidation 重写）的卡片直接不挂，绝不按索引猜测。
+
+**护栏与配置：** 顶层 `json_render` 配置段控制卡片生成（`enabled` 总开关、`model_override` 指定 provider、`max_tokens` 单次调用输出预算、`timeout_seconds` 单次调用的无进展窗口——任何流式信号到达即续命，思考模型的长推理阶段不会被误杀；真正卡死的流在窗口用满后被掐断）。运行时护栏：并发闸门（超限的 Run 直接跳过、不排队）、停滞取消、进程退出时取消进行中的生成；卡片调用强制禁用模型思考（请求体注入 `enable_thinking: false`，不影响主 agent 对话）。每次生成记录 `json_render.generate` span（`json_render.patch_count`、token usage attributes），可在 Trace 查看器观察。
+
+**其他通道：** 卡片事件走独立 mpsc 经 `ChannelManager` 路由，不进 `AgentEvent` 广播；`Channel` trait 的 `write_card` 默认 no-op，CLI/cron/heartbeat 继承默认实现直接丢弃。
 
 ## 扩展通道
 
@@ -111,6 +141,8 @@ pub trait Channel: Send + Sync {
     async fn read_input(&mut self) -> Result<String>;
     async fn write_output(&mut self, result: &BusResult) -> Result<()>;
     async fn write_status(&mut self, session_id: &str, state: &TaskState) -> Result<()>;
+    async fn write_event(&mut self, event: &AgentEvent) -> Result<()> { Ok(()) }
+    async fn write_card(&mut self, event: &CardEvent) -> Result<()> { Ok(()) }
     async fn prepare_inject(&self) -> Result<String>;
     fn session_id(&self) -> String {
         format!("{}:{}", self.id(), self.chat_id())

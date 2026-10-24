@@ -31,6 +31,7 @@ impl AfterTurnHook for FireTaskCompletedHook {
             });
             hook.fire_event(AgentEvent::TaskCompleted {
                 session_id: spec.session_id.clone(),
+                run_id: hook.run_id().to_string(),
                 result: text,
             });
         } else {
@@ -40,6 +41,7 @@ impl AfterTurnHook for FireTaskCompletedHook {
             });
             hook.fire_event(AgentEvent::TaskFailed {
                 session_id: spec.session_id.clone(),
+                run_id: hook.run_id().to_string(),
                 error,
             });
         }

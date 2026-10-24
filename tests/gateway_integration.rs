@@ -33,6 +33,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
                     temperature: 0.7,
                     max_tokens: 4096,
                     prompt_cache_enabled: false,
+                    disable_thinking: false,
                     unknown: Default::default(),
                 },
             );
@@ -55,6 +56,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
         web_fetch: None,
         tracing: Default::default(),
         memory: Default::default(),
+        json_render: Default::default(),
     }
 }
 

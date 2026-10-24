@@ -30,6 +30,7 @@
 | [路径管理](path.md) | `path.rs` | 路径解析、默认值、沙箱验证、波浪号展开 |
 | [工具系统](tool.md) | `tool.rs`, `tools/` | Tool trait、ToolManager、工具结果处理 |
 | [记忆模块](memory.md) | `memory/` | category 化长期记忆、可插拔 backend、历史与游标 |
+| [卡片生成](channels.md#卡片下发card) | `card/` | Run 后独立流式调用、Catalog 注册、spec 编译、侧车回放、护栏（机制文档在通道文档「卡片下发」节） |
 | [工作池](worker.md) | `worker.rs` | 异步 Worker 与动态 WorkerPool |
 | [I/O 调度器](io_scheduler.md) | `io_scheduler.rs` | 阻塞读取循环、stdin 处理 |
 | [配置编辑 schema](config.md#webui-配置编辑器) | `config_schema.rs` | schema 序列化 + path-patch 引擎（WebUI 配置编辑器后端） |

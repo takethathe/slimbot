@@ -17,6 +17,7 @@ impl PreTurnHook for NotifyRunningHook {
         });
         hook.fire_event(AgentEvent::TaskStarted {
             session_id: spec.session_id.clone(),
+            run_id: hook.run_id().to_string(),
         });
         Ok(HookAction::Continue)
     }

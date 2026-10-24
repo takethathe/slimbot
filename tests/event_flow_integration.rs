@@ -570,10 +570,12 @@ fn test_agent_event_serializes_correctly() {
     // Verify the serde tag produces expected JSON for the frontend SSE contract
     let event = AgentEvent::TaskStarted {
         session_id: "webui:chat1".to_string(),
+        run_id: "run-1".to_string(),
     };
     let json = serde_json::to_string(&event).unwrap();
     assert!(json.contains(r#""type":"task_started""#));
     assert!(json.contains(r#""session_id":"webui:chat1""#));
+    assert!(json.contains(r#""run_id":"run-1""#));
 
     let event = AgentEvent::ToolCall {
         session_id: "webui:chat1".to_string(),
@@ -586,6 +588,7 @@ fn test_agent_event_serializes_correctly() {
 
     let event = AgentEvent::TaskCompleted {
         session_id: "webui:chat1".to_string(),
+        run_id: "run-2".to_string(),
         result: "All done".to_string(),
     };
     let json = serde_json::to_string(&event).unwrap();

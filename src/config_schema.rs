@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, MemoryConfig,
-    ProviderConfig, ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
+    AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig,
+    MemoryConfig, ProviderConfig, ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
 };
 use crate::config_macro::FieldMeta;
 
@@ -150,6 +150,12 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
             "Web Fetch",
             WebFetchConfig::fields(),
             &to_value_map(&config.web_fetch.clone().unwrap_or_default()),
+        ),
+        scalar_section(
+            "json_render",
+            "JSON Render · Cards",
+            JsonRenderConfig::fields(),
+            &to_value_map(&config.json_render),
         ),
         scalar_section(
             "tracing",
@@ -499,6 +505,7 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
             set_gateway(config, sub, field, value)
         }
         ["web_fetch", field] => set_web_fetch(config, field, value),
+        ["json_render", field] => set_json_render(config, field, value),
         ["memory", field] => set_memory(config, field, value),
         ["tracing", "enabled"] => {
             config.tracing.enabled = value_bool(value, "tracing.enabled")?;
@@ -558,6 +565,9 @@ fn set_provider_field(
         "prompt_cache_enabled" => {
             provider.prompt_cache_enabled =
                 value_bool(value, &format!("{}.prompt_cache_enabled", prefix))?
+        }
+        "disable_thinking" => {
+            provider.disable_thinking = value_bool(value, &format!("{}.disable_thinking", prefix))?
         }
         _ => return Err(format!("Unknown provider field: {}", field)),
     }
@@ -660,6 +670,25 @@ fn set_memory(config: &mut Config, field: &str, value: &serde_json::Value) -> Re
     match field {
         "backend" => config.memory.backend = value_str(value, "memory.backend")?,
         _ => return Err(format!("Unknown memory field: {}", field)),
+    }
+    Ok(())
+}
+
+fn set_json_render(
+    config: &mut Config,
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match field {
+        "enabled" => config.json_render.enabled = value_bool(value, "json_render.enabled")?,
+        "model_override" => {
+            config.json_render.model_override = value_opt_str(value, "json_render.model_override")?
+        }
+        "max_tokens" => config.json_render.max_tokens = value_u32(value, "json_render.max_tokens")?,
+        "timeout_seconds" => {
+            config.json_render.timeout_seconds = value_u64(value, "json_render.timeout_seconds")?
+        }
+        _ => return Err(format!("Unknown json_render field: {}", field)),
     }
     Ok(())
 }
@@ -905,6 +934,7 @@ mod tests {
                 temperature: 0.7,
                 max_tokens: 4096,
                 prompt_cache_enabled: true,
+                disable_thinking: false,
                 unknown: Default::default(),
             },
         );
@@ -949,6 +979,7 @@ mod tests {
             web_fetch: Some(WebFetchConfig::default()),
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         }
     }
 
@@ -980,6 +1011,7 @@ mod tests {
                 "gateway.heartbeat",
                 "gateway.dream",
                 "web_fetch",
+                "json_render",
                 "tracing",
                 "memory",
                 "providers",
@@ -1105,6 +1137,40 @@ mod tests {
         assert!(backends.items.as_ref().unwrap().is_empty());
         let bt = backends.item_fields.as_ref().unwrap();
         assert_eq!(bt.len(), 5);
+    }
+
+    #[test]
+    fn test_schema_json_render_section_shows_defaults() {
+        let mut config = make_config();
+        config.json_render = crate::config::JsonRenderConfig::default();
+        let tree = serialize_schema(&config);
+        let jr = section(&tree, "json_render");
+        assert_eq!(field(jr, "enabled").value, json!(true));
+        assert_eq!(field(jr, "max_tokens").value, json!(2048));
+        assert_eq!(field(jr, "timeout_seconds").value, json!(30));
+        assert_eq!(field(jr, "model_override").kind, "optional_string");
+        assert_eq!(field(jr, "model_override").value, json!(null));
+    }
+
+    #[test]
+    fn test_patch_json_render_fields() {
+        let mut config = make_config();
+        let ops = vec![
+            op(PatchOpKind::Set, "json_render.enabled", json!(false)),
+            op(PatchOpKind::Set, "json_render.max_tokens", json!(1024)),
+            op(PatchOpKind::Set, "json_render.timeout_seconds", json!(10)),
+            op(
+                PatchOpKind::Set,
+                "json_render.model_override",
+                json!("cheap"),
+            ),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert!(!config.json_render.enabled);
+        assert_eq!(config.json_render.max_tokens, 1024);
+        assert_eq!(config.json_render.timeout_seconds, 10);
+        assert_eq!(config.json_render.model_override, Some("cheap".to_string()));
     }
 
     #[test]

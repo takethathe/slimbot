@@ -55,7 +55,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         Box::pin(async move {
             tx.send(BusResult {
                 session_id: format!("{}:{}", channel, chat_id),
-                task_id: String::new(),
+                run_id: uuid::Uuid::new_v4().to_string(),
                 content,
             })
             .await
@@ -141,7 +141,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
                 && let (Some(channel), Some(chat_id)) = (&job_clone.payload.channel, &job_clone.payload.to) {
                     mb.publish_outbound(BusResult {
                         session_id: format!("{}:{}", channel, chat_id),
-                        task_id: String::new(),
+                        run_id: uuid::Uuid::new_v4().to_string(),
                         content: result.content,
                     }).await;
                 }
@@ -211,7 +211,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         Box::pin(async move {
             mb.publish_outbound(BusResult {
                 session_id: "webui:webui_main".to_string(),
-                task_id: String::new(),
+                run_id: uuid::Uuid::new_v4().to_string(),
                 content: resp,
             })
             .await;
@@ -232,7 +232,43 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     let (channel_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     // Register webui factory with shutdown channel
+    let mut card_service_for_shutdown: Option<Arc<crate::card::CardService>> = None;
     if config.channels.contains_key("webui") {
+        // Card generation lives in the channel layer: it listens to Run
+        // lifecycle events on the broadcast, produces cards off an independent
+        // model call, and delivers them over a dedicated mpsc that the manager
+        // routes to the WebUI channel. Only genuine WebUI Runs register.
+        let (card_tx, card_rx) = tokio::sync::mpsc::channel::<crate::card::CardEvent>(
+            crate::card::CARD_CHANNEL_CAPACITY,
+        );
+        // Card calls get their own provider instance when json_render says so:
+        // provider identity inherited or overridden, output budget overridden.
+        let card_provider = card_provider_config(config.as_ref())
+            .map(|pc| {
+                Arc::new(crate::provider::OpenAIProvider::new(&pc))
+                    as Arc<dyn crate::provider::Provider>
+            })
+            .unwrap_or_else(|| agent_loop.provider());
+        let card_policy = crate::card::CardPolicy {
+            enabled: config.json_render.enabled,
+            max_concurrent: 2,
+            timeout: std::time::Duration::from_secs(config.json_render.timeout_seconds),
+        };
+        let service = crate::card::CardService::new(
+            card_provider,
+            agent_loop.session_manager(),
+            crate::card::CardStore::new(paths.session_dir()),
+            card_tx,
+        )
+        .with_policy(card_policy);
+        let service = match agent_loop.tracer() {
+            Some(tracer) => service.with_tracer(tracer),
+            None => service,
+        };
+        let card_service = Arc::new(service);
+        card_service_for_shutdown = Some(card_service.clone());
+        crate::card::spawn_listener(card_service.clone(), event_tx.subscribe());
+        channel_manager.attach_card_rx(card_rx);
         channel_manager.register_webui_factory(
             agent_loop.session_manager(),
             channel_shutdown_tx.clone(),
@@ -240,6 +276,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             trace_paths.clone(),
             trace_startup_ms,
             paths.config_path().to_string_lossy().to_string(),
+            Some(card_service),
         );
     }
 
@@ -293,6 +330,17 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     // Signal channel servers to stop (webui etc.)
     let _ = channel_shutdown_tx.send(());
 
+    // Cancel in-flight card generations rather than let them hang the exit.
+    if let Some(card_service) = &card_service_for_shutdown {
+        let cancelled = card_service.shutdown();
+        if !cancelled.is_empty() {
+            info!(
+                "[gateway] cancelled {} inflight card generation(s)",
+                cancelled.len()
+            );
+        }
+    }
+
     // Graceful shutdown with overall timeout.
     // Race against a second Ctrl+C for forced exit.
     hb_for_shutdown.stop();
@@ -314,6 +362,25 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the provider config for card generation: identity comes from the
+/// main agent provider, or the `json_render.model_override` provider name
+/// when it exists in the map; the output budget is always the card-specific
+/// `json_render.max_tokens`, and thinking is forced off (a card is a
+/// mechanical transcript→JSONL conversion — reasoning only buys latency).
+/// `None` when no provider resolves at all.
+fn card_provider_config(config: &Config) -> Option<crate::config::ProviderConfig> {
+    let base = config
+        .json_render
+        .model_override
+        .as_deref()
+        .and_then(|name| config.providers.get(name))
+        .or_else(|| config.providers.get(&config.agent.provider))?;
+    let mut pc = base.clone();
+    pc.max_tokens = config.json_render.max_tokens;
+    pc.disable_thinking = true;
+    Some(pc)
 }
 
 #[cfg(test)]
@@ -355,6 +422,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -377,6 +445,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -387,6 +456,81 @@ mod tests {
             Some(workspace_dir.to_str().unwrap()),
         )
         .unwrap()
+    }
+
+    fn card_test_config() -> crate::config::Config {
+        let mut config = crate::config::Config {
+            agent: crate::config::AgentConfig {
+                provider: "main".to_string(),
+                ..Default::default()
+            },
+            providers: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "main".to_string(),
+                    crate::config::ProviderConfig {
+                        model: "gpt-4o".to_string(),
+                        api_key: "k".to_string(),
+                        max_tokens: 4096,
+                        ..Default::default()
+                    },
+                );
+                map.insert(
+                    "cheap".to_string(),
+                    crate::config::ProviderConfig {
+                        model: "gpt-4o-mini".to_string(),
+                        api_key: "k".to_string(),
+                        max_tokens: 8192,
+                        ..Default::default()
+                    },
+                );
+                map
+            },
+            ..Default::default()
+        };
+        config.json_render = crate::config::JsonRenderConfig::default();
+        config
+    }
+
+    #[test]
+    fn test_card_provider_inherits_main_provider_with_card_budget() {
+        let config = card_test_config();
+        let pc = card_provider_config(&config).expect("main provider resolves");
+        assert_eq!(pc.model, "gpt-4o");
+        assert_eq!(
+            pc.max_tokens, 2048,
+            "card calls carry json_render.max_tokens, not the provider's"
+        );
+    }
+
+    #[test]
+    fn test_card_provider_model_override_switches_provider() {
+        let mut config = card_test_config();
+        config.json_render.model_override = Some("cheap".to_string());
+        let pc = card_provider_config(&config).unwrap();
+        assert_eq!(pc.model, "gpt-4o-mini");
+        assert_eq!(pc.max_tokens, 2048);
+    }
+
+    #[test]
+    fn test_card_provider_disables_thinking_for_card_calls() {
+        // Card generation is a mechanical transcript→JSONL conversion: model
+        // reasoning only costs latency and can starve the no-progress
+        // timeout, so the card provider always turns thinking off.
+        let config = card_test_config();
+        let pc = card_provider_config(&config).expect("main provider resolves");
+        assert!(
+            pc.disable_thinking,
+            "card calls must never run in thinking mode"
+        );
+    }
+
+    #[test]
+    fn test_card_provider_unknown_override_falls_back_to_main() {
+        let mut config = card_test_config();
+        config.json_render.model_override = Some("ghost".to_string());
+        let pc = card_provider_config(&config).unwrap();
+        assert_eq!(pc.model, "gpt-4o");
     }
 
     #[tokio::test]
@@ -499,6 +643,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -612,6 +757,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -634,6 +780,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let mut tool_manager = ToolManager::new(workspace_dir.clone());
@@ -687,6 +834,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -762,7 +910,7 @@ mod tests {
         // Send a result
         let res = BusResult {
             session_id: "test-session".to_string(),
-            task_id: "test-task".to_string(),
+            run_id: "test-task".to_string(),
             content: "test result".to_string(),
         };
         let result = mb.outbound_tx().send(res).await;
@@ -901,6 +1049,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -920,6 +1069,7 @@ mod tests {
         // Send an event
         let event = AgentEvent::TaskStarted {
             session_id: "test-session".to_string(),
+            run_id: "run-1".to_string(),
         };
         let result = event_tx.send(event);
         assert!(result.is_ok());
@@ -936,7 +1086,7 @@ mod tests {
     async fn test_gateway_bus_result_serialization() {
         let result = BusResult {
             session_id: "test-session".to_string(),
-            task_id: "task-123".to_string(),
+            run_id: "task-123".to_string(),
             content: "Test content".to_string(),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -946,7 +1096,7 @@ mod tests {
 
         let deserialized: BusResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.session_id, "test-session");
-        assert_eq!(deserialized.task_id, "task-123");
+        assert_eq!(deserialized.run_id, "task-123");
         assert_eq!(deserialized.content, "Test content");
     }
 
@@ -1037,11 +1187,13 @@ mod tests {
         // Test different AgentEvent variants
         let event1 = AgentEvent::TaskStarted {
             session_id: "session-1".to_string(),
+            run_id: "run-1".to_string(),
         };
         assert!(matches!(event1, AgentEvent::TaskStarted { .. }));
 
         let event2 = AgentEvent::TaskCompleted {
             session_id: "session-2".to_string(),
+            run_id: "run-2".to_string(),
             result: "result".to_string(),
         };
         assert!(matches!(event2, AgentEvent::TaskCompleted { .. }));
@@ -1102,7 +1254,7 @@ mod tests {
         for i in 0..5 {
             let result = BusResult {
                 session_id: format!("session-{}", i),
-                task_id: format!("task-{}", i),
+                run_id: format!("task-{}", i),
                 content: format!("Content {}", i),
             };
             let send_result = outbound_tx.send(result).await;
@@ -1327,6 +1479,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: true,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1349,6 +1502,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         };
 
         assert_eq!(config.agent.max_iterations, 50);
@@ -1514,7 +1668,7 @@ mod tests {
         let result1 = tx1
             .send(BusResult {
                 session_id: "session-1".to_string(),
-                task_id: "task-1".to_string(),
+                run_id: "task-1".to_string(),
                 content: "content-1".to_string(),
             })
             .await;
@@ -1523,7 +1677,7 @@ mod tests {
         let result2 = tx2
             .send(BusResult {
                 session_id: "session-2".to_string(),
-                task_id: "task-2".to_string(),
+                run_id: "task-2".to_string(),
                 content: "content-2".to_string(),
             })
             .await;
@@ -1891,7 +2045,7 @@ mod tests {
                 tokio::spawn(async move {
                     tx.send(BusResult {
                         session_id: format!("session-{}", i),
-                        task_id: format!("task-{}", i),
+                        run_id: format!("task-{}", i),
                         content: format!("content-{}", i),
                     })
                     .await
@@ -2087,7 +2241,7 @@ mod tests {
         let result = outbound_tx
             .send(BusResult {
                 session_id: "test".to_string(),
-                task_id: "test".to_string(),
+                run_id: "test".to_string(),
                 content: "test".to_string(),
             })
             .await;
@@ -2366,7 +2520,7 @@ mod tests {
         let result1 = tx1
             .send(BusResult {
                 session_id: "s1".to_string(),
-                task_id: "t1".to_string(),
+                run_id: "t1".to_string(),
                 content: "c1".to_string(),
             })
             .await;
@@ -2375,7 +2529,7 @@ mod tests {
         let result2 = tx2
             .send(BusResult {
                 session_id: "s2".to_string(),
-                task_id: "t2".to_string(),
+                run_id: "t2".to_string(),
                 content: "c2".to_string(),
             })
             .await;

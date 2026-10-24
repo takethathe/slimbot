@@ -1,5 +1,6 @@
 pub(crate) mod agent_loop;
 pub(crate) mod bootstrap;
+pub mod card;
 pub(crate) mod channel;
 pub(crate) mod cli;
 pub(crate) mod commands;

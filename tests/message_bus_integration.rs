@@ -50,7 +50,7 @@ async fn test_outbound_result_flow() {
 
     let result = BusResult {
         session_id: "test:chat1".to_string(),
-        task_id: "task-123".to_string(),
+        run_id: "task-123".to_string(),
         content: "final answer".to_string(),
     };
 
@@ -58,7 +58,7 @@ async fn test_outbound_result_flow() {
 
     let received = rx.recv().await.unwrap();
     assert_eq!(received.session_id, "test:chat1");
-    assert_eq!(received.task_id, "task-123");
+    assert_eq!(received.run_id, "task-123");
     assert_eq!(received.content, "final answer");
 }
 
@@ -108,7 +108,7 @@ async fn test_concurrent_inbound_outbound() {
         let req = in_rx.recv().await.unwrap();
         let result = BusResult {
             session_id: req.session_id,
-            task_id: "task-1".to_string(),
+            run_id: "task-1".to_string(),
             content: format!("processed: {}", req.content),
         };
         out_tx.send(result).await.unwrap();
@@ -138,13 +138,63 @@ async fn test_concurrent_inbound_outbound() {
 fn test_bus_result_serde_round_trip() {
     let result = BusResult {
         session_id: "cli:abc".to_string(),
-        task_id: "task-42".to_string(),
+        run_id: "task-42".to_string(),
         content: "some result".to_string(),
     };
 
     let json = serde_json::to_string(&result).unwrap();
     let deserialized: BusResult = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.session_id, "cli:abc");
-    assert_eq!(deserialized.task_id, "task-42");
+    assert_eq!(deserialized.run_id, "task-42");
     assert_eq!(deserialized.content, "some result");
+}
+
+// ── Run id contract (ticket 01) ──
+
+#[test]
+fn test_bus_result_serializes_run_id_not_task_id() {
+    // The outbound result's serialized field name must be `run_id`; the old
+    // `task_id` name must no longer appear.
+    let result = BusResult {
+        session_id: "cli:abc".to_string(),
+        run_id: "r-1".to_string(),
+        content: "x".to_string(),
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(
+        json.contains("\"run_id\""),
+        "json should contain run_id: {json}"
+    );
+    assert!(
+        !json.contains("task_id"),
+        "json should not contain task_id: {json}"
+    );
+}
+
+#[test]
+fn test_task_hook_assigns_unique_nonempty_run_id() {
+    // Each inbound construction point (TaskHook) allocates a distinct, non-empty
+    // run id.
+    let a = TaskHook::new("cli:c1");
+    let b = TaskHook::new("cli:c1");
+    assert!(!a.run_id().is_empty());
+    assert!(!b.run_id().is_empty());
+    assert_ne!(a.run_id(), b.run_id());
+}
+
+#[test]
+fn test_task_hook_run_id_survives_builder_transitions() {
+    // Attaching status/event channels must not change the assigned run id.
+    let (status_tx, _status_rx) = tokio::sync::mpsc::channel(1);
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<slimbot::AgentEvent>(1);
+    let hook = TaskHook::new("webui:c1")
+        .with_status_channel(status_tx)
+        .with_events(event_tx);
+    assert!(!hook.run_id().is_empty());
+}
+
+#[test]
+fn test_task_hook_with_run_id_uses_given_id() {
+    let hook = TaskHook::new("cli:c1").with_run_id("fixed-run");
+    assert_eq!(hook.run_id(), "fixed-run");
 }

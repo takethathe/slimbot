@@ -27,6 +27,34 @@ fn extract_channel_id(session_id: &str) -> &str {
     session_id.split(':').next().unwrap_or("")
 }
 
+/// Route one card event to the channel named by its session-id prefix. An
+/// unknown channel logs an error rather than panicking; channels that cannot
+/// render cards drop the event via the default no-op `write_card`. Extracted
+/// from the router loop so the routing decision is directly testable.
+async fn dispatch_card(
+    channels: &Mutex<HashMap<String, Box<dyn Channel>>>,
+    event: &crate::card::CardEvent,
+) {
+    let channel_id = extract_channel_id(event.session_id());
+    let mut ch_guard = channels.lock().await;
+    match ch_guard.get_mut(channel_id) {
+        Some(channel) => {
+            if let Err(e) = channel.write_card(event).await {
+                error!(
+                    "[ChannelManager] Failed to write card to {}: {}",
+                    channel_id, e
+                );
+            }
+        }
+        None => {
+            error!(
+                "[ChannelManager] No channel for card session: {}",
+                event.session_id()
+            );
+        }
+    }
+}
+
 /// Channel trait, abstracts all I/O channels
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -68,6 +96,12 @@ pub trait Channel: Send + Sync {
     async fn write_event(&mut self, _event: &AgentEvent) -> Result<()> {
         Ok(())
     }
+    /// Send a card event to the client. Default: no-op — only WebUI-like channels
+    /// render cards; CLI, cron, heartbeat inherit this and drop the event. This
+    /// keeps card delivery off the `AgentEvent` broadcast entirely.
+    async fn write_card(&mut self, _event: &crate::card::CardEvent) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Channel factory trait, creates channels by type from config
@@ -86,6 +120,9 @@ pub struct ChannelManager {
     message_bus: Arc<MessageBus>,
     /// Owned outbound receiver, consumed once by `run`/`run_with_shutdown`.
     outbound_rx: std::sync::Mutex<Option<mpsc::Receiver<BusResult>>>,
+    /// Owned card-event receiver, consumed once by `run_with_shutdown`. Set via
+    /// `attach_card_rx`; absent (None) means card delivery is not wired (CLI).
+    card_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::card::CardEvent>>>,
     config: Arc<Config>,
     io_handles: Arc<Mutex<HashMap<String, IoHandle>>>,
     io_scheduler: IoScheduler,
@@ -105,6 +142,7 @@ impl ChannelManager {
             factories: HashMap::new(),
             message_bus,
             outbound_rx: std::sync::Mutex::new(Some(outbound_rx)),
+            card_rx: std::sync::Mutex::new(None),
             config,
             io_handles: Arc::new(Mutex::new(HashMap::new())),
             io_scheduler,
@@ -112,6 +150,16 @@ impl ChannelManager {
         };
         // Auto-register all built-in channel factories
         cm
+    }
+
+    /// Attach the card-event receiver this manager should route. Call before
+    /// `run_with_shutdown`; the receiver is taken once when the loop starts.
+    pub fn attach_card_rx(&self, rx: mpsc::Receiver<crate::card::CardEvent>) {
+        *self.card_rx.lock().unwrap() = Some(rx);
+    }
+
+    fn take_card_rx(&self) -> Option<mpsc::Receiver<crate::card::CardEvent>> {
+        self.card_rx.lock().unwrap().take()
     }
 
     /// Return the event broadcast sender for channels to subscribe to agent events.
@@ -182,6 +230,7 @@ impl ChannelManager {
     }
 
     /// Register the webui channel factory (requires session_manager for chat listing).
+    #[allow(clippy::too_many_arguments)]
     pub fn register_webui_factory(
         &mut self,
         session_manager: SharedSessionManager,
@@ -190,6 +239,7 @@ impl ChannelManager {
         trace_paths: Vec<String>,
         trace_startup_ms: Option<i64>,
         config_path: String,
+        card: Option<Arc<crate::card::CardService>>,
     ) {
         let factory = WebuiChannelFactory::new(
             self.message_bus.clone(),
@@ -199,6 +249,7 @@ impl ChannelManager {
             trace_paths,
             trace_startup_ms,
             config_path,
+            card,
         );
         self.factories
             .insert("webui".to_string(), Box::new(factory));
@@ -349,6 +400,19 @@ impl ChannelManager {
         let channels = self.channels.clone();
         let mut outbound_rx = self.take_outbound_rx();
 
+        // Card-event router: a dedicated mpsc, independent of the outbound and
+        // broadcast paths. Route by session prefix to the owning channel; an
+        // unknown channel logs an error rather than panicking. Only channels
+        // that render cards (WebUI) override `write_card`; others no-op it.
+        if let Some(mut card_rx) = self.take_card_rx() {
+            let channels = self.channels.clone();
+            tokio::spawn(async move {
+                while let Some(event) = card_rx.recv().await {
+                    dispatch_card(&channels, &event).await;
+                }
+            });
+        }
+
         loop {
             tokio::select! {
                 result = outbound_rx.recv() => {
@@ -485,6 +549,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: true,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -496,6 +561,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         }
     }
 
@@ -658,5 +724,103 @@ mod tests {
         cm.init().await.unwrap();
         // Channels are stored in a map keyed by type, so we should have 2 entries
         assert!(!cm.channels.lock().await.is_empty()); // At least 1 since both factory create same channel
+    }
+
+    // ── Card-event routing (seam 4) ──
+
+    /// A channel that records the run ids of card events it is asked to write,
+    /// so routing can be asserted from the outside.
+    struct RecordingCardChannel {
+        channel_id: String,
+        seen: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Channel for RecordingCardChannel {
+        fn id(&self) -> &str {
+            &self.channel_id
+        }
+        fn name(&self) -> &str {
+            "Recorder"
+        }
+        fn chat_id(&self) -> &str {
+            "rec"
+        }
+        async fn read_input(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn write_output(&mut self, _result: &BusResult) -> Result<()> {
+            Ok(())
+        }
+        async fn write_status(&mut self, _session_id: &str, _state: &TaskState) -> Result<()> {
+            Ok(())
+        }
+        async fn prepare_inject(&self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn start(&self, _inbound_tx: tokio::sync::mpsc::Sender<BusRequest>) {}
+        async fn write_card(&mut self, event: &crate::card::CardEvent) -> Result<()> {
+            self.seen.lock().await.push(event.run_id().to_string());
+            Ok(())
+        }
+    }
+
+    fn completed_event(session_id: &str, run_id: &str) -> crate::card::CardEvent {
+        crate::card::CardEvent::Completed {
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            spec: serde_json::json!({"root": "r", "elements": {"r": {"type": "Card"}}}),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_card_routes_to_matching_channel() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut map: HashMap<String, Box<dyn Channel>> = HashMap::new();
+        map.insert(
+            "webui".to_string(),
+            Box::new(RecordingCardChannel {
+                channel_id: "webui".to_string(),
+                seen: seen.clone(),
+            }),
+        );
+        let channels = Mutex::new(map);
+
+        dispatch_card(&channels, &completed_event("webui:chat1", "run-1")).await;
+
+        assert_eq!(seen.lock().await.as_slice(), &["run-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_card_unknown_channel_does_not_panic() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut map: HashMap<String, Box<dyn Channel>> = HashMap::new();
+        map.insert(
+            "webui".to_string(),
+            Box::new(RecordingCardChannel {
+                channel_id: "webui".to_string(),
+                seen: seen.clone(),
+            }),
+        );
+        let channels = Mutex::new(map);
+
+        // Session prefixed by a channel that is not registered: logged, dropped.
+        dispatch_card(&channels, &completed_event("telegram:chat9", "run-2")).await;
+
+        assert!(
+            seen.lock().await.is_empty(),
+            "no channel received the event"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_card_default_is_noop() {
+        // TestChannel does not override write_card — the default must accept
+        // the event without error (CLI/cron/heartbeat inherit this).
+        let mut ch = TestChannel::new("cli", "default");
+        let result = ch
+            .write_card(&completed_event("cli:default", "run-3"))
+            .await;
+        assert!(result.is_ok());
     }
 }

@@ -337,6 +337,7 @@ pub struct TaskHook {
     status_tx: Option<tokio::sync::mpsc::Sender<(String, TaskState)>>,
     session_id: String,
     event_tx: Option<broadcast::Sender<AgentEvent>>,
+    run_id: String,
 }
 
 /// Events broadcast through TaskHook for fine-grained channel notifications.
@@ -345,13 +346,16 @@ pub struct TaskHook {
 pub enum AgentEvent {
     TaskStarted {
         session_id: String,
+        run_id: String,
     },
     TaskCompleted {
         session_id: String,
+        run_id: String,
         result: String,
     },
     TaskFailed {
         session_id: String,
+        run_id: String,
         error: String,
     },
     PreIteration {
@@ -381,7 +385,7 @@ pub enum AgentEvent {
 impl AgentEvent {
     pub fn session_id(&self) -> &str {
         match self {
-            AgentEvent::TaskStarted { session_id } => session_id,
+            AgentEvent::TaskStarted { session_id, .. } => session_id,
             AgentEvent::TaskCompleted { session_id, .. } => session_id,
             AgentEvent::TaskFailed { session_id, .. } => session_id,
             AgentEvent::PreIteration { session_id, .. } => session_id,
@@ -399,6 +403,7 @@ impl TaskHook {
             status_tx: None,
             session_id: session_id.to_string(),
             event_tx: None,
+            run_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -407,6 +412,7 @@ impl TaskHook {
             status_tx: Some(tx),
             session_id: self.session_id,
             event_tx: None,
+            run_id: self.run_id,
         }
     }
 
@@ -416,6 +422,17 @@ impl TaskHook {
             status_tx: self.status_tx,
             session_id: self.session_id,
             event_tx: Some(tx),
+            run_id: self.run_id,
+        }
+    }
+
+    /// Override the run id (test helper to pin a deterministic id).
+    pub fn with_run_id(self, run_id: &str) -> Self {
+        Self {
+            status_tx: self.status_tx,
+            session_id: self.session_id,
+            event_tx: self.event_tx,
+            run_id: run_id.to_string(),
         }
     }
 
@@ -434,6 +451,13 @@ impl TaskHook {
     /// Returns the session_id associated with this hook.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The unique identifier for the Run this hook drives. Assigned when the
+    /// hook is constructed (the inbound construction point) and carried through
+    /// lifecycle events, the outbound result, and card events.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
     }
 }
 
@@ -573,6 +597,7 @@ impl SessionTaskBuilder {
                     .tracer(tracer)
                     .max_tokens(max_tokens)
                     .build();
+                let run_id = hook.run_id().to_string();
                 let result = runner
                     .run(
                         content,
@@ -594,7 +619,7 @@ impl SessionTaskBuilder {
                 let _ = outbound_tx
                     .send(BusResult {
                         session_id: sid2,
-                        task_id: String::new(),
+                        run_id,
                         content,
                     })
                     .await;
@@ -732,23 +757,42 @@ pub fn message_content_str(msg: &Message) -> &str {
 }
 
 /// Simplified message for frontend display.
+///
+/// `ts` exposes the stored message's anchor so clients can reattach replayed
+/// cards; `card` is filled by the WebUI history endpoint only when a sidecar
+/// card matches that anchor exactly. Both default cleanly for legacy data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum FrontendMessage {
-    User { content: String },
-    Assistant { content: String },
+    User {
+        content: String,
+        #[serde(default)]
+        ts: String,
+    },
+    Assistant {
+        content: String,
+        #[serde(default)]
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<serde_json::Value>,
+    },
 }
 
 impl FrontendMessage {
     pub fn from_message(msg: &Message) -> Option<Self> {
         match msg {
-            Message::User { content, .. } => Some(Self::User {
+            Message::User { content, meta, .. } => Some(Self::User {
                 content: content.as_text().to_string(),
+                ts: meta.timestamp.clone(),
             }),
-            Message::Assistant { content, .. } => content
+            Message::Assistant { content, meta, .. } => content
                 .as_ref()
                 .filter(|c| !c.trim().is_empty())
-                .map(|c| Self::Assistant { content: c.clone() }),
+                .map(|c| Self::Assistant {
+                    content: c.clone(),
+                    ts: meta.timestamp.clone(),
+                    card: None,
+                }),
             _ => None,
         }
     }
@@ -1852,10 +1896,61 @@ mod tests {
         // load_session_messages should skip consolidated lines
         let messages = sm.load_session_messages("s1").unwrap();
         assert_eq!(messages.len(), 2); // only new1 and reply2
-        assert!(matches!(&messages[0], FrontendMessage::User { content } if content == "new1"));
+        assert!(matches!(&messages[0], FrontendMessage::User { content, .. } if content == "new1"));
         assert!(
-            matches!(&messages[1], FrontendMessage::Assistant { content } if content == "reply2")
+            matches!(&messages[1], FrontendMessage::Assistant { content, .. } if content == "reply2")
         );
+    }
+
+    #[test]
+    fn test_frontend_message_carries_ts_and_optional_card() {
+        // Replay contract: every message exposes its anchor (`ts`); assistant
+        // messages may carry an attached card; user messages never do.
+        let user = Message::User {
+            meta: MessageMeta {
+                timestamp: "2026-10-24T00:00:00Z".to_string(),
+            },
+            content: Content::Plain("hi".to_string()),
+            runtime_content: None,
+        };
+        let v = serde_json::to_value(FrontendMessage::from_message(&user).unwrap()).unwrap();
+        assert_eq!(v["role"], serde_json::json!("user"));
+        assert_eq!(v["ts"], serde_json::json!("2026-10-24T00:00:00Z"));
+        assert!(v.get("card").is_none());
+
+        let asst = Message::Assistant {
+            meta: MessageMeta {
+                timestamp: "ts-a".to_string(),
+            },
+            content: Some("done".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
+        let mut fm = FrontendMessage::from_message(&asst).unwrap();
+        if let FrontendMessage::Assistant { card, .. } = &mut fm {
+            *card = Some(serde_json::json!({"root": "r"}));
+        }
+        let v = serde_json::to_value(&fm).unwrap();
+        assert_eq!(v["ts"], serde_json::json!("ts-a"));
+        assert_eq!(v["card"]["root"], serde_json::json!("r"));
+        // Without a card the field is absent, not null — old clients stay clean.
+        let v = serde_json::to_value(FrontendMessage::from_message(&asst).unwrap()).unwrap();
+        assert!(v.get("card").is_none());
+
+        // Legacy wire data (no ts, no card) still deserializes.
+        let old: FrontendMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "x"
+        }))
+        .unwrap();
+        match old {
+            FrontendMessage::User { content, ts } => {
+                assert_eq!(content, "x");
+                assert!(ts.is_empty());
+            }
+            other => panic!("expected User, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1869,7 +1964,10 @@ mod tests {
         };
         let fm = FrontendMessage::from_message(&user);
         assert!(fm.is_some());
-        assert!(matches!(fm.unwrap(), FrontendMessage::User { content } if content == "hello"));
+        assert!(matches!(
+            fm.unwrap(),
+            FrontendMessage::User { content, .. } if content == "hello"
+        ));
 
         let asst = Message::Assistant {
             meta: MessageMeta {
@@ -1881,7 +1979,10 @@ mod tests {
             thinking_blocks: None,
         };
         let fm = FrontendMessage::from_message(&asst);
-        assert!(matches!(fm.unwrap(), FrontendMessage::Assistant { content } if content == "hi"));
+        assert!(matches!(
+            fm.unwrap(),
+            FrontendMessage::Assistant { content, .. } if content == "hi"
+        ));
 
         let system = Message::System {
             meta: MessageMeta {
@@ -1954,6 +2055,7 @@ mod tests {
     fn test_frontend_message_serde() {
         let user = FrontendMessage::User {
             content: "hello".to_string(),
+            ts: "t1".to_string(),
         };
         let json = serde_json::to_string(&user).unwrap();
         assert!(json.contains("\"role\":\"user\""));
@@ -1961,6 +2063,8 @@ mod tests {
 
         let asst = FrontendMessage::Assistant {
             content: "hi".to_string(),
+            ts: "t2".to_string(),
+            card: None,
         };
         let json = serde_json::to_string(&asst).unwrap();
         assert!(json.contains("\"role\":\"assistant\""));

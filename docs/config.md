@@ -77,7 +77,8 @@ cargo run -- -d /data/myapp setup
   "providers": { ... },
   "tools": [ ... ],
   "channels": { ... },
-  "gateway": { ... }
+  "gateway": { ... },
+  "json_render": { ... }
 }
 ```
 
@@ -90,6 +91,7 @@ cargo run -- -d /data/myapp setup
 | `tools` | array | 否 | `[]` | 注册的工具定义列表 |
 | `channels` | object | 否 | `{}` | 通信通道定义（键值映射） |
 | `gateway` | object | 否 | 见下文 | Gateway 模式配置 |
+| `json_render` | object | 否 | 见下文 | WebUI 卡片生成配置 |
 
 ### `channels` — 通信通道
 
@@ -163,6 +165,19 @@ cargo run -- -d /data/myapp setup
 
 **Dream 说明：** Dream 服务定期分析 `memory/history.jsonl` 中未处理的对话历史，将关键事实整理到长期记忆文件（SOUL.md, USER.md, MEMORY.md, skills/）。可通过 `/dream` 命令手动触发。Dream 完成后会清理已处理的 history 条目（保留最近 50 条）。
 
+### `json_render` — WebUI 卡片生成
+
+控制一次 Run 结束后独立的卡片生成调用（机制见 `docs/channels.md` 「卡片下发」，决策见 `docs/adr/0005`）。缺段时用默认值。
+
+| 字段 | 类型 | 默认值 | 范围 | 说明 |
+|------|------|--------|------|------|
+| `enabled` | bool | `true` | — | 卡片生成总开关（真正的门依旧是 Catalog 注册：未注册的会话从不产生卡片） |
+| `model_override` | string \| null | `null` | — | 可选：指定卡片生成用的 provider 名称（默认用主 agent 的 provider，未命中时回退） |
+| `max_tokens` | uint | `2048` | 64–32768 | 单次卡片生成调用的输出 token 预算（覆盖所用 provider 的 `max_tokens`） |
+| `timeout_seconds` | uint | `30` | 1–300 | 单次卡片生成调用的**无进展窗口**（秒）：流式信号（内容增量或存活心跳）到达即续命，窗口内毫无信号才判停滞，静默降级为 `failed` 事件 |
+
+**说明：** 卡片 provider 的身份（base_url/api_key/model）来自 `model_override` 命中的 provider 或主 agent provider，`max_tokens` 恒为 `json_render.max_tokens`，且 `disable_thinking` 恒为 true（卡片是机械的转录→JSONL 转换，思考只会拖慢速度并拉长首信号等待，主 agent 对话不受此影响）。
+
 ### `agent` — Agent 配置
 
 SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用一个 Provider。
@@ -200,6 +215,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `temperature` | float | range(0.0, 2.0) | `0.7` | 采样温度 |
 | `max_tokens` | uint | range(1, 100000) | `4096` | 单次最大响应 token 数 |
 | `prompt_cache_enabled` | bool | — | `true` | 是否启用 prompt 缓存 |
+| `disable_thinking` | bool | — | `false` | 强制禁用该 provider 调用的思考/推理模式（请求体注入 `enable_thinking: false`，DashScope 兼容接口字段；卡片生成路径恒为 true） |
 
 **URL 解析逻辑（归一化）：** `api_url` 优先级更高。如果为空，则从 `base_url` 推导：
 - `base_url` 以 `/chat/completions` 结尾 → 直接使用

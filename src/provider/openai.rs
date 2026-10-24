@@ -8,7 +8,7 @@ use crate::session::Message;
 use crate::tool::ToolDefinition;
 use crate::trace::SpanRecorder;
 
-use super::{FinishReason, LLMResponse, Usage};
+use super::{FinishReason, LLMResponse, StreamSignal, Usage};
 
 pub struct OpenAIProvider {
     client: reqwest::Client,
@@ -241,6 +241,128 @@ struct ApiFunction {
     arguments: String,
 }
 
+impl ApiUsage {
+    fn to_usage(&self) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt_tokens.unwrap_or(0),
+            prompt_cache_hit_tokens: self
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
+            completion_tokens: self.completion_tokens.unwrap_or(0),
+            total_tokens: self.total_tokens.unwrap_or(0),
+        }
+    }
+}
+
+/// Byte-level SSE line splitter. Network chunks can split an event anywhere;
+/// a UTF-8 continuation byte is always ≥ 0x80 and never 0x0A, so buffering
+/// raw bytes and splitting on `\n` cannot corrupt a half-received character.
+#[derive(Default)]
+struct SseLineReader {
+    buf: Vec<u8>,
+}
+
+impl SseLineReader {
+    fn feed(&mut self, bytes: &[u8], on_data: &mut dyn FnMut(&str)) {
+        self.buf.extend_from_slice(bytes);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            Self::handle_line(&line[..pos], on_data);
+        }
+    }
+
+    /// Flush a trailing line the stream never terminated with `\n`.
+    fn finish(&mut self, on_data: &mut dyn FnMut(&str)) {
+        if !self.buf.is_empty() {
+            let line = std::mem::take(&mut self.buf);
+            Self::handle_line(&line, on_data);
+        }
+    }
+
+    fn handle_line(raw: &[u8], on_data: &mut dyn FnMut(&str)) {
+        let line = String::from_utf8_lossy(raw);
+        let line = line.trim_end_matches('\r');
+        // Blank lines separate events; comments (": ...") and other fields
+        // ("event:", "id:", "retry:") carry no payload.
+        if let Some(data) = line.strip_prefix("data:") {
+            on_data(data.trim());
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    usage: Option<ApiUsage>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    content: Option<String>,
+}
+
+/// Accumulates parsed SSE payloads: content deltas, the finish reason, and
+/// the trailing usage chunk delivered via `stream_options.include_usage`.
+#[derive(Default)]
+struct StreamAccumulator {
+    content: String,
+    usage: Usage,
+    finish_reason: Option<String>,
+    done: bool,
+}
+
+/// What one `data:` payload turned out to be, after accumulation.
+#[derive(Debug, PartialEq, Eq)]
+enum Payload {
+    /// A content increment.
+    Delta(String),
+    /// A valid payload with no content (role opening, reasoning chunk, usage,
+    /// `[DONE]`): proof the stream is alive.
+    Alive,
+    /// A malformed payload: skipped — garbage is neither content nor progress.
+    Garbage,
+}
+
+impl StreamAccumulator {
+    /// Consume one `data:` payload, classifying it for the caller. Malformed
+    /// payloads are skipped: garbage mid-stream must not abort a generation
+    /// the way the non-streaming path would fail the whole call.
+    fn handle_data(&mut self, data: &str) -> Payload {
+        if data == "[DONE]" {
+            self.done = true;
+            return Payload::Alive;
+        }
+        let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
+            return Payload::Garbage;
+        };
+        if let Some(u) = chunk.usage {
+            self.usage = u.to_usage();
+        }
+        for choice in chunk.choices {
+            if let Some(fr) = choice.finish_reason {
+                self.finish_reason = Some(fr);
+            }
+            if let Some(c) = choice.delta.content
+                && !c.is_empty()
+            {
+                self.content.push_str(&c);
+                return Payload::Delta(c);
+            }
+        }
+        Payload::Alive
+    }
+}
+
 #[async_trait]
 impl crate::provider::Provider for OpenAIProvider {
     async fn chat(
@@ -265,6 +387,12 @@ impl crate::provider::Provider for OpenAIProvider {
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
         });
+
+        // Off-switch for thinking/reasoning modes (DashScope-compatible
+        // `enable_thinking`; card generation sets it, the agent body never does).
+        if self.config.disable_thinking {
+            body["enable_thinking"] = serde_json::json!(false);
+        }
 
         if let Some(tools) = tools {
             let tool_defs = build_tool_defs(tools, self.config.prompt_cache_enabled);
@@ -334,16 +462,7 @@ impl crate::provider::Provider for OpenAIProvider {
         let usage = api_resp
             .usage
             .as_ref()
-            .map(|u| Usage {
-                prompt_tokens: u.prompt_tokens.unwrap_or(0),
-                prompt_cache_hit_tokens: u
-                    .prompt_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.cached_tokens)
-                    .unwrap_or(0),
-                completion_tokens: u.completion_tokens.unwrap_or(0),
-                total_tokens: u.total_tokens.unwrap_or(0),
-            })
+            .map(ApiUsage::to_usage)
             .unwrap_or_default();
 
         let tool_call_count = match &tool_calls {
@@ -373,11 +492,205 @@ impl crate::provider::Provider for OpenAIProvider {
             usage,
         })
     }
+
+    async fn chat_stream(
+        &self,
+        messages: &[&Message],
+        tools: Option<&[ToolDefinition]>,
+        recorder: Option<&dyn SpanRecorder>,
+        on_signal: &mut (dyn FnMut(StreamSignal) + Send),
+    ) -> Result<LLMResponse> {
+        if tools.is_some() {
+            // Streaming only covers plain content (the card call never passes
+            // tools): tool-calling requests fall back to non-streaming.
+            debug!("[OpenAIProvider] chat_stream with tools → non-streaming fallback");
+            let resp = self.chat(messages, tools, recorder).await?;
+            if let Some(content) = &resp.content
+                && !content.is_empty()
+            {
+                on_signal(StreamSignal::Content(content.clone()));
+            }
+            return Ok(resp);
+        }
+
+        debug!(
+            "[OpenAIProvider] POST {} (stream, model={}, messages={})",
+            self.api_url,
+            self.config.model,
+            messages.len()
+        );
+
+        let api_messages = build_api_messages(messages, self.config.prompt_cache_enabled);
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": api_messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "stream": true,
+            "stream_options": { "include_usage": true },
+        });
+        if self.config.disable_thinking {
+            body["enable_thinking"] = serde_json::json!(false);
+        }
+
+        if let Some(rec) = recorder {
+            rec.set_attribute("gen_ai.provider.name", serde_json::json!("openai"));
+            rec.set_attribute("gen_ai.request.model", serde_json::json!(self.config.model));
+            if let Ok(body_str) = serde_json::to_string(&body) {
+                rec.set_attribute("http.request.body", serde_json::json!(body_str));
+            }
+        }
+
+        let resp = self
+            .client
+            .post(&self.api_url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await?;
+            anyhow::bail!("API request failed: {} - {}", status, text);
+        }
+
+        use futures::StreamExt;
+        let mut reader = SseLineReader::default();
+        let mut acc = StreamAccumulator::default();
+        let mut stream = resp.bytes_stream();
+        // Valid `data:` payloads without content (role-only openings, reasoning
+        // chunks, trailing usage, [DONE]) surface as Activity: the stream is
+        // demonstrably alive, which consumers may use to tell apart "thinking"
+        // Malformed payloads emit no signal at all. `acc` is passed explicitly
+        // so the loop can still read `acc.done` between feeds.
+        let mut emit = |acc: &mut StreamAccumulator, data: &str| match acc.handle_data(data) {
+            Payload::Delta(delta) => on_signal(StreamSignal::Content(delta)),
+            Payload::Alive => on_signal(StreamSignal::Activity),
+            Payload::Garbage => {}
+        };
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Failed to read streaming chunk")?;
+            reader.feed(&chunk, &mut |data| emit(&mut acc, data));
+            if acc.done {
+                break;
+            }
+        }
+        // A stream closed without [DONE]: flush whatever unterminated tail is left.
+        reader.finish(&mut |data| emit(&mut acc, data));
+
+        let finish_reason = match acc.finish_reason.as_deref() {
+            Some("stop") | None => FinishReason::Stop,
+            Some("tool_calls") => FinishReason::ToolCalls,
+            Some("length") => FinishReason::Length,
+            Some("error") => FinishReason::Error,
+            _ => FinishReason::Error,
+        };
+        debug!(
+            "[OpenAIProvider] Stream done: finish={:?}, content_len={}, {}",
+            finish_reason,
+            acc.content.len(),
+            acc.usage
+        );
+
+        Ok(LLMResponse {
+            content: if acc.content.is_empty() {
+                None
+            } else {
+                Some(acc.content)
+            },
+            tool_calls: None,
+            finish_reason,
+            usage: acc.usage,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sse_line_reader_buffers_event_split_across_chunks() {
+        // Seam 2: one SSE event chopped in two by the network must still yield
+        // exactly one complete data payload (never half a JSON).
+        let mut reader = SseLineReader::default();
+        let mut payloads: Vec<String> = Vec::new();
+        reader.feed(b"data: {\"choices\":[{\"del", &mut |d| {
+            payloads.push(d.to_string())
+        });
+        assert!(payloads.is_empty(), "partial line must not surface");
+        reader.feed(
+            b"ta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n",
+            &mut |d| payloads.push(d.to_string()),
+        );
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0], r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
+        assert_eq!(payloads[1], "[DONE]");
+    }
+
+    #[test]
+    fn test_sse_line_reader_ignores_blank_lines_comments_and_other_fields() {
+        let mut reader = SseLineReader::default();
+        let mut payloads: Vec<String> = Vec::new();
+        reader.feed(
+            b": keep-alive\n\nevent: message\nid: 7\ndata: ok\n",
+            &mut |d| payloads.push(d.to_string()),
+        );
+        assert_eq!(payloads, vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn test_sse_line_reader_finish_flushes_unterminated_tail() {
+        let mut reader = SseLineReader::default();
+        let mut payloads: Vec<String> = Vec::new();
+        reader.feed(b"data: tail", &mut |d| payloads.push(d.to_string()));
+        assert!(payloads.is_empty());
+        reader.finish(&mut |d| payloads.push(d.to_string()));
+        assert_eq!(payloads, vec!["tail".to_string()]);
+    }
+
+    #[test]
+    fn test_accumulator_collects_deltas_finish_and_trailing_usage() {
+        let mut acc = StreamAccumulator::default();
+        assert_eq!(
+            acc.handle_data(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
+            Payload::Alive,
+            "role-only chunk carries no content but proves liveness"
+        );
+        assert_eq!(
+            acc.handle_data(r#"{"choices":[{"delta":{"content":"{\"op\""}}]}"#),
+            Payload::Delta("{\"op\"".to_string())
+        );
+        assert_eq!(
+            acc.handle_data(r#"{"choices":[{"delta":{"content":":1}"},"finish_reason":"stop"}]}"#),
+            Payload::Delta(":1}".to_string())
+        );
+        // Usage arrives in a trailing chunk with no choices.
+        acc.handle_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}"#,
+        );
+        assert!(!acc.done);
+        acc.handle_data("[DONE]");
+        assert!(acc.done, "[DONE] terminates the stream");
+        assert_eq!(acc.content, "{\"op\":1}");
+        assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(acc.usage.prompt_tokens, 5);
+        assert_eq!(acc.usage.completion_tokens, 7);
+        assert_eq!(acc.usage.total_tokens, 12);
+    }
+
+    #[test]
+    fn test_accumulator_skips_malformed_payloads() {
+        let mut acc = StreamAccumulator::default();
+        assert_eq!(acc.handle_data("not json at all"), Payload::Garbage);
+        assert_eq!(
+            acc.handle_data(r#"{"choices":[{"delta":{"content":"kept"}}]}"#),
+            Payload::Delta("kept".to_string())
+        );
+        assert_eq!(acc.content, "kept");
+    }
     use crate::provider::Provider;
     use crate::session::Content;
 
@@ -398,6 +711,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: 4096,
             prompt_cache_enabled: true,
+            disable_thinking: false,
             unknown: Default::default(),
         }
     }
@@ -903,6 +1217,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: 4096,
             prompt_cache_enabled: false,
+            disable_thinking: false,
             unknown: Default::default(),
         };
 
@@ -990,6 +1305,7 @@ mod tests {
             temperature: 0.5,
             max_tokens: 2048,
             prompt_cache_enabled: true,
+            disable_thinking: false,
             unknown: Default::default(),
         };
 
@@ -1189,6 +1505,7 @@ mod tests {
                 temperature: 0.7,
                 max_tokens: 4096,
                 prompt_cache_enabled: false,
+                disable_thinking: false,
                 unknown: Default::default(),
             };
             let provider = OpenAIProvider::new(&config);
@@ -1367,6 +1684,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: 4096,
             prompt_cache_enabled: false,
+            disable_thinking: false,
             unknown: Default::default(),
         };
 
@@ -1885,5 +2203,70 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
         assert_eq!(parsed["model"], "gpt-4");
         assert!(parsed["messages"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_chat_disable_thinking_injects_enable_thinking_false() {
+        // A provider config marked disable_thinking must send the DashScope-
+        // compatible off-switch in the request body — and an unmarked config
+        // must not carry the field at all (other endpoints need not see it).
+        let provider =
+            OpenAIProvider::new(&make_config("http://127.0.0.1:1/v1/chat/completions", ""));
+        let recorder = MockRecorder {
+            attributes: Default::default(),
+        };
+        let user = Message::user("hello".to_string());
+        let messages: Vec<&Message> = vec![&user];
+        let _ = provider.chat(&messages, None, Some(&recorder)).await;
+        let body = recorded_body(&recorder);
+        assert!(
+            body.get("enable_thinking").is_none(),
+            "default config must not carry the off-switch: {body}"
+        );
+
+        let mut cfg = make_config("http://127.0.0.1:1/v1/chat/completions", "");
+        cfg.disable_thinking = true;
+        let provider = OpenAIProvider::new(&cfg);
+        let recorder = MockRecorder {
+            attributes: Default::default(),
+        };
+        let _ = provider.chat(&messages, None, Some(&recorder)).await;
+        let body = recorded_body(&recorder);
+        assert_eq!(
+            body["enable_thinking"],
+            serde_json::json!(false),
+            "disable_thinking must send enable_thinking=false: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_disable_thinking_injects_enable_thinking_false() {
+        // The streaming path (card generation) carries the same off-switch.
+        let mut cfg = make_config("http://127.0.0.1:1/v1/chat/completions", "");
+        cfg.disable_thinking = true;
+        let provider = OpenAIProvider::new(&cfg);
+        let recorder = MockRecorder {
+            attributes: Default::default(),
+        };
+        let user = Message::user("hello".to_string());
+        let messages: Vec<&Message> = vec![&user];
+        let _ = provider
+            .chat_stream(&messages, None, Some(&recorder), &mut |_| {})
+            .await;
+        let body = recorded_body(&recorder);
+        assert_eq!(
+            body["enable_thinking"],
+            serde_json::json!(false),
+            "streaming body must also disable thinking: {body}"
+        );
+    }
+
+    fn recorded_body(recorder: &MockRecorder) -> serde_json::Value {
+        let attrs = recorder.attributes.lock().unwrap();
+        let body = attrs
+            .get("http.request.body")
+            .expect("request body recorded even on failure");
+        let body_str = body.as_str().expect("body stored as a string attribute");
+        serde_json::from_str(body_str).unwrap()
     }
 }

@@ -32,6 +32,10 @@ pub trait Channel: Send + Sync {
     /// 输出 Agent 运行时事件（tool_call、assistant_message 等）
     async fn write_event(&mut self, event: &AgentEvent) -> Result<()> { Ok(()) }
 
+    /// 输出卡片事件（WebUI 生成式 UI）。默认 no-op——只有 WebUI 类通道渲染卡片，
+    /// CLI、cron、heartbeat 继承默认实现直接丢弃。
+    async fn write_card(&mut self, event: &CardEvent) -> Result<()> { Ok(()) }
+
     /// 准备注入到上下文的额外信息（可选）
     async fn prepare_inject(&self) -> Result<String>;
 
@@ -108,6 +112,16 @@ loop:
 ```
 
 当所有通道关闭、outbound 发送端断开时，此方法返回。
+
+### 卡片事件路由
+
+卡片事件（`CardEvent`，见 `docs/channels.md` 「卡片下发」）**不走 `AgentEvent` 广播**，而是经独立 mpsc 进入 `ChannelManager`：
+
+```rust
+channel_manager.attach_card_rx(card_rx); // Gateway 接线时调用，未接线则无卡片链路（如 CLI）
+```
+
+`run_with_shutdown` 循环同时监听 outbound 与 card 通道，卡片事件按 `session_id` 的通道前缀路由到对应通道并调用 `write_card`（`dispatch_card` 纯函数，路由决策可直接单测）。不支持卡片的通道由默认 no-op 实现兜底，无需感知卡片机制存在。
 
 ## CliChannel
 

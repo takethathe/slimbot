@@ -417,6 +417,18 @@ impl AgentLoop {
         self.session_manager.clone()
     }
 
+    /// The provider used for agent turns. Card generation reuses this same
+    /// provider (a later slice adds optional model override via config).
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        self.provider.clone()
+    }
+
+    /// The shared tracer, for wiring-time injection into non-runner
+    /// instrumentation (e.g. the card service's `json_render.generate` span).
+    pub fn tracer(&self) -> Option<Arc<Tracer>> {
+        self.tracer.clone()
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -494,7 +506,7 @@ impl AgentLoop {
         let _ = outbound_tx
             .send(BusResult {
                 session_id: session_id.to_string(),
-                task_id: String::new(),
+                run_id: uuid::Uuid::new_v4().to_string(),
                 content: response,
             })
             .await;
@@ -562,7 +574,7 @@ impl AgentLoop {
                             let _ = outbound_tx
                                 .send(BusResult {
                                     session_id: request.session_id.clone(),
-                                    task_id: String::new(),
+                                    run_id: uuid::Uuid::new_v4().to_string(),
                                     content: response,
                                 })
                                 .await;
@@ -590,7 +602,7 @@ impl AgentLoop {
                             if !msg.is_empty() {
                                 message_bus.publish_outbound(BusResult {
                                     session_id: sid.clone(),
-                                    task_id: String::new(),
+                                    run_id: uuid::Uuid::new_v4().to_string(),
                                     content: msg,
                                 }).await;
                             }
@@ -804,6 +816,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -826,6 +839,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -1013,6 +1027,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1035,6 +1050,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
@@ -1073,6 +1089,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1095,6 +1112,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1151,6 +1169,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1173,6 +1192,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let agent_loop = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
@@ -1210,6 +1230,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1232,6 +1253,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let agent_loop =
@@ -1269,6 +1291,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1291,6 +1314,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let mut agent_loop =
@@ -1364,6 +1388,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1386,6 +1411,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1427,6 +1453,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1449,6 +1476,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
         AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
             .await
@@ -1524,6 +1552,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
         let (event_tx, _) = broadcast::channel::<crate::session::AgentEvent>(256);
         let channel_manager = Arc::new(crate::channel::ChannelManager::new(
@@ -1589,6 +1618,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1611,6 +1641,7 @@ mod tests {
             web_fetch: None,
             tracing: Default::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
@@ -1693,6 +1724,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1715,6 +1747,7 @@ mod tests {
             web_fetch: None,
             tracing: crate::config::TraceConfig::default(),
             memory: Default::default(),
+            json_render: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1907,6 +1940,7 @@ mod tests {
                         temperature: 0.7,
                         max_tokens: 4096,
                         prompt_cache_enabled: false,
+                        disable_thinking: false,
                         unknown: Default::default(),
                     },
                 );
@@ -1941,6 +1975,7 @@ mod tests {
                 unknown: Default::default(),
             },
             memory: Default::default(),
+            json_render: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());

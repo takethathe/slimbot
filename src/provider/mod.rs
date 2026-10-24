@@ -98,11 +98,65 @@ pub trait Provider: Send + Sync {
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
     ) -> Result<LLMResponse>;
+
+    /// Streaming variant of [`chat`](Self::chat): signals are handed to
+    /// `on_signal` as they arrive; the returned `LLMResponse` carries the
+    /// accumulated whole.
+    ///
+    /// The default implementation degrades to non-streaming: it calls `chat()`
+    /// and emits the entire content as a single delta, so providers without a
+    /// streaming endpoint (and existing test doubles) work unchanged. Callers
+    /// must not read the silence of a degraded provider as a stall: providers
+    /// that cannot stream emit no signals until the call completes.
+    async fn chat_stream(
+        &self,
+        messages: &[&Message],
+        tools: Option<&[ToolDefinition]>,
+        recorder: Option<&dyn SpanRecorder>,
+        on_signal: &mut (dyn FnMut(StreamSignal) + Send),
+    ) -> Result<LLMResponse> {
+        let resp = self.chat(messages, tools, recorder).await?;
+        if let Some(content) = &resp.content
+            && !content.is_empty()
+        {
+            on_signal(StreamSignal::Content(content.clone()));
+        }
+        Ok(resp)
+    }
+}
+
+/// One observation delivered to a [`Provider::chat_stream`] consumer as the
+/// call progresses. Splitting content from mere liveness lets a reasoning
+/// model's non-content chunks (or any keep-alive) hold off a consumer's
+/// no-progress timeout without feeding the consumer's content pipeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamSignal {
+    /// A content increment, to be rendered or compiled.
+    Content(String),
+    /// Transport-level progress with nothing to show yet: the call is alive.
+    Activity,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_chat_stream_default_degrades_to_one_delta() {
+        // Seam 2: a provider that only implements `chat` must still satisfy
+        // `chat_stream`, emitting the whole content as a single delta.
+        let provider = MockProvider::new();
+        let mut signals: Vec<StreamSignal> = Vec::new();
+        let resp = provider
+            .chat_stream(&[], None, None, &mut |s| signals.push(s))
+            .await
+            .unwrap();
+        assert_eq!(
+            signals,
+            vec![StreamSignal::Content("Mock response".to_string())]
+        );
+        assert_eq!(resp.content, Some("Mock response".to_string()));
+    }
 
     #[test]
     fn test_finish_reason_display() {

@@ -1,5 +1,27 @@
 # TODO
 
+## WebUI json-render 卡片（2026-10-24 完成）
+
+- [x] **run_id 贯通（T01）** — 恒为空串的 `BusResult.task_id` 落实并改名 `run_id`，从 `TaskHook` 分配，贯穿生命周期事件、`BusResult` 与卡片事件
+- [x] **SpecCompiler + transcript 裁剪（T02）** — `src/card/`：JSONL patch 流式编译为 Card spec（`root` + `elements` + `state`），坏行跳过/超限熔断；Run transcript 按消息游标裁剪（`TaskStarted` 记游标、`TaskCompleted` 读 `messages[cursor..]`）
+- [x] **首张卡片端到端（T03）** — `CardService`（channel 层、Run 后独立流式调用）、Catalog 注册端点 `POST /json-render/catalog`（fail-closed 能力握手）、`Channel::write_card` 默认 no-op + 独立 mpsc 经 `ChannelManager` 路由、前端 index.html 卡片渲染（不污染会话）
+- [x] **卡片流式铺开（T04）** — `Provider::chat_stream`（trait 默认降级为单次 delta）+ OpenAI 真流式 SSE（`stream:true` + `include_usage`、`SseLineReader` 跨 chunk 缓冲、坏行跳过、带 tools 回落非流式）；`CardEvent::Started/Delta/Completed/Failed`；前端 rAF 合并增量渲染
+- [x] **词表扩充与卡片内交互（T05）** — 前端 registry 扩到十二种组件；卡片内交互限本地状态（`setState`/`visible`），动作不上行
+- [x] **卡片回放（T06）** — Card sidecar `sessions/{chat_id}.cards.jsonl`（以 Run 末条 assistant 消息 timestamp 为锚，不进会话 JSONL）；`/session` 返回契约扩 `ts`/`card` 字段，按锚点精确挂回，锚点消失则不挂
+- [x] **护栏与配置（T07）** — `CardPolicy`（并发闸门 max 2 超限跳过、30s 超时、进程退出取消进行中生成）；`json_render.generate` span（`json_render.patch_count` + token usage，失败路径 Error status）；顶层 `json_render` 配置段（enabled/model_override/max_tokens/timeout_seconds，入 config schema + patch）；卡片 provider 解析（override 命中或回退主 provider，预算恒为 json_render.max_tokens）
+- [x] **文档收口（T08）** — docs/channels.md 卡片下发节 + 端点表、docs/channel.md `write_card`/卡片路由、docs/provider.md 重写为实际 trait（含流式契约）、docs/config.md `json_render` 段、CONTEXT.md 术语与 ADR 0005
+- [x] **验证** — `cargo fmt -- --check`、`cargo clippy --all-targets`（无 warning）、`cargo test` 全过（1181 lib + 全部集成）
+- [x] **上线后修复：无进展超时窗口（2026-10-24）** — 旧语义下 `timeout_seconds` 是单次调用总时长上限，思考模型（如 qwen3 推理阶段只发 `reasoning_content` chunk）必被误杀。`Provider::chat_stream` 回调从 `FnMut(String)` 升级为 `FnMut(StreamSignal)`（`Content` 内容增量 / `Activity` 传输层存活心跳）；OpenAI 实现把合法但无内容的 chunk（role 开场、reasoning、usage、`[DONE]`）映射为 `Activity`，坏行不发信号；`CardService::generate` 改为看门狗结构（provider 调用入 worker task，每信号续命，biased select 监督 done/tick/deadline，停滞或取消时由 `AbortOnDrop` 掐断 worker），窗口内毫无信号才判停滞。降级（非流式）provider 行为不变：调用完成前零信号，表现仍为总时长上限。回归测试：`test_stream_activity_signals_extend_the_timeout_window`、`test_stream_stall_after_progress_still_fails`
+- [x] **上线后修复：卡片调用禁用思考（2026-10-24）** — `ProviderConfig` 新增 `disable_thinking` 字段（true 时非流式/流式请求体都注入 `enable_thinking: false`，DashScope 兼容接口扩展字段；未标记的 provider 不发该字段）；`card_provider_config` 对卡片 provider 强制置 true（机械的转录→JSONL 转换不需要推理，思考阶段白白拖慢首信号与总延迟），主 agent 对话不受影响。回归测试：`test_card_provider_disables_thinking_for_card_calls`、`test_chat_disable_thinking_injects_enable_thinking_false`、`test_chat_stream_disable_thinking_injects_enable_thinking_false`
+
+Spec 见 `.scratch/webui-json-render-cards/spec.md`；票文见同目录 `issues/`；决策见 `docs/adr/0005-post-run-card-generation.md`。
+
+**后续切片：**
+
+- [ ] **卡片动作上行（emit）** — 卡片交互驱动新一轮对话：需单独输入通道、防重入、「用户打字 vs 卡片点击」区分（ADR 0005 已标注另立 ADR）
+- [ ] **多套 Catalog** — 当前每 chat 一份上报的 Catalog prompt；多客户端词表共存（不同版本 registry / 不同主题词表）与服务端选套策略待立项
+- [ ] **侧车清理策略** — `*.cards.jsonl` 只追加无回收：会话删除/consolidation 后锚点失效的卡片清理、体积上限、与 session 生命周期对齐均未实现
+
 ## Memory entry 索引与检索（只读切片，2026-09-26 完成）
 
 - [x] **ADR 0004** — 记录 entry 层是文档的派生视图、有意偏离 zeroclaw 的 entry 权威模型、关键词优先、只读、ADR 0003 继续有效（叠加关系）
