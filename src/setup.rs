@@ -20,6 +20,8 @@ fn default_config() -> Config {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     }
 }
 
@@ -115,6 +117,8 @@ fn create_directories_and_bootstrap(paths: &PathManager) -> Result<()> {
     std::fs::create_dir_all(paths.workspace_dir())?;
     std::fs::create_dir_all(paths.skills_dir())?;
     std::fs::create_dir_all(paths.memory_dir())?;
+    std::fs::create_dir_all(paths.agents_dir())?;
+    std::fs::create_dir_all(paths.triggers_dir())?;
 
     // Write bootstrap files (skip if already exists)
     for (dest, template) in bootstrap_files() {
@@ -122,6 +126,9 @@ fn create_directories_and_bootstrap(paths: &PathManager) -> Result<()> {
         if path.exists() {
             eprintln!("  {} already exists, skipping.", dest);
         } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::write(&path, template)?;
             eprintln!("  Created {}.", dest);
         }
@@ -185,6 +192,8 @@ mod tests {
         assert!(paths.workspace_dir().exists());
         assert!(paths.skills_dir().exists());
         assert!(paths.memory_dir().exists());
+        assert!(paths.agents_dir().exists());
+        assert!(paths.triggers_dir().exists());
 
         // Bootstrap files should exist
         let workspace = paths.workspace_dir();
@@ -193,6 +202,7 @@ mod tests {
         assert!(workspace.join("SOUL.md").exists());
         assert!(workspace.join("TOOLS.md").exists());
         assert!(workspace.join("memory").join("MEMORY.md").exists());
+        assert!(workspace.join("agents").join("trigger.md").exists());
         // identity/dream stay embedded-only — never written to the workspace.
         assert!(!workspace.join("identity.md").exists());
         assert!(!workspace.join("dream.md").exists());

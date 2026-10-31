@@ -12,7 +12,7 @@ use crate::info;
 use crate::message_bus::{BusResult, MessageBus};
 use crate::path::PathManager;
 use crate::session::{AgentEvent, TaskHook};
-use crate::tool::ToolManager;
+use crate::tool::{Tool, ToolManager};
 use crate::tools::cron::CronTool;
 use crate::tools::message::MessageTool;
 
@@ -47,11 +47,18 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
     tool_manager.init_from_config(&config.tools);
 
+    // The catalog mirrors the main loop's tool set as factories, so each
+    // subagent run can assemble its own ToolManager without touching the
+    // shared one (which would break prompt caching and concurrent runs).
+    let mut catalog = crate::agent::ToolCatalog::new();
+    catalog.register_builtin_set(&config.tools, paths.workspace_dir());
+
     // Create message tool with send callback
     let mut message_tool = MessageTool::new();
     let outbound_tx = message_bus.outbound_tx();
+    let send_outbound = outbound_tx.clone();
     message_tool.set_send_callback(Arc::new(move |channel, chat_id, content| {
-        let tx = outbound_tx.clone();
+        let tx = send_outbound.clone();
         Box::pin(async move {
             tx.send(BusResult {
                 session_id: format!("{}:{}", channel, chat_id),
@@ -64,11 +71,72 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     }));
     tool_manager.register(Box::new(message_tool));
 
+    // Catalog factory for `message`: one instance per run, same send path.
+    catalog.register(
+        "message",
+        Arc::new(move || {
+            let tx = outbound_tx.clone();
+            let mut tool = MessageTool::new();
+            tool.set_send_callback(Arc::new(move |channel, chat_id, content| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    tx.send(BusResult {
+                        session_id: format!("{}:{}", channel, chat_id),
+                        run_id: uuid::Uuid::new_v4().to_string(),
+                        content,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                })
+            }));
+            Some(Box::new(tool) as Box<dyn Tool>)
+        }),
+    );
+
     // Create cron service and cron tool
     let cron_service = CronService::new(paths.workspace_dir());
     let cron_service_arc = Arc::new(cron_service);
     let cron_tool = CronTool::new(cron_service_arc.clone());
     tool_manager.register(Box::new(cron_tool));
+    let cron_for_catalog = cron_service_arc.clone();
+    catalog.register(
+        "cron",
+        Arc::new(move || Some(Box::new(CronTool::new(cron_for_catalog.clone())) as Box<dyn Tool>)),
+    );
+
+    // Trigger data sources live outside the main loop's tool list: the
+    // `trigger_source` and `trigger` tools are visible only to agents that
+    // declare them, while the tick itself runs in the background. Both tools and
+    // the tick share the *same* layers, so what an agent creates is what the
+    // next tick judges.
+    let (source_layer, rules_layer, trigger_secrets) =
+        crate::trigger::build_layers(&config.triggers, paths.workspace_dir());
+    let sources_for_catalog = source_layer.clone();
+    catalog.register(
+        "trigger_source",
+        Arc::new(move || {
+            Some(Box::new(crate::trigger::tool::TriggerSourceTool::new(
+                sources_for_catalog.clone(),
+            )) as Box<dyn Tool>)
+        }),
+    );
+    let rules_for_catalog = rules_layer.clone();
+    let sources_for_trigger = source_layer.clone();
+    let secrets_for_trigger = trigger_secrets.clone();
+    let workspace_for_trigger = paths.workspace_dir().to_path_buf();
+    catalog.register(
+        "trigger",
+        Arc::new(move || {
+            Some(
+                Box::new(crate::trigger::subscription::tool::TriggerTool::new(
+                    rules_for_catalog.clone(),
+                    sources_for_trigger.clone(),
+                    workspace_for_trigger.clone(),
+                    secrets_for_trigger.clone(),
+                )) as Box<dyn Tool>,
+            )
+        }),
+    );
 
     // Create AgentLoop with pre-configured tool manager
     let agent_loop = Arc::new(
@@ -78,6 +146,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             inbound_rx,
             config.clone(),
             tool_manager,
+            catalog,
         )
         .await?,
     );
@@ -319,6 +388,47 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         }
     });
 
+    // Spawn the trigger tick loop and its consumer. The tick is its own
+    // interval, so `every_n_ticks` never drifts and neither cron nor heartbeat
+    // can delay it; the consumer sits outside that interval, so an agent run can
+    // outlive the tick that queued it.
+    {
+        let tracer = agent_loop
+            .tracer()
+            .map(|t| (*t).clone())
+            .unwrap_or_else(|| crate::trace::Tracer::new(vec![]));
+        // One subagent runtime and one message bus for the whole process: a
+        // trigger fire and a `subagent` tool call share the same concurrency
+        // gate and the same route back to a conversation.
+        let dispatch = crate::trigger::dispatch::Dispatcher::new(
+            Some(agent_loop.subagent_runtime()),
+            message_bus.clone(),
+            crate::trigger::history_path(paths.workspace_dir()),
+            config.triggers.history_lines,
+            config.triggers.max_queue,
+            config.triggers.max_merge,
+            tracer.clone(),
+        );
+        let trigger_service = crate::trigger::TriggerService::from_parts(
+            source_layer.clone(),
+            rules_layer.clone(),
+            trigger_secrets.clone(),
+            dispatch.clone(),
+            &config.triggers,
+            tracer,
+        );
+        if trigger_service.is_enabled() {
+            info!(
+                "[gateway] trigger tick started (interval={}s)",
+                trigger_service.tick_interval().as_secs()
+            );
+            tokio::spawn(dispatch.run());
+            tokio::spawn(trigger_service.run());
+        } else {
+            info!("[gateway] trigger tick disabled");
+        }
+    }
+
     info!("[gateway] Running, press Ctrl+C to stop");
 
     // Wait for Ctrl+C
@@ -448,6 +558,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -664,6 +776,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -801,6 +915,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let mut tool_manager = ToolManager::new(workspace_dir.clone());
@@ -818,6 +934,7 @@ mod tests {
             _receivers.inbound,
             config,
             tool_manager,
+            crate::agent::ToolCatalog::new(),
         )
         .await;
         assert!(result.is_ok());
@@ -855,6 +972,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -1070,6 +1189,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
@@ -1523,6 +1644,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         };
 
         assert_eq!(config.agent.max_iterations, 50);

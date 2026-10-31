@@ -14,6 +14,78 @@ _Avoid_: turn, task, request
 一次 Run 的唯一标识，在请求进入消息总线时分配，贯穿该 Run 的生命周期事件、结果与卡片事件。
 _Avoid_: task id, request id, turn id（代码历史字段名为 `task_id`，已统一为 `run_id`）
 
+### Identity & trust
+
+**Owner**:
+slimbot 的唯一人类主体（v1 永久单用户）。一个 gateway 只有一个 owner；会话、记忆、审批与投递最终都归属于 owner。
+_Avoid_: user（多用户语境下才用）, account
+
+**Owner id**:
+owner 的稳定标识（v1 固定为单例值），把会话、任务、审计与投递记录关联到同一个主体。
+_Avoid_: user id, account id
+
+**TurnKind**:
+一次 Run 的发起来源（User / Cron / Heartbeat / Trigger / Subagent），用于区分「谁在驱动这次运行」，不改变 Run 本身的定义。
+_Avoid_: task type, run type
+
+**Session**:
+一个通道内的对话上下文（如 WebUI 的一个 chat、Telegram 的一个私聊或群组），归 owner 所有；同一 owner 可拥有多个通道会话，记忆跨会话共享。
+_Avoid_: chat, conversation（`chat_id` 仍指通道内标识）
+
+**Risk level**:
+工具自带的能力分类（只读 / 工作区写入 / 命令执行 / 网络外出 / 对外发送），是工具的事实声明，不随配置改变。
+_Avoid_: permission, capability tier
+
+**Control level**:
+一个风险级在运行时受到的管控强度——普通（直接执行）/ 中级（需 owner 确认）/ 高级（直接拒绝），由配置决定。
+_Avoid_: risk level（那是工具的事实，不可配）
+
+**Pending approval**:
+一次 Run 中因中级管控而挂起、等待 owner 在**下一轮**确认的一个具体动作（工具 + 参数），仅在紧邻的下一轮可兑现，过期、重启或无人值守时作废。
+_Avoid_: ask user, confirm tool, confirmation dialog（v1 明确不存在阻塞式追问/确认工具，也不存在等待输入的挂起 Run）
+
+**Approval redemption**:
+在确认轮里重新发起已记录的同一个动作、并通过参数一致性校验后真正执行的过程。
+_Avoid_: auto approve, retry
+
+### Trigger
+
+**Data source**:
+被定期观察的一个外部或本地信息渠道。
+_Avoid_: feed, connector, watcher
+
+**Agent**:
+一份可被委托执行任务的独立定义：角色、可用能力、交付偏好。
+_Avoid_: agent profile, bot, persona
+
+**Subagent**:
+由 agent 发起的一次独立执行，有自己的会话，与发起方隔离。
+_Avoid_: worker, child agent
+
+**Trigger**:
+一条持久规则：「当某条件成立时，做某事并告知某人」。
+_Avoid_: subscription, rule, watcher
+
+**Condition**:
+trigger 的判定逻辑：读当下的世界，回答「命中了吗」。
+_Avoid_: filter, predicate
+
+**Snapshot**:
+某一时刻所有 data source 的只读视图。
+_Avoid_: cache, state
+
+**Fire**:
+一次命中：trigger 从规则变成动作的那一刻。
+_Avoid_: hit, match, emit
+
+**Evidence**:
+命中时被挑选出来、允许进入模型上下文的少量事实片段。
+_Avoid_: sample, payload, excerpt
+
+**Delivery**:
+把命中结果送回某个 channel 的行为。
+_Avoid_: notify, push, send
+
 ### Card (Generative UI)
 
 **Card**:
@@ -77,6 +149,40 @@ _Avoid_: vector store, memory db, cache
 **Embedded resource**:
 构建期经 `include!` 编进二进制的模板与静态文件（`src/embed.rs`、`resources/`）。
 _Avoid_: embed（当意指向量 embedding 时，须写全 `embedding`）
+
+**Promotion**:
+把一条 Memory entry 从「落地区文档」升到其规范归属文档（如从 core 升到 skill / user）的整理动作，由 Dream 在记忆整理时执行，不是写入时发生的判断。
+_Avoid_: memory routing（那是 Dream 提示词里的分类规则，不是晋升本身）, migrate
+
+**Protected document**:
+主模型不得改写、只能由 Dream 改的记忆文档（人格与身份描述、技能文档等）。
+_Avoid_: read-only doc（它不是只读，主模型仍可读）, locked file
+
+**Memory snapshot**:
+Dream 实际改写某篇记忆文档前，把旧内容按运行时间戳归档的一份副本。它既是回滚的载体（粒度 = 这篇文档回到这次 Dream 之前），也是条目年龄的推导源。快照目录不进入检索语料。
+_Avoid_: backup（泛指易与整体数据备份混称）, git commit（回滚刻意不依赖 git）
+
+**Entry age**:
+一条 Memory entry 的正文首次出现在 Memory snapshot 序列中的那一次，到当前之间的跨度。它是系统侧的推导值，只作为 Dream 整理时的侧信道提示，不进文档、不进检索结果。标题行的变动不改变它。
+_Avoid_: observed_date（v1 不写日期）, 时间戳（那是 history 行的系统时间，不是条目年龄）
+
+### Context pressure
+
+**Context pressure**:
+可用上下文容量接近上限时，「该扔掉什么」的判定状态及其动作集合。
+_Avoid_: token budget（budget 一词归花费配额独占）, overflow, context full
+
+**Derivation anchor**:
+唯一按绝对值配置的容量参数（模型窗口的 token 数）；其余长度类限制均由它按百分比派生。
+_Avoid_: max tokens（那指单次响应输出上限）, 全局预算
+
+**Tool-result exemption**:
+工具自述的属性：其结果既不被长度截断也不被残余清理。不随配置改变，与 Risk level 同类。
+_Avoid_: whitelist, compactable list（那是旧的按工具名硬编码的中心名单）
+
+**Residual cleanup**:
+把已过期的旧工具结果在上下文中压成一句引用的动作，引用里带已保存全文的位置，因而「被扔掉」不等于「不可找回」。
+_Avoid_: microcompact（代码符号名）, drop（不带可找回线索的整条丢弃只属于上下文裁剪，不是本动作）
 
 ### Observability
 

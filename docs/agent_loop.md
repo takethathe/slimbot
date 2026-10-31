@@ -4,7 +4,7 @@
 
 ## 概述
 
-`AgentLoop` 是 SlimBot 的顶层编排组件，负责初始化管理所有核心子系统的实例，包括 Provider、ToolManager、SessionManager、MemoryService 和 Consolidator。通过 `start_inbound()` 启动后台入站监听任务。
+`AgentLoop` 是 SlimBot 的顶层编排组件，负责初始化管理所有核心子系统的实例，包括 Provider、ToolManager、ToolCatalog、SessionManager、MemoryService、Consolidator、DreamService 和 SubagentRuntime。通过 `start_inbound()` 启动后台入站监听任务。
 
 ## 结构
 
@@ -17,7 +17,13 @@ pub struct AgentLoop {
     session_manager: SharedSessionManager,
     memory_service: SharedMemory,  // Arc<tokio::sync::Mutex<MemoryService>>
     message_bus: Arc<MessageBus>,
+    inbound_rx: Mutex<Option<mpsc::Receiver<BusRequest>>>,  // start_inbound 一次性消费
     consolidator: Arc<Consolidator>,
+    shutdown_tx: broadcast::Sender<()>,  // 广播关闭入站循环与 I/O 调度器
+    runner: AgentRunner,                 // 预构建、跨任务复用（cron/heartbeat 走此路径）
+    tracer: Option<Arc<Tracer>>,
+    dream_service: Arc<DreamService>,
+    subagent_runtime: Arc<SubagentRuntime>,  // 与触发器 Dispatcher 共享同一实例
 }
 ```
 
@@ -26,10 +32,19 @@ pub struct AgentLoop {
 `AgentLoop::from_config(paths, message_bus, config)` 按以下顺序初始化：
 
 1. **创建 Provider**：从 `config.providers` 中查找 agent 引用的 provider，创建 `OpenAIProvider`
-2. **创建 ToolManager**：以 `workspace_dir` 为根目录，调用 `init_from_config()` 注册内置工具
+2. **创建 ToolManager**：以 `workspace_dir` 为根目录，调用 `init_from_config()` 注册内置工具；gateway 模式改由 `from_config_with_tools()` 传入预装配的 ToolManager + ToolCatalog（见下）
 3. **创建 SessionManager**：指向 session 目录，由 `Arc<Mutex<>>` 包装
 4. **创建 MemoryService**：经 `MemoryService::with_backend`（按 `memory.backend` 配置选择 backend）指向 workspace 目录，由 `Arc<tokio::sync::Mutex<>>` 包装，调用 `init()`
 5. **创建 Consolidator**：传入 provider、session_manager、memory_service、`context_window_tokens`、`max_completion_tokens`
+6. **装配工具与运行时**（`from_parts`）：主循环注册 `memory_search`（同时镜像进 catalog）；创建 `SubagentRuntime`（全局并发闸 `subagent.max_concurrent`）并仅向主循环注册 `subagent` 工具；`ToolCatalog::install_global()` 供 agent 定义校验与 `known_tool_names()` 查询
+
+## Gateway 装配
+
+gateway 模式在创建 AgentLoop 前先注册额外工具：
+
+- `message` / `cron`：同时注册进 ToolManager 和 ToolCatalog（子代理可声明）
+- `trigger_source` / `trigger`：**只注册进 ToolCatalog**，主循环不可见
+- 启动后通过 `agent_loop.subagent_runtime()` 把同一个 `SubagentRuntime` 交给触发器 `Dispatcher`，因此触发器 `agent` action 与 `subagent` 工具调用共用同一个并发闸和同一条回会话的路
 
 ## 公共方法
 

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use tokio::sync::{Notify, broadcast, mpsc};
 
+use crate::agent::{SubagentRuntime, SubagentTool, ToolCatalog, default_tool_set};
 use crate::commands::{CommandTier, classify_command};
 use crate::config::Config;
 use crate::consolidate::Consolidator;
@@ -188,6 +189,8 @@ pub struct AgentLoop {
     tracer: Option<Arc<Tracer>>,
     /// Dream service for background dream tasks.
     dream_service: Arc<crate::dream::DreamService>,
+    /// Subagent runtime, shared with the trigger dispatcher.
+    subagent_runtime: Arc<SubagentRuntime>,
 }
 
 /// Returned by `AgentLoop::run()` so the caller can publish input and
@@ -276,6 +279,8 @@ impl AgentLoop {
 
         let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
         tool_manager.init_from_config(&config.tools);
+        let mut catalog = ToolCatalog::new();
+        catalog.register_builtin_set(&config.tools, paths.workspace_dir());
 
         Self::from_parts(
             paths,
@@ -284,6 +289,7 @@ impl AgentLoop {
             config,
             provider,
             tool_manager,
+            catalog,
         )
         .await
     }
@@ -296,6 +302,7 @@ impl AgentLoop {
         inbound_rx: mpsc::Receiver<BusRequest>,
         config: Arc<Config>,
         tool_manager: ToolManager,
+        catalog: ToolCatalog,
     ) -> Result<Self> {
         let provider_config = config
             .providers
@@ -310,6 +317,7 @@ impl AgentLoop {
             config,
             provider,
             tool_manager,
+            catalog,
         )
         .await
     }
@@ -321,6 +329,7 @@ impl AgentLoop {
         config: Arc<Config>,
         provider: Arc<dyn Provider>,
         mut tool_manager: ToolManager,
+        mut catalog: ToolCatalog,
     ) -> Result<Self> {
         let session_manager = SessionManager::new(paths.session_dir())?;
         let session_manager_arc = Arc::new(tokio::sync::Mutex::new(session_manager));
@@ -341,6 +350,17 @@ impl AgentLoop {
         tool_manager.register(Box::new(
             crate::tools::memory_search::MemorySearchTool::new(memory_service.clone()),
         ));
+        // The same tool must be constructible per run, otherwise a subagent
+        // would lose memory search even though it is part of the default set.
+        let memory_for_catalog = memory_service.clone();
+        catalog.register(
+            "memory_search",
+            Arc::new(move || {
+                Some(Box::new(crate::tools::memory_search::MemorySearchTool::new(
+                    memory_for_catalog.clone(),
+                )) as Box<dyn Tool>)
+            }),
+        );
 
         // Build providers map from config for DreamService
         let mut providers_map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
@@ -358,8 +378,6 @@ impl AgentLoop {
         ));
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
-
-        let tool_manager_arc = Arc::new(tool_manager);
 
         // Build DreamService
         let dream_service = Arc::new(crate::dream::DreamService::new(
@@ -379,6 +397,28 @@ impl AgentLoop {
             .unwrap_or(4096);
 
         let tracer = build_tracer(&config, paths.workspace_dir());
+
+        // Subagent runtime: per-run tool managers are assembled from the
+        // catalog, so the main loop's tool table and prompt cache never change.
+        let catalog = Arc::new(catalog);
+        let subagent_runtime = Arc::new(SubagentRuntime::new(
+            catalog.clone(),
+            paths.workspace_dir().to_path_buf(),
+            provider.clone(),
+            session_manager_arc.clone(),
+            memory_service.clone(),
+            config.agent.clone(),
+            default_tool_set(&config.tools),
+            max_tokens,
+            config.subagent.max_concurrent,
+            tracer.clone(),
+            message_bus.clone(),
+        ));
+        // Only the main loop gets `subagent`; agent runs can never declare it.
+        tool_manager.register(Box::new(SubagentTool::new(subagent_runtime.clone())));
+        ToolCatalog::install_global(catalog);
+
+        let tool_manager_arc = Arc::new(tool_manager);
 
         let runner = AgentRunner::new(
             tool_manager_arc.clone(),
@@ -406,6 +446,7 @@ impl AgentLoop {
             runner,
             tracer,
             dream_service,
+            subagent_runtime,
         })
     }
 
@@ -431,6 +472,12 @@ impl AgentLoop {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The subagent runtime, shared with the trigger dispatcher so both
+    /// entry points obey one concurrency gate.
+    pub fn subagent_runtime(&self) -> Arc<SubagentRuntime> {
+        self.subagent_runtime.clone()
     }
 
     /// Run a single task within the given session.
@@ -840,6 +887,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         };
         let config_json = serde_json::to_string_pretty(&config).unwrap();
         std::fs::write(&config_path, config_json).unwrap();
@@ -1051,6 +1100,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
@@ -1113,6 +1164,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1122,6 +1175,7 @@ mod tests {
             _receivers.inbound,
             config,
             tool_manager,
+            crate::agent::ToolCatalog::new(),
         )
         .await;
         let agent_loop = result.expect("gateway AgentLoop must build");
@@ -1193,6 +1247,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let agent_loop = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
@@ -1254,6 +1310,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let agent_loop =
@@ -1315,6 +1373,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let mut agent_loop =
@@ -1412,6 +1472,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1422,6 +1484,7 @@ mod tests {
             config,
             provider,
             tool_manager,
+            crate::agent::ToolCatalog::new(),
         )
         .await
         .unwrap()
@@ -1477,6 +1540,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
         AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config)
             .await
@@ -1553,6 +1618,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
         let (event_tx, _) = broadcast::channel::<crate::session::AgentEvent>(256);
         let channel_manager = Arc::new(crate::channel::ChannelManager::new(
@@ -1642,6 +1709,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
 
         let result = AgentLoop::from_config(&paths, message_bus, _receivers.inbound, config).await;
@@ -1748,6 +1817,8 @@ mod tests {
             tracing: crate::config::TraceConfig::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1758,6 +1829,7 @@ mod tests {
             config,
             provider,
             tool_manager,
+            crate::agent::ToolCatalog::new(),
         )
         .await
         .unwrap();
@@ -1976,6 +2048,8 @@ mod tests {
             },
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         });
         let provider = Arc::new(MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -1986,6 +2060,7 @@ mod tests {
             config,
             provider,
             tool_manager,
+            crate::agent::ToolCatalog::new(),
         )
         .await
         .unwrap();

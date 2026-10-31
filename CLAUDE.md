@@ -5,7 +5,7 @@ slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支�
 ## 构建和运行
 
 - **运行：** `cargo run -- setup` （初始化配置、目录和 bootstrap 文件），然后 `cargo run -- <config.json路径>` （默认 `~/.slimbot/config.json`）
-- **Gateway 模式：** `cargo run -- gateway` （启动 cron、heartbeat 和 enabled channels，包括 WebUI）
+- **Gateway 模式：** `cargo run -- gateway` （启动 cron、heartbeat、trigger 60s tick 和 enabled channels，包括 WebUI）
 - **快速检查：** `cargo check --message-format=json 2>/dev/null | jq -c 'select(.reason == "compiler-message") | {level: .message.level, location: (.message.spans[0] | "\(.file_name):\(.line_start)"), message: .message.message}'` （JSON 输出 + jq 压缩，仅保留诊断信息，减少 token 消耗）
 - **提交前检查：** `cargo fmt -- --check`、`cargo clippy`（无新 warning）、`cargo test` 全部通过
 
@@ -16,7 +16,8 @@ slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支�
 - `main`（Entry）、`cli`（参数解析）、`config`（配置读写）、`bootstrap`（workspace 模板）、`setup`（setup 命令）、`agent_loop`（顶层协调）、`runner`（ReAct 循环核心）
 - `session`（会话管理 + JSONL 持久化）、`context`（system prompt 构建）、`message_bus`（消息总线）、`tool`（Tool trait + ToolManager）、`tools/`（内置工具实现）、`channel/`（CLI + WebUI 通道）
 - `gateway`（Gateway 模式入口）、`cron/`（定时任务）、`heartbeat/`（心跳服务）、`provider/`（LLM API 封装）
-- `consolidate`（会话摘要压缩）、`memory`（记忆存储）、`snip`（上下文截断）
+- `trigger/`（触发器层：source 采集 → subscription 判定 → dispatch 投递）、`agent/`（子代理定义 + ToolCatalog + SubagentRuntime）、`codemode/`（JS 脚本沙箱：rquickjs + 双层超时 + 宿主白名单）
+- `consolidate`（会话摘要压缩）、`memory`（记忆存储）、`snip`（上下文截断）、`dream`（记忆合并）
 
 `docs/` 为文档目录。
 
@@ -24,13 +25,13 @@ slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支�
 
 **CLI 模式：** `ChannelManager` 轮询输入 → `MessageBus` 封装任务 → `AgentRunner` 执行 ReAct 循环 → 结果回传通道。
 
-**Gateway 模式：** 额外启动 `CronService`（定时任务）和 `HeartbeatService`（心跳检测），触发 `AgentLoop.run_task()`。WebUI 通过 SSE 广播 `AgentEvent`。
+**Gateway 模式：** 额外启动 `CronService`（定时任务）、`HeartbeatService`（心跳检测）和 `TriggerService` + `Dispatcher`（触发器：tick 只采集/判定/入队，行动在队列外执行），触发 `AgentLoop.run_task()`。WebUI 通过 SSE 广播 `AgentEvent`。
 
 **核心数据流：** `ContextBuilder` 构建消息 → `Provider.chat()` 调用 LLM → `ToolManager.execute()` 执行工具 → `SessionManager.persist()` 持久化 JSONL。
 
 ## 数据目录
 
-`~/.slimbot/workspace/` 包含：`AGENTS.md`、`USER.md`、`SOUL.md`、`TOOLS.md`（setup 生成）、`HEARTBEAT.md`、`skills/`、`cron/jobs.json`、`sessions/{id}.jsonl`。
+`~/.slimbot/workspace/` 包含：`AGENTS.md`、`USER.md`、`SOUL.md`、`TOOLS.md`（setup 生成）、`HEARTBEAT.md`、`agents/`（agent 定义，setup 铺出 `trigger.md`）、`skills/`、`triggers/`（源与规则定义 + history.jsonl）、`cron/jobs.json`、`sessions/{id}.jsonl`。
 
 `data_dir` 和 `workspace_dir` 独立配置，后者默认 `{data_dir}/workspace`。未修改的 bootstrap 文件会被 `context.rs` 跳过。
 
@@ -41,6 +42,8 @@ slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支�
 - Provider 接口：`Provider::chat(&[&Message])` 引用传递，避免 clone
 - Session ID 格式：`{channel_id}:{chat_id}`
 - 循环结束：超出 `max_iterations` 或模型返回无 tool_calls
+- 一个能力一个入口：同一能力不同时做 agent 和 skill（agent 是“可被启动的执行体”，skill 是“可被加载的知识”），否则模型会走不用读文档的那条路
+- 子代理与触发器行动：`subagent` 工具与触发器 `agent` action 共用同一个 `SubagentRuntime`（全局并发闸）；子代理会话仅内存、跑完即删，外部内容只以证据形式进入上下文（ADR 0009）
 
 ## 开发规范
 

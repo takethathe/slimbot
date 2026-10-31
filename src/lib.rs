@@ -1,8 +1,10 @@
+pub mod agent;
 pub(crate) mod agent_loop;
 pub(crate) mod bootstrap;
 pub mod card;
 pub(crate) mod channel;
 pub(crate) mod cli;
+pub(crate) mod codemode;
 pub(crate) mod commands;
 pub(crate) mod config;
 pub(crate) mod config_defs;
@@ -31,6 +33,7 @@ pub(crate) mod tool;
 pub(crate) mod tools;
 pub mod trace;
 pub(crate) mod trace_viewer;
+pub(crate) mod trigger;
 pub(crate) mod utils;
 pub(crate) mod worker;
 
@@ -71,6 +74,7 @@ pub use utils::{
 };
 
 // Re-export for binary usage.
+pub use agent::{AgentDefinition, AgentRegistry, SubagentRuntime, ToolCatalog};
 pub use agent_loop::AgentLoop;
 pub use cli::{CliArgs, Commands, run_agent_session};
 pub use gateway::run_gateway;

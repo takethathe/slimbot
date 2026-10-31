@@ -1,8 +1,10 @@
 use crate::embed::{EMBEDDED_FILES, get_content_by_dest};
 
-/// The five memory document templates written into a new workspace.
+/// The memory document templates written into a new workspace, plus the one
+/// built-in agent definition.
 /// Returns (workspace-relative dest, content): AGENTS, USER, SOUL, TOOLS in
-/// the workspace root, MEMORY in the memory/ dir.
+/// the workspace root, MEMORY in the memory/ dir, the `trigger` agent in the
+/// agents/ dir.
 /// `identity.md` / `dream.md` are kept embedded-only (never written to disk);
 /// their content is injected directly from the template at build/run time.
 pub fn bootstrap_files() -> impl Iterator<Item = (&'static str, &'static str)> {
@@ -12,6 +14,7 @@ pub fn bootstrap_files() -> impl Iterator<Item = (&'static str, &'static str)> {
         ("SOUL.md", "SOUL.md"),
         ("TOOLS.md", "TOOLS.md"),
         ("memory/MEMORY.md", "MEMORY.md"),
+        ("agents/trigger.md", "agents/trigger.md"),
     ]
     .into_iter()
     .filter_map(|(dest, template)| get_content_by_dest(template).map(|content| (dest, content)))
@@ -48,12 +51,25 @@ mod tests {
         assert!(names.contains(&"SOUL.md"));
         assert!(names.contains(&"TOOLS.md"));
         assert!(names.contains(&"memory/MEMORY.md"));
+        assert!(names.contains(&"agents/trigger.md"));
+    }
+
+    #[test]
+    fn test_trigger_agent_template_declares_its_tool() {
+        let content = bootstrap_files()
+            .find(|(dest, _)| *dest == "agents/trigger.md")
+            .map(|(_, content)| content)
+            .expect("trigger agent must be bootstrapped");
+        assert!(content.starts_with("---\n"));
+        assert!(content.contains("name: trigger"));
+        assert!(content.contains("tools: trigger_source"));
+        assert!(content.contains("timeout_secs: 300"));
     }
 
     #[test]
     fn test_bootstrap_excludes_identity_and_dream() {
         let names: Vec<_> = bootstrap_files().map(|(n, _)| n).collect();
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
         assert!(!names.contains(&"identity.md"));
         assert!(!names.contains(&"dream.md"));
     }

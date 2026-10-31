@@ -156,7 +156,7 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule reminders and recurring tasks. Actions: add, list, remove."
+        "Low-level scheduler for fixed-time system jobs (e.g. dream maintenance). Actions: add, list, remove. For everyday reminders and anything condition-based, delegate to the `trigger` agent instead."
     }
 
     fn parameters(&self) -> serde_json::Value {

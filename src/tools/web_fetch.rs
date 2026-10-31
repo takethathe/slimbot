@@ -39,7 +39,10 @@ static RE_BLANK_LINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").
 
 /// Check whether an IP address is private, loopback, link-local, or otherwise
 /// not safe to access from a server-side fetcher.
-fn is_private_ip(ip: IpAddr) -> bool {
+///
+/// Shared with the trigger layer: a `collect.js` script may issue HTTP reads,
+/// so it must apply the same target rules as the `web_fetch` tool.
+pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.is_loopback()
@@ -85,7 +88,10 @@ fn resolve_host(host: &str, port: u16) -> std::result::Result<SocketAddr, String
 
 /// Resolve and validate the target host off the async worker thread, returning
 /// a SocketAddr to pin for the request (mitigates DNS rebinding TOCTOU).
-async fn resolve_and_pin(parsed: &Url, port: u16) -> std::result::Result<SocketAddr, String> {
+pub(crate) async fn resolve_and_pin(
+    parsed: &Url,
+    port: u16,
+) -> std::result::Result<SocketAddr, String> {
     let host = parsed
         .host()
         .ok_or_else(|| "Invalid URL: missing domain".to_string())?;
@@ -108,7 +114,7 @@ async fn resolve_and_pin(parsed: &Url, port: u16) -> std::result::Result<SocketA
 /// IP-literal host must not be private. Domain hosts are DNS-validated and
 /// pinned later in `fetch_html` (off the async thread). Returns the parsed
 /// Url for reuse by the caller.
-fn validate_url(url: &str) -> std::result::Result<Url, String> {
+pub(crate) fn validate_url(url: &str) -> std::result::Result<Url, String> {
     let parsed = Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
 
     let scheme = parsed.scheme();

@@ -745,7 +745,7 @@ function buildControl(field, path) {
       const info = document.createElement('div');
       info.className = 'list-hint';
       const n = Array.isArray(field.value) ? field.value.length : 0;
-      info.innerHTML = n + ' item' + (n === 1 ? '' : 's') + ' — edited in the <a href="#sec-tracing.backends">tracing.backends</a> section below.';
+      info.innerHTML = n + ' item' + (n === 1 ? '' : 's') + ' — edited in the <a href="#sec-' + field.path + '">' + field.path + '</a> section below.';
       wrap.appendChild(info);
       break;
     }

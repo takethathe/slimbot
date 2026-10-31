@@ -1,9 +1,10 @@
 # 内置工具
 
-SlimBot 的工具分三组：
+SlimBot 的工具分四组：
 
 - **内置工具（9 个）** —— Shell 执行、文件读写编辑、目录操作、搜索与 `web_fetch`。它们在 `config.json` 的 `tools` 数组中逐个启用/禁用，数组为空时全部启用。
-- **运行期装配工具** —— `memory_search`（主循环，只读）与 `message` / `cron`（gateway 模式）。它们由代码在装配时注册，**不**进 `tools` 数组，也无法在那里禁用。
+- **运行期装配工具** —— `memory_search`（主循环，只读）、`subagent`（仅主循环）、`message` / `cron`（gateway 模式）。它们由代码在装配时注册，**不**进 `tools` 数组，也无法在那里禁用。
+- **目录限定工具（catalog-only）** —— `trigger_source` / `trigger`。只在 `ToolCatalog` 注册，主循环不可见，仅当 agent 定义显式声明时装配给子代理。
 - **Dream 专用工具** —— `memory_read` / `memory_write` / `memory_edit`，只在 Dream 沙箱内存在，沙箱没有任何文件或 shell 工具。
 
 记忆机制本身见 [Memory](memory.md)。
@@ -274,6 +275,35 @@ SlimBot 的工具分三组：
 
 ---
 
+### `subagent`
+
+启动一个子代理：在独立会话里用独立工具集执行一个一次性任务，**立即**返回 `run_id`；结果稍后以 `[Subagent result]` 消息回流发起会话。仅主循环可见，agent 定义不可声明（保留工具）。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `agent` | string | 是 | `# Available Agents` 列表中的代理名 |
+| `task` | string | 是 | 完整任务描述；子代理看不到当前对话，需自带全部上下文 |
+
+**行为：**
+- 并发超限立即拒绝（`RejectWhenFull`），不排队；触发器 `agent` action 则等槽位
+- 会话 `subagent:<agent>:<run_id>` 仅内存，跑完即 `drop_session`，不落 JSONL
+- 完整机制见 [agent.md](agent.md)
+
+---
+
+## 目录限定工具（catalog-only）
+
+`trigger_source` 与 `trigger` 只在 `ToolCatalog` 注册，主循环工具表里没有它们；只有 agent 定义显式声明的工具（如 bootstrap 的 `trigger` agent）会把它们装配进子代理的 `ToolManager`。两个工具都是 `action` 驱动的 CRUD：
+
+| 工具 | actions | 对象 |
+|------|---------|------|
+| `trigger_source` | `list` / `create` / `update` / `delete` | 数据源：采集脚本，把一个通道（文件/接口/邮箱）归一为 `{items: [...]}`；`list` 只报字段名和类型，不报采样值 |
+| `trigger` | `list` / `create` / `update` / `delete` / `test` | 订阅规则：监控数据源 + 判定脚本 + 命中后的 action；`test` 用当前快照试跑一次 |
+
+完整参数、脚本约定与投递机制见 [trigger.md](trigger.md)。
+
+---
+
 ## Dream 专用工具
 
 这三个工具只由 `DreamService::build_tools` 注册进 Dream 沙箱，主循环看不到它们。所有写操作经 `MemoryService` facade 落到 backend，不允许直接操作文件。
@@ -302,7 +332,7 @@ SlimBot 的工具分三组：
 
 ## 配置
 
-工具在 `config.json` 的 `tools` 数组中配置，数组为空时 9 个内置工具全部启用。`tools` 数组只能构造 `create_tool()` 支持的内置工具——`memory_search`、`message`、`cron` 与 Dream 的三个记忆工具在代码中装配，不在其中。
+工具在 `config.json` 的 `tools` 数组中配置，数组为空时 9 个内置工具全部启用。`tools` 数组只能构造 `create_tool()` 支持的内置工具——`memory_search`、`subagent`、`message`、`cron`、catalog-only 的 `trigger_source` / `trigger` 与 Dream 的三个记忆工具在代码中装配，不在其中。
 
 ```json
 {

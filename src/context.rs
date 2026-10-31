@@ -141,6 +141,10 @@ impl ContextBuilder {
         // 3. Skills
         self.load_skills_into_parts(&mut parts).await;
 
+        // 3b. Available agents: one line per agent definition, same style and
+        // position as skills. An empty section is not injected at all.
+        self.load_agents_into_parts(&mut parts);
+
         // 4. Core long-term memory
         if let Some(content) = core_memory {
             parts.push(format!("## Long-term Memory\n{}", content));
@@ -216,6 +220,19 @@ impl ContextBuilder {
         }
     }
 
+    /// Append the `# Available Agents` section. Definitions live under
+    /// `agents/<name>.md` and are validated against the process-wide tool
+    /// catalog, so an agent declaring a missing tool never shows up here.
+    fn load_agents_into_parts(&self, parts: &mut Vec<String>) {
+        let registry = crate::agent::load_workspace_registry(&self.workspace_dir);
+        for (name, err) in registry.rejected() {
+            crate::debug!("[ContextBuilder] agent '{}' rejected: {}", name, err);
+        }
+        if let Some(section) = registry.prompt_section() {
+            parts.push(section);
+        }
+    }
+
     /// Build the complete message list for an LLM call using two-list approach.
     /// `runtime_ctx` can be provided to ensure stability across multiple calls within a turn.
     pub async fn build_messages(
@@ -231,8 +248,16 @@ impl ContextBuilder {
             session_id
         );
 
-        // Build system prompt
-        let system_prompt = self.build_system_prompt(channel, session_summary).await;
+        // Build system prompt. A session-scoped override (subagent runs, whose
+        // agent body *is* the prompt) wins over the composed prompt.
+        let system_override = {
+            let sm = self.session_manager.lock().await;
+            sm.system_override(session_id)
+        };
+        let system_prompt = match system_override {
+            Some(prompt) => prompt,
+            None => self.build_system_prompt(channel, session_summary).await,
+        };
         let system_message = Message::system(system_prompt);
 
         // Get history Arc and current_turn Vec from SessionManager

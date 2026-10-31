@@ -38,6 +38,9 @@ system_parts = []
 3. 技能（经 memory backend 枚举，见下）
    区分 always skills（完整加载）和可选 skills（仅显示名称列表）
 
+3b. 可用代理（agents/<name>.md，见下）
+   # Available Agents —— 每个代理一行名称+描述；无可用代理时整段不注入
+
 4. 长期记忆（category Core）
    ## Long-term Memory
    <MEMORY.md content>
@@ -84,6 +87,16 @@ RunContext { messages, tools }
 - **可选 skills**（`always: false`）：仅显示名称、描述和可加载路径（`skills/<name>/SKILL.md`）列表，由 Agent 按需读取
 - 无 frontmatter 的文件：视为 always skill，完整加载
 
+## 代理定义加载
+
+`load_agents_into_parts()` 经 `agent::load_workspace_registry()` 枚举 `workspace_dir/agents/*.md`，生成 `# Available Agents` 段落（与技能段落同级、同样式）：
+
+- 每个通过校验的代理渲染为 `- **name** — description` 一行，正文不进入 system prompt（正文只在子代理运行时作为其专属 system prompt 注入）
+- 定义按进程级 `ToolCatalog` 校验：声明了不存在工具的代理被拒绝，不进入列表，仅 debug 日志记录原因
+- 段落内含使用指引：子代理在自身会话中执行、通过 `subagent` 工具启动、调用立即返回
+
+技能与代理的分工：skill 是主代理自己按需读取的操作知识（`skills/<name>/SKILL.md`）；agent 是一次性外包执行单元（`agents/<name>.md`，自带工具集与并发闸），详见 [agent.md](agent.md)。
+
 ## 会话摘要注入
 
 当 `session_summary` 参数为 `Some` 且非空时，在系统 prompt 注入 `[Archived Context Summary]` 段落。该摘要来自 `Consolidator` 的 `last_summary` 字段，代替已被驱逐的旧消息，提供跨轮次的上下文。
@@ -120,5 +133,6 @@ provider.chat(&messages, ctx.tools.as_deref()).await;
 ## 注意事项
 
 - 工作区文件在每次 `build()` 时**从磁盘实时读取**，修改文件后无需重启即可生效
-- 技能文件同样实时读取，支持动态加载/卸载技能
+- 技能文件同样实时读取，支持动态加载/卸载技能；代理定义同样每轮重新枚举
+- 子代理运行时通过 `SessionManager::system_override()` 注入会话级 system prompt（代理正文即 prompt），此时不使用组合式 system prompt
 - System prompt 可能很长，需要注意模型的上下文窗口限制

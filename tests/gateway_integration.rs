@@ -57,6 +57,8 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     }
 }
 

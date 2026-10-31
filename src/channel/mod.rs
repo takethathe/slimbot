@@ -562,6 +562,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         }
     }
 

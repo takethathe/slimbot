@@ -86,6 +86,22 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 3. 每个通道调用 `channel.start(inbound_tx)` 启动内部读取循环
 4. `run().await` 在主线程上监听 `outbound_rx`，按 `channel_id` 路由到对应通道的 `write_output()`
 
+### TriggerService + Dispatcher（gateway 常驻）
+
+触发器是 cron 之上的一层，与 cron / heartbeat 并列跑自己的固定 60s tick（详见 [trigger.md](trigger.md)）：
+
+```
+每 60s：reload 定义 → freeze 快照 → 采集到期的源 → 判定到期的规则 → 命中入队
+队列外：单个消费者按创建顺序执行 action（起子代理 / 注入 notify / 只记历史）
+投递：publish_inbound(来源会话) → 主 loop 总结并回复；唯一例外是失败告警走 publish_outbound
+```
+
+把行动挪出 tick 是为了让 30s 硬超时不会掩断一次正在跑的子代理；三个并列的 root span（`trigger.tick` / `trigger.fire` / `subagent.run`）靠 id 关联而不设父子。
+
+### SubagentRuntime（与主 loop 共用）
+
+子代理是一份 `agents/<name>.md` 定义的一次性执行（详见 [agent.md](agent.md)）：自己的会话只在内存、按定义从 `ToolCatalog` 装配 `ToolManager`、全局并发闸。主 loop 的 `subagent` 工具与触发器的 `agent` action 共用同一个 runtime 实例，因此共用同一个闸与同一条回会话的路。脚本执行（采集 / 判定）走 `codemode` 沙箱：rquickjs + 专职线程 + 双层超时 + 宿主函数白名单（详见 [codemode.md](codemode.md)）。
+
 ## 数据流
 
 ### Inbound（用户输入）
@@ -140,6 +156,9 @@ AgentRunner 状态变更 → TaskHook.notify_status()
 | MessageBus | 纯通道，无后台任务 | 职责单一，AgentLoop 自己负责处理逻辑 |
 | 工厂注册 | ChannelManager 内部自动注册 | 简化 main.rs，不需要手动注入工厂 |
 | Consolidator | 可选注入 `Arc<Consolidator>` | 不传入时跳过摘要，传入时自动触发 |
+| 触发器行动 | 在 tick 之外的单消费者队列执行 | 模型调用不能挤进 tick 的硬超时；队满丢弃而不顺延，迟到十分钟的提醒比不提醒更糟 |
+| 子代理会话 | `mark_ephemeral` + 跑完 `drop_session` | 不留 JSONL、不进 consolidator，一次性任务不该污染长期上下文 |
+| 外部内容 | 只以证据形式进入上下文，快照不落盘 | 见 [ADR 0009](adr/0009-no-raw-external-content.md) |
 
 ## 目录结构与模块关系
 
@@ -167,6 +186,13 @@ main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   │     ├── memory/ ── category 化长期记忆、backend、历史记录
   │     ├── worker.rs ── WorkerPool 异步执行池
   │     └── io_scheduler.rs ── I/O 调度、阻塞读取
+  │
+  ├── gateway.rs ── Gateway 模式：cron / heartbeat / trigger 三个常驻 tick
+  │     ├── trigger/ ── 触发器层（source 采集 → subscription 判定 → dispatch 投递）
+  │     ├── agent/ ── 子代理定义 + ToolCatalog + SubagentRuntime
+  │     ├── codemode/ ── 脚本沙箱（rquickjs + 专职线程 + 双层超时 + 宿主白名单）
+  │     ├── cron/ ── 定时任务
+  │     └── heartbeat/ ── 心跳服务
   │
   └── log.rs + macros.rs ── 日志系统、级别过滤、彩色输出
 ```

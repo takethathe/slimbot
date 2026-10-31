@@ -12,7 +12,8 @@ use crate::config_normalize::apply_normalize;
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
     AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig, MemoryConfig,
-    ProviderConfig, TraceBackendEntry, TraceConfig, WebFetchConfig,
+    ProviderConfig, SecretEntry, SubagentConfig, TraceBackendEntry, TraceConfig, TriggersConfig,
+    WebFetchConfig,
 };
 
 // ── Root Config ──
@@ -37,6 +38,13 @@ pub struct Config {
     /// it independently of the WebUI channel entry itself.
     #[serde(default)]
     pub json_render: JsonRenderConfig,
+    /// Subagent runtime guardrails. Top level because the capability is shared
+    /// by the main loop and the trigger dispatcher.
+    #[serde(default)]
+    pub subagent: SubagentConfig,
+    /// Trigger layer configuration (tick cadence, queue limits, secrets).
+    #[serde(default)]
+    pub triggers: TriggersConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -191,6 +199,8 @@ impl Config {
         self.gateway.dream.clamp();
         self.json_render.clamp();
         self.memory.clamp();
+        self.subagent.clamp();
+        self.triggers.clamp();
         if let Some(wf) = &mut self.web_fetch {
             wf.clamp();
         }
@@ -556,6 +566,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         }
     }
 

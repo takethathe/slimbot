@@ -21,6 +21,8 @@ fn test_default_config_structure() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     // Normalize fills in default provider name
@@ -54,6 +56,8 @@ fn test_normalize_fills_empty_agent_provider() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
     config.agent.provider.clear();
 
@@ -75,6 +79,8 @@ fn test_normalize_derives_url_from_base_url() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -104,6 +110,8 @@ fn test_normalize_preserves_existing_api_url() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -132,6 +140,8 @@ fn test_normalize_falls_back_to_default_url_when_no_base() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -160,6 +170,8 @@ fn test_normalize_trailing_slash_stripped_from_base_url() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -188,6 +200,8 @@ fn test_normalize_removes_empty_tools_and_channels() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     config.tools.push(ToolEntry {
@@ -228,6 +242,8 @@ fn test_normalize_does_not_touch_api_key() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     config.providers.get_mut("default").unwrap().api_key = "sk-secret".to_string();
@@ -251,6 +267,8 @@ fn test_normalize_max_iterations_and_timeout_via_clamp() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
     config.agent.max_iterations = 0; // below range
     config.agent.timeout_seconds = 0; // below range
@@ -280,6 +298,8 @@ fn test_write_default_config_creates_file() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
     config.save(path).unwrap();
 
@@ -304,6 +324,8 @@ fn test_written_config_is_valid_json() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
     config.save(path).unwrap();
 
@@ -357,6 +379,8 @@ fn test_normalize_multiple_providers() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     config.normalize();

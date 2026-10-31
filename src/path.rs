@@ -113,6 +113,16 @@ impl PathManager {
         self.workspace_dir.join("memory")
     }
 
+    /// Directory holding subagent definitions (`agents/<name>.md`).
+    pub fn agents_dir(&self) -> PathBuf {
+        self.workspace_dir.join("agents")
+    }
+
+    /// Directory holding trigger definitions (`triggers/sources`, `triggers/triggers`).
+    pub fn triggers_dir(&self) -> PathBuf {
+        self.workspace_dir.join("triggers")
+    }
+
     pub fn tool_results_dir(&self) -> PathBuf {
         self.workspace_dir.join(".tool_results")
     }

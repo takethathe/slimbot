@@ -683,6 +683,12 @@ pub struct Session {
     pub history: Arc<[Message]>, // Persisted, clean messages (immutable, zero-clone share)
     pub current_turn: Vec<Message>, // Current turn buffer (may have runtime_content)
     meta: SessionMeta,
+    /// Ephemeral sessions (subagent runs) are memory-only: nothing is ever
+    /// written to disk and they are dropped when the run finishes.
+    ephemeral: bool,
+    /// When set, replaces the composed system prompt for every run of this
+    /// session. Used by subagent runs, whose agent definition is the prompt.
+    system_override: Option<String>,
 }
 
 impl Session {
@@ -922,6 +928,9 @@ impl SessionManager {
     }
 
     pub(crate) fn save_session_meta(&self, session_id: &str) {
+        if self.sessions.get(session_id).is_some_and(|s| s.ephemeral) {
+            return;
+        }
         if let Some(meta) = self.sessions.get(session_id).map(|s| s.meta.clone()) {
             let _ = self.save_meta_file(session_id, &meta);
         }
@@ -971,6 +980,8 @@ impl SessionManager {
                     char_per_token_ratio,
                     last_summary,
                 }),
+                ephemeral: false,
+                system_override: None,
             },
         );
         self.runners
@@ -980,14 +991,17 @@ impl SessionManager {
 
     /// Submit a SessionTask to a session. The session guarantees sequential execution.
     /// The task's closure is consumed and executed once.
-    pub async fn submit_task(&mut self, task: SessionTask) {
-        let runner = self
-            .runners
-            .get(&task.session_id)
-            .cloned()
-            .expect("no runner for session");
+    ///
+    /// Returns an explicit error when the session has no runner instead of
+    /// panicking: the caller (inbound loop) can log and skip, and a runner is
+    /// normally created together with its session by `get_or_create`.
+    pub async fn submit_task(&mut self, task: SessionTask) -> Result<()> {
+        let runner = self.runners.get(&task.session_id).cloned().ok_or_else(|| {
+            anyhow::anyhow!("no runner registered for session '{}'", task.session_id)
+        })?;
         let wrapped = task.wrap(runner.clone());
         runner.submit(wrapped);
+        Ok(())
     }
 
     pub async fn add_message(&mut self, session_id: &str, mut msg: Message) -> Result<()> {
@@ -1192,6 +1206,47 @@ impl SessionManager {
         self.sessions.contains_key(session_id)
     }
 
+    /// Mark a session as ephemeral (memory-only). Ephemeral sessions never
+    /// write messages or metadata to disk, so a subagent run leaves no trace.
+    pub fn mark_ephemeral(&mut self, session_id: &str) -> bool {
+        match self.sessions.get_mut(session_id) {
+            Some(session) => {
+                session.ephemeral = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Override the system prompt for every run of this session.
+    pub fn set_system_override(&mut self, session_id: &str, prompt: String) -> bool {
+        match self.sessions.get_mut(session_id) {
+            Some(session) => {
+                session.system_override = Some(prompt);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The per-session system prompt override, if any.
+    pub fn system_override(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|s| s.system_override.clone())
+    }
+
+    /// Remove a session and its executor from memory (subagent runs are
+    /// one-shot). Any leftover files are removed too, so a dropped session can
+    /// never be rehydrated from disk.
+    pub fn drop_session(&mut self, session_id: &str) -> bool {
+        let removed = self.sessions.remove(session_id).is_some();
+        self.runners.remove(session_id);
+        let _ = std::fs::remove_file(self.session_dir.join(format!("{}.jsonl", session_id)));
+        let _ = std::fs::remove_file(self.meta_path(session_id));
+        removed
+    }
+
     /// Cancel all pending and running tasks for a session and reset to a fresh token.
     /// Returns the new (non-cancelled) token, which the sentinel task should use.
     /// Already-queued tasks hold clones of the old token and will observe cancellation.
@@ -1251,6 +1306,12 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?
             .current_turn
             .len();
+
+        // Ephemeral sessions (subagent runs) are memory-only by design: no
+        // message files, no meta files, nothing left behind on any exit path.
+        if self.sessions.get(session_id).is_some_and(|s| s.ephemeral) {
+            return Ok(());
+        }
 
         let needs_rewrite = self
             .sessions

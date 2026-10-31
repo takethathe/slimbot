@@ -91,6 +91,32 @@ define_config! {
 }
 
 define_config! {
+    "subagent" => SubagentConfig {
+        max_concurrent: usize = 3, range(1, 16), desc: "Max subagent runs executing at the same time (shared by the main loop and triggers)",
+    }
+}
+
+define_config! {
+    "triggers" => TriggersConfig {
+        enabled: bool = true, none, desc: "Master switch for the trigger tick (sources are not collected when off)",
+        tick_interval_s: u64 = 60, range(1, 3600), desc: "Fixed trigger tick interval in seconds",
+        tick_timeout_s: u64 = 30, range(1, 600), desc: "Hard timeout for one tick (collect + judge + enqueue) in seconds",
+        max_concurrent_collect: usize = 4, range(1, 16), desc: "Max sources collected concurrently within one tick",
+        max_queue: usize = 20, range(1, 200), desc: "Max pending fires in the dispatch queue (overflow is dropped)",
+        max_merge: usize = 3, range(1, 20), desc: "Max notify messages merged into one inbound input per origin per tick",
+        history_lines: usize = 5000, range(100, 100_000), desc: "Fire history lines kept before the file is rolled to one generation",
+        secrets: Vec<SecretEntry> = Vec::<SecretEntry>::new(), none, desc: "Secrets available to scripts via ctx.secret(name); values are masked",
+    }
+}
+
+define_config! {
+    "triggers.secrets" => SecretEntry {
+        name: String = "".to_string(), str_max(128), desc: "Secret name used by ctx.secret(name)",
+        value: String = "".to_string(), secret, desc: "Secret value (masked in the config editor)",
+    }
+}
+
+define_config! {
     "memory" => MemoryConfig {
         backend: String = "markdown".to_string(), allowed(["markdown"]), desc: "Memory backend type (markdown | future: sqlite)",
     }

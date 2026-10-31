@@ -5,7 +5,7 @@
 | 文档 | 说明 |
 |------|------|
 | [配置指南](config.md) | `config.json` 结构、验证规则、多 Provider 配置 |
-| [内置工具](tools.md) | 9 个内置工具（shell、文件读写编辑、目录、grep/find_files、web_fetch），加 `memory_search` 与 Dream 专用记忆工具 |
+| [内置工具](tools.md) | 9 个内置工具（shell、文件读写编辑、目录、grep/find_files、web_fetch），加 `memory_search`、`subagent` 与 Dream 专用记忆工具；触发器工具（`trigger` / `trigger_source`）只对声明它们的 agent 可见 |
 | [日志系统](logging.md) | 日志级别、CLI 参数、输出格式 |
 
 ## 核心模块
@@ -21,6 +21,9 @@
 | [消息总线](message_bus.md) | `message_bus.rs` | 请求分发、任务封装、结果路由 |
 | [Provider](provider.md) | `provider/` | Provider 接口、OpenAI 兼容 API 集成 |
 | [通道](channel.md) | `channel/` | 通道抽象、工厂模式、并发 I/O 循环 |
+| [触发器层](trigger.md) | `trigger/` | 固定 tick、数据源采集与快照、边沿判定、执行投递与 fire 账本 |
+| [子代理运行时](agent.md) | `agent/` | agent 定义与工具增量、一次性 run、并发闸、结果投递 |
+| [脚本沙箱](codemode.md) | `codemode/` | rquickjs 专职线程、双层超时、宿主函数白名单、凭证抹除 |
 
 ## 基础设施模块
 

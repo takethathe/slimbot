@@ -1,5 +1,44 @@
 # TODO
 
+## personal agent v1（wayfinder 建图中，2026-10-31）
+
+- [x] **能力调研** — 行业一手资料 + 代码核对的缺口分析：`.scratch/personal-agent-capabilities/research.md`
+- [x] **Wayfinder map** — 五件底座（信任边界、记忆写侧、MCP + 一个真实集成、一个 IM 通道、可靠性）的决策地图与 15 张票（票 15 上下文压力由票 05 毕业新增）：`.scratch/personal-agent-capabilities/map.md`；目的地是 `spec.md` + ADR，落稿后交 `/implement`
+- [x] **WebUI 认证与网络边界** — 纯本机入口、无认证、只监听 loopback + 四条浏览器侧中间件；已回填票 02，决策见 `docs/adr/0010`
+- [x] **工具风险与审批策略** — 5 类风险级 → 3 档管控；审批以回合结束 + 下一轮兑现，无 `ask_user` 工具；已回填票 03，决策见 `docs/adr/0011`
+- [x] **记忆写侧语义** — 单文件漏斗（主模型只用 file 工具写 MEMORY.md）+ 分类/晋升归 Dream + Protected document 代码强制；已回填票 05，决策见 `docs/adr/0012`；连带判定 `Daily` v1 不建设、history 不进检索语料
+- [x] **上下文压力（Context pressure）** — 单一窗口锚 + 占比派生全部长度限制；清理与可找回配对（引用带落盘路径、必要时补落盘）；豁免改为工具自述 `context_exempt()`；已回填票 15，决策见 `docs/adr/0013`；连带两条 breaking change（废弃 `agent.max_tool_result_chars`、`context_window_tokens` 移到 provider 段）
+- [x] **记忆生命周期** — 把已做判断的地方接上容量（不新增 flush、不多新机件）：summary 预算 512 字节→窗口 2% 占比、history 只删已处理连续前缀、Dream 接 trace + 指纹级审计（不建独立审计文件）、改读真实配置（两锚分离）、回滚靠写前快照（`memory/.snapshots/` 分层轮转、不用 git）、条目不写日期、年龄由快照序列 diff 反推、成功判定换结构判定；已回填票 06，决策见 `docs/adr/0014`；回溯修订票 05 provenance 约定与票 15 文档预算锚归属
+- [x] **研究票：密钥与 OAuth 凭证管理** — 结论写入 `.scratch/personal-agent-capabilities/research-secrets-oauth.md`，已回填票 04；keychain 优先 / env 次之 / 0600 配置兼容
+- [x] **单用户身份模型** — 显式单例 owner；共享记忆 / 分通道会话；群聊只有 owner 可授权；结论回填票 01
+- [x] **触发器设计（wayfinder 已收官，2026-10-31）** — 七张决策票全部 resolved，spec 与 ADR 已落稿：`.scratch/personal-agent-triggers/spec.md` + `docs/adr/0006..0009`；ADR 篇目：subagent 运行时形状、触发器是 cron 之上的一层、codemode 运行时选型、外部内容不进上下文
+  - [x] 01 subagent 机制 [x] 02 采集与快照 [x] 03 判定语义
+  - [x] 04 执行与投递 [x] 05 codemode 运行时 [x] 06 时间源
+  - [x] 07 提示词/skill/文档 [x] 08 spec 落稿
+- [ ] **Frontier（下一个 map）** — 检索与存储（票 07）、MCP 客户端（票 08）、首个 IM 通道（票 09）、出站投递（票 10）、可靠性预算（票 11）、触发器接缝（票 12）、v1 差异化（票 13）、spec 落稿（票 14）；heartbeat 与触发器的长期边界、群聊 origin 归属已随本 map 移出范围
+
+## 记忆生命周期实现切片（票 06 裁决，2026-10-31）
+
+决策见票 06 + `docs/adr/0014`；实现待 spec 落稿后展开。本票发现的实现级缺陷（先于新功能修）：
+
+- [ ] **两个 panic 修复** — `dream.rs` `build_prompt` 的 `&e.content[..500]` 是字节切片，中文非 char boundary 会 panic 导致 cursor 不推进、每 tick 重跑同一批再崩（永久卡死）；`consolidate.rs` summary 保头截断必须走 `is_char_boundary` 循环（同仓库已有参考）
+- [ ] **cursor 归零重复整理** — `compact_history_after_dream` 的 `saturating_sub(deleted_count)` 在被删数大于游标时归 0，剩下条目被当全部未处理→重复写入；删除范围限定为“已处理的连续前缀”，cursor 删后仍指向第一条未处理
+- [ ] **summary 预算改占比** — `MAX_SUMMARY_BYTES = 512` 改为按票 15 窗口 2% 占比派生（含绝对上下限）；`[skip]` 行进 `history.jsonl` 前在代码里过滤掉
+- [ ] **Dream 接 trace + 改读真实配置** — 接上 `None` 的 tracer（session `system:dream`）；删掉 `AgentConfig::default()` 轻径，改读 provider/agent；两锚分离（截断类取自身窗口、文档预算取主 agent 窗口）
+- [ ] **成功判定换结构判定** — 英文子串 `contains("error"/"failed")` 改为：run 正常结束（无 error finish_reason、未超 `max_iterations`）且是否有写入；cursor 推进与快照写成功同一判定分支
+- [ ] **写前快照与分层轮转** — memory 工具改写前复制旧内容到 `memory/.snapshots/{run 时间戳}/{文档}`（只含本轮真动过的）；最近 30 天全留、之后每篇每日一、更久每月一；清理挂 Dream 成功分支（与 `tool-results/` TTL 同点）
+- [ ] **年龄反推与标记清洗** — 逐快照 diff 算出正文行首次出现版本→只附进 Dream 提示侧信道（标题行不计年龄、缺档标未知不外推）；`memory_read` 零注解，读写两侧剔年龄标记（`memory_edit` 的 `old_string` **匹配前**就剔）；覆盖 `file_writer`/`file_editor` 写 MEMORY.md 路径；清洗动作记 trace
+
+## personal agent 触发器（实现切片，2026-10-31 起）
+
+Spec 见 `.scratch/personal-agent-triggers/spec.md`（实现阶段的唯一依据；文件路径与行号等易过时细节见同目录 `issues/08-spec-assembly.md` 的 `## Comments` 存档）；决策见 `docs/adr/0006..0009`。实现票 10–14 在 `.scratch/personal-agent-triggers/issues/`：10 与 11 可并行，12 依赖两者，13 依赖 12，14 依赖 10 与 13。
+
+- [ ] **10 subagent 机制**（票 10）— `src/agent/`：`agents/*.md` 扫描与校验、per-run `ToolManager`、`RunRegistry` + 并发闸、`subagent` 工具、`# Available Agents` 注入、`[Subagent result]` 经 `publish_inbound` 回 origin、`drop_session` 与不落盘、`subagent.run` span
+- [ ] **11 codemode 沙箱**（票 11）— `src/codemode/`：rquickjs 执行层（专职线程 + LocalSet）、宿主函数注册、双层超时、内存上限、输出截断、secret 脱敏
+- [ ] **12 源采集与 shape**（票 12）— `src/trigger/source/` + `trigger_source` 工具 + tick 骨架 + 内置 `trigger` agent：目录扫描与热加载、`collect.js` 归一化、`snapshot`/`append` 去重、ring + TTL、freeze/commit、到期判定与并发 4、失败降频
+- [ ] **13 判定、状态机与试跑**（票 13）— `src/trigger/subscription/` + `trigger` 的 list/create/update/delete/test：`judge.js` 契约与返回校验、边沿 + cooldown 状态机、ready 门槛、`schedule` 闸门、`state.json` 原子读写、失败自愈与告警计数
+- [ ] **14 执行、投递与历史**（票 14）— `src/trigger/dispatch/` + gateway 装配：`DispatchQueue`、`agent`/`notify` action、`deliver` 三级求值、`notify` 同 tick 合并、失败告警、`history.jsonl`、三个 root span、`docs/trigger.md`
+
 ## WebUI json-render 卡片（2026-10-24 完成）
 
 - [x] **run_id 贯通（T01）** — 恒为空串的 `BusResult.task_id` 落实并改名 `run_id`，从 `TaskHook` 分配，贯穿生命周期事件、`BusResult` 与卡片事件
@@ -37,9 +76,9 @@ Spec 见 `.scratch/memory-entry-index/spec.md`。
 
 **后续切片：**
 
-- [ ] **切片 2：配置与查询增强** — `memory.search.*` 开关（如需）、`Daily` category 语义与每日日志写入方、前缀与短语查询
+- [ ] **切片 2：配置与查询增强** — `memory.search.*` 开关（如需）、前缀与短语查询；~~Daily category 语义与每日日志写入方~~（personal agent v1 票 05 已判定：`Daily` 无写者、不进检索语料，v1 不建设）
 - [ ] **切片 3：embedding / hybrid** — 引入 `SearchMode`，以 embedding provider 替换或融合 `KeywordIndex`
-- [ ] **切片 4：写侧** — `store` / `forget` / `supersede` / dedup gate / 冲突取代 / 时间衰减 / retention（独立立项 + 新 ADR）；前置：把 `hash` 换成稳定哈希（如 sha2）以支持跨运行去重
+- [ ] **切片 4：写侧** — 已由 personal agent v1 票 05 定案并改写：~~`store` / `forget` / `supersede` / dedup gate / 冲突取代~~ 均不新增工具，主模型用现有 `file_writer`/`file_editor` 写 `memory/MEMORY.md`，分类与晋升归 Dream（见 `docs/adr/0012`）；~~把 `hash` 换成稳定哈希（如 sha2）~~ v1 不做（条目身份是标题/正文，跳进程稳定 id 无消费者）。待做：写盘改 `write_file_atomic`、指纹乐观并发校验、Protected document 拒写、`gateway.dream.doc_budget.*` 预算与超限置标记（`retention` / 时间衰减仍待票 06、票 15）
 
 ## Memory 模块统一：category 化 + backend 抽象（2026-09-26）
 
@@ -233,8 +272,8 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 - [x] Dream prompt 模板从 `resources/templates/dream.md` 嵌入，包含四文件路由、MECE 分类、历史属性标签、删除/保留启发式
 - [x] Dream 完成后推进 dream_cursor，并调用 compact_history_after_dream 清理已处理条目（保留最近 50 条）
 - [x] Dream 使用独立 session `system:dream`，不配置 consolidator
-- [ ] 支持通过 git log 为记忆行添加年龄标注（line age annotation）
-- [ ] Dream 编辑结果记录到 `history.jsonl` 作为审计日志
+- [ ] ~~支持通过 git log 为记忆行添加年龄标注~~ — 票 06 已否决：年龄由 `memory/.snapshots/` 快照序列 diff 反推，不用 git（见 `docs/adr/0014`）
+- [ ] ~~Dream 编辑结果记录到 history.jsonl 作为审计日志~~ — 票 06 已定：审计接 trace（session `system:dream`）+ 指纹级（旧/新内容指纹、类别/文档名、`EditOutcome`、处理行范围），全文走票 15 落盘引用；不建独立审计文件
 
 ## Context Builder 对齐 nanobot
 
@@ -332,3 +371,21 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 - [ ] **升级 reqwest 到 0.12** — 当前使用 0.11，0.12 支持 HTTP/3 和改进的 TLS 处理（`Cargo.toml:18`）
 - [ ] **补充测试覆盖** — FileReader 缺少成功读取/截断测试、路径安全缺少 symlink 越界测试、Cron 缺少并发 tick 测试、Session 缺少并发提交竞态测试
 - [ ] **优化 Message 序列化避免中间 Value 分配** — `serde_json::json!()` 每次 LLM 调用为每条消息分配中间 JSON Value。实现自定义 `Serialize` 直接写 OpenAI 格式（`provider/openai.rs:118-203`）
+
+## personal agent 触发器（已实现，2026-10-31）
+
+- [x] **Wayfinder map** — 触发器体系（数据源采集与快照、订阅判定、subagent 承载、codemode 运行时、与 cron 的接缝）的决策地图：`.scratch/personal-agent-triggers/map.md`；票文在同目录 `issues/`，终点产物是 spec（票 08）
+- [x] **研究票 05（已完成）** — codemode 运行时选型选 rquickjs 0.14（详见 `.scratch/personal-agent-triggers/research-codemode-runtime.md`）；待补：`target/probe/` 的编译体积实测（受网络阻塞）
+- [x] **票 01（已完成）** — subagent 机制：`agents/<name>.md` schema、增量工具与拒绝启动、`subagent{agent,task}` 异步契约、内存会话跑完即删、`[Subagent result]` 回流文案
+- [x] **票 02（已完成）** — 采集与快照层：`triggers/sources/<id>/`（meta.json + collect.js）、id 系统生成、`{items}` 归一化 + freeze/commit 一致视图、固定 tick 60s、快照不落盘、`trigger_sources` 只给结构不给值
+- [x] **票 03（已完成）** — 订阅定义与判定：`triggers/triggers/<id>/`（meta.json + condition.js + state.json）、`judge(ctx)` 返回 `{fire, evidence, detail}`、边沿+cooldown 状态机、ready 门槛、不自动 disable
+- [x] **票 04（已完成）** — 触发执行与投递：origin 同 cron payload、`publish_inbound` 回主 Loop、同 tick 合并、失败告警例外、三个并列 root span、`history.jsonl`
+- [x] **票 06（已完成）** — 时间源与 cron 接缝：独立 `interval(60s)` tick、`schedule` 复用 `CronSchedule` 但不入 `jobs.json`、只用本地时间、`ctx.now()/boot_at()/uptime_s()`、重启不补触发、只读的 `trigger_test`
+- [x] **票 07（已完成）** — 提示词/skill/文档：触发器只以内置 agent `agents/trigger.md` 存在（一个能力一个入口）、两个多 action 工具、GLOSSARY 九词、ADR 0006-0009
+- [x] **票 08（已完成）** — spec 汇编：`spec.md` 为权威规格，拆出实现票 10-14；实现细节（路径/行号/片段）存档在票 08 记录里
+- [x] **实现票 10（已完成）** — subagent 运行时：`src/agent/`（定义扫描校验、ToolCatalog、per-run 工具装配、并发闸、`subagent` 工具、内存会话跑完即删、`[Subagent result]` 回流）
+- [x] **实现票 11（已完成）** — codemode 沙箱：`src/codemode/`（rquickjs 专职线程 + current-thread runtime + LocalSet、interrupt + 外层 deadline 双层超时、宿主函数白名单、Redactor 脱敏）
+- [x] **实现票 12（已完成）** — 源采集与快照：`src/trigger/source/`（mtime 热加载、collect 脚本、`{items}` 归一化、freeze/commit 一致视图、健康度与降频）+ `trigger_source` 工具
+- [x] **实现票 13（已完成）** — 判定与状态机：`src/trigger/subscription/`（judge 脚本、边沿+cooldown、ready 门槛、store/state.json 宿主独占写、试跑）+ `trigger` 工具
+- [x] **实现票 14（已完成）** — 执行投递与历史：`src/trigger/dispatch.rs`（有界队列、deliver 三级求值、同 tick 合并、失败告警例外、history.jsonl 六字段、三个并列 root span）
+- [x] **文档收口（票 07 §8 清单）** — 新增 `docs/trigger.md`、`docs/agent.md`、`docs/codemode.md`；同步 `docs/index.md`、`docs/architecture.md`、`docs/context.md`、`docs/tool.md`、`docs/tools.md`、`docs/agent_loop.md`、`CLAUDE.md`、`cron` 工具描述、memory skill 的 agents/skills 边界

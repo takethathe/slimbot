@@ -71,8 +71,19 @@ pub struct ToolManager {
 | 工具 | 装配位置 | 说明 |
 |------|----------|------|
 | `memory_search` | `AgentLoop::from_parts` | 主循环只读记忆检索，CLI 与 gateway 恒可用，无法在配置中禁用 |
+| `subagent` | `AgentLoop::from_parts`（仅主循环） | 启动子代理；保留工具，agent 定义不可声明 |
 | `message` / `cron` | gateway 启动时 | 需要 channel 回调与 cron 运行时 |
+| `trigger_source` / `trigger` | gateway 启动时，**只注册进 `ToolCatalog`** | 主循环不可见，仅当 agent 定义显式声明时才装配到子代理 |
 | `memory_read` / `memory_write` / `memory_edit` | `DreamService::build_tools` | 只在 Dream 沙箱内注册，沙箱无文件工具 |
+
+## ToolCatalog 与可见性
+
+`ToolCatalog` 是工具工厂的进程级注册表（`src/agent/catalog.rs`）：子代理运行时按定义从 catalog 装配自己的 `ToolManager`，主循环的共享工具表与 prompt cache 因此不受影响。
+
+- gateway 与 CLI 模式都在启动时 `register_builtin_set()` 镜像内置工具，`from_parts` 再补 `memory_search`；gateway 另补 `message` / `cron` / `trigger_source` / `trigger`
+- `STATIC_TOOL_NAMES`（13 个）用于在 catalog 尚未组装时（如构建 system prompt）校验工具名
+- 保留工具：`FORBIDDEN_AGENT_TOOLS = ["cron", "subagent"]`，agent 声明它们会被整份拒绝（防止绕过触发器层与并发闸）
+- `ToolCatalog::install_global()` 后，`agent::known_tool_names()` 与触发器工具可查询当前可见工具集
 
 ### `to_openai_functions`
 

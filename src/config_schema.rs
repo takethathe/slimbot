@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig,
-    MemoryConfig, ProviderConfig, ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
+    MemoryConfig, ProviderConfig, SecretEntry, SubagentConfig, ToolEntry, TraceBackendEntry,
+    TraceConfig, TriggersConfig, WebFetchConfig,
 };
 use crate::config_macro::FieldMeta;
 
@@ -169,10 +170,23 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
             MemoryConfig::fields(),
             &to_value_map(&config.memory),
         ),
+        scalar_section(
+            "subagent",
+            "Subagent",
+            SubagentConfig::fields(),
+            &to_value_map(&config.subagent),
+        ),
+        scalar_section(
+            "triggers",
+            "Triggers",
+            TriggersConfig::fields(),
+            &to_value_map(&config.triggers),
+        ),
         providers_section(config),
         tools_section(config),
         channels_section(config),
         tracing_backends_section(config),
+        trigger_secrets_section(config),
     ];
     SchemaTree { sections }
 }
@@ -459,6 +473,44 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// `triggers.secrets`: a list of `{name, value}` entries, edited like
+/// `tracing.backends`. The value stays masked by the `secret` flag on the
+/// field, so the editor never receives a plaintext key.
+fn trigger_secrets_section(config: &Config) -> SchemaSection {
+    let metas = SecretEntry::fields();
+    let item_fields = metas
+        .iter()
+        .map(|m| field_from_meta(m, m.default.clone(), meta_name(m)))
+        .collect();
+
+    let items = config
+        .triggers
+        .secrets
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let fields = fields_from_metas(
+                metas,
+                &to_value_map(entry),
+                &format!("triggers.secrets.{}", i),
+            );
+            SchemaItem {
+                key: None,
+                fields,
+                extra: None,
+            }
+        })
+        .collect();
+
+    SchemaSection {
+        name: "triggers.secrets".to_string(),
+        label: "Trigger Secrets".to_string(),
+        fields: Vec::new(),
+        item_fields: Some(item_fields),
+        items: Some(items),
+    }
+}
+
 // ── Patch engine ──
 
 /// Apply patches to a config with the same clamp → normalize → validate
@@ -516,8 +568,65 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
             Ok(())
         }
         ["tracing", "backends", idx, field] => set_backend_field(config, idx, field, value),
+        ["subagent", field] => set_subagent(config, field, value),
+        ["triggers", field] => set_triggers(config, field, value),
+        ["triggers", "secrets", idx, field] => set_secret_field(config, idx, field, value),
         _ => Err(format!("Unsupported patch path: {}", segs.join("."))),
     }
+}
+
+fn set_subagent(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
+    match field {
+        "max_concurrent" => {
+            config.subagent.max_concurrent = value_u32(value, "subagent.max_concurrent")? as usize
+        }
+        _ => return Err(format!("Unknown subagent field: {}", field)),
+    }
+    Ok(())
+}
+
+fn set_triggers(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
+    match field {
+        "enabled" => config.triggers.enabled = value_bool(value, "triggers.enabled")?,
+        "tick_interval_s" => {
+            config.triggers.tick_interval_s = value_u64(value, "triggers.tick_interval_s")?
+        }
+        "tick_timeout_s" => {
+            config.triggers.tick_timeout_s = value_u64(value, "triggers.tick_timeout_s")?
+        }
+        "max_concurrent_collect" => {
+            config.triggers.max_concurrent_collect =
+                value_u32(value, "triggers.max_concurrent_collect")? as usize
+        }
+        "max_queue" => config.triggers.max_queue = value_u32(value, "triggers.max_queue")? as usize,
+        "max_merge" => config.triggers.max_merge = value_u32(value, "triggers.max_merge")? as usize,
+        "history_lines" => {
+            config.triggers.history_lines = value_u32(value, "triggers.history_lines")? as usize
+        }
+        _ => return Err(format!("Unknown triggers field: {}", field)),
+    }
+    Ok(())
+}
+
+fn set_secret_field(
+    config: &mut Config,
+    idx: &str,
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let i = parse_index(idx)?;
+    let prefix = format!("triggers.secrets.{}", idx);
+    let entry = config
+        .triggers
+        .secrets
+        .get_mut(i)
+        .ok_or_else(|| format!("{}: index out of range", prefix))?;
+    match field {
+        "name" => entry.name = value_str(value, &format!("{}.name", prefix))?,
+        "value" => entry.value = value_str(value, &format!("{}.value", prefix))?,
+        _ => return Err(format!("Unknown secret field: {}", field)),
+    }
+    Ok(())
 }
 
 fn set_agent(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
@@ -781,6 +890,12 @@ fn add_path(config: &mut Config, op: &PatchOp, segs: &[&str]) -> Result<(), Stri
             config.tracing.backends.push(backend);
             Ok(())
         }
+        ["triggers", "secrets"] => {
+            let entry: SecretEntry = serde_json::from_value(op.value.clone())
+                .map_err(|e| format!("triggers.secrets: invalid secret object: {}", e))?;
+            config.triggers.secrets.push(entry);
+            Ok(())
+        }
         _ => Err(format!("add not supported for path: {}", segs.join("."))),
     }
 }
@@ -816,6 +931,15 @@ fn remove_path(config: &mut Config, segs: &[&str]) -> Result<(), String> {
                 Err(format!("tracing.backends.{}: index out of range", idx))
             } else {
                 config.tracing.backends.remove(i);
+                Ok(())
+            }
+        }
+        ["triggers", "secrets", idx] => {
+            let i = parse_index(idx)?;
+            if i >= config.triggers.secrets.len() {
+                Err(format!("triggers.secrets.{}: index out of range", idx))
+            } else {
+                config.triggers.secrets.remove(i);
                 Ok(())
             }
         }
@@ -980,6 +1104,8 @@ mod tests {
             tracing: Default::default(),
             memory: Default::default(),
             json_render: Default::default(),
+            subagent: Default::default(),
+            triggers: Default::default(),
         }
     }
 
@@ -1014,12 +1140,86 @@ mod tests {
                 "json_render",
                 "tracing",
                 "memory",
+                "subagent",
+                "triggers",
                 "providers",
                 "tools",
                 "channels",
                 "tracing.backends",
+                "triggers.secrets",
             ]
         );
+    }
+
+    #[test]
+    fn test_schema_triggers_section_marks_secret_values() {
+        let mut config = make_config();
+        config.triggers.secrets.push(SecretEntry {
+            name: "weather".to_string(),
+            value: "plaintext-key".to_string(),
+            unknown: Default::default(),
+        });
+
+        let tree = serialize_schema(&config);
+        let secrets_section = section(&tree, "triggers.secrets");
+        let item = &secrets_section.items.as_ref().unwrap()[0];
+
+        let name = item.fields.iter().find(|f| f.name == "name").unwrap();
+        assert_eq!(name.kind, "string");
+        assert_eq!(name.value, json!("weather"));
+        assert_eq!(name.path, "triggers.secrets.0.name");
+
+        // The value is a secret: the editor only sees the flag, never the key.
+        let value = item.fields.iter().find(|f| f.name == "value").unwrap();
+        assert_eq!(value.kind, "secret");
+        assert!(value.secret);
+        assert_eq!(value.value, serde_json::Value::Null);
+
+        // The scalar section advertises the collection instead of inlining it.
+        let triggers = section(&tree, "triggers");
+        let secrets = field(triggers, "secrets");
+        assert_eq!(secrets.kind, "list");
+        assert_eq!(secrets.path, "triggers.secrets");
+    }
+
+    #[test]
+    fn test_patch_add_set_remove_trigger_secret() {
+        let mut config = make_config();
+        let ops = vec![
+            op(
+                PatchOpKind::Add,
+                "triggers.secrets",
+                json!({"name": "api", "value": "v1"}),
+            ),
+            op(PatchOpKind::Set, "triggers.secrets.0.value", json!("v2")),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.triggers.secrets.len(), 1);
+        assert_eq!(config.triggers.secrets[0].name, "api");
+        assert_eq!(config.triggers.secrets[0].value, "v2");
+
+        let ops = vec![op(PatchOpKind::Remove, "triggers.secrets.0", json!(null))];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert!(config.triggers.secrets.is_empty());
+    }
+
+    #[test]
+    fn test_patch_triggers_and_subagent_scalars() {
+        let mut config = make_config();
+        let ops = vec![
+            op(PatchOpKind::Set, "subagent.max_concurrent", json!(5)),
+            op(PatchOpKind::Set, "triggers.enabled", json!(false)),
+            op(PatchOpKind::Set, "triggers.tick_interval_s", json!(120)),
+            op(PatchOpKind::Set, "triggers.max_queue", json!(30)),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.subagent.max_concurrent, 5);
+        assert!(!config.triggers.enabled);
+        assert_eq!(config.triggers.tick_interval_s, 120);
+        assert_eq!(config.triggers.max_queue, 30);
     }
 
     #[test]

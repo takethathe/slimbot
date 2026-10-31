@@ -218,6 +218,8 @@ fn test_save_and_reload_round_trip() {
         tracing: Default::default(),
         memory: Default::default(),
         json_render: Default::default(),
+        subagent: Default::default(),
+        triggers: Default::default(),
     };
 
     config.save(path).unwrap();

@@ -21,3 +21,7 @@ SOUL, USER, TOOLS, AGENTS, `memory/MEMORY.md` and the newest history entries are
 ## Ownership
 
 Dream rewrites `SOUL.md`, `USER.md` and `memory/MEMORY.md` from consolidated conversation history, and merges new workflows into `skills/<name>/SKILL.md`. State a correction in your reply and keep applying it yourself until it shows up in memory — consolidation decides when the next Dream run sees it.
+
+## Skills vs agents
+
+A skill is knowledge to load; an agent (`agents/<name>.md`) is an executable to launch. Give a capability one home only, never both — when both exist the model takes the shortcut of calling the agent and the document rots. Reusable *executors* with their own tools go to `agents/`; knowledge and conventions go to `skills/`.
