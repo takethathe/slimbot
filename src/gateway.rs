@@ -367,9 +367,10 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 /// Resolve the provider config for card generation: identity comes from the
 /// main agent provider, or the `json_render.model_override` provider name
 /// when it exists in the map; the output budget is always the card-specific
-/// `json_render.max_tokens`, and thinking is forced off (a card is a
-/// mechanical transcript→JSONL conversion — reasoning only buys latency).
-/// `None` when no provider resolves at all.
+/// `json_render.max_tokens`, prompt caching is always on (the catalog prompt
+/// is the one stable prefix a card call has) and thinking is forced off (a
+/// card is a mechanical transcript→JSONL conversion — reasoning only buys
+/// latency). `None` when no provider resolves at all.
 fn card_provider_config(config: &Config) -> Option<crate::config::ProviderConfig> {
     let base = config
         .json_render
@@ -379,6 +380,7 @@ fn card_provider_config(config: &Config) -> Option<crate::config::ProviderConfig
         .or_else(|| config.providers.get(&config.agent.provider))?;
     let mut pc = base.clone();
     pc.max_tokens = config.json_render.max_tokens;
+    pc.prompt_cache_enabled = true;
     pc.disable_thinking = true;
     Some(pc)
 }
@@ -522,6 +524,24 @@ mod tests {
         assert!(
             pc.disable_thinking,
             "card calls must never run in thinking mode"
+        );
+    }
+
+    #[test]
+    fn test_card_provider_forces_prompt_cache_on_for_card_calls() {
+        // The catalog prompt is the only stable prefix a card call has, so
+        // caching must not depend on the (possibly cache-less) provider it
+        // was inherited from: the card provider always enables it.
+        let mut config = card_test_config();
+        config
+            .providers
+            .get_mut("main")
+            .unwrap()
+            .prompt_cache_enabled = false;
+        let pc = card_provider_config(&config).expect("main provider resolves");
+        assert!(
+            pc.prompt_cache_enabled,
+            "card calls must always mark their cacheable prefix"
         );
     }
 

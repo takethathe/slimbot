@@ -124,7 +124,7 @@ WebUI 在会话气泡下方渲染生成式 UI 卡片（json-render Card spec）�
 
 **回放：** 完成的 spec 追加到 Card sidecar（`sessions/{chat_id}.cards.jsonl`），以该 Run 末条 assistant 消息的 `timestamp` 为锚，**不写进会话 JSONL**（避免 patch 文本污染 agent 上下文）。`/session/{chat_id}` 读取时按锚点精确挂回 assistant 消息的 `card` 字段；锚点已不存在（被 consolidation 重写）的卡片直接不挂，绝不按索引猜测。
 
-**护栏与配置：** 顶层 `json_render` 配置段控制卡片生成（`enabled` 总开关、`model_override` 指定 provider、`max_tokens` 单次调用输出预算、`timeout_seconds` 单次调用的无进展窗口——任何流式信号到达即续命，思考模型的长推理阶段不会被误杀；真正卡死的流在窗口用满后被掐断）。运行时护栏：并发闸门（超限的 Run 直接跳过、不排队）、停滞取消、进程退出时取消进行中的生成；卡片调用强制禁用模型思考（请求体注入 `enable_thinking: false`，不影响主 agent 对话）。每次生成记录 `json_render.generate` span（`json_render.patch_count`、token usage attributes），可在 Trace 查看器观察。
+**护栏与配置：** 顶层 `json_render` 配置段控制卡片生成（`enabled` 总开关、`model_override` 指定 provider、`max_tokens` 单次调用输出预算、`timeout_seconds` 单次调用的无进展窗口——任何流式信号到达即续命，思考模型的长推理阶段不会被误杀；真正卡死的流在窗口用满后被掐断）。运行时护栏：并发闸门（超限的 Run 直接跳过、不排队）、停滞取消、进程退出时取消进行中的生成；卡片调用一律以流式、关闭思考、开启 prompt cache 发起（请求体分别带 `stream: true`、`enable_thinking: false` 与 `cache_control`，均不影响主 agent 对话）。每次生成记录 `json_render.generate` span（`json_render.patch_count`、token usage attributes），其下挂 `chat` 子 span 携带 provider 身份、完整请求体与本次调用的 token/缓存命中，可在 Trace 查看器直接审计。
 
 **其他通道：** 卡片事件走独立 mpsc 经 `ChannelManager` 路由，不进 `AgentEvent` 广播；`Channel` trait 的 `write_card` 默认 no-op，CLI/cron/heartbeat 继承默认实现直接丢弃。
 

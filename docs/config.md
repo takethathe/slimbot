@@ -176,7 +176,7 @@ cargo run -- -d /data/myapp setup
 | `max_tokens` | uint | `2048` | 64–32768 | 单次卡片生成调用的输出 token 预算（覆盖所用 provider 的 `max_tokens`） |
 | `timeout_seconds` | uint | `30` | 1–300 | 单次卡片生成调用的**无进展窗口**（秒）：流式信号（内容增量或存活心跳）到达即续命，窗口内毫无信号才判停滞，静默降级为 `failed` 事件 |
 
-**说明：** 卡片 provider 的身份（base_url/api_key/model）来自 `model_override` 命中的 provider 或主 agent provider，`max_tokens` 恒为 `json_render.max_tokens`，且 `disable_thinking` 恒为 true（卡片是机械的转录→JSONL 转换，思考只会拖慢速度并拉长首信号等待，主 agent 对话不受此影响）。
+**说明：** 卡片 provider 的身份（base_url/api_key/model）来自 `model_override` 命中的 provider 或主 agent provider，`max_tokens` 恒为 `json_render.max_tokens` ，且 `disable_thinking` 恒为 true（卡片是机械的转录→JSONL 转换，思考只会拖慢速度并拉长首信号等待，主 agent 对话不受此影响）。启动该调用的 `prompt_cache_enabled` 同样恒为 true（即使 provider 上显式写了 `false` 也覆盖；Catalog prompt 是卡片调用唯一稳定的前缀），请求一律以 `stream: true` 发起；两者都不回写被继承的 provider 配置，也不影响主 agent 对话。
 
 ### `agent` — Agent 配置
 

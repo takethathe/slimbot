@@ -21,8 +21,10 @@
 //!
 //! Runtime guardrails live in [`CardPolicy`] (concurrency cap, per-call
 //! no-progress timeout, ops off-switch), the generated span
-//! `json_render.generate` carries patch count and token usage for debugging,
-//! and [`CardService::shutdown`] cancels in-flight generations at process exit.
+//! `json_render.generate` carries patch count and token usage for debugging
+//! with the provider request itself recorded on its `chat` child span (thinking
+//! off, cache markers, `stream: true`), and [`CardService::shutdown`] cancels
+//! in-flight generations at process exit.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -89,6 +91,73 @@ struct GenerationOutcome {
     resp: anyhow::Result<LLMResponse>,
     spec: Option<serde_json::Value>,
     patch_count: usize,
+}
+
+/// Owns the `chat` span of one provider call.
+///
+/// A worker cancelled before it reports an outcome (no-progress timeout,
+/// shutdown) drops this guard without settling it, and the drop marks the span
+/// errored: an aborted card call must never surface as a healthy `ok` chat.
+struct ChatSpan {
+    guard: SpanGuard,
+    settled: bool,
+}
+
+impl ChatSpan {
+    fn new(guard: SpanGuard) -> Self {
+        guard.set_attribute("gen_ai.operation.name", serde_json::json!("chat"));
+        Self {
+            guard,
+            settled: false,
+        }
+    }
+
+    /// Record the call's outcome (usage, finish reason, failure) on the span.
+    fn settle(&mut self, resp: &anyhow::Result<LLMResponse>) {
+        self.settled = true;
+        match resp {
+            Ok(r) => {
+                self.guard.set_attribute(
+                    "gen_ai.usage.input_tokens",
+                    serde_json::json!(r.usage.prompt_tokens),
+                );
+                self.guard.set_attribute(
+                    "gen_ai.usage.output_tokens",
+                    serde_json::json!(r.usage.completion_tokens),
+                );
+                self.guard.set_attribute(
+                    "gen_ai.usage.cache_read.input_tokens",
+                    serde_json::json!(r.usage.prompt_cache_hit_tokens),
+                );
+                self.guard.set_attribute(
+                    "gen_ai.response.finish_reasons",
+                    serde_json::json!([r.finish_reason.to_string()]),
+                );
+            }
+            Err(e) => {
+                self.guard
+                    .set_attribute("error.type", serde_json::json!("provider_error"));
+                self.guard.set_status(SpanStatus::Error(e.to_string()));
+            }
+        }
+    }
+}
+
+impl SpanRecorder for ChatSpan {
+    fn set_attribute(&self, key: &str, value: serde_json::Value) {
+        self.guard.set_attribute(key, value);
+    }
+}
+
+impl Drop for ChatSpan {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.guard
+                .set_attribute("error.type", serde_json::json!("cancelled"));
+            self.guard
+                .set_status(SpanStatus::Error("cancelled before completion".into()));
+        }
+    }
 }
 
 /// Card generation service, shared behind an `Arc`.
@@ -428,6 +497,15 @@ impl CardService {
             run_id: run_id.clone(),
         });
 
+        // The provider call gets its own `chat` child span, mirroring the
+        // runner's shape: the request itself — thinking off, cache markers,
+        // `stream: true` — rides the recorder attributes, so a card call is
+        // audit-able instead of surfacing only as token counts.
+        let mut chat_span: Option<ChatSpan> = self.tracer.as_ref().map(|t| {
+            let parent_ctx = span.as_ref().map(|s| s.context());
+            ChatSpan::new(t.start_span("chat", parent_ctx.as_ref()))
+        });
+
         // The provider call runs on its own task; every stream signal it
         // emits (content or liveness) ticks a watchdog. The policy timeout is
         // a *no-progress* budget, not a wall-clock cap: reasoning models spend
@@ -470,7 +548,14 @@ impl CardService {
                 }
             };
             let m: [&Message; 2] = [&msgs[0], &msgs[1]];
-            let resp = provider.chat_stream(&m, None, None, &mut on_signal).await;
+            let recorder: Option<&dyn SpanRecorder> =
+                chat_span.as_ref().map(|s| s as &dyn SpanRecorder);
+            let resp = provider
+                .chat_stream(&m, None, recorder, &mut on_signal)
+                .await;
+            if let Some(s) = chat_span.as_mut() {
+                s.settle(&resp);
+            }
             let spec = compiler.finish();
             let _ = done_tx
                 .send(GenerationOutcome {
@@ -699,6 +784,50 @@ mod tests {
                 tool_calls: None,
                 finish_reason: FinishReason::Stop,
                 usage: Usage::default(),
+            })
+        }
+    }
+
+    /// Provider that writes one attribute through the recorder it is handed
+    /// and reports whether a recorder was there at all, so a test can prove
+    /// the card request is inspectable in the trace.
+    struct RecorderProbeProvider {
+        saw_recorder: Arc<std::sync::Mutex<bool>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecorderProbeProvider {
+        async fn chat(
+            &self,
+            _messages: &[&Message],
+            _tools: Option<&[ToolDefinition]>,
+            _recorder: Option<&dyn SpanRecorder>,
+        ) -> anyhow::Result<LLMResponse> {
+            unreachable!("card generation must use chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[&Message],
+            _tools: Option<&[ToolDefinition]>,
+            recorder: Option<&dyn SpanRecorder>,
+            on_signal: &mut (dyn FnMut(StreamSignal) + Send),
+        ) -> anyhow::Result<LLMResponse> {
+            *self.saw_recorder.lock().unwrap() = recorder.is_some();
+            if let Some(rec) = recorder {
+                rec.set_attribute("gen_ai.provider.name", json!("openai"));
+            }
+            on_signal(StreamSignal::Content(VALID_SPEC_JSONL.to_string()));
+            Ok(LLMResponse {
+                content: Some(VALID_SPEC_JSONL.to_string()),
+                tool_calls: None,
+                finish_reason: FinishReason::Stop,
+                usage: Usage {
+                    prompt_tokens: 11,
+                    prompt_cache_hit_tokens: 5,
+                    completion_tokens: 7,
+                    total_tokens: 18,
+                },
             })
         }
     }
@@ -1067,6 +1196,8 @@ mod tests {
 
         let (card_tx, mut card_rx) = mpsc::channel(16);
         let (event_tx, _) = broadcast::channel(16);
+        let backend = RecordingBackend::new();
+        let tracer = Arc::new(crate::trace::Tracer::new(vec![backend.clone()]));
         let service = Arc::new(
             CardService::new(
                 Arc::new(BlockingProvider),
@@ -1077,7 +1208,8 @@ mod tests {
             .with_policy(CardPolicy {
                 timeout: Duration::from_millis(80),
                 ..Default::default()
-            }),
+            })
+            .with_tracer(tracer),
         );
         let _listener = spawn_listener(service.clone(), event_tx.subscribe());
 
@@ -1109,6 +1241,24 @@ mod tests {
         );
         let sidecar = session_dir.join("chat7.cards.jsonl");
         assert!(!sidecar.exists(), "a timed-out generation writes nothing");
+
+        // The cancelled call must not keep looking like a healthy inference:
+        // its `chat` child span closes as errored once the worker is aborted.
+        let mut chat = None;
+        for _ in 0..100 {
+            if let Some(span) = backend.end_for("chat") {
+                chat = Some(span);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let chat = chat.expect("the stalled call is still traced");
+        assert!(
+            matches!(&chat.status, crate::trace::SpanStatus::Error(msg) if msg.contains("cancelled")),
+            "cancellation is visible on the span: {:?}",
+            chat.status
+        );
+        assert_eq!(chat.attributes.get("error.type"), Some(&json!("cancelled")));
     }
 
     /// Streaming provider that keeps the transport alive with `Activity`
@@ -1364,14 +1514,18 @@ mod tests {
         );
     }
 
-    /// Captures span ends (with the name resolved from span-start) so tests
-    /// can assert on the `json_render.generate` instrumentation from outside.
+    /// Captures span ends (with the name and parent resolved from span-start)
+    /// so tests can assert on the `json_render.generate` and `chat`
+    /// instrumentation from outside.
     struct RecordingBackend {
-        starts: std::sync::Mutex<HashMap<String, String>>,
+        /// span_id → (name, parent_span_id)
+        starts: std::sync::Mutex<HashMap<String, (String, Option<String>)>>,
         ends: std::sync::Mutex<Vec<RecordedSpan>>,
     }
 
     struct RecordedSpan {
+        span_id: String,
+        parent_span_id: Option<String>,
         name: String,
         status: crate::trace::SpanStatus,
         attributes: std::collections::BTreeMap<String, serde_json::Value>,
@@ -1392,6 +1546,8 @@ mod tests {
                 .iter()
                 .find(|s| s.name == name)
                 .map(|s| RecordedSpan {
+                    span_id: s.span_id.clone(),
+                    parent_span_id: s.parent_span_id.clone(),
                     name: s.name.clone(),
                     status: s.status.clone(),
                     attributes: s.attributes.clone(),
@@ -1406,10 +1562,10 @@ mod tests {
             name: &str,
             _start: std::time::SystemTime,
         ) {
-            self.starts
-                .lock()
-                .unwrap()
-                .insert(ctx.span_id.clone(), name.to_string());
+            self.starts.lock().unwrap().insert(
+                ctx.span_id.clone(),
+                (name.to_string(), ctx.parent_span_id.clone()),
+            );
         }
 
         fn on_span_end(
@@ -1419,7 +1575,7 @@ mod tests {
             status: &crate::trace::SpanStatus,
             attributes: &std::collections::BTreeMap<String, serde_json::Value>,
         ) {
-            let name = self
+            let (name, parent_span_id) = self
                 .starts
                 .lock()
                 .unwrap()
@@ -1427,6 +1583,8 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             self.ends.lock().unwrap().push(RecordedSpan {
+                span_id: ctx.span_id.clone(),
+                parent_span_id,
                 name,
                 status: status.clone(),
                 attributes: attributes.clone(),
@@ -1491,6 +1649,91 @@ mod tests {
         // The generation call's token usage is recorded on the span…
         assert!(span.attributes.contains_key("gen_ai.usage.input_tokens"));
         assert!(span.attributes.contains_key("gen_ai.usage.output_tokens"));
+    }
+
+    #[tokio::test]
+    async fn test_generation_call_is_traced_as_a_chat_child_span() {
+        // The provider request itself must be inspectable: thinking-off, cache
+        // markers and `stream: true` live in the recorder attributes, and the
+        // call hangs off `json_render.generate` as a `chat` child.
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        let sm = build_sm(session_dir.clone());
+        seed_turn(&sm, "webui:chat-trace", "q", "a").await;
+
+        let backend = RecordingBackend::new();
+        let tracer = Arc::new(crate::trace::Tracer::new(vec![backend.clone()]));
+        let (card_tx, mut card_rx) = mpsc::channel(16);
+        let (event_tx, _) = broadcast::channel(16);
+        let saw_recorder = Arc::new(std::sync::Mutex::new(false));
+        let service = Arc::new(
+            CardService::new(
+                Arc::new(RecorderProbeProvider {
+                    saw_recorder: saw_recorder.clone(),
+                }),
+                sm,
+                CardStore::new(&session_dir),
+                card_tx,
+            )
+            .with_tracer(tracer),
+        );
+        let _listener = spawn_listener(service.clone(), event_tx.subscribe());
+
+        service
+            .register_catalog("chat-trace", "prompt".into(), "h".into())
+            .unwrap();
+        service.register_run("run-trace", "webui:chat-trace", "chat-trace");
+        event_tx
+            .send(AgentEvent::TaskStarted {
+                session_id: "webui:chat-trace".into(),
+                run_id: "run-trace".into(),
+            })
+            .unwrap();
+        event_tx
+            .send(AgentEvent::TaskCompleted {
+                session_id: "webui:chat-trace".into(),
+                run_id: "run-trace".into(),
+                result: String::new(),
+            })
+            .unwrap();
+        let _ = drain(&mut card_rx).await;
+
+        let generate = backend
+            .end_for("json_render.generate")
+            .expect("a json_render.generate span");
+        let chat = backend
+            .end_for("chat")
+            .expect("the card call must be traced as a chat span");
+        assert_eq!(
+            chat.attributes.get("gen_ai.operation.name"),
+            Some(&json!("chat"))
+        );
+        // Attributes written through the recorder by the provider make it in.
+        assert_eq!(
+            chat.attributes.get("gen_ai.provider.name"),
+            Some(&json!("openai"))
+        );
+        assert_eq!(
+            chat.attributes.get("gen_ai.usage.input_tokens"),
+            Some(&json!(11))
+        );
+        assert_eq!(
+            chat.attributes.get("gen_ai.usage.output_tokens"),
+            Some(&json!(7))
+        );
+        assert_eq!(
+            chat.attributes.get("gen_ai.usage.cache_read.input_tokens"),
+            Some(&json!(5))
+        );
+        assert_eq!(
+            chat.parent_span_id.as_deref(),
+            Some(generate.span_id.as_str()),
+            "the chat span hangs off json_render.generate"
+        );
+        assert!(
+            *saw_recorder.lock().unwrap(),
+            "the provider must receive the span recorder"
+        );
     }
 
     #[tokio::test]

@@ -95,6 +95,8 @@ pub struct Tracer {
 | 每次 ReAct 循环迭代 | `iteration` | `invoke_agent slimbot` | 框架自定义 span，包裹 chat + 工具循环 |
 | 骨架调用 `provider.chat()` 处 | `chat` | `iteration` | guard 传给 provider 写 body；`gen_ai.operation.name=chat` |
 | 骨架调用 `tool.execute()` 处 | `execute_tool {name}` | `iteration` | 如 `execute_tool shell`；`gen_ai.operation.name=execute_tool` |
+| `CardService::generate()` 一次卡片生成 | `json_render.generate` | 无（独立 trace） | 卡片生成的父 span；`json_render.patch_count` + token usage |
+| 卡片调用 `provider.chat_stream()` 处 | `chat` | `json_render.generate` | 与 `iteration` 下的 `chat` 同一套语义；guard 传给 provider 写 body，被取消/停滞时以 `error.type=cancelled` 结束 |
 
 根 span 的 guard 生命周期覆盖整个 `run()` 的骨架作用域；`chat` / `execute_tool {name}` 的 guard 只包裹各自调用。
 
