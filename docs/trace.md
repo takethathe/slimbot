@@ -1,6 +1,6 @@
 # Trace 机制
 
-多 backend 的 span 埋点机制，用于观测一次 task run 的完整执行过程。术语定义见 [CONTEXT.md](../CONTEXT.md)，架构决策见 [ADR-0001](adr/0001-self-built-span-model.md)。
+多 backend 的 span 埋点机制，用于观测一次 task run 的完整执行过程。术语定义见 [GLOSSARY.md](../GLOSSARY.md)，架构决策见 [ADR-0001](adr/0001-self-built-span-model.md)。
 
 ## 目标与非目标
 

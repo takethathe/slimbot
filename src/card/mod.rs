@@ -3,7 +3,7 @@
 //! Cards are a presentation-layer artifact produced by an *independent* model
 //! call fired after a Run completes — they are not session messages, do not
 //! enter the agent context, and are WebUI-only. See `docs/adr/0005` for the
-//! rationale and `CONTEXT.md` for the vocabulary.
+//! rationale and `GLOSSARY.md` for the vocabulary.
 //!
 //! Building blocks:
 //! - [`spec`]: the streaming Card spec compiler (JSONL patch → Card spec),

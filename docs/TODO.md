@@ -9,7 +9,7 @@
 - [x] **词表扩充与卡片内交互（T05）** — 前端 registry 扩到十二种组件；卡片内交互限本地状态（`setState`/`visible`），动作不上行
 - [x] **卡片回放（T06）** — Card sidecar `sessions/{chat_id}.cards.jsonl`（以 Run 末条 assistant 消息 timestamp 为锚，不进会话 JSONL）；`/session` 返回契约扩 `ts`/`card` 字段，按锚点精确挂回，锚点消失则不挂
 - [x] **护栏与配置（T07）** — `CardPolicy`（并发闸门 max 2 超限跳过、30s 超时、进程退出取消进行中生成）；`json_render.generate` span（`json_render.patch_count` + token usage，失败路径 Error status）；顶层 `json_render` 配置段（enabled/model_override/max_tokens/timeout_seconds，入 config schema + patch）；卡片 provider 解析（override 命中或回退主 provider，预算恒为 json_render.max_tokens）
-- [x] **文档收口（T08）** — docs/channels.md 卡片下发节 + 端点表、docs/channel.md `write_card`/卡片路由、docs/provider.md 重写为实际 trait（含流式契约）、docs/config.md `json_render` 段、CONTEXT.md 术语与 ADR 0005
+- [x] **文档收口（T08）** — docs/channels.md 卡片下发节 + 端点表、docs/channel.md `write_card`/卡片路由、docs/provider.md 重写为实际 trait（含流式契约）、docs/config.md `json_render` 段、CONTEXT.md（现为 GLOSSARY.md）术语与 ADR 0005
 - [x] **验证** — `cargo fmt -- --check`、`cargo clippy --all-targets`（无 warning）、`cargo test` 全过（1181 lib + 全部集成）
 - [x] **上线后修复：无进展超时窗口（2026-10-24）** — 旧语义下 `timeout_seconds` 是单次调用总时长上限，思考模型（如 qwen3 推理阶段只发 `reasoning_content` chunk）必被误杀。`Provider::chat_stream` 回调从 `FnMut(String)` 升级为 `FnMut(StreamSignal)`（`Content` 内容增量 / `Activity` 传输层存活心跳）；OpenAI 实现把合法但无内容的 chunk（role 开场、reasoning、usage、`[DONE]`）映射为 `Activity`，坏行不发信号；`CardService::generate` 改为看门狗结构（provider 调用入 worker task，每信号续命，biased select 监督 done/tick/deadline，停滞或取消时由 `AbortOnDrop` 掐断 worker），窗口内毫无信号才判停滞。降级（非流式）provider 行为不变：调用完成前零信号，表现仍为总时长上限。回归测试：`test_stream_activity_signals_extend_the_timeout_window`、`test_stream_stall_after_progress_still_fails`
 - [x] **上线后修复：卡片调用禁用思考（2026-10-24）** — `ProviderConfig` 新增 `disable_thinking` 字段（true 时非流式/流式请求体都注入 `enable_thinking: false`，DashScope 兼容接口扩展字段；未标记的 provider 不发该字段）；`card_provider_config` 对卡片 provider 强制置 true（机械的转录→JSONL 转换不需要推理，思考阶段白白拖慢首信号与总延迟），主 agent 对话不受影响。回归测试：`test_card_provider_disables_thinking_for_card_calls`、`test_chat_disable_thinking_injects_enable_thinking_false`、`test_chat_stream_disable_thinking_injects_enable_thinking_false`
@@ -53,7 +53,7 @@ Spec 见 `.scratch/memory-entry-index/spec.md`。
 - [x] **bootstrap/setup 收窄** — 只写 5 个记忆文件 + skills；identity/dream 仅嵌入不落盘
 - [x] **Dream 改造** — 工具收敛为 `memory_read` / `memory_write` / `memory_edit`（白名单 soul/user/core/skill），移除全部文件工具；dream.md 重写
 - [x] **删除兼容层** — 移除 `MemoryStore` / `SharedMemoryStore` 别名与旧同步方法
-- [x] **文档 + ADR** — docs/memory.md 重写，bootstrap/context/index 更新，CONTEXT.md 术语，ADR 0003
+- [x] **文档 + ADR** — docs/memory.md 重写，bootstrap/context/index 更新，CONTEXT.md（现为 GLOSSARY.md）术语，ADR 0003
 - [ ] **后续：sqlite backend** — 实现第二个 `MemoryBackend`，接线 `memory.backend` 白名单
 - [x] **entry 级只读检索** — 在 backend trait 之上叠加派生 entry 层（见 ADR 0004；写侧仍待切片 4）
 - [ ] **后续：entry 写侧 API** — 若出现逐条目去重 / 语义召回需求，在 entry 层之上增加写侧（见上方切片 4）
@@ -98,7 +98,7 @@ Spec 见 `.scratch/memory-entry-index/spec.md`。
 - [x] **patch 引擎** — `apply_config_patch`（set/add/remove 按 dot-path），应用后 clamp→normalize→validate，失败返回逐字段错误不写盘；非法 path/类型错误返回 Err
 - [x] **WebUI 接线** — `config_path` 穿入 `register_webui_factory`→`WebuiChannelFactory`→`WebuiChannel`→`AppState`；新增 `GET /config`、`GET /config/api/state`（schema + 密钥掩码）、`POST /config/api/update`（patch 应用 + 写回）；handler 为薄壳
 - [x] **前端** — `resources/webui/config.html`：按 schema kind 动态渲染表单、集合 CRUD（providers/backends 结构化、tools/channels 开关+裸 JSON）、api_key 掩码 + 留空不变、逐字段错误高亮 + 放弃重载、顶部重启生效提示、index/traces/config 双向互链
-- [x] **文档** — `docs/config.md` 增补「WebUI 配置编辑器」章节；`docs/index.md` 修正陈旧 `config_scheme.md` 条目（删除该陈旧文档）；`CONTEXT.md` 术语与 `docs/adr/0002` 已落盘
+- [x] **文档** — `docs/config.md` 增补「WebUI 配置编辑器」章节；`docs/index.md` 修正陈旧 `config_scheme.md` 条目（删除该陈旧文档）；`CONTEXT.md`（现为 `GLOSSARY.md`）术语与 `docs/adr/0002` 已落盘
 - [x] **验证** — `cargo fmt --check`、`cargo clippy`（无新 warning）、`cargo test` 全过（982 lib + 集成）
 
 Spec 见 `.scratch/webui-config-editor/spec.md`。
@@ -111,7 +111,7 @@ Spec 见 `.scratch/webui-config-editor/spec.md`。
 - [x] **WebUI 接线** — `resolve_trace_file_paths` 结果注入 `WebuiChannelFactory` → `WebuiChannel` → `AppState`；无 file backend 时路径为空，查看器显示禁用态
 - [x] **后端接口** — `GET /traces`（HTML）+ `/traces/api/traces`（列表，按开始时间降序，含 `startup_ms`/`disabled`/`too_large`）+ `/traces/api/trace/{id}`（span 树详情 + 扁平 spans，404 兜底）+ `/common.css`；解析/分组/排序/建树在 `src/trace_viewer.rs` 纯函数（可单测），handler 为薄壳；50 MiB 大小保护
 - [x] **前端** — 抽公共 `webui/common.css`（index.html 视觉零变化）；新增 `resources/webui/traces.html`（列表 + 树形展开 + 大 JSON 折叠 + 超长截断 + 空态/禁用态 + 双向互链 + 启动时间/已运行时长 + 手动刷新/自动加载）
-- [x] **文档** — `docs/trace.md` 截断语义与默认路径更新、CONTEXT.md 增补 trace file / trace viewer 术语、ADR-0001 不涉及无需更新
+- [x] **文档** — `docs/trace.md` 截断语义与默认路径更新、CONTEXT.md（现为 GLOSSARY.md）增补 trace file / trace viewer 术语、ADR-0001 不涉及无需更新
 - [x] **code review 修复** — `startup_ms` 由接线层记录真实 Gateway 启动截断时刻（替代文件 mtime，避免追加后失真）；`TraceDetail` 补充 `full_trace_id`；移除根 span 恒有 end 的不可达 running 分支；前端抽取 `renderSpanDetail` 去重、清理 `fmtTime`/`statusBadge` 死代码
 - [x] **验证** — `cargo fmt --check`、`cargo clippy`（无新 warning）、`cargo test` 全过（941 lib + 集成）
 

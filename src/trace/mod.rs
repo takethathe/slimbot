@@ -2,7 +2,7 @@
 //!
 //! One run (`AgentRunner::run()`) maps to one trace: a root span plus its
 //! child spans (`iteration`, `provider.chat`, `tool.{name}`), all sharing the
-//! same trace id. Term definitions live in `CONTEXT.md`; design narrative in
+//! same trace id. Term definitions live in `GLOSSARY.md`; design narrative in
 //! `docs/trace.md`; the decision to build a self-contained span model instead
 //! of adopting the `tracing` crate is recorded in `docs/adr/0001-self-built-span-model.md`.
 //!
