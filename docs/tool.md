@@ -62,6 +62,17 @@ pub struct ToolManager {
 | `file_editor` | 搜索替换编辑 |
 | `list_dir` | 目录列表 |
 | `make_dir` | 目录创建 |
+| `grep` | 内容搜索 |
+| `find_files` | 文件发现 |
+| `web_fetch` | 网页抓取 |
+
+`tools` 数组只能表达 `create_tool()` 能构造的工具（仅需 workspace 目录）。其余工具在装配处直接 `register`：
+
+| 工具 | 装配位置 | 说明 |
+|------|----------|------|
+| `memory_search` | `AgentLoop::from_parts` | 主循环只读记忆检索，CLI 与 gateway 恒可用，无法在配置中禁用 |
+| `message` / `cron` | gateway 启动时 | 需要 channel 回调与 cron 运行时 |
+| `memory_read` / `memory_write` / `memory_edit` | `DreamService::build_tools` | 只在 Dream 沙箱内注册，沙箱无文件工具 |
 
 ### `to_openai_functions`
 

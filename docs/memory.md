@@ -122,7 +122,7 @@ Dream 通过 memory 工具（而非文件工具）维护记忆。`category` 为�
 | `memory_write(category, name?, content)` | 创建或覆盖文档；允许创建新 skill |
 | `memory_edit(category, name?, old_string, new_string)` | 唯一匹配的原地替换 |
 
-已存在的 skill 名列表注入每个工具的 description。Dream 沙箱**没有**任何文件系统工具。
+已存在的 skill 名列表注入每个工具的 description。Dream 沙箱**没有**任何文件系统工具。字段与行为细节见 [内置工具](tools.md) 的「Dream 专用工具」一节。
 
 ## Memory entry 与 Memory index（派生检索层）
 
@@ -168,13 +168,7 @@ Dream 通过 memory 工具（而非文件工具）维护记忆。`category` 为�
 
 主循环在 CLI 与 gateway 两种模式下都注册 `memory_search`（`AgentLoop::from_parts`；与 `message` / `cron` 一样**不**进 `config.tools`，因为后者只能构造仅需 workspace 的内置工具）。
 
-| 参数 | 说明 |
-|------|------|
-| `query` | 必填 string，中文与英文均可 |
-| `category` | 可选，8 个 category 字符串之一，作**过滤器**（不是权限边界——主循环本就持有 `file_reader`） |
-| `limit` | 可选 integer，缺省 10，硬上限 50（超出钳到 50，不报错；小于 1 或非整数报错） |
-
-输出先给一行汇总（`<n> memory entries matched "<query>":`），随后每条一行：无 heading 时为 `- [<category>] <content>  (<source>)`，命中 heading 时为 `- [<category>] <heading> — <content>  (<source>)`。内容按 240 字符截断（换行折为空格），整体沿用既有 tool result 截断机制。无匹配时返回明确文案而非空串。工具**只读**：不写记忆、不落盘、不改任何持久状态。
+`category` 参数只是结果过滤器，**不是**权限边界（主循环本就持有 `file_reader`）。返回值是纯文本（汇总行 + 逐条 category / heading / source），不引入结构化协议；无匹配时返回明确文案而非空串。参数、打分与检索范围的完整说明见 [内置工具](tools.md) 的 `memory_search` 一节。
 
 ## 设计考量
 

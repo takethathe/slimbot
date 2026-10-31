@@ -1,28 +1,23 @@
 ---
 name: memory
-description: Two-layer memory system with Dream-managed knowledge files.
+description: Long-term memory: which documents Dream owns, and how to recall a stored fact or an older event.
 always: true
 ---
 
 # Memory
 
-## Structure
+## Recall a stored fact — `memory_search`
 
-- `SOUL.md` — Bot personality and communication style. **Managed by Dream.** Do NOT edit.
-- `USER.md` — User profile and preferences. **Managed by Dream.** Do NOT edit.
-- `memory/MEMORY.md` — Long-term facts (project context, important decisions). **Managed by Dream.** Do NOT edit.
-- `memory/history.jsonl` — Append-only JSONL, not loaded into context automatically. Use `grep` to search it.
+SOUL, USER, TOOLS, AGENTS, `memory/MEMORY.md` and the newest history entries are already in this prompt — each document appears only once it differs from its template. `memory_search` covers the rest: a read-only search over those documents plus every `skills/<name>/SKILL.md` and custom `memory/<name>.md`, returning matching paragraphs with their category, enclosing heading and source path.
 
-## Search Past Events
+- `query` — keywords; Chinese and English both work
+- `category` — optional filter: `agent`, `soul`, `tools`, `user`, `core`, `skill`, `custom` (`daily` is reserved and empty)
+- `limit` — default 10, max 50
 
-`memory/history.jsonl` is JSONL format — each line is a JSON object with `cursor`, `timestamp`, `content`.
+## Recall an older event
 
-- For broad searches, start with `shell: grep "pattern" memory/history.jsonl` before requesting full file content
-- Use exact timestamps or keywords as search patterns
-- Read `memory/history.jsonl` directly with `file_reader` for small files
+`memory_search` reads documents only, never the history log. The newest entries are already in this prompt; for anything older, search the log listed in your workspace notes with `grep`, or `file_reader` when it is small.
 
-## Important
+## Ownership
 
-- **Do NOT edit SOUL.md, USER.md, or MEMORY.md.** They are automatically managed by the Dream process.
-- If you notice outdated information, note it in your response — Dream will correct it on its next run.
-- Memory content is automatically injected into your context when relevant.
+Dream rewrites `SOUL.md`, `USER.md` and `memory/MEMORY.md` from consolidated conversation history, and merges new workflows into `skills/<name>/SKILL.md`. State a correction in your reply and keep applying it yourself until it shows up in memory — consolidation decides when the next Dream run sees it.
