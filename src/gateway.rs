@@ -543,6 +543,7 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
+                owner: Default::default(),
                 cron: crate::config::CronConfig {
                     enabled: false,
                     unknown: Default::default(),
@@ -761,6 +762,7 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
+                owner: Default::default(),
                 cron: crate::config::CronConfig {
                     enabled: false,
                     unknown: Default::default(),
@@ -900,6 +902,7 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
+                owner: Default::default(),
                 cron: crate::config::CronConfig {
                     enabled: false,
                     unknown: Default::default(),
@@ -957,6 +960,7 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
+                owner: Default::default(),
                 cron: crate::config::CronConfig {
                     enabled: false,
                     unknown: Default::default(),
@@ -1037,12 +1041,11 @@ mod tests {
         let (mb, _receivers) = MessageBus::new();
 
         // Send a request
-        let req = BusRequest {
-            session_id: "test-session".to_string(),
-            content: "test content".to_string(),
-            channel_inject: None,
-            hook: TaskHook::new("test-session"),
-        };
+        let req = BusRequest::owner(
+            "test-session",
+            "test content",
+            TaskHook::new("test-session"),
+        );
         let result = mb.inbound_tx().send(req).await;
         assert!(result.is_ok());
 
@@ -1174,6 +1177,7 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
+                owner: Default::default(),
                 cron: crate::config::CronConfig {
                     enabled: false,
                     unknown: Default::default(),
@@ -1244,12 +1248,7 @@ mod tests {
     #[tokio::test]
     async fn test_gateway_bus_request_creation() {
         let hook = TaskHook::new("test-session");
-        let request = BusRequest {
-            session_id: "test-session".to_string(),
-            content: "Test input".to_string(),
-            channel_inject: None,
-            hook,
-        };
+        let request = BusRequest::owner("test-session", "Test input", hook);
         assert_eq!(request.session_id, "test-session");
         assert_eq!(request.content, "Test input");
         assert!(request.channel_inject.is_none());
@@ -1474,12 +1473,7 @@ mod tests {
 
         // Send a request
         let hook = TaskHook::new("test-session");
-        let request = BusRequest {
-            session_id: "test-session".to_string(),
-            content: "test input".to_string(),
-            channel_inject: None,
-            hook,
-        };
+        let request = BusRequest::owner("test-session", "test input", hook);
         let result = inbound_tx.send(request).await;
         assert!(result.is_ok());
     }
@@ -1629,6 +1623,7 @@ mod tests {
             tools: vec![],
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
+                owner: Default::default(),
                 cron: crate::config::CronConfig {
                     enabled: true,
                     unknown: Default::default(),
@@ -1947,22 +1942,12 @@ mod tests {
         // Both senders should work
         let hook = TaskHook::new("test-session");
         let result1 = tx1
-            .send(BusRequest {
-                session_id: "session-1".to_string(),
-                content: "content-1".to_string(),
-                channel_inject: None,
-                hook: hook.clone(),
-            })
+            .send(BusRequest::owner("session-1", "content-1", hook.clone()))
             .await;
         assert!(result1.is_ok());
 
         let result2 = tx2
-            .send(BusRequest {
-                session_id: "session-2".to_string(),
-                content: "content-2".to_string(),
-                channel_inject: None,
-                hook,
-            })
+            .send(BusRequest::owner("session-2", "content-2", hook))
             .await;
         assert!(result2.is_ok());
     }
@@ -2371,12 +2356,7 @@ mod tests {
         // Send to inbound
         let hook = TaskHook::new("test");
         let result = inbound_tx
-            .send(BusRequest {
-                session_id: "test".to_string(),
-                content: "test".to_string(),
-                channel_inject: None,
-                hook,
-            })
+            .send(BusRequest::owner("test", "test", hook))
             .await;
         assert!(result.is_ok());
 

@@ -338,6 +338,10 @@ pub struct TaskHook {
     session_id: String,
     event_tx: Option<broadcast::Sender<AgentEvent>>,
     run_id: String,
+    /// The principal whose task this is. v1 has exactly one owner, but the id is
+    /// threaded through the task so approvals, audit and delivery never have to
+    /// guess "whose" a run is.
+    owner_id: String,
 }
 
 /// Events broadcast through TaskHook for fine-grained channel notifications.
@@ -404,7 +408,19 @@ impl TaskHook {
             session_id: session_id.to_string(),
             event_tx: None,
             run_id: uuid::Uuid::new_v4().to_string(),
+            owner_id: crate::identity::DEFAULT_OWNER_ID.to_string(),
         }
+    }
+
+    /// Pin the principal this task belongs to (the configured owner).
+    pub fn with_owner_id(mut self, owner_id: &str) -> Self {
+        self.owner_id = owner_id.to_string();
+        self
+    }
+
+    /// The principal this task belongs to.
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
     }
 
     pub fn with_status_channel(self, tx: tokio::sync::mpsc::Sender<(String, TaskState)>) -> Self {
@@ -413,6 +429,7 @@ impl TaskHook {
             session_id: self.session_id,
             event_tx: None,
             run_id: self.run_id,
+            owner_id: self.owner_id,
         }
     }
 
@@ -423,6 +440,7 @@ impl TaskHook {
             session_id: self.session_id,
             event_tx: Some(tx),
             run_id: self.run_id,
+            owner_id: self.owner_id,
         }
     }
 
@@ -433,6 +451,7 @@ impl TaskHook {
             session_id: self.session_id,
             event_tx: self.event_tx,
             run_id: run_id.to_string(),
+            owner_id: self.owner_id,
         }
     }
 

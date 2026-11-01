@@ -82,9 +82,27 @@ _Avoid_: hit, match, emit
 命中时被挑选出来、允许进入模型上下文的少量事实片段。
 _Avoid_: sample, payload, excerpt
 
+### Delivery
+
 **Delivery**:
-把命中结果送回某个 channel 的行为。
-_Avoid_: notify, push, send
+把一条消息送回某个 channel 的行为。主动消息（cron / heartbeat / trigger / agent 主动 `message`）都走同一投递模型，不因来源不同而分叉。
+_Avoid_: notify, push, send（泛化动词；`notify` 在代码里特指 trigger 的入站动作）
+
+**Delivery target**:
+一次投递的落点。解析优先级：**显式 deliver-to（创建任务时指定）> 创建该任务的 Origin session > Owner primary channel（最后兜底）**。显式目标一旦给出即胜过默认 origin。
+_Avoid_: recipient, destination（代码层用 `DeliveryTarget{channel, chat_id}`）
+
+**Origin session**:
+创建/设定某任务时所处的那个会话——任务的隐式投递目标默认就是它。heartbeat 由配置启动、不立于任何会话，没有 origin。
+_Avoid_: source session, origin channel（严格说 origin 是会话，不只 channel）
+
+**Owner primary channel**:
+owner 首次交互所建立的那个会话通道，作为任务无显式目标且无 origin 时的最后兜底落点。未建立时不投递（降级 log-only）。
+_Avoid_: default channel（v1 不存在运行期另设的全局默认目标）, home channel
+
+**Silent delivery**:
+任务显式声明 `deliver:false`，故意不把结果投给任何通道。它是唯一的策略性静默条件，与“目标尚不存在”的兜底降级区分。
+_Avoid_: quiet hours（v1 不做）, mute
 
 ### Card (Generative UI)
 
@@ -183,6 +201,66 @@ _Avoid_: whitelist, compactable list（那是旧的按工具名硬编码的中�
 **Residual cleanup**:
 把已过期的旧工具结果在上下文中压成一句引用的动作，引用里带已保存全文的位置，因而「被扔掉」不等于「不可找回」。
 _Avoid_: microcompact（代码符号名）, drop（不带可找回线索的整条丢弃只属于上下文裁剪，不是本动作）
+
+### MCP
+
+**MCP server**:
+一份配置声明的外部工具提供者（stdio 进程或 HTTP 端点），提供一组可被 codemode 脚本调用的工具。它不是模型 `tools` schema 中的一项。一个 MCP server 就是一个连接器（见 `### Connector`）：“MCP server”指该连接器的具体交付形式、“Connector”指 codemode 可直接调用的外部能力封装这一角色。
+_Avoid_: plugin, extension
+
+**McpService**:
+Gateway 级服务，管理所有已配置 MCP server 的连接池、工具列表缓存、健康检查与退避重连。codemode 的 tool bridge 通过它路由调用。
+_Avoid_: MCP client（泛指协议实现）, MCP manager
+
+**Codemode (agent entry)**:
+模型在 ReAct 循环中可调用的一个工具：模型写 JS 源码，宿主在 QuickJS VM 里执行，脚本通过 `tools.*()` / `searchTools()` 调用工具，结果返回模型。区别于 trigger 路径的 `collect` / `judge` 入口。
+_Avoid_: code interpreter, script runner, sandbox（后者指执行环境而非模型可调用的工具本身）
+
+**searchTools**:
+codemode 脚本内的全局函数，用 BM25 排序发现已连接 MCP server 的工具（返回 `{ name, description }[]`）。它不搜内置工具（那些已在 schema 可见）。
+_Avoid_: tool_search（那是 pi 的模型级工具，本决策不用它）, memory_search（那是记忆检索）
+
+### Connector
+
+**Connector**:
+一段 **codemode 可直接调用的、非基础原语、非内置工具**的外部能力封装；同一个连接器既能“获取信息”也能“执行动作”。定义特征是从 codemode 内可被调用，不是“凡与外部相连”——MCP server 是连接器的一个特例（v1 的实例）。
+_Avoid_: Channel/通道（与连接器正交，是会话/传输面）, 基础原语（时间/网络这类 codemode 内置原语，不算连接器）, 内置工具（`file_editor`/`shell`/`message`/`web_fetch` 等，不算连接器）, 执行器（那是消费连接器写侧的动作脚本）, json-render 卡片（属 Channel 侧展示，不是连接器）
+
+**Executor (执行器)**:
+与采集器（触发器源 `collect.js`）**操作镜像**的 codemode 动作脚本：消费连接器的写侧，对外部资源执行一次真实动作。由 subagent 创建与调用、**按需执行**（无常驻 tick；周期性的“动”由触发器 fire 驱动）。其动作带副作用，纳入审批（见 Risk level / Pending approval）；无人值守一律按 Deny。
+_Avoid_: Connector（连接器是它调用的能力后端，不是脚本本身）, 采集器（那是只读侧）, tool
+
+### IM Channel
+
+**Feishu Channel**:
+slimbot 的首个 IM 通道（v1）。以企业自建应用 + WebSocket 长连接接入飞书；一个 `feishu` Channel 实例内部按会话管理多个 chat。
+_Avoid_: Telegram, 邮件通道（均为后续通道）
+
+**Owner open_id**:
+飞书通道中 owner 的通道内身份（`ou_…`），纯配置声明，把入站消息映射到 owner；非该身份的私聊静默忽略。
+_Avoid_: Owner id（那是全局主体标识）, chat_id（那是会话标识）
+
+**Interactive card (Feishu)**:
+飞书消息体系里的富交互卡片，承载 agent 逐步刷新直至定稿的流式输出。它与本项目的 Card（WebUI 生成式 UI）是两回事，不可简称 Card 混称。
+_Avoid_: Card（在本项目已专指 WebUI 生成式 UI）, typing indicator
+
+### Reliability
+
+**Run deadline**:
+一次 Run 的挂钟上限；到点按「取消」语义收尾（与主动停止同一条路径），区别于崩溃或半截会话。
+_Avoid_: provider timeout（那是单次调用的上限）, hang
+
+**Transient failure**:
+上游（模型服务 / 网络）可预期会自行恢复的失败（限流、临时过载、连接超时），允许有界重试。
+_Avoid_: hard failure, error（裸用不分可重试性）
+
+**Hard failure**:
+不会因重试而改变的失败（密钥失效、额度耗尽、计费问题）：绝不重试，把上游原话作为可操作提示送达 owner。
+_Avoid_: transient failure, fatal（不指进程崩溃）
+
+**Skipped run**:
+任务因停机错过触发窗口而留下的显式「未做」痕迹；刻意不补跑，也不静默丢弃。
+_Avoid_: missed run（口语，但不强调留痕）, failed run（没执行不等于执行失败）
 
 ### Observability
 

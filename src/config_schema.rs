@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig,
-    MemoryConfig, ProviderConfig, SecretEntry, SubagentConfig, ToolEntry, TraceBackendEntry,
-    TraceConfig, TriggersConfig, WebFetchConfig,
+    MemoryConfig, OwnerConfig, ProviderConfig, SecretEntry, SubagentConfig, ToolEntry,
+    TraceBackendEntry, TraceConfig, TriggersConfig, WebFetchConfig,
 };
 use crate::config_macro::FieldMeta;
 
@@ -127,6 +127,12 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
             "Agent",
             AgentConfig::fields(),
             &to_value_map(&config.agent),
+        ),
+        scalar_section(
+            "gateway.owner",
+            "Gateway · Owner",
+            OwnerConfig::fields(),
+            &to_value_map(&config.gateway.owner),
         ),
         scalar_section(
             "gateway.cron",
@@ -553,7 +559,7 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
         ["tools", idx, field] => set_tool_field(config, idx, field, value),
         ["channels", name, "enabled"] => set_channel_enabled(config, name, value),
         ["channels", name, "extra"] => set_channel_extra(config, name, value),
-        ["gateway", sub, field] if matches!(*sub, "cron" | "heartbeat" | "dream") => {
+        ["gateway", sub, field] if matches!(*sub, "owner" | "cron" | "heartbeat" | "dream") => {
             set_gateway(config, sub, field, value)
         }
         ["web_fetch", field] => set_web_fetch(config, field, value),
@@ -733,6 +739,10 @@ fn set_gateway(
     value: &serde_json::Value,
 ) -> Result<(), String> {
     match (sub, field) {
+        ("owner", "id") => config.gateway.owner.id = value_str(value, "gateway.owner.id")?,
+        ("owner", "display_name") => {
+            config.gateway.owner.display_name = value_opt_str(value, "gateway.owner.display_name")?
+        }
         ("cron", "enabled") => {
             config.gateway.cron.enabled = value_bool(value, "gateway.cron.enabled")?
         }
@@ -1089,6 +1099,7 @@ mod tests {
             }],
             channels,
             gateway: crate::config::GatewayConfig {
+                owner: Default::default(),
                 cron: CronConfig {
                     enabled: true,
                     unknown: Default::default(),
@@ -1133,6 +1144,7 @@ mod tests {
             names,
             vec![
                 "agent",
+                "gateway.owner",
                 "gateway.cron",
                 "gateway.heartbeat",
                 "gateway.dream",

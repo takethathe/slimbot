@@ -377,12 +377,11 @@ impl SubagentRuntime {
         );
         let session = origin.session_id();
         self.bus
-            .publish_inbound(BusRequest {
-                session_id: session.clone(),
-                content: message,
-                channel_inject: None,
-                hook: TaskHook::new(&session),
-            })
+            .publish_inbound(BusRequest::owner(
+                session.clone(),
+                message,
+                TaskHook::new(&session),
+            ))
             .await;
     }
 }

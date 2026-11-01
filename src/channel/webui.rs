@@ -5,8 +5,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::sse::Event,
+    http::{Method, Request, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response, sse::Event},
     routing::{get, post},
 };
 use serde::Serialize;
@@ -19,6 +20,50 @@ use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::{AgentEvent, SharedSessionManager, TaskHook, TaskState};
 use crate::{debug, error, info};
+
+/// Hostnames the local-only WebUI accepts, both as a bind address and in the
+/// `Host` header. Any other value is refused: the WebUI is never reachable from
+/// another machine (ADR 0010), so an off-box bind is a misconfiguration, not a
+/// deployment choice.
+const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
+/// True when `host` is a loopback name or address. Ports and IPv6 brackets are
+/// ignored, so `localhost:8080` and `[::1]:8080` both count.
+pub fn is_loopback_host(host: &str) -> bool {
+    LOOPBACK_HOSTS.contains(&host_name(host).to_ascii_lowercase().as_str())
+}
+
+/// Strip an optional port from a `Host`-style value, leaving the host name.
+/// Bracketed IPv6 (`[::1]:8080`) and bare IPv6 (`::1`) are both handled; a bare
+/// IPv6 literal has no port to strip.
+fn host_name(value: &str) -> &str {
+    let trimmed = value.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or("");
+    }
+    if trimmed.matches(':').count() > 1 {
+        return trimmed;
+    }
+    match trimmed.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => trimmed,
+    }
+}
+
+/// Validate the configured bind host. Only loopback is allowed; there is no
+/// override flag and no `trusted_hosts` backdoor, because a configurable escape
+/// hatch is exactly how the `0.0.0.0` default happened in the first place.
+pub fn validate_bind_host(host: &str) -> Result<()> {
+    if is_loopback_host(host) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "channels.webui.host = '{}' is not a loopback address. The WebUI is a local-only \
+         surface: set it to 127.0.0.1 (or localhost / ::1), and reach SlimBot remotely \
+         through an IM channel instead",
+        host
+    )
+}
 
 struct AppState {
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<SsePayload>>>>>,
@@ -68,8 +113,11 @@ impl WebuiChannel {
         let host = config
             .get("host")
             .and_then(|v| v.as_str())
-            .unwrap_or("0.0.0.0")
+            .unwrap_or("127.0.0.1")
             .to_string();
+        // Fail startup on a non-loopback bind (ADR 0010). `ChannelManager::init`
+        // propagates this error, so a bad config never silently exposes the UI.
+        validate_bind_host(&host)?;
         let port = config.get("port").and_then(|v| v.as_u64()).unwrap_or(8080) as u16;
         Ok(Self {
             host,
@@ -213,6 +261,13 @@ impl WebuiChannel {
 
             let app = build_router(Arc::new(state));
 
+            // Defense in depth: even a hand-constructed channel cannot bind a
+            // non-loopback address.
+            if let Err(e) = validate_bind_host(&host) {
+                error!("[webui] Refusing to start: {}", e);
+                return;
+            }
+
             let listener = match tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -271,6 +326,98 @@ fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/json-render/catalog", post(catalog_register_handler))
         .route("/common.css", get(common_css_handler))
         .with_state(state)
+        // Every route sits behind the local-only guardrails: Host allowlist
+        // (kills DNS rebinding), same-origin Origin + JSON content type +
+        // `Sec-Fetch-Site` on mutations (kill CSRF and `no-cors` posts). No
+        // authentication and no CORS headers — the local machine *is* the owner.
+        .layer(middleware::from_fn(guard_local_request))
+}
+
+/// True when `origin` names the same authority as the request's `Host` header.
+/// Scheme is not compared beyond being http(s): the server is plain HTTP on
+/// loopback, and reverse proxying is explicitly out of scope (ADR 0010).
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin.trim().split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+    let authority = authority.trim_end_matches('/');
+    authority.eq_ignore_ascii_case(host.trim())
+}
+
+/// Reject a request whose headers do not prove it came from the local UI itself.
+///
+/// Layering of the four controls, per ADR 0010:
+/// 1. `Host` must be loopback → `421` (this is the DNS-rebinding defence).
+/// 2. Mutating requests must carry a same-origin `Origin` → `403`.
+/// 3. Mutating requests must be `application/json` → `415` (forces preflight).
+/// 4. Mutating requests must say `Sec-Fetch-Site: same-origin` → `403`.
+async fn guard_local_request(req: Request<axum::body::Body>, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let Some(host) = host else {
+        return (StatusCode::MISDIRECTED_REQUEST, "missing Host header").into_response();
+    };
+    if !is_loopback_host(&host) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "non-loopback Host is not allowed",
+        )
+            .into_response();
+    }
+
+    let mutating = matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if mutating {
+        let origin_ok = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|origin| origin_matches_host(origin, &host));
+        if !origin_ok {
+            return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+        }
+
+        let json_ok = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+            });
+        if !json_ok {
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "mutating requests must be application/json",
+            )
+                .into_response();
+        }
+
+        let fetch_site_ok = req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("same-origin"));
+        if !fetch_site_ok {
+            return (
+                StatusCode::FORBIDDEN,
+                "mutating requests must be Sec-Fetch-Site: same-origin",
+            )
+                .into_response();
+        }
+    }
+
+    next.run(req).await
 }
 
 /// Chat info returned by the chat list endpoint.
@@ -547,12 +694,9 @@ async fn message_handler(
     if let Some(card) = &state.card {
         card.register_run(hook.run_id(), &session_id, &chat_id);
     }
-    let request = BusRequest {
-        session_id,
-        content: body,
-        channel_inject: None,
-        hook,
-    };
+    // The WebUI is a local-only surface: a request that reaches it comes from
+    // this machine, which *is* the owner (ADR 0010 — no authentication).
+    let request = BusRequest::owner(session_id, body, hook);
 
     match state.inbound_tx.send(request).await {
         Ok(_) => StatusCode::OK,
@@ -717,7 +861,8 @@ mod tests {
     fn test_webui_channel_from_config_defaults() {
         let config = json!({});
         let ch = WebuiChannel::from_config(&config).unwrap();
-        assert_eq!(ch.host, "0.0.0.0");
+        // Breaking change (ADR 0010): the default is loopback, not 0.0.0.0.
+        assert_eq!(ch.host, "127.0.0.1");
         assert_eq!(ch.port, 8080);
         assert_eq!(ch.channel_id, "webui");
     }
@@ -1279,6 +1424,176 @@ mod tests {
         panic!(
             "trace detail route did not match full trace id (last HTTP {:?})",
             last_status
+        );
+    }
+
+    // ── Local-only boundary (ADR 0010) ──
+
+    /// Spawn the real router (with the guardrail layer) on an ephemeral port.
+    async fn spawn_guarded_router() -> u16 {
+        let state = Arc::new(AppState {
+            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inbound_tx: MessageBus::new().0.inbound_tx(),
+            channel_id: "webui".to_string(),
+            session_manager: None,
+            index_html: "<h1>ok</h1>".to_string(),
+            traces_html: String::new(),
+            config_html: String::new(),
+            config_path: String::new(),
+            event_tx: None,
+            trace_paths: Vec::new(),
+            trace_startup_ms: None,
+            card: None,
+        });
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        port
+    }
+
+    #[test]
+    fn test_webui_from_config_non_loopback_host_fails_startup() {
+        let Err(err) = WebuiChannel::from_config(&json!({"host": "0.0.0.0", "port": 8080})) else {
+            panic!("a non-loopback bind must fail startup");
+        };
+        assert!(
+            err.to_string().contains("127.0.0.1"),
+            "the error must say how to fix it: {}",
+            err
+        );
+        let Err(err) = WebuiChannel::from_config(&json!({"host": "192.168.1.10", "port": 8080}))
+        else {
+            panic!("a LAN bind must fail startup");
+        };
+        assert!(err.to_string().contains("not a loopback address"));
+    }
+
+    #[test]
+    fn test_webui_from_config_defaults_to_loopback_host() {
+        let ch = WebuiChannel::from_config(&json!({"port": 8080})).unwrap();
+        assert_eq!(ch.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_webui_from_config_accepts_every_loopback_form() {
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let ch = WebuiChannel::from_config(&json!({"host": host, "port": 0}))
+                .unwrap_or_else(|e| panic!("{host} must be accepted: {e}"));
+            assert_eq!(ch.host, host);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webui_guard_rejects_non_loopback_host_header() {
+        let port = spawn_guarded_router().await;
+        let res = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .header("host", "attacker.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status().as_u16(),
+            StatusCode::MISDIRECTED_REQUEST.as_u16()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webui_guard_allows_loopback_get_without_cors_headers() {
+        let port = spawn_guarded_router().await;
+        let res = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), StatusCode::OK.as_u16());
+        assert!(
+            res.headers().get("access-control-allow-origin").is_none(),
+            "the local-only UI must never open a cross-origin window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webui_guard_rejects_mutation_without_origin() {
+        let port = spawn_guarded_router().await;
+        let res = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/json-render/catalog"))
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), StatusCode::FORBIDDEN.as_u16());
+    }
+
+    #[tokio::test]
+    async fn test_webui_guard_rejects_cross_origin_mutation() {
+        let port = spawn_guarded_router().await;
+        let res = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/json-render/catalog"))
+            .header("origin", "https://attacker.example.com")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), StatusCode::FORBIDDEN.as_u16());
+    }
+
+    #[tokio::test]
+    async fn test_webui_guard_rejects_non_json_mutation() {
+        let port = spawn_guarded_router().await;
+        let res = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/json-render/catalog"))
+            .header("origin", format!("http://127.0.0.1:{port}"))
+            .header("content-type", "text/plain")
+            .header("sec-fetch-site", "same-origin")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status().as_u16(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE.as_u16()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webui_guard_rejects_mutation_without_sec_fetch_site() {
+        let port = spawn_guarded_router().await;
+        let res = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/json-render/catalog"))
+            .header("origin", format!("http://127.0.0.1:{port}"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), StatusCode::FORBIDDEN.as_u16());
+    }
+
+    #[tokio::test]
+    async fn test_webui_guard_accepts_same_origin_json_mutation() {
+        // No card service is wired, so the handler answers 503 — which proves the
+        // request passed all four guardrails and reached the route.
+        let port = spawn_guarded_router().await;
+        let res = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/json-render/catalog"))
+            .header("origin", format!("http://127.0.0.1:{port}"))
+            .header("content-type", "application/json; charset=utf-8")
+            .header("sec-fetch-site", "same-origin")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status().as_u16(),
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
         );
     }
 

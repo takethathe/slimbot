@@ -18,6 +18,7 @@ pub(crate) mod dream;
 pub(crate) mod embed;
 pub(crate) mod gateway;
 pub(crate) mod heartbeat;
+pub mod identity;
 pub(crate) mod io_scheduler;
 pub(crate) mod log;
 pub(crate) mod macros;
@@ -41,13 +42,14 @@ pub(crate) mod worker;
 pub use channel::{Channel, ChannelFactory, ChannelManager};
 pub use config::{
     ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, DreamConfig, GatewayConfig,
-    HeartbeatConfig, ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
+    HeartbeatConfig, OwnerConfig, ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
 };
 pub use config_defs::{AgentConfig, ProviderConfig};
 pub use config_macro::{FieldMeta, Normalizable};
 pub use consolidate::Consolidator;
 pub use context::{ContextBuilder, RunContext, build_runtime_context};
 pub use cron::{CronJob, CronPayload, CronSchedule, CronService};
+pub use identity::{Author, DEFAULT_OWNER_ID, Owner};
 pub use log::{LogLevel, init as log_init, log, should_log};
 pub use memory::backend::{EditOutcome, MemoryBackend, MemoryBackendKind};
 pub use memory::category::MemoryCategory;

@@ -24,12 +24,7 @@ async fn test_inbound_request_flow() {
     let tx = bus.inbound_tx();
     let mut rx = receivers.inbound;
 
-    let request = BusRequest {
-        session_id: "test:chat1".to_string(),
-        content: "hello".to_string(),
-        channel_inject: None,
-        hook: TaskHook::new("test:chat1"),
-    };
+    let request = BusRequest::owner("test:chat1", "hello", TaskHook::new("test:chat1"));
 
     tx.send(request).await.unwrap();
 
@@ -71,24 +66,18 @@ async fn test_inbound_channel_fills_up() {
 
     // Fill up the channel (capacity is 32)
     for i in 0..32 {
-        let request = BusRequest {
-            session_id: format!("test:{}", i),
-            content: format!("msg {}", i),
-            channel_inject: None,
-            hook: TaskHook::new("test:chat1"),
-        };
+        let request = BusRequest::owner(
+            format!("test:{}", i),
+            format!("msg {}", i),
+            TaskHook::new("test:chat1"),
+        );
         // Use try_send to avoid blocking
         let result = tx.try_send(request);
         assert!(result.is_ok(), "should accept up to capacity");
     }
 
     // Next try_send should fail (channel full)
-    let request = BusRequest {
-        session_id: "overflow".to_string(),
-        content: "overflow".to_string(),
-        channel_inject: None,
-        hook: TaskHook::new("test:chat1"),
-    };
+    let request = BusRequest::owner("overflow", "overflow", TaskHook::new("test:chat1"));
     let result = tx.try_send(request);
     assert!(result.is_err(), "should reject when full");
 }
@@ -116,12 +105,11 @@ async fn test_concurrent_inbound_outbound() {
 
     // Send a request
     in_tx
-        .send(BusRequest {
-            session_id: "test:1".to_string(),
-            content: "do something".to_string(),
-            channel_inject: None,
-            hook: TaskHook::new("test:1"),
-        })
+        .send(BusRequest::owner(
+            "test:1",
+            "do something",
+            TaskHook::new("test:1"),
+        ))
         .await
         .unwrap();
 

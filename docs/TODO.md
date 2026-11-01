@@ -9,13 +9,78 @@
 - [x] **记忆写侧语义** — 单文件漏斗（主模型只用 file 工具写 MEMORY.md）+ 分类/晋升归 Dream + Protected document 代码强制；已回填票 05，决策见 `docs/adr/0012`；连带判定 `Daily` v1 不建设、history 不进检索语料
 - [x] **上下文压力（Context pressure）** — 单一窗口锚 + 占比派生全部长度限制；清理与可找回配对（引用带落盘路径、必要时补落盘）；豁免改为工具自述 `context_exempt()`；已回填票 15，决策见 `docs/adr/0013`；连带两条 breaking change（废弃 `agent.max_tool_result_chars`、`context_window_tokens` 移到 provider 段）
 - [x] **记忆生命周期** — 把已做判断的地方接上容量（不新增 flush、不多新机件）：summary 预算 512 字节→窗口 2% 占比、history 只删已处理连续前缀、Dream 接 trace + 指纹级审计（不建独立审计文件）、改读真实配置（两锚分离）、回滚靠写前快照（`memory/.snapshots/` 分层轮转、不用 git）、条目不写日期、年龄由快照序列 diff 反推、成功判定换结构判定；已回填票 06，决策见 `docs/adr/0014`；回溯修订票 05 provenance 约定与票 15 文档预算锚归属
+- [x] **检索与存储（research 票）** — v1 不新增任何检索机件（向量/sqlite/增量/transcript/评估集均出 scope）；主召回是整篇注入不是检索，现有 BM25-lite + 内存派生索引继续；接缝在 `MemoryIndex` trait + `SearchMode`（ADR 0004）；已回填票 07，决策见 `docs/adr/0015`，调研纪要见 `.scratch/personal-agent-capabilities/research-retrieval-storage.md`
+- [x] **MCP 客户端范围与安全（research 票）** — MCP 工具不进模型 schema，只通过 codemode 沙箱发现与调用；searchTools 复用 KeywordIndex BM25-lite；Gateway 级 McpService 管理连接；断连退避摘除；stdio + streamable HTTP；配置归 `config.json` 的 `mcp.servers[]`；验收集成 filesystem；已回填票 08，决策见 `docs/adr/0016`
+- [x] **首个 IM 通道与身份** — 飞书为 v1 首个 IM 通道（Telegram/邮件降为后续）；Rust 原生 channel 坐社区 crate `larksuite-oapi-sdk-rs`（只开 `channel` feature、锁版本、禁 axum）；企业自建应用 + 单条 WS 长连、gateway 为唯一连接持有者；`channels.feishu.owner_open_id` 绑 owner；仅 p2p、群组关闭；session_id `feishu:{oc_…}` 两段式不变；流式卡片/图片/附件/markdown 全进 v1；隐私护栏（锁版本+audit、永不记正文/open_id/tenant_key/app_secret/token、入站媒体只按 file-key 下载防 SSRF）；已回填票 09，决策见 `docs/adr/0017`
+- [x] **出站投递路由** — 投递模型大部分已存在（`BusResult{session_id}`→outbound→`ChannelManager` 前缀路由），本票 codify + 去 heartbeat 硬编码，不新建 DeliveryTarget 网络/持久 outbox/全局投递账本；目标解析优先级 = 显式 deliver-to（创建时指定）> 创建任务的 origin 会话 > owner 主通道（兜底）；唯一静默条件 = `deliver:false`；轻量 `DeliveryTarget{channel, chat_id}` + 共享 `resolve_target`；防打扰沿用 trigger 既有（quiet hours/去重/分级出 v1）；best-effort 无 outbox、重启不补投；审批只约束 agent 主动 `message`；可观测复用 per-source + trace；已回填票 10
+- [x] **可靠性与预算** — v1 走最小可靠闭环、其余推迟（事实核查：message_bus 已 bounded、token 已进 trace、OTel trace backend 已存、取消路径现成）；超时 = 给 `run()` 套挂钟 deadline 且复用 `/stop` 取消路径（`timeout_seconds` 从此有真身）、provider 超时入配置；调度时区全库统一 `chrono::Local`、不引 chrono-tz（修 UTC/Local 双把表）；停机只补记 `skipped`、绝不补跑；瞬时错有限退避重试、不做 fallback provider；不设成本硬上限（额度交 provider 提示）；provider 错误按 `code` 分类、配额/鉴权类不重试且把原话经投递路径递 owner、响应体永不落 session/日志（隐私）、重复硬错告警合并；不建 `/health`/OTel metrics（靠 trace+日志，OTel trace 经 config 接 collector）；已回填票 11，决策见 `docs/adr/0018`
+- [x] **触发器接缝与排期** — 触发器 effort 已决策且大部分实现落地（a8eeaa0），本票 = 接缝规则非排期：trigger = 已落地基线（不列 M3 gate）；投递“谁触发就投给谁（origin）、除 `record`/`deliver:false`”，票 10 `resolve_target` 的 owner 兜底只对无 origin 源生效、trigger origin 不可达维持 book-only（迁移 `destination()`→`resolve_target` 是唯一真代码接缝）；时间源不统一实现只声明一致（trigger 自带 Local、票 11 改 cron 不触及它）；evidence→记忆继承票 05+ADR 0009、只落消化表述+provenance 标注、原文不入记忆、不建 taint-tracking；审批继承票 03 无人值守=Deny；不新增术语、subagent/采集/判定/codemode 权威仍归触发器票 01–08；**不建 ADR**；已回填票 12
+- [x] **v1 差异化范围** — 开题时用户引入**执行器（Executor）+ 连接器（Connector）**（术语 Q5–Q9 收口）：执行器进 v1、为与采集器镜像的一等 codemode 动作原语（仅 codemode 内、subagent 创建与调用、按需执行）；连接器 = codemode 可直接调用的外部能力封装（**MCP server 是其特例**、v1 唯一实例），Channel 与它正交、json-render 卡片属 Channel 展示不算连接器、内置工具/时间网络原语都不是；审批走票 03（`external_send`/无人值守=Deny）；v1 一个真实集成 = GitHub 式 MCP 连接器 + 执行器；完整镜像实现另立子 effort。**差异化边界写死**：D1=已落地触发器+连接器动作；D2=票 05+06无 WebUI diff、回滚走文件快照；D3 卡片 actions 回传/语音/**D4 技能供应链**/**数据导出工具均出 v1**（审批不需按钮、数据即明文文件）；附 5 条成功场景；已回填票 13，决策见 `docs/adr/0019`，GLOSSARY 新增 `### Connector`
 - [x] **研究票：密钥与 OAuth 凭证管理** — 结论写入 `.scratch/personal-agent-capabilities/research-secrets-oauth.md`，已回填票 04；keychain 优先 / env 次之 / 0600 配置兼容
 - [x] **单用户身份模型** — 显式单例 owner；共享记忆 / 分通道会话；群聊只有 owner 可授权；结论回填票 01
 - [x] **触发器设计（wayfinder 已收官，2026-10-31）** — 七张决策票全部 resolved，spec 与 ADR 已落稿：`.scratch/personal-agent-triggers/spec.md` + `docs/adr/0006..0009`；ADR 篇目：subagent 运行时形状、触发器是 cron 之上的一层、codemode 运行时选型、外部内容不进上下文
   - [x] 01 subagent 机制 [x] 02 采集与快照 [x] 03 判定语义
   - [x] 04 执行与投递 [x] 05 codemode 运行时 [x] 06 时间源
   - [x] 07 提示词/skill/文档 [x] 08 spec 落稿
-- [ ] **Frontier（下一个 map）** — 检索与存储（票 07）、MCP 客户端（票 08）、首个 IM 通道（票 09）、出站投递（票 10）、可靠性预算（票 11）、触发器接缝（票 12）、v1 差异化（票 13）、spec 落稿（票 14）；heartbeat 与触发器的长期边界、群聊 origin 归属已随本 map 移出范围
+- [x] **spec 落稿（票 14，2026-11-01）** — `.scratch/personal-agent-capabilities/spec.md`（`ready-for-agent`），汇总决策票 01–13 + ADR 0006–0019；wayfinder map 已 closed
+- [ ] **v1 实现票（/to-tickets 拆出 13 张，2026-11-01）** — `.scratch/personal-agent-capabilities/issues/16–28`（均 `ready-for-agent`）：16 owner+WebUI 本地边界 / 17 resolve_target 投递接缝 / 18 时区统一+run deadline+skipped / 19 provider 错误分类+超时+重试透传 / 20 上下文压力+两项破坏性 config 迁移 / 21 审批全链路 / 22 密钥解析链 / 23 记忆单文件漏斗 / 24 记忆生命周期快照回滚 / 25 codemode agent 入口（tools.*+searchTools）/ 26 MCP 连接器+GitHub 首集成 / 27 飞书 p2p 文字 / 28 飞书流式卡片+图文。当前 Frontier（无阻塞）：**16、18、20、21、22、23**。执行器完整镜像另立子 effort map（镜像 triggers），不在本组票内
+- [ ] **Frontier（下一个 map）** — heartbeat 与触发器的长期边界、群聊 origin 归属已随 capabilities map 移出范围；**执行器/连接器子 effort 已开图（2026-11-01）**：`.scratch/executor-connector/map.md`（7 票，研究票 07 已 resolved，frontier：01/02/03）
+
+## 执行器与连接器子 effort（wayfinder：`.scratch/executor-connector/`）
+
+目的地 = `spec.md`（执行器体系 + MCP 连接器消费面的实现规格）；只产决策不写实现码，开工门槛 = 父票 25/21 落地。已锁前提（ADR 0019 + destination 轮）：执行器=采集器镜像的 codemode 动作脚本、按需执行、动域只对外；连接器 v1=MCP 特例；能力表是唯一安全闸；evidence/审批地基继承 ADR 0009/0011。
+
+## 飞书 IM 通道（票 09 裁决的实现切片，待 spec 落稿后展开）
+
+决策见票 09 + `docs/adr/0017`。前置：`Cargo.toml` 加 `larksuite-oapi-sdk-rs = { version = "=0.3.x", default-features = false, features = ["channel"] }`，标记为安全敏感依赖。
+
+- [ ] **配置与注册** — `channels.feishu` 段（`app_id`、`app_secret`(secret 标记 + env override)、`owner_open_id`、`domain`、`streaming`）；`FeishuChannelFactory`（`channel_type = "feishu"`）注册进 `ChannelManager`；gateway 装配时确保唯一连接持有者
+- [ ] **入站链路** — WS 长连 + crate `channel` 归一化 → `NormalizedMessage` → `publish_inbound`；owner 校验（非 `owner_open_id` 私聊静默忽略、群组丢弃）；session_id `feishu:{oc_…}`
+- [ ] **出站流式卡片** — `AgentEvent` delta → CardKit 流式卡片原位刷新 → 收尾定稿；agent markdown → 飞书卡片 markdown 子集映射
+- [ ] **媒体** — 入站图片/文件按飞书 file-key 经 im API 下载进 workspace（**不拉任意 URL，防 SSRF**）；出站发图/发文件
+- [ ] **隐私护栏落地** — 适配器不记正文/open_id/tenant_key/app_secret/token；`LarkError` 只落变体+错误码进 session；逐 call-site 核验 crate 的 `tracing` 未泄 PII（否则加 filtering layer）
+- [ ] **cargo audit** — 纳入提交前检查；升级前重 diff 其 tracing/error 面
+- [ ] **验收** — owner 私聊流式全链路 + 图片/文件收发 + 重启续会话 + 非 owner 忽略 + 日志/session 无明文密钥与正文
+
+## 出站投递路由（票 10 裁决的实现切片，待 spec 落稿后展开）
+
+决策见票 10。大部分投递链路已存在，本切片 = codify 约定 + 去硬编码 + 提炼共享件；不新建 DeliveryTarget 网络 / 持久 outbox / 全局投递账本。
+
+- [ ] **提炼 `resolve_target` 公共件** — 把 trigger `dispatch.rs::destination()` 上升为 `resolve_target(explicit, origin, owner_primary) -> Option<DeliveryTarget>`，优先级 **显式 deliver-to > origin 会话 > owner 主通道**；`DeliveryTarget{channel, chat_id}` 两段式（不加 thread/topic/priority）
+- [ ] **三源共用** — cron / trigger / heartbeat 的投递都改走 `resolve_target`；trigger `destination()` 迁移到它（行为逐字不变，由既有测试锁定）
+- [ ] **owner 主通道来源** — 运行时记录 owner 首次交互的 `{channel}:{chat_id}`（飞书 owner p2p）作为最后兜底；未建立时降级 log-only
+- [ ] **heartbeat 去硬编码** — 删除 `gateway.rs` 写死的 `webui:webui_main`；无创建对话 → 落 owner 主通道；可 `gateway.heartbeat.channel`/`to` 覆盖
+- [ ] **静默语义** — `deliver:false` 是唯一策略静默条件；与“目标不存在”的 log-only 兜底区分
+- [ ] **验收** — 在 webui 建的“发到飞书”job → 落飞书（显式优先）；无 target 的系统事件 → 落 owner 主通道；`deliver:false` → 静默；重启不重复投；日志/session 无投递正文泄露（对齐票 09 隐私）
+
+## 可靠性与预算（票 11 裁决的实现切片，待 spec 落稿后展开）
+
+决策见票 11 + `docs/adr/0018`。姿态 = 复用既有机件补齐可预期性，不多造（无预算硬上限/无 /health/无 metrics/无补跑）。
+
+- [ ] **run 级挂钟 deadline** — 给 `AgentRunner::run()` 套 `tokio::time::timeout(agent.timeout_seconds)`，超时**走现成 CancellationToken 取消路径**（AfterTurn 回滚/consolidate 照常收尾）；`timeout_seconds` 从此被真正执行
+- [ ] **provider 超时入配置** — `openai.rs` 写死的 reqwest `.timeout(180s)` 改为 `ProviderConfig` 派生字段
+- [ ] **调度时区统一 Local** — `cron/service.rs::compute_next_cron` 从 `chrono::Utc` 改 `chrono::Local`，与 trigger 层 + `at` 解析对齐；不引 chrono-tz；`tz` 字段保留不参与计算（标注不生效）
+- [ ] **错过窗口记 skipped** — 过期 `At` 从“返回 None 静默禁用”改为显式写 `skipped` 状态进 run_history（不补跑）；`Every`/`Cron` 重算下一次保持现状
+- [ ] **provider 瞬时错退避重试** — 只对 429（带 `Retry-After`）/5xx/连接超时有限次（2–3）指数退避重试；无 fallback provider；工具不框架重试（现状保持）
+- [ ] **provider 错误分类与投递** — 把 `bail!("API request failed: {status}-{body}")` 拆成按 `error.code`/`type` 分类；鉴权/计费/配额类不重试、本轮失败、**把 provider 原话提炼成通知经票 10 投递给 owner**；`context_length_exceeded` 交票 15；**只提结构化 code/message、响应体不落 session/日志**；重复硬错复用 trigger 告警合并
+- [ ] **验收** — 超 deadline 会话不半截；同一 cron 表达式两路解析同值；过期 At 记 skipped 可见；401/配额不重试且原话递 owner、日志无响应体明文；OTel trace 经 config 指向 collector 可查；无 /health/metrics
+
+## 触发器接缝（票 12 裁决的实现切片，待 spec 落稿后展开）
+
+决策见票 12。触发器已落地，本切片 = 与 v1 底座的集成，非新建。
+
+- [ ] **迁移 `destination()`→`resolve_target`** — `trigger/dispatch.rs` 的两级投递（显式→origin→book-only）接进票 10 共享 `resolve_target`；**行为逐字不变**（既有 trigger dispatch 测试锁定）：owner 兜底只对无 origin 源生效，trigger origin 不可达时仍 book-only
+- [ ] **spec/architecture 交叉引用** — 在 `docs/architecture.md`/spec 补一段“投递（票10）/可靠性（票11）同样 govern trigger 的出站与失败处理”；无新配置/工具/术语
+- [ ] **验收** — trigger 三源（notify/agent/record）投递语义迁移后不变；主 cron UTC→Local 改动不影响 trigger 到期判定（自带 Local）；无人值守 subagent 中/高风险工具 Deny、不阻塞
+
+## v1 差异化与执行器/连接器（票 13 裁决，待 spec 落稿后展开）
+
+决策见票 13 + `docs/adr/0019`（已重写为《执行器…》）。执行器/连接器进 v1 但只定接缝；完整“镜像触发器”实现另立子 effort（新地图，复制触发器路径）。
+
+- [ ] **执行器/连接器写进 spec（仅定位）** — v1 spec 含一节：执行器（与采集器镜像的一等 codemode 动作原语、按需执行、subagent 创建与调用）+ 连接器（codemode 可直接调用的外部能力封装、MCP 为特例）；审批入票 03、外部内容入票 05+ADR 0009；**不展开实现细节**
+- [ ] **开连接器/执行器子 effort** — 待 v1 spec 成形后新建 `.scratch/connector/` 地图，镜像 `personal-agent-triggers`：`executors/<id>/{meta.json, act.js}`、actuation HostBindings、连接器（含非-MCP）能力封装、subagent 创建、codemode 调用面、审批粒度（整脚本 vs 逐动作）
+- [ ] **v1 边界写死进 spec** — 明写 D3 卡片 actions 回传/语音/D4 技能供应链/数据导出工具均出 v1，各带一句理由；5 条 v1 成功场景作验收基线
+- [ ] **验收** — spec 中执行器/连接器定位与 ADR 0019/GLOSSARY `### Connector`/`### Executor` 一致；D1–D4 无残留“待决”；5 场景可逐条映射到已有能力
 
 ## 记忆生命周期实现切片（票 06 裁决，2026-10-31）
 
@@ -77,7 +142,7 @@ Spec 见 `.scratch/memory-entry-index/spec.md`。
 **后续切片：**
 
 - [ ] **切片 2：配置与查询增强** — `memory.search.*` 开关（如需）、前缀与短语查询；~~Daily category 语义与每日日志写入方~~（personal agent v1 票 05 已判定：`Daily` 无写者、不进检索语料，v1 不建设）
-- [ ] **切片 3：embedding / hybrid** — 引入 `SearchMode`，以 embedding provider 替换或融合 `KeywordIndex`
+- [ ] ~~**切片 3：embedding / hybrid**~~ — **票 07 已裁决出 v1**（向量/sqlite/增量/transcript/评估集均不建）；接缝留在 `MemoryIndex` trait + `SearchMode`（ADR 0004）；重开条件：skill 数量增长到 keyword 漏检明显 / MEMORY.md 预算失效使检索升为主路径（见 `docs/adr/0015`）
 - [ ] **切片 4：写侧** — 已由 personal agent v1 票 05 定案并改写：~~`store` / `forget` / `supersede` / dedup gate / 冲突取代~~ 均不新增工具，主模型用现有 `file_writer`/`file_editor` 写 `memory/MEMORY.md`，分类与晋升归 Dream（见 `docs/adr/0012`）；~~把 `hash` 换成稳定哈希（如 sha2）~~ v1 不做（条目身份是标题/正文，跳进程稳定 id 无消费者）。待做：写盘改 `write_file_atomic`、指纹乐观并发校验、Protected document 拒写、`gateway.dream.doc_budget.*` 预算与超限置标记（`retention` / 时间衰减仍待票 06、票 15）
 
 ## Memory 模块统一：category 化 + backend 抽象（2026-09-26）
@@ -193,7 +258,7 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 ### 高级工具
 
 - [ ] **spawn** — 后台子代理创建，支持传入指令和等待结果，用于并行任务执行
-- [ ] **mcp** — MCP 服务器客户端，连接外部 MCP 服务并将其工具包装为原生工具
+- [ ] **mcp** — MCP 客户端通过 codemode 沙箱暴露（票 08 裁决，ADR 0016）：McpService gateway 级管理 stdio/HTTP 连接、searchTools BM25 发现、断连退避摘除、配置 `mcp.servers[]`；验收集成 filesystem；前置基建：codemode-as-model-tool（`src/tools/codemode.rs` + `ENTRY_AGENT`）
 - [ ] **self** — 运行时状态检查，返回当前 session 信息、配置、可用工具列表等
 - [x] **message** — 向用户发送消息（用于 channel 推送场景，如 telegram/whatsapp）
 - [ ] **notebook** — Jupyter notebook (`.ipynb`) 编辑工具，支持代码单元格和 markdown 单元格增删改

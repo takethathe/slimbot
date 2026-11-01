@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::identity::Author;
 use crate::session::TaskHook;
 
 /// Capacity for inbound/outbound mpsc channels. Large enough to absorb bursts,
@@ -16,6 +17,46 @@ pub struct BusRequest {
     pub content: String,
     pub channel_inject: Option<String>,
     pub hook: TaskHook,
+    /// Who authored this message. The identity layer lets only an
+    /// owner-authored message authorize a consequential action or write durable
+    /// memory; a bystander sharing the conversation cannot.
+    pub author: Author,
+}
+
+impl BusRequest {
+    /// A request the owner's authority stands behind: local surfaces (CLI,
+    /// WebUI), the owner's own IM messages, and system-generated inbound input
+    /// (trigger notices, subagent results) that the owner's own configuration
+    /// started.
+    pub fn owner(
+        session_id: impl Into<String>,
+        content: impl Into<String>,
+        hook: TaskHook,
+    ) -> Self {
+        Self::authored(Author::Owner, session_id, content, hook)
+    }
+
+    /// A request whose author trust was resolved by the channel boundary.
+    pub fn authored(
+        author: Author,
+        session_id: impl Into<String>,
+        content: impl Into<String>,
+        hook: TaskHook,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            content: content.into(),
+            channel_inject: None,
+            hook,
+            author,
+        }
+    }
+
+    /// Builder helper: inject a pre-composed channel message body.
+    pub fn with_channel_inject(mut self, inject: Option<String>) -> Self {
+        self.channel_inject = inject;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,13 +138,8 @@ mod tests {
     async fn test_new_returns_connected_senders_and_receivers() {
         let (bus, mut receivers) = MessageBus::new();
 
-        bus.publish_inbound(BusRequest {
-            session_id: "s1".to_string(),
-            content: "hello".to_string(),
-            channel_inject: None,
-            hook: TaskHook::new("s1"),
-        })
-        .await;
+        bus.publish_inbound(BusRequest::owner("s1", "hello", TaskHook::new("s1")))
+            .await;
         bus.publish_outbound(BusResult {
             session_id: "s1".to_string(),
             run_id: "r1".to_string(),

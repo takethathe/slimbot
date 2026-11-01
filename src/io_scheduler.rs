@@ -91,12 +91,7 @@ impl IoScheduler {
                             break;
                         }
 
-                        let request = BusRequest {
-                            session_id: session_id.clone(),
-                            content: input,
-                            channel_inject: None,
-                            hook: hook.clone(),
-                        };
+                        let request = BusRequest::owner(session_id.clone(), input, hook.clone());
                         if let Err(e) = tx.send(request).await {
                             error!("[{}] Failed to send inbound: {}", channel_name, e);
                             break;

@@ -161,6 +161,33 @@ impl ChannelFactory for CliChannelFactory {
 
 已在 `ChannelManager::new()` 中自动注册，配置中 `type: "cli"` 的条目会自动创建为 CLI 通道。
 
+## WebUI 通道的边界与护栏（ADR 0010）
+
+WebUI 是**纯本机入口**：无认证、无 token，本机即 owner。
+
+- **绑定**：只允许 loopback（`127.0.0.1` / `localhost` / `::1`），默认 `127.0.0.1`；其他值在 `WebuiChannel::from_config` 即失败（`ChannelManager::init` 向上抛出，启动失败），`start_server` 启动前再校验一次。
+- **四条全局中间件**（`guard_local_request`，覆盖整张路由表，不逐 handler）：
+
+| 顺序 | 控制 | 适用 | 失败响应 |
+|---|---|---|---|
+| 1 | `Host` 必须是 loopback | 所有请求 | `421 Misdirected Request`（封死 DNS rebinding） |
+| 2 | 同源 `Origin`（缺失即拒） | 变更请求（POST/PUT/PATCH/DELETE） | `403` |
+| 3 | `Content-Type: application/json` | 变更请求 | `415`（借浏览器 preflight 挡住 `no-cors` 简单请求） |
+| 4 | `Sec-Fetch-Site: same-origin` | 变更请求 | `403` |
+
+不返回任何 CORS 头（零跨源）。因此脚本与集成测试调变更端点时必须显式带 `Origin`、`Content-Type`、`Sec-Fetch-Site` 三个头。
+
+端点保护矩阵：
+
+| 端点 | 方法 | 保护 |
+|---|---|---|
+| `/`、`/common.css`、`/traces`、`/config` | GET（静态页） | Host |
+| `/chats`、`/session/*chat_id`、`/traces/api/*`、`/config/api/state` | GET（只读） | Host |
+| `/sse?chat_id=` | GET | Host（跨源读取由 SOP 阻挡） |
+| `/message?chat_id=`、`/chats`、`/config/api/update`、`/json-render/catalog` | POST | Host + Origin + `application/json` + `Sec-Fetch-Site` |
+
+本机任意进程仍可全权操作 WebUI（含写配置）——显式接受，不做缓解。
+
 ## 添加新通道类型
 
 1. 实现 `Channel` trait（包括 `start` 和 `send_output`）

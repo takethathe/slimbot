@@ -112,8 +112,12 @@ cargo run -- -d /data/myapp setup
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `host` | string | 否 | `"0.0.0.0"` | 监听地址 |
+| `host` | string | 否 | `"127.0.0.1"` | 监听地址，**只允许 `127.0.0.1` / `localhost` / `::1`**；其他值直接启动失败（见 ADR 0010） |
 | `port` | integer | 否 | `8080` | 监听端口 |
+
+> **Breaking change（ADR 0010）**：默认 `host` 从 `0.0.0.0` 改为 `127.0.0.1`，且不再接受任何非 loopback 值。WebUI 是纯本机入口、无认证；远程访问请用 IM 通道。以 `0.0.0.0` 配置的实例升级后**启动会失败**并给出修复提示。
+
+WebUI 为补偿「无认证」在 HTTP 层强制四条护栏（全局中间件，不逐 handler）：`Host` 必须是 loopback（否则 `421`，封死 DNS rebinding）；变更请求必须带同源 `Origin`（缺失即 `403`）、必须是 `application/json`（否则 `415`）、必须带 `Sec-Fetch-Site: same-origin`（否则 `403`）；且不返回任何 CORS 头。脚本/curl 调变更端点时必须显式带上这四个头。
 
 ```json
 {
@@ -136,6 +140,7 @@ cargo run -- -d /data/myapp setup
 ```json
 {
   "gateway": {
+    "owner": { "id": "owner", "display_name": null },
     "cron": {
       "enabled": true
     },
@@ -155,6 +160,8 @@ cargo run -- -d /data/myapp setup
 
 | 子字段 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
+| `owner.id` | string | `"owner"` | 单用户的稳定标识：记忆、审批、投递都以它为归属（v1 永久单用户） |
+| `owner.display_name` | string \| null | `null` | owner 的展示名（可选，仅用于显示） |
 | `cron.enabled` | bool | `true` | 是否启用 cron 定时调度 |
 | `heartbeat.enabled` | bool | `true` | 是否启用 heartbeat 定期检查 |
 | `heartbeat.interval_s` | uint | `1800` | heartbeat 检查间隔（秒），默认 30 分钟 |

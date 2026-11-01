@@ -492,12 +492,11 @@ impl Dispatcher {
             return Some("no inbound consumer is running".to_string());
         }
         self.bus
-            .publish_inbound(BusRequest {
-                session_id: dest.to_string(),
-                content: compose_notice(fires),
-                channel_inject: None,
-                hook: TaskHook::new(dest),
-            })
+            .publish_inbound(BusRequest::owner(
+                dest,
+                compose_notice(fires),
+                TaskHook::new(dest),
+            ))
             .await;
         None
     }

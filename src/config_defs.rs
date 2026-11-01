@@ -52,6 +52,13 @@ define_config! {
 // the pre-migration hand-written structs (they were never clamped before).
 
 define_config! {
+    "gateway.owner" => OwnerConfig {
+        id: String = "owner".to_string(), str_max(64), desc: "Stable identifier of the single principal this gateway serves",
+        display_name: Option<String> = None::<String>, none, desc: "Human-readable owner name (optional, display only)",
+    }
+}
+
+define_config! {
     "gateway.cron" => CronConfig {
         enabled: bool = true, none, desc: "Whether cron scheduling is enabled",
     }

@@ -12,8 +12,8 @@ use crate::config_normalize::apply_normalize;
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
     AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig, MemoryConfig,
-    ProviderConfig, SecretEntry, SubagentConfig, TraceBackendEntry, TraceConfig, TriggersConfig,
-    WebFetchConfig,
+    OwnerConfig, ProviderConfig, SecretEntry, SubagentConfig, TraceBackendEntry, TraceConfig,
+    TriggersConfig, WebFetchConfig,
 };
 
 // ── Root Config ──
@@ -49,6 +49,9 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct GatewayConfig {
+    /// The single principal this gateway serves (v1: permanently single-user).
+    #[serde(default)]
+    pub owner: OwnerConfig,
     #[serde(default)]
     pub cron: CronConfig,
     #[serde(default)]
@@ -1514,6 +1517,7 @@ mod tests {
     #[test]
     fn test_config_gateway_config_custom() {
         let gateway_config = crate::config::GatewayConfig {
+            owner: Default::default(),
             cron: crate::config::CronConfig {
                 enabled: true,
                 unknown: Default::default(),

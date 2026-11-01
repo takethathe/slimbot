@@ -102,6 +102,20 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 
 子代理是一份 `agents/<name>.md` 定义的一次性执行（详见 [agent.md](agent.md)）：自己的会话只在内存、按定义从 `ToolCatalog` 装配 `ToolManager`、全局并发闸。主 loop 的 `subagent` 工具与触发器的 `agent` action 共用同一个 runtime 实例，因此共用同一个闸与同一条回会话的路。脚本执行（采集 / 判定）走 `codemode` 沙箱：rquickjs + 专职线程 + 双层超时 + 宿主函数白名单（详见 [codemode.md](codemode.md)）。
 
+### 单用户信任边界（身份层）
+
+一个 gateway 服务且只服务一个 `owner`（`gateway.owner`，v1 永久单用户，见 ADR 0010）。身份层只做两件事：给记忆/审批/投递一个稳定的「谁的」，以及在入站口判定「谁说的」。
+
+- **归属**：`TaskHook` 携带 `owner_id`；记忆不分 owner 分区，会话仍按 `{channel}:{chat_id}` 独立（「在哪」与「谁的」正交）。
+- **作者信任**：入站 `BusRequest.author` 为 `Author::Owner`（本机 CLI / WebUI、owner 本人私聊、由 owner 配置启动的系统注入）或 `Author::Bystander`。`Bystander` 的入站消息在 `AgentLoop` 入站口被**直接拒绝**并回一条固定说明——它不能授权任何动作、不能写记忆；v1 无群聊，因此不需要「不可信但可读」的中间态。
+- **WebUI 边界**：只监听 loopback（非 loopback 直接启动失败、无 override），无认证、无 token，本机即 owner；补偿控制是四条浏览器侧中间件（Host 白名单 / 同源 Origin / `application/json` / `Sec-Fetch-Site`）+ 零 CORS 头。本机任意进程仍可全权操作 WebUI，这一点显式接受。
+
+### Connector / Executor（外部接口层）
+
+连接器 = codemode 可直接调用的、非基础原语、非内置工具的外部能力封装（同一连接器既读又动）；MCP server 是 v1 唯一实例（见 `GLOSSARY.md` `### Connector`）。它把「agent 对外部系统的能力」抽象成一个可寻址的服务单元，与 Channel（会话/传输面）正交，区别于宿主内置工具（file/shell/message）与 codemode 基础原语（时间、`ctx.http`）。
+
+在此之上是两种 codemode 消费者，互为操作镜像：**采集器**（触发器源 `collect.js`，读侧、周期采集，已落地）与**执行器**（`act.js`，写侧、按需动作；v1 决策见 [ADR 0019](adr/0019-executor-as-codemode-operation-primitive.md)，完整实现走连接器子 effort）。执行器动作带副作用、纳入审批（[ADR 0011](adr/0011-approval-by-turn-end-redemption.md)）、无人值守 Deny。
+
 ## 数据流
 
 ### Inbound（用户输入）
