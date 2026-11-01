@@ -483,6 +483,8 @@ impl Tool for WebFetchTool {
         })
     }
 
+    // Deliberately not context-exempt: re-fetching a page only loses its text.
+
     async fn execute(&self, args: serde_json::Value) -> Result<String> {
         // All error paths return Ok(error_json) so the model sees a uniform
         // shape it can parse and retry, matching the other web_fetch failures.

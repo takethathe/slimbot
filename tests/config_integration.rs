@@ -156,7 +156,9 @@ fn test_agent_defaults() {
     let config = Config::load(path).unwrap();
     assert_eq!(config.agent.max_iterations, 40);
     assert_eq!(config.agent.timeout_seconds, 120);
-    assert_eq!(config.agent.max_tool_result_chars, 8000);
+    // `agent.max_tool_result_chars` is deprecated: limits now derive from the
+    // provider window plus the `pressure` ratio table.
+    assert_eq!(config.pressure.single_tool_result_ratio, 0.25);
     assert!(config.agent.persist_tool_results);
 }
 
@@ -178,6 +180,7 @@ fn test_save_and_reload_round_trip() {
             model: "gpt-4".to_string(),
             temperature: 0.5,
             max_tokens: 2048,
+            context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
             unknown: Default::default(),
@@ -198,13 +201,12 @@ fn test_save_and_reload_round_trip() {
     );
 
     let config = Config {
+        pressure: Default::default(),
         agent: AgentConfig {
             provider: "my-provider".to_string(),
             max_iterations: 10,
             timeout_seconds: 60,
-            max_tool_result_chars: 4000,
             persist_tool_results: false,
-            context_window_tokens: 8192,
             unknown: Default::default(),
         },
         providers,

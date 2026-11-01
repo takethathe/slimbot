@@ -3,7 +3,7 @@ use std::fs;
 
 use tempfile::NamedTempFile;
 
-use slimbot::{AgentConfig, ChannelConfig, Config, ProviderConfig, ToolEntry};
+use slimbot::{AgentConfig, ChannelConfig, Config, PressureConfig, ProviderConfig, ToolEntry};
 
 // ── Default config generation ──
 
@@ -12,6 +12,7 @@ fn test_default_config_structure() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -47,6 +48,7 @@ fn test_normalize_fills_empty_agent_provider() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -70,6 +72,7 @@ fn test_normalize_derives_url_from_base_url() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -101,6 +104,7 @@ fn test_normalize_preserves_existing_api_url() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -131,6 +135,7 @@ fn test_normalize_falls_back_to_default_url_when_no_base() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -161,6 +166,7 @@ fn test_normalize_trailing_slash_stripped_from_base_url() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -191,6 +197,7 @@ fn test_normalize_removes_empty_tools_and_channels() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -233,6 +240,7 @@ fn test_normalize_does_not_touch_api_key() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -258,6 +266,7 @@ fn test_normalize_max_iterations_and_timeout_via_clamp() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -289,6 +298,7 @@ fn test_write_default_config_creates_file() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -315,6 +325,7 @@ fn test_written_config_is_valid_json() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let config = Config {
+        pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: vec![],
@@ -356,19 +367,19 @@ fn test_normalize_multiple_providers() {
             model: "Qwen/Qwen2.5-72B-Instruct".to_string(),
             temperature: 0.7,
             max_tokens: 4096,
+            context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
             unknown: Default::default(),
         },
     );
     let mut config = Config {
+        pressure: Default::default(),
         agent: AgentConfig {
             provider: "siliconflow".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: true,
-            context_window_tokens: 8192,
             unknown: Default::default(),
         },
         providers,
@@ -396,15 +407,22 @@ fn test_normalize_multiple_providers() {
 fn test_config_defaults_match_expected_values() {
     let agent_defaults = AgentConfig::defaults();
     let provider_defaults = ProviderConfig::defaults();
+    let pressure_defaults = PressureConfig::defaults();
 
     assert_eq!(agent_defaults["provider"], "");
     assert_eq!(agent_defaults["max_iterations"], 40);
     assert_eq!(agent_defaults["timeout_seconds"], 120);
-    assert_eq!(agent_defaults["max_tool_result_chars"], 8000);
     assert!(agent_defaults["persist_tool_results"].as_bool().unwrap());
-    assert_eq!(agent_defaults["context_window_tokens"], 32768);
+    // Length limits moved out of `agent`: the window lives on the provider and
+    // the percentages live in the `pressure` section.
+    assert!(!agent_defaults.contains_key("max_tool_result_chars"));
+    assert!(!agent_defaults.contains_key("context_window_tokens"));
 
     assert_eq!(provider_defaults["r#type"], "openai");
+    assert_eq!(provider_defaults["context_window_tokens"], 32768);
+    assert_eq!(pressure_defaults["single_tool_result_ratio"], 0.25);
+    assert_eq!(pressure_defaults["consolidate_trigger_ratio"], 0.5);
+    assert_eq!(pressure_defaults["tool_results_ttl_days"], 7);
     assert_eq!(provider_defaults["base_url"], "https://api.openai.com");
     assert_eq!(provider_defaults["model"], "gpt-4o");
     assert_eq!(provider_defaults["temperature"], 0.7);

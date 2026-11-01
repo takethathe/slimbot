@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,9 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task_local;
 
 use crate::config::ToolEntry;
-use crate::utils::{
-    TOOL_RESULT_PREVIEW_CHARS, TOOL_RESULTS_DIR, build_persisted_reference, write_file_atomic,
-};
+use crate::utils::{TOOL_RESULTS_DIR, build_persisted_reference};
 use crate::{debug, error, warn_log};
 
 // Re-export for runner.rs
@@ -106,6 +103,19 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> serde_json::Value;
+
+    /// Whether this tool's results are exempt from context pressure.
+    ///
+    /// Exempt means "neither truncated to a length limit nor replaced by a
+    /// placeholder when old": both stages read this single self-report. Tools
+    /// that control their own output size (or whose loss would make the model
+    /// repeat a user-visible action, e.g. delivering a message) report `true`.
+    /// There is deliberately no central allowlist, so third-party (MCP) tools
+    /// default to `false` and get trimmed aggressively.
+    fn context_exempt(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, args: serde_json::Value) -> Result<String>;
 }
 
@@ -204,6 +214,17 @@ impl ToolManager {
             .ok_or_else(|| anyhow::anyhow!("Tool not found: {}", name))?;
         tool.execute(args).await
     }
+
+    /// Whether the named tool reports itself exempt from context pressure.
+    ///
+    /// Unknown tools (never registered here, e.g. an MCP tool reached through
+    /// codemode) are not exempt: their results are trimmed like any other.
+    pub fn is_context_exempt(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .map(|tool| tool.context_exempt())
+            .unwrap_or(false)
+    }
 }
 
 fn create_builtin_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
@@ -233,26 +254,23 @@ pub fn persist_tool_result(
     tool_call_id: &str,
     content: &str,
     max_chars: usize,
+    preview_chars: usize,
 ) -> String {
-    if content.len() <= max_chars {
+    if max_chars > 0 && content.len() <= max_chars {
         return content.to_string();
     }
 
-    let results_dir = workspace_dir.join(TOOL_RESULTS_DIR);
-    if let Err(e) = fs::create_dir_all(&results_dir) {
-        error!("Failed to create tool-results dir: {}", e);
+    let Some(_rel_path) =
+        crate::utils::persist_tool_result_file(workspace_dir, tool_call_id, content)
+    else {
+        error!("Failed to persist tool result for {}", tool_call_id);
         return content.to_string();
-    }
+    };
 
-    let file_path = results_dir.join(format!("{}.txt", tool_call_id));
-    if !file_path.exists()
-        && let Err(e) = write_file_atomic(&file_path, content)
-    {
-        error!("Failed to persist tool result: {}", e);
-        return content.to_string();
-    }
-
-    build_persisted_reference(&file_path, content, TOOL_RESULT_PREVIEW_CHARS)
+    let file_path = workspace_dir
+        .join(TOOL_RESULTS_DIR)
+        .join(format!("{}.txt", tool_call_id));
+    build_persisted_reference(&file_path, content, preview_chars)
 }
 
 /// Test helpers shared by tool tests across modules.
@@ -447,7 +465,7 @@ mod tests {
     #[test]
     fn test_persist_tool_result_under_limit() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = persist_tool_result(tmp.path(), "call-1", "short result", 100);
+        let result = persist_tool_result(tmp.path(), "call-1", "short result", 100, 20);
         assert_eq!(result, "short result");
     }
 
@@ -455,10 +473,72 @@ mod tests {
     fn test_persist_tool_result_over_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let content = "x".repeat(2000); // well over the 1200 preview limit
-        let result = persist_tool_result(tmp.path(), "call-2", &content, 100);
+        let result = persist_tool_result(tmp.path(), "call-2", &content, 100, 1200);
         assert!(result.contains("persisted"));
         assert!(result.contains("call-2"));
         assert!(result.contains("Original size"));
+    }
+
+    #[test]
+    fn test_persist_tool_result_honours_preview_ratio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "y".repeat(5_000);
+        let result = persist_tool_result(tmp.path(), "call-3", &content, 100, 300);
+        // Header + a 300 char preview only: the preview limit is window-derived.
+        assert!(result.contains(&"y".repeat(300)));
+        assert!(!result.contains(&"y".repeat(301)));
+    }
+
+    #[test]
+    fn test_persist_tool_result_writes_file_under_tool_results_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "z".repeat(5_000);
+        persist_tool_result(tmp.path(), "call-4", &content, 100, 1200);
+        let path = tmp.path().join("tool-results").join("call-4.txt");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    }
+
+    #[test]
+    fn test_tool_context_exempt_defaults_to_false() {
+        struct Plain;
+
+        #[async_trait]
+        impl Tool for Plain {
+            fn name(&self) -> &str {
+                "plain"
+            }
+            fn description(&self) -> &str {
+                "plain"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        assert!(!Plain.context_exempt());
+    }
+
+    #[test]
+    fn test_tool_manager_reports_self_declared_exemption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = ToolManager::new(tmp.path().to_path_buf());
+        tm.init_from_config(&[]);
+
+        assert!(
+            tm.is_context_exempt("file_reader"),
+            "file_reader keeps its own output in bounds"
+        );
+        assert!(
+            !tm.is_context_exempt("shell"),
+            "shell output is trimmed under pressure"
+        );
+        assert!(
+            !tm.is_context_exempt("never_registered"),
+            "unknown tools (e.g. MCP) are not exempt by default"
+        );
     }
 
     #[test]

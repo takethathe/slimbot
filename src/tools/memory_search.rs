@@ -127,6 +127,12 @@ impl crate::tool::Tool for MemorySearchTool {
         })
     }
 
+    fn context_exempt(&self) -> bool {
+        // Retrieval hits are what the model went looking for; trimming them
+        // would force the same search again for no smaller result.
+        true
+    }
+
     async fn execute(&self, args: Value) -> Result<String> {
         let query = match args.get("query").and_then(Value::as_str) {
             Some(query) => query.trim().to_string(),
@@ -168,6 +174,12 @@ mod tests {
         let memory = Arc::new(Mutex::new(MemoryService::new(&workspace)));
         memory.lock().await.init().unwrap();
         (MemorySearchTool::new(memory), tmp)
+    }
+
+    #[tokio::test]
+    async fn test_memory_search_reports_context_exempt() {
+        let (tool, _tmp) = make_tool().await;
+        assert!(tool.context_exempt());
     }
 
     async fn set(tool: &MemorySearchTool, category: &MemoryCategory, content: &str) {

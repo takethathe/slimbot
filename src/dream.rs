@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::config::DreamConfig;
 use crate::memory::SharedMemory;
+use crate::pressure::PressureAnchor;
 use crate::provider::Provider;
 use crate::session::SharedSessionManager;
 use crate::tool::ToolManager;
@@ -16,6 +17,8 @@ pub struct DreamService {
     config: DreamConfig,
     providers: Arc<HashMap<String, Arc<dyn Provider>>>,
     default_provider: Arc<dyn Provider>,
+    /// Window anchor: Dream only needs its cleanup knobs (tool-result TTL).
+    pressure: PressureAnchor,
 }
 
 pub struct DreamResult {
@@ -40,7 +43,15 @@ impl DreamService {
             config,
             providers,
             default_provider,
+            pressure: PressureAnchor::default(),
         }
+    }
+
+    /// Attach the configured window anchor (tool-result TTL lives under
+    /// `pressure`), so Dream's housekeeping follows the same config section.
+    pub fn with_pressure(mut self, pressure: PressureAnchor) -> Self {
+        self.pressure = pressure;
+        self
     }
 
     pub async fn build_prompt(&self) -> Option<(String, usize)> {
@@ -189,6 +200,14 @@ impl DreamService {
             // Compact history
             self.compact_history_after_dream().await;
 
+            // Housekeeping rides on Dream's success branch instead of a new
+            // timer: expired persisted tool results are swept only after a
+            // successful pass (ADR 0013: cleanup must not orphan references).
+            let swept = self.sweep_expired_tool_results();
+            if swept > 0 {
+                crate::info!("[DreamService] Swept {swept} expired tool result file(s)");
+            }
+
             DreamResult {
                 success: true,
                 elapsed_ms,
@@ -201,6 +220,18 @@ impl DreamService {
                 message: format!("Dream did not complete: {}", result.content),
             }
         }
+    }
+
+    /// Delete persisted tool results older than `pressure.tool_results_ttl_days`.
+    ///
+    /// Returns the number of removed files. A missing `tool-results/` directory
+    /// is not an error: most workspaces never persist a result.
+    pub(crate) fn sweep_expired_tool_results(&self) -> usize {
+        let days = self.pressure.config.tool_results_ttl_days.max(1);
+        crate::utils::sweep_tool_results(
+            &self.workspace_dir,
+            std::time::Duration::from_secs(days * 86_400),
+        )
     }
 
     async fn compact_history_after_dream(&self) {
@@ -495,5 +526,57 @@ mod tests {
         assert_eq!(entries[49].content, "entry 2100");
         // Dream cursor should be adjusted: 2000 - 2050 = 0 (saturating)
         assert_eq!(ms.get_last_dream_cursor(), 0);
+    }
+
+    /// Backdate a file's mtime so TTL tests do not sleep.
+    fn backdate(path: &std::path::Path, days: u64) {
+        use std::fs::FileTimes;
+        let file = fs::File::options().write(true).open(path).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        file.set_times(FileTimes::new().set_modified(when)).unwrap();
+    }
+
+    fn write_tool_result(service: &DreamService, name: &str, days_old: u64) -> std::path::PathBuf {
+        let dir = service.workspace_dir.join("tool-results");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, "full output").unwrap();
+        backdate(&path, days_old);
+        path
+    }
+
+    #[tokio::test]
+    async fn test_dream_sweep_removes_expired_tool_results() {
+        // Dream's success branch is the only place housekeeping runs.
+        let (service, _tmp_dir) = make_service().await;
+        let expired = write_tool_result(&service, "expired.txt", 8);
+
+        assert_eq!(service.sweep_expired_tool_results(), 1);
+        assert!(!expired.exists());
+    }
+
+    #[tokio::test]
+    async fn test_dream_sweep_keeps_results_inside_ttl() {
+        let (service, _tmp_dir) = make_service().await;
+        let fresh = write_tool_result(&service, "fresh.txt", 1);
+
+        assert_eq!(service.sweep_expired_tool_results(), 0);
+        assert!(fresh.exists());
+    }
+
+    #[tokio::test]
+    async fn test_dream_sweep_honours_configured_ttl() {
+        let (service, _tmp_dir) = make_service().await;
+        let service = service.with_pressure(PressureAnchor::new(
+            32_768,
+            crate::config::PressureConfig {
+                tool_results_ttl_days: 30,
+                ..Default::default()
+            },
+        ));
+        let eight_days_old = write_tool_result(&service, "eight.txt", 8);
+
+        assert_eq!(service.sweep_expired_tool_results(), 0);
+        assert!(eight_days_old.exists(), "8 days is inside a 30-day TTL");
     }
 }

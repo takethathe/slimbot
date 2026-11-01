@@ -531,9 +531,7 @@ mod tests {
                 provider: "default".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
-                max_tool_result_chars: 10000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -548,6 +546,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: true,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -564,6 +563,7 @@ mod tests {
             json_render: Default::default(),
             subagent: Default::default(),
             triggers: Default::default(),
+            pressure: Default::default(),
         }
     }
 

@@ -93,14 +93,14 @@ async fn test_char_per_token_ratio_persists_and_reloads() {
         sm.persist("s1").await.unwrap();
     }
 
-    // Reload: ratio defaults to 4.0 since no LLM call happened
+    // Reload: ratio defaults to the cold-start 3.0 since no LLM call happened
     {
         let mut sm = SessionManager::new(session_dir).unwrap();
         sm.get_or_create("s1").await.unwrap(); // load from disk
         let data = sm.get_session_data("s1");
         assert!(data.is_some());
         let data = data.unwrap();
-        assert_eq!(data.char_per_token_ratio, 4.0);
+        assert_eq!(data.char_per_token_ratio, 3.0);
     }
 }
 

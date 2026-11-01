@@ -99,9 +99,7 @@ fn test_config() -> AgentConfig {
         provider: "test".to_string(),
         max_iterations: 40,
         timeout_seconds: 120,
-        max_tool_result_chars: 8000,
         persist_tool_results: false,
-        context_window_tokens: 32768,
         unknown: Default::default(),
     }
 }

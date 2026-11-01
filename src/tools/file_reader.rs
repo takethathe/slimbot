@@ -31,6 +31,13 @@ impl Tool for FileReaderTool {
         "Read the contents of a file. Path must be within the workspace directory."
     }
 
+    /// Exempt from context trimming: the tool already bounds its own output
+    /// (line ranges), so replacing a read with a placeholder would only force
+    /// the model to read the same file again.
+    fn context_exempt(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

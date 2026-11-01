@@ -19,6 +19,7 @@
 | [会话管理](session.md) | `session.rs` | 会话生命周期、任务队列、JSONL 持久化 |
 | [定时任务](cron.md) | `cron/` | 本地时间调度的 jobs.json、tick 语义、错过的一次性窗口只记 `skipped` |
 | [会话压缩](consolidate.md) | `consolidate.rs` | Token 预算触发摘要、消息驱逐、上下文注入 |
+| [上下文压力](snip.md) | `pressure.rs`, `snip.rs` | 单一窗口锚派生全部长度限制、两阶段截断、引用带落盘路径（ADR 0013） |
 | [消息总线](message_bus.md) | `message_bus.rs` | 请求分发、任务封装、结果路由 |
 | [Provider](provider.md) | `provider/` | Provider 接口、OpenAI 兼容 API 集成 |
 | [通道](channel.md) | `channel/` | 通道抽象、工厂模式、并发 I/O 循环 |

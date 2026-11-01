@@ -11,19 +11,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::info;
 use crate::memory::SharedMemory;
+use crate::pressure::{DEFAULT_CHAR_PER_TOKEN_RATIO, PressureAnchor};
 use crate::provider::{FinishReason, Provider};
 use crate::session::{Message, SharedSessionManager, message_content_chars, message_content_str};
 
 /// Hard cap on messages per consolidation chunk.
+///
+/// A constant on purpose: raising it can silently drop conversation history the
+/// user has no way to judge (ADR 0013, decision 13).
 const MAX_CHUNK_MESSAGES: usize = 60;
-/// Extra headroom for tokenizer estimation drift.
-const SAFETY_BUFFER: u32 = 512;
-/// Prompt can use up to 50% of context window before triggering consolidation.
-const CONTEXT_BUDGET_FRACTION: f64 = 0.5;
-/// Consolidation reduces prompt to 60% of budget, leaving room for next turn.
-const CONSOLIDATION_TARGET_FRACTION: f64 = 0.6;
-/// Maximum allowed size of a summary in bytes.
-const MAX_SUMMARY_BYTES: usize = 512;
 /// Max retries for LLM-driven summary compression before force-truncating.
 const MAX_COMPRESS_RETRIES: usize = 2;
 
@@ -31,7 +27,9 @@ pub struct Consolidator {
     provider: Arc<dyn Provider>,
     session_manager: SharedSessionManager,
     memory_service: SharedMemory,
-    context_window_tokens: u32,
+    /// Window anchor + ratio table: the trigger, the target and the summary
+    /// length are all percentages of it.
+    anchor: PressureAnchor,
     cancel_token: CancellationToken,
 }
 
@@ -46,9 +44,15 @@ impl Consolidator {
             provider,
             session_manager,
             memory_service,
-            context_window_tokens,
+            anchor: PressureAnchor::from_window(context_window_tokens),
             cancel_token: CancellationToken::new(),
         }
+    }
+
+    /// Replace the window anchor (window tokens + `pressure.*` ratio table).
+    pub fn with_anchor(mut self, anchor: PressureAnchor) -> Self {
+        self.anchor = anchor;
+        self
     }
 
     /// Estimate token count for a single message using the session's observed
@@ -138,12 +142,16 @@ impl Consolidator {
     /// Summarize messages via LLM and append to history.jsonl.
     /// Returns the summary text on success.
     ///
-    /// Enforces MAX_SUMMARY_BYTES in three layers:
-    /// 1. The initial prompt instructs the LLM to stay within 512 bytes.
+    /// Enforces the window-derived summary budget in three layers:
+    /// 1. The initial prompt states the character budget it must stay within.
     /// 2. If the result is still too large, re-prompt up to MAX_COMPRESS_RETRIES
     ///    times asking the LLM to compress its output.
     /// 3. As a last resort, force-truncate the result at a UTF-8 boundary.
-    async fn archive(&self, messages: &[Message]) -> Result<Option<String>> {
+    async fn archive(
+        &self,
+        messages: &[Message],
+        summary_max_chars: usize,
+    ) -> Result<Option<String>> {
         if messages.is_empty() {
             return Ok(None);
         }
@@ -155,7 +163,7 @@ impl Consolidator {
             .provider
             .chat(
                 &[
-                    &Message::system(self.system_prompt()),
+                    &Message::system(self.system_prompt(summary_max_chars)),
                     &Message::user(formatted),
                 ],
                 None,
@@ -178,12 +186,12 @@ impl Consolidator {
 
         // Layer 2: LLM-driven compression retries.
         for attempt in 0..MAX_COMPRESS_RETRIES {
-            if summary.len() <= MAX_SUMMARY_BYTES {
+            if summary.chars().count() <= summary_max_chars {
                 break;
             }
             info!(
-                "[Consolidator] Summary too large ({} bytes), compressing (attempt {}/{MAX_COMPRESS_RETRIES})",
-                summary.len(),
+                "[Consolidator] Summary too large ({} chars, budget {summary_max_chars}), compressing (attempt {}/{MAX_COMPRESS_RETRIES})",
+                summary.chars().count(),
                 attempt + 1,
             );
 
@@ -191,7 +199,7 @@ impl Consolidator {
                 .provider
                 .chat(
                     &[
-                        &Message::system(Self::compress_prompt()),
+                        &Message::system(Self::compress_prompt(summary_max_chars)),
                         &Message::user(summary.clone()),
                     ],
                     None,
@@ -215,12 +223,16 @@ impl Consolidator {
         }
 
         // Layer 3: force-truncate if still over the limit.
-        if summary.len() > MAX_SUMMARY_BYTES {
+        if summary.chars().count() > summary_max_chars {
             info!(
-                "[Consolidator] Summary still too large after {MAX_COMPRESS_RETRIES} compress retries ({} bytes), force-truncating",
-                summary.len()
+                "[Consolidator] Summary still too large after {MAX_COMPRESS_RETRIES} compress retries ({} chars, budget {summary_max_chars}), force-truncating",
+                summary.chars().count()
             );
-            let mut cut = MAX_SUMMARY_BYTES;
+            let mut cut = summary
+                .char_indices()
+                .nth(summary_max_chars)
+                .map(|(i, _)| i)
+                .unwrap_or(summary.len());
             while cut > 0 && !summary.is_char_boundary(cut) {
                 cut -= 1;
             }
@@ -240,8 +252,8 @@ impl Consolidator {
         Ok(Some(summary))
     }
 
-    fn system_prompt(&self) -> String {
-        "Extract key facts from this conversation. For each fact, annotate its memory attributes.
+    fn system_prompt(&self, summary_max_chars: usize) -> String {
+        format!("Extract key facts from this conversation. For each fact, annotate its memory attributes.
 
 Only SNIP facts deserve a non-[skip] mark:
 - Signal: would the user need to repeat this if forgotten?
@@ -264,14 +276,14 @@ Priority: user corrections and preferences > solutions > decisions > events > en
 Do not mark something [skip] merely because it might already exist in long-term memory; Dream handles cross-file deduplication later.
 
 Output concise bullet points only. No preamble, no commentary.
-Your entire output MUST NOT exceed 512 bytes. Be ruthlessly concise — every byte counts.
-If nothing noteworthy happened, output: (nothing)"
-            .to_string()
+Your entire output MUST NOT exceed {summary_max_chars} characters. Be ruthlessly concise — every character counts.
+If nothing noteworthy happened, output: (nothing)")
     }
 
-    fn compress_prompt() -> String {
-        "Compress the following summary to fit within 512 bytes. Keep only the most important facts. Output the compressed summary directly, with no preamble or commentary."
-            .to_string()
+    fn compress_prompt(summary_max_chars: usize) -> String {
+        format!(
+            "Compress the following summary to fit within {summary_max_chars} characters. Keep only the most important facts. Output the compressed summary directly, with no preamble or commentary."
+        )
     }
 
     /// Internal: perform one round of consolidation. Returns the number of
@@ -325,7 +337,8 @@ If nothing noteworthy happened, output: (nothing)"
             session_id
         );
 
-        let summary = self.archive(&chunk).await.ok().flatten();
+        let summary_max_chars = self.anchor.limits(ratio).summary_max_chars;
+        let summary = self.archive(&chunk, summary_max_chars).await.ok().flatten();
 
         // If cancelled during archive, skip all file I/O and meta updates.
         if self.cancel_token.is_cancelled() {
@@ -350,19 +363,20 @@ If nothing noteworthy happened, output: (nothing)"
     /// Summarize the session when the prompt exceeds the token budget.
     /// Returns `true` when a consolidation round actually ran.
     pub async fn maybe_consolidate(&self, session_id: &str, prompt_tokens: u32) -> Result<bool> {
-        if self.context_window_tokens == 0 {
+        // The trigger is judged on the authoritative track (provider-reported
+        // `prompt_tokens`), so only the derived token numbers matter here; the
+        // chars-per-token ratio only scales the summary budget below.
+        let limits = self.anchor.limits(DEFAULT_CHAR_PER_TOKEN_RATIO);
+        if limits.consolidate_trigger_tokens == 0 {
             return Ok(false);
         }
 
-        // Budget: allow prompt to use up to 85% of context window, minus safety buffer.
-        let budget =
-            ((self.context_window_tokens as f64 * CONTEXT_BUDGET_FRACTION) as u32) - SAFETY_BUFFER;
-        if prompt_tokens <= budget {
+        // Trigger = window × pressure.consolidate_trigger_ratio.
+        if prompt_tokens <= limits.consolidate_trigger_tokens {
             return Ok(false);
         }
 
-        let target = (budget as f64 * CONSOLIDATION_TARGET_FRACTION) as u32;
-        let tokens_to_remove = prompt_tokens.saturating_sub(target);
+        let tokens_to_remove = prompt_tokens.saturating_sub(limits.consolidate_target_tokens);
 
         let consolidated = self
             .consolidate_one_round(session_id, tokens_to_remove)
@@ -382,9 +396,41 @@ If nothing noteworthy happened, output: (nothing)"
 mod tests {
     use super::*;
 
+    /// Summary budget for the test anchor (32768-token window, cold-start ratio).
+    fn summary_budget() -> usize {
+        PressureAnchor::from_window(TEST_WINDOW_TOKENS)
+            .limits(DEFAULT_CHAR_PER_TOKEN_RATIO)
+            .summary_max_chars
+    }
+
+    const TEST_WINDOW_TOKENS: u32 = 32_768;
+
     #[test]
-    fn test_consolidation_threshold_is_50_percent() {
-        assert!((CONTEXT_BUDGET_FRACTION - 0.5).abs() < f64::EPSILON);
+    fn test_consolidate_trigger_derives_from_window_ratio() {
+        let limits =
+            PressureAnchor::from_window(TEST_WINDOW_TOKENS).limits(DEFAULT_CHAR_PER_TOKEN_RATIO);
+        assert_eq!(limits.consolidate_trigger_tokens, TEST_WINDOW_TOKENS / 2);
+        assert_eq!(
+            limits.consolidate_target_tokens,
+            (limits.consolidate_trigger_tokens as f64 * 0.6) as u32
+        );
+    }
+
+    #[test]
+    fn test_consolidate_limits_double_with_window() {
+        // Trigger, target and summary budget all scale with the single anchor.
+        let small = PressureAnchor::from_window(32_768).limits(DEFAULT_CHAR_PER_TOKEN_RATIO);
+        let large = PressureAnchor::from_window(65_536).limits(DEFAULT_CHAR_PER_TOKEN_RATIO);
+
+        assert_eq!(
+            large.consolidate_trigger_tokens,
+            small.consolidate_trigger_tokens * 2
+        );
+        assert_eq!(
+            large.consolidate_target_tokens,
+            small.consolidate_target_tokens * 2
+        );
+        assert_eq!(large.summary_max_chars, small.summary_max_chars * 2);
     }
 
     #[test]
@@ -631,9 +677,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_maybe_consolidate_same_tokens_only_at_smaller_window() {
+        // The same provider-reported token count must cross the trigger only
+        // for the smaller window: the trigger is a percentage of the anchor.
+        let provider = Arc::new(SequenceMockProvider::new(vec![(
+            "- summary".to_string(),
+            FinishReason::Stop,
+        )]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        let wide = consolidator.with_anchor(PressureAnchor::from_window(65_536));
+        assert!(
+            !wide.maybe_consolidate(&session_id, 20_000).await.unwrap(),
+            "20000 tokens is below half of a 64k window"
+        );
+
+        let narrow = wide.with_anchor(PressureAnchor::from_window(32_768));
+        assert!(
+            narrow.maybe_consolidate(&session_id, 20_000).await.unwrap(),
+            "20000 tokens is above half of a 32k window"
+        );
+    }
+
+    #[tokio::test]
     async fn test_summary_within_limit_no_compression() {
         let short_summary = "- User prefers dark mode".to_string();
-        assert!(short_summary.len() <= MAX_SUMMARY_BYTES);
+        assert!(short_summary.len() <= summary_budget());
 
         let provider = Arc::new(SequenceMockProvider::new(vec![(
             short_summary.clone(),
@@ -657,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_summary_over_limit_compresses_on_first_retry() {
-        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 100);
+        let large_summary = "x".repeat(summary_budget() + 100);
         let compressed_summary = "- User prefers dark mode".to_string();
 
         let provider = Arc::new(SequenceMockProvider::new(vec![
@@ -678,13 +747,13 @@ mod tests {
             .read_recent_history(10);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].content.contains("dark mode"));
-        assert!(entries[0].content.len() <= MAX_SUMMARY_BYTES);
+        assert!(entries[0].content.len() <= summary_budget());
     }
 
     #[tokio::test]
     async fn test_summary_over_limit_needs_multiple_retries() {
-        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 200);
-        let medium_summary = "y".repeat(MAX_SUMMARY_BYTES + 50);
+        let large_summary = "x".repeat(summary_budget() + 200);
+        let medium_summary = "y".repeat(summary_budget() + 50);
         let compressed_summary = "- User chose SQLite".to_string();
 
         let provider = Arc::new(SequenceMockProvider::new(vec![
@@ -706,14 +775,14 @@ mod tests {
             .read_recent_history(10);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].content.contains("SQLite"));
-        assert!(entries[0].content.len() <= MAX_SUMMARY_BYTES);
+        assert!(entries[0].content.len() <= summary_budget());
     }
 
     #[tokio::test]
     async fn test_summary_over_limit_all_retries_exhausted_force_truncates() {
-        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 100);
-        let still_large_1 = "y".repeat(MAX_SUMMARY_BYTES + 50);
-        let still_large_2 = "z".repeat(MAX_SUMMARY_BYTES + 20);
+        let large_summary = "x".repeat(summary_budget() + 100);
+        let still_large_1 = "y".repeat(summary_budget() + 50);
+        let still_large_2 = "z".repeat(summary_budget() + 20);
 
         let provider = Arc::new(SequenceMockProvider::new(vec![
             (large_summary, FinishReason::Stop),
@@ -733,13 +802,13 @@ mod tests {
             .await
             .read_recent_history(10);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content.len(), MAX_SUMMARY_BYTES);
+        assert_eq!(entries[0].content.len(), summary_budget());
         assert!(entries[0].content.chars().all(|c| c == 'z'));
     }
 
     #[tokio::test]
     async fn test_compress_returns_error_falls_to_truncation() {
-        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 100);
+        let large_summary = "x".repeat(summary_budget() + 100);
 
         let provider = Arc::new(SequenceMockProvider::new(vec![
             (large_summary.clone(), FinishReason::Stop),
@@ -758,12 +827,12 @@ mod tests {
             .await
             .read_recent_history(10);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content.len(), MAX_SUMMARY_BYTES);
+        assert_eq!(entries[0].content.len(), summary_budget());
     }
 
     #[tokio::test]
     async fn test_compress_returns_empty_falls_to_truncation() {
-        let large_summary = "x".repeat(MAX_SUMMARY_BYTES + 100);
+        let large_summary = "x".repeat(summary_budget() + 100);
 
         let provider = Arc::new(SequenceMockProvider::new(vec![
             (large_summary.clone(), FinishReason::Stop),
@@ -782,15 +851,14 @@ mod tests {
             .await
             .read_recent_history(10);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content.len(), MAX_SUMMARY_BYTES);
+        assert_eq!(entries[0].content.len(), summary_budget());
     }
 
     #[tokio::test]
     async fn test_force_truncate_utf8_boundary() {
-        // Create a summary with multi-byte UTF-8 characters at the boundary
-        // Each emoji is 4 bytes, so 128 emojis = 512 bytes exactly
-        let mut large_summary = "🎉".repeat(128); // exactly 512 bytes
-        large_summary.push_str("extra"); // now 517 bytes
+        // Multi-byte characters at the boundary must not be split.
+        let mut large_summary = "🎉".repeat(summary_budget());
+        large_summary.push_str("extra");
 
         let provider = Arc::new(SequenceMockProvider::new(vec![(
             large_summary,
@@ -809,14 +877,14 @@ mod tests {
             .await
             .read_recent_history(10);
         assert_eq!(entries.len(), 1);
-        // Should truncate to 512 bytes (128 emojis), not break a character
-        assert_eq!(entries[0].content.len(), 512);
-        assert_eq!(entries[0].content, "🎉".repeat(128));
+        // Should truncate to the derived character budget, not break a character
+        assert_eq!(entries[0].content, "🎉".repeat(summary_budget()));
+        assert_eq!(entries[0].content.chars().count(), summary_budget());
     }
 
     #[tokio::test]
     async fn test_force_truncate_ascii_exact_boundary() {
-        let large_summary = "a".repeat(MAX_SUMMARY_BYTES + 10);
+        let large_summary = "a".repeat(summary_budget() + 10);
 
         let provider = Arc::new(SequenceMockProvider::new(vec![(
             large_summary,
@@ -835,18 +903,18 @@ mod tests {
             .await
             .read_recent_history(10);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content.len(), MAX_SUMMARY_BYTES);
+        assert_eq!(entries[0].content.len(), summary_budget());
     }
 
     #[test]
-    fn test_compress_prompt_mentions_512_bytes() {
-        let prompt = Consolidator::compress_prompt();
-        assert!(prompt.contains("512 bytes"));
+    fn test_compress_prompt_states_derived_budget() {
+        let prompt = Consolidator::compress_prompt(summary_budget());
+        assert!(prompt.contains(&format!("{} characters", summary_budget())));
         assert!(prompt.contains("Compress"));
     }
 
     #[test]
-    fn test_system_prompt_mentions_512_bytes() {
+    fn test_system_prompt_states_derived_budget() {
         let tmp = TempDir::new().unwrap();
         let session_dir = tmp.path().join("sessions");
         let workspace_dir = tmp.path().join("workspace");
@@ -861,13 +929,23 @@ mod tests {
         let provider = Arc::new(SequenceMockProvider::new(vec![]));
         let consolidator = Consolidator::new(provider, sm, ms, 32768);
 
-        let prompt = consolidator.system_prompt();
-        assert!(prompt.contains("512 bytes"));
+        let prompt = consolidator.system_prompt(summary_budget());
+        assert!(
+            prompt.contains(&format!("{} characters", summary_budget())),
+            "the prompt states the window-derived budget"
+        );
     }
 
     #[test]
-    fn test_max_summary_bytes_constant() {
-        assert_eq!(MAX_SUMMARY_BYTES, 512);
+    fn test_summary_budget_derives_from_window() {
+        let small = PressureAnchor::from_window(32_768)
+            .limits(DEFAULT_CHAR_PER_TOKEN_RATIO)
+            .summary_max_chars;
+        let large = PressureAnchor::from_window(65_536)
+            .limits(DEFAULT_CHAR_PER_TOKEN_RATIO)
+            .summary_max_chars;
+        assert_eq!(large, small * 2);
+        assert_ne!(small, 512, "no longer a hardcoded byte budget");
     }
 
     #[test]

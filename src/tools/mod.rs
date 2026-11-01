@@ -116,6 +116,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_builtin_tools_self_report_context_exemption() {
+        // Exemption is a self-report from the tool, not a central name list: a
+        // tool that bounds its own output says so, everything else is trimmed.
+        let tmp = tempfile::tempdir().unwrap();
+        let exempt = |name: &str| {
+            create_tool(name, tmp.path())
+                .unwrap_or_else(|| panic!("tool {name} not registered"))
+                .context_exempt()
+        };
+
+        // `memory_search` and `message` are registered by the agent loop, so
+        // their self-report is covered by their own module tests.
+        assert!(exempt("file_reader"), "file_reader bounds its own output");
+        assert!(!exempt("web_fetch"), "a lost page is only a refetch");
+        assert!(!exempt("shell"), "shell output is trimmed under pressure");
+        assert!(!exempt("grep"), "grep output is trimmed under pressure");
+    }
+
+    #[test]
     fn test_resolve_existing_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "hello").unwrap();

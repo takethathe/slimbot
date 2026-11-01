@@ -552,13 +552,12 @@ mod tests {
         // Create a minimal config file
         let config_path = data_dir.join("config.json");
         let config = crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -573,6 +572,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -629,6 +629,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         api_key: "k".to_string(),
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         ..Default::default()
                     },
                 );
@@ -638,6 +639,7 @@ mod tests {
                         model: "gpt-4o-mini".to_string(),
                         api_key: "k".to_string(),
                         max_tokens: 8192,
+                        context_window_tokens: 32768,
                         ..Default::default()
                     },
                 );
@@ -791,13 +793,12 @@ mod tests {
     async fn test_gateway_channel_manager_creation() {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: std::collections::HashMap::new(),
@@ -865,6 +866,7 @@ mod tests {
         // backend so the resolution finds the default workspace path.
         let trace_paths = crate::agent_loop::resolve_trace_file_paths(
             &Config {
+                pressure: Default::default(),
                 tracing: serde_json::from_value(serde_json::json!({
                     "enabled": true,
                     "backends": [
@@ -915,13 +917,12 @@ mod tests {
 
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -936,6 +937,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -993,13 +995,12 @@ mod tests {
     async fn test_gateway_shutdown_channels() {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: std::collections::HashMap::new(),
@@ -1212,13 +1213,12 @@ mod tests {
     async fn test_gateway_channel_manager_no_channels() {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: std::collections::HashMap::new(),
@@ -1642,13 +1642,12 @@ mod tests {
     #[tokio::test]
     async fn test_gateway_config_with_all_fields() {
         let config = crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 50,
                 timeout_seconds: 180,
-                max_tool_result_chars: 12000,
                 persist_tool_results: true,
-                context_window_tokens: 64000,
                 unknown: Default::default(),
             },
             providers: {
@@ -1663,6 +1662,7 @@ mod tests {
                         model: "gpt-4".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: true,
                         disable_thinking: false,
                         unknown: Default::default(),

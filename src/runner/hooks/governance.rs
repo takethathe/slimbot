@@ -15,25 +15,29 @@ impl PreChatHook for GovernanceHook {
     async fn call(&self, spec: &RunSpec, state: &mut RunState) -> Result<HookAction> {
         let mut all_messages = std::mem::take(&mut state.messages);
 
+        // Every length limit below derives from the single window anchor,
+        // measured with this session's estimation ratio.
+        let limits = spec
+            .pressure
+            .limits(super::char_per_token_ratio(spec).await);
+        // One self-report decides what may be trimmed: the same predicate
+        // gates both the full-result cleanup and the length truncation.
+        let exempt = |name: &str| spec.tool_manager.is_context_exempt(name);
+
         // History governance: clean orphans, backfill, microcompact, budget tool results.
         AgentRunner::drop_orphan_tool_results(&mut all_messages);
         AgentRunner::backfill_missing_tool_results(&mut all_messages);
-        all_messages = crate::snip::microcompact(all_messages);
-        all_messages = crate::snip::apply_tool_result_budget(all_messages);
+        all_messages =
+            crate::snip::microcompact(all_messages, &limits, &spec.workspace_dir, &exempt);
+        all_messages = crate::snip::apply_tool_result_budget(
+            all_messages,
+            &limits,
+            &spec.workspace_dir,
+            &exempt,
+        );
 
         // Snip: truncate messages to fit within token budget (stateless, no persistence).
-        let char_per_token_ratio = {
-            let sm = spec.session_manager.lock().await;
-            sm.get_session_data(&spec.session_id)
-                .map(|d| d.char_per_token_ratio)
-                .unwrap_or(4.0)
-        };
-        all_messages = crate::snip::snip_messages(
-            all_messages,
-            spec.config.context_window_tokens,
-            spec.max_tokens,
-            char_per_token_ratio,
-        );
+        all_messages = crate::snip::snip_messages(all_messages, &limits, spec.max_tokens);
 
         // Post-snip cleanup: snipping may have created new orphans.
         AgentRunner::drop_orphan_tool_results(&mut all_messages);
@@ -73,6 +77,7 @@ mod tests {
             session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
             tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
             config: crate::config::AgentConfig::default(),
+            pressure: Default::default(),
             memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
             consolidator: None,
             initial_message_count: 0,

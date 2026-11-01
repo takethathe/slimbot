@@ -24,6 +24,7 @@
   - [x] 07 提示词/skill/文档 [x] 08 spec 落稿
 - [x] **spec 落稿（票 14，2026-11-01）** — `.scratch/personal-agent-capabilities/spec.md`（`ready-for-agent`），汇总决策票 01–13 + ADR 0006–0019；wayfinder map 已 closed
 - [ ] **v1 实现票（/to-tickets 拆出 13 张，2026-11-01）** — `.scratch/personal-agent-capabilities/issues/16–28`（均 `ready-for-agent`）：16 owner+WebUI 本地边界 / 17 resolve_target 投递接缝 / 18 时区统一+run deadline+skipped / 19 provider 错误分类+超时+重试透传 / 20 上下文压力+两项破坏性 config 迁移 / 21 审批全链路 / 22 密钥解析链 / 23 记忆单文件漏斗 / 24 记忆生命周期快照回滚 / 25 codemode agent 入口（tools.*+searchTools）/ 26 MCP 连接器+GitHub 首集成 / 27 飞书 p2p 文字 / 28 飞书流式卡片+图文。当前 Frontier（无阻塞）：**16、18、20、21、22、23**。执行器完整镜像另立子 effort map（镜像 triggers），不在本组票内
+- [x] **票 20 落地（上下文压力 + 两项破坏性配置迁移）** — `src/pressure.rs` 定义唯一锚（`providers.context_window_tokens`，默认 32768）与占比表（单条 25% / 预览 4% / 余量 3% / 触发 50% / 目标 60% / 摘要 2% + 绝对夹取），冷启动比例改 3.0；`src/config_migrate.rs` 一次性迁移旧 `agent.context_window_tokens`（搬到对应 provider 并写 `[config migration]` 日志）与废弃 `agent.max_tool_result_chars`；`Tool::context_exempt()` 自述取代中央名单（`file_reader`/`memory_search`/`message`）；`snip` 两阶段清理的引用均带 `tool-results/<id>.txt` 路径，未落盘者清理时补写；`tool-results/` 按 `pressure.tool_results_ttl_days` 由 Dream 成功收尾清扫（无新定时器）；`setup` 与 WebUI `config_schema` 同步
 - [ ] **Frontier（下一个 map）** — heartbeat 与触发器的长期边界、群聊 origin 归属已随 capabilities map 移出范围；**执行器/连接器子 effort 已开图（2026-11-01）**：`.scratch/executor-connector/map.md`（7 票，研究票 07 已 resolved，frontier：01/02/03）
 
 ## 执行器与连接器子 effort（wayfinder：`.scratch/executor-connector/`）
@@ -88,7 +89,7 @@
 
 - [ ] **两个 panic 修复** — `dream.rs` `build_prompt` 的 `&e.content[..500]` 是字节切片，中文非 char boundary 会 panic 导致 cursor 不推进、每 tick 重跑同一批再崩（永久卡死）；`consolidate.rs` summary 保头截断必须走 `is_char_boundary` 循环（同仓库已有参考）
 - [ ] **cursor 归零重复整理** — `compact_history_after_dream` 的 `saturating_sub(deleted_count)` 在被删数大于游标时归 0，剩下条目被当全部未处理→重复写入；删除范围限定为“已处理的连续前缀”，cursor 删后仍指向第一条未处理
-- [ ] **summary 预算改占比** — `MAX_SUMMARY_BYTES = 512` 改为按票 15 窗口 2% 占比派生（含绝对上下限）；`[skip]` 行进 `history.jsonl` 前在代码里过滤掉
+- [~] **summary 预算改占比** — `MAX_SUMMARY_BYTES = 512` 已由票 20 改为 `pressure.summary_ratio`（窗口 2%，256–8192 字符夹取）；剩余：`[skip]` 行进 `history.jsonl` 前在代码里过滤掉
 - [ ] **Dream 接 trace + 改读真实配置** — 接上 `None` 的 tracer（session `system:dream`）；删掉 `AgentConfig::default()` 轻径，改读 provider/agent；两锚分离（截断类取自身窗口、文档预算取主 agent 窗口）
 - [ ] **成功判定换结构判定** — 英文子串 `contains("error"/"failed")` 改为：run 正常结束（无 error finish_reason、未超 `max_iterations`）且是否有写入；cursor 推进与快照写成功同一判定分支
 - [ ] **写前快照与分层轮转** — memory 工具改写前复制旧内容到 `memory/.snapshots/{run 时间戳}/{文档}`（只含本轮真动过的）；最近 30 天全留、之后每篇每日一、更久每月一；清理挂 Dream 成功分支（与 `tool-results/` TTL 同点）

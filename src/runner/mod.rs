@@ -95,6 +95,7 @@ pub struct AgentRunnerBuilder {
     consolidator: Option<Arc<Consolidator>>,
     tracer: Option<Arc<Tracer>>,
     max_tokens: Option<u32>,
+    pressure: Option<crate::pressure::PressureAnchor>,
     hooks: HookRegistry,
 }
 
@@ -110,6 +111,7 @@ impl AgentRunnerBuilder {
             consolidator: None,
             tracer: None,
             max_tokens: None,
+            pressure: None,
             hooks: HookRegistry::new(),
         }
     }
@@ -157,6 +159,16 @@ impl AgentRunnerBuilder {
 
     pub fn max_tokens(mut self, mt: u32) -> Self {
         self.max_tokens = Some(mt);
+        self
+    }
+
+    /// Set the context-pressure anchor (window tokens + ratio table).
+    ///
+    /// The window is a provider property, so callers pass
+    /// [`crate::pressure::PressureAnchor::from_config`] rather than an agent
+    /// setting. When unset, the default anchor (32k window) is used.
+    pub fn pressure(mut self, anchor: crate::pressure::PressureAnchor) -> Self {
+        self.pressure = Some(anchor);
         self
     }
 
@@ -257,6 +269,7 @@ impl AgentRunnerBuilder {
         let workspace_dir = self.workspace_dir.expect("workspace_dir required");
         let memory_service = self.memory_service.expect("memory_service required");
         let max_tokens = self.max_tokens.unwrap_or(4096);
+        let pressure = self.pressure.unwrap_or_default();
 
         // Builders that never called `with_defaults` (or added no custom hooks)
         // still get the stock behavior out of the box.
@@ -278,6 +291,7 @@ impl AgentRunnerBuilder {
             consolidator: self.consolidator,
             tracer: self.tracer,
             max_tokens,
+            pressure,
             hooks,
         }
     }
@@ -293,6 +307,7 @@ pub struct AgentRunner {
     consolidator: Option<Arc<Consolidator>>,
     tracer: Option<Arc<Tracer>>,
     max_tokens: u32,
+    pressure: crate::pressure::PressureAnchor,
     hooks: HookRegistry,
 }
 
@@ -300,6 +315,15 @@ impl AgentRunner {
     /// Create a new builder for constructing an `AgentRunner`.
     pub fn builder() -> AgentRunnerBuilder {
         AgentRunnerBuilder::new()
+    }
+
+    /// Replace the context-pressure anchor after construction.
+    ///
+    /// `new` keeps its established signature; callers that know the provider
+    /// window (the agent loop, Dream) override the default anchor here.
+    pub fn with_pressure(mut self, pressure: crate::pressure::PressureAnchor) -> Self {
+        self.pressure = pressure;
+        self
     }
 
     /// Construct a runner with the stock default hooks.
@@ -421,6 +445,7 @@ impl AgentRunner {
             session_manager: self.session_manager.clone(),
             tool_manager: self.tool_manager.clone(),
             config: self.config.clone(),
+            pressure: self.pressure.clone(),
             memory_service: self.memory_service.clone(),
             consolidator: self.consolidator.clone(),
             tracer: self.tracer.clone(),

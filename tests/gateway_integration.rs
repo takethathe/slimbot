@@ -15,9 +15,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
             provider: "default".to_string(),
             max_iterations: 10,
             timeout_seconds: 30,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         },
         providers: {
@@ -32,6 +30,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
                     model: "gpt-4o".to_string(),
                     temperature: 0.7,
                     max_tokens: 4096,
+                    context_window_tokens: 32768,
                     prompt_cache_enabled: false,
                     disable_thinking: false,
                     unknown: Default::default(),
@@ -62,6 +61,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
         json_render: Default::default(),
         subagent: Default::default(),
         triggers: Default::default(),
+        pressure: Default::default(),
     }
 }
 

@@ -12,8 +12,8 @@ use crate::config_normalize::apply_normalize;
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
     AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig, MemoryConfig,
-    OwnerConfig, ProviderConfig, SecretEntry, SubagentConfig, TraceBackendEntry, TraceConfig,
-    TriggersConfig, WebFetchConfig,
+    OwnerConfig, PressureConfig, ProviderConfig, SecretEntry, SubagentConfig, TraceBackendEntry,
+    TraceConfig, TriggersConfig, WebFetchConfig,
 };
 
 // ── Root Config ──
@@ -45,6 +45,10 @@ pub struct Config {
     /// Trigger layer configuration (tick cadence, queue limits, secrets).
     #[serde(default)]
     pub triggers: TriggersConfig,
+    /// Context-pressure ratio table: every length limit is a percentage of the
+    /// provider window (see `docs/config.md` and ADR 0013).
+    #[serde(default)]
+    pub pressure: PressureConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -204,6 +208,7 @@ impl Config {
         self.memory.clamp();
         self.subagent.clamp();
         self.triggers.clamp();
+        self.pressure.clamp();
         if let Some(wf) = &mut self.web_fetch {
             wf.clamp();
         }
@@ -240,7 +245,7 @@ impl Config {
 
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("Failed to read config file")?;
-        let mut config: Config = serde_json::from_str(&content).context("Invalid config JSON")?;
+        let mut config = Self::parse(&content)?;
         config.clamp();
         config.normalize();
         config.validate()?;
@@ -250,10 +255,24 @@ impl Config {
     /// Load config without validation (for setup preview where api_key may be empty).
     pub fn load_for_preview(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("Failed to read config file")?;
-        let mut config: Config = serde_json::from_str(&content).context("Invalid config JSON")?;
+        let mut config = Self::parse(&content)?;
         config.clamp();
         config.normalize();
         Ok(config)
+    }
+
+    /// Parse a config document, applying the legacy-key migrations first.
+    ///
+    /// Old keys are read here (and their values honoured) before being removed
+    /// from the document, so a migrated config is written back in the new shape
+    /// by the next `setup`/save and the note only fires once.
+    fn parse(content: &str) -> Result<Self> {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(content).context("Invalid config JSON")?;
+        for note in crate::config_migrate::migrate_legacy_keys(&mut raw) {
+            crate::config_migrate::emit(&note);
+        }
+        serde_json::from_value(raw).context("Invalid config JSON")
     }
 
     pub fn save(&self, path: &str) -> Result<()> {
@@ -480,6 +499,18 @@ impl Config {
             }
         }
 
+        // Diff pressure ratios (window-derived context limits)
+        if old.pressure != new.pressure {
+            Self::diff_json_objects(
+                "pressure",
+                &old.pressure,
+                &new.pressure,
+                &mut paths,
+                &mut old_values,
+                &mut new_values,
+            );
+        }
+
         // Diff web_fetch config
         if old.web_fetch != new.web_fetch {
             Self::diff_json_objects(
@@ -546,6 +577,7 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 temperature: 0.7,
                 max_tokens: 4096,
+                context_window_tokens: 32768,
                 prompt_cache_enabled: true,
                 disable_thinking: false,
                 unknown: Default::default(),
@@ -556,9 +588,7 @@ mod tests {
                 provider: "default".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
-                max_tool_result_chars: 10000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers,
@@ -571,6 +601,7 @@ mod tests {
             json_render: Default::default(),
             subagent: Default::default(),
             triggers: Default::default(),
+            pressure: Default::default(),
         }
     }
 
@@ -742,11 +773,17 @@ mod tests {
         let mut cfg = make_test_config();
         cfg.agent.max_iterations = u32::MAX;
         cfg.agent.timeout_seconds = u64::MAX;
-        cfg.agent.context_window_tokens = u32::MAX;
+        cfg.providers
+            .get_mut("default")
+            .unwrap()
+            .context_window_tokens = u32::MAX;
         cfg.clamp();
         assert_eq!(cfg.agent.max_iterations, 200); // max clamp
         assert_eq!(cfg.agent.timeout_seconds, 600); // max clamp
-        assert_eq!(cfg.agent.context_window_tokens, 200_000); // max clamp from range(1024, 200_000)
+        assert_eq!(
+            cfg.providers.get("default").unwrap().context_window_tokens,
+            200_000
+        ); // max clamp from range(1024, 200_000)
     }
 
     #[test]
@@ -872,6 +909,7 @@ mod tests {
                 model: "gpt-3.5-turbo".to_string(),
                 temperature: 0.5,
                 max_tokens: 2048,
+                context_window_tokens: 32768,
                 prompt_cache_enabled: false,
                 disable_thinking: false,
                 unknown: Default::default(),
@@ -1001,6 +1039,7 @@ mod tests {
             model: "gpt-4".to_string(),
             temperature: 0.7,
             max_tokens: 4096,
+            context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
             unknown: Default::default(),
@@ -1016,9 +1055,7 @@ mod tests {
             provider: "default".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         };
         let json = serde_json::to_string(&agent).unwrap();
@@ -1058,9 +1095,27 @@ mod tests {
         assert_eq!(agent.provider, "");
         assert_eq!(agent.max_iterations, 40);
         assert_eq!(agent.timeout_seconds, 120);
-        assert_eq!(agent.max_tool_result_chars, 8000);
         assert!(agent.persist_tool_results);
-        assert_eq!(agent.context_window_tokens, 32768);
+    }
+
+    #[test]
+    fn test_config_pressure_defaults_match_adr() {
+        let pressure = crate::config::PressureConfig::default();
+        assert_eq!(pressure.single_tool_result_ratio, 0.25);
+        assert_eq!(pressure.persisted_preview_ratio, 0.04);
+        assert_eq!(pressure.snip_safety_ratio, 0.03);
+        assert_eq!(pressure.consolidate_trigger_ratio, 0.50);
+        assert_eq!(pressure.consolidate_target_ratio, 0.60);
+        assert_eq!(pressure.summary_ratio, 0.02);
+        assert_eq!(pressure.tool_results_ttl_days, 7);
+    }
+
+    #[test]
+    fn test_config_provider_owns_context_window() {
+        // The window anchor moved out of `agent`: it describes the model, not
+        // the loop.
+        let provider = crate::config::ProviderConfig::default();
+        assert_eq!(provider.context_window_tokens, 32768);
     }
 
     // ── Tracing config ──
@@ -1191,6 +1246,7 @@ mod tests {
             model: "gpt-4-turbo".to_string(),
             temperature: 0.3,
             max_tokens: 8192,
+            context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
             unknown: Default::default(),
@@ -1214,17 +1270,13 @@ mod tests {
             provider: "custom-provider".to_string(),
             max_iterations: 100,
             timeout_seconds: 300,
-            max_tool_result_chars: 16000,
             persist_tool_results: true,
-            context_window_tokens: 64000,
             unknown: Default::default(),
         };
         assert_eq!(agent.provider, "custom-provider");
         assert_eq!(agent.max_iterations, 100);
         assert_eq!(agent.timeout_seconds, 300);
-        assert_eq!(agent.max_tool_result_chars, 16000);
         assert!(agent.persist_tool_results);
-        assert_eq!(agent.context_window_tokens, 64000);
     }
 
     #[test]
@@ -1241,6 +1293,7 @@ mod tests {
                 model: "gpt-3.5-turbo".to_string(),
                 temperature: 0.9,
                 max_tokens: 2048,
+                context_window_tokens: 32768,
                 prompt_cache_enabled: false,
                 disable_thinking: false,
                 unknown: Default::default(),
@@ -1277,7 +1330,10 @@ mod tests {
     fn test_config_compute_diff_context_window_change() {
         let old = make_test_config();
         let mut new = make_test_config();
-        new.agent.context_window_tokens = 128000;
+        new.providers
+            .get_mut("default")
+            .unwrap()
+            .context_window_tokens = 128000;
 
         let diff = Config::compute_diff(&old, &new);
         assert!(!diff.paths.is_empty());
@@ -1388,17 +1444,17 @@ mod tests {
     }
 
     #[test]
-    fn test_config_compute_diff_max_tool_result_chars_change() {
+    fn test_config_compute_diff_pressure_ratio_change() {
         let old = make_test_config();
         let mut new = make_test_config();
-        new.agent.max_tool_result_chars = 16000;
+        new.pressure.single_tool_result_ratio = 0.5;
 
         let diff = Config::compute_diff(&old, &new);
         assert!(!diff.paths.is_empty());
         assert!(
             diff.paths
                 .iter()
-                .any(|p| p.contains("max_tool_result_chars"))
+                .any(|p| p.contains("single_tool_result_ratio"))
         );
     }
 
@@ -1452,6 +1508,7 @@ mod tests {
             model: "gpt-4".to_string(),
             temperature: 0.7,
             max_tokens: 4096,
+            context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
             unknown: Default::default(),
@@ -1466,9 +1523,7 @@ mod tests {
             provider: "default".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         };
         // Verify unknown fields are empty by default

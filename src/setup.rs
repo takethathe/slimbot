@@ -22,6 +22,7 @@ fn default_config() -> Config {
         json_render: Default::default(),
         subagent: Default::default(),
         triggers: Default::default(),
+        pressure: Default::default(),
     }
 }
 
@@ -85,11 +86,12 @@ fn print_config_summary(config: &Config, paths: &PathManager) {
     eprintln!("  providers:");
     for (name, provider) in &config.providers {
         eprintln!(
-            "    {}: type={} model={} api_key={}",
+            "    {}: type={} model={} api_key={} context_window_tokens={}",
             name,
             provider.r#type,
             provider.model,
-            mask_api_key(&provider.api_key)
+            mask_api_key(&provider.api_key),
+            provider.context_window_tokens,
         );
     }
     eprintln!("  tools: {} entries", config.tools.len());
@@ -178,6 +180,67 @@ mod tests {
     fn test_mask_api_key_exactly_9_chars() {
         let result = mask_api_key("123456789");
         assert_eq!(result, "1234****6789");
+    }
+
+    #[test]
+    fn test_default_config_has_window_anchor_in_provider_section() {
+        let config = default_config();
+        assert_eq!(config.providers["default"].context_window_tokens, 32_768);
+    }
+
+    #[test]
+    fn test_default_config_omits_deprecated_agent_keys() {
+        let json = serde_json::to_value(default_config()).unwrap();
+        assert!(json["agent"].get("context_window_tokens").is_none());
+        assert!(json["agent"].get("max_tool_result_chars").is_none());
+        assert_eq!(
+            json["providers"]["default"]["context_window_tokens"],
+            serde_json::json!(32_768)
+        );
+    }
+
+    #[test]
+    fn test_default_config_exposes_pressure_ratios() {
+        let json = serde_json::to_value(default_config()).unwrap();
+        let single = json["pressure"]["single_tool_result_ratio"]
+            .as_f64()
+            .unwrap() as f32;
+        let preview = json["pressure"]["persisted_preview_ratio"]
+            .as_f64()
+            .unwrap() as f32;
+        assert!((single - 0.25).abs() < 1e-6);
+        assert!((preview - 0.04).abs() < 1e-6);
+        assert_eq!(json["pressure"]["tool_results_ttl_days"].as_u64(), Some(7));
+    }
+
+    #[test]
+    fn test_setup_migrates_legacy_window_key_and_rewrites_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "agent": { "provider": "default", "context_window_tokens": 64000, "max_tool_result_chars": 8000 },
+                "providers": { "default": { "api_key": "k", "model": "m" } }
+            }"#,
+        )
+        .unwrap();
+
+        run_setup(
+            Some(config_path.to_str().unwrap()),
+            tmp.path().join("data").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(rewritten["agent"].get("context_window_tokens").is_none());
+        assert!(rewritten["agent"].get("max_tool_result_chars").is_none());
+        assert_eq!(
+            rewritten["providers"]["default"]["context_window_tokens"],
+            serde_json::json!(64_000)
+        );
     }
 
     #[test]

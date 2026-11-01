@@ -70,6 +70,8 @@ pub struct RunSpec {
     pub tool_manager: Arc<ToolManager>,
     /// Agent configuration snapshot.
     pub config: AgentConfig,
+    /// Context-pressure anchor for this run (window tokens + ratio table).
+    pub pressure: crate::pressure::PressureAnchor,
     /// Shared memory store used by the context builder.
     pub memory_service: SharedMemory,
     /// Optional consolidator triggered after a successful turn.
@@ -209,6 +211,7 @@ mod tests {
             )),
             tool_manager: Arc::new(ToolManager::new(workspace_dir.clone())),
             config: AgentConfig::default(),
+            pressure: Default::default(),
             memory_service: Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryService::new(
                 &workspace_dir,
             ))),

@@ -42,7 +42,7 @@ pub fn build_persisted_reference(
 ) -> String
 ```
 
-构建超长工具结果的引用字符串，格式：
+构建超长工具结果的引用字符串（`preview_max` 由 `pressure.persisted_preview_ratio` 派生，不再是固定常量），格式：
 
 ```
 [tool output persisted]
@@ -59,5 +59,15 @@ Preview:
 | 常量 | 值 | 说明 |
 |------|-----|------|
 | `TOOL_RESULTS_DIR` | `"tool-results"` | 工具结果存储目录名 |
-| `TOOL_RESULT_PREVIEW_CHARS` | `1200` | 持久化引用中的预览字符数 |
 | `HEAD_TAIL_CHUNK` | `2000` | 头尾截断的单块大小 |
+
+## 工具结果文件
+
+```rust
+pub fn tool_result_rel_path(tool_call_id: &str) -> String          // "tool-results/<id>.txt"
+pub fn existing_tool_result_path(workspace: &Path, id: &str) -> Option<String>
+pub fn persist_tool_result_file(workspace: &Path, id: &str, content: &str) -> Option<String>
+pub fn sweep_tool_results(workspace: &Path, ttl: Duration) -> usize
+```
+
+`persist_tool_result_file` 从不覆盖已有文件（首个完整副本获胜）；`sweep_tool_results` 按 mtime 删除过期文件，由 Dream 成功收尾调用（TTL = `pressure.tool_results_ttl_days`），不新建定时器。

@@ -126,18 +126,29 @@ pub fn persist_tool_result(
     workspace_dir: &Path,
     tool_call_id: &str,
     content: &str,
-    max_chars: usize,
+    max_chars: usize,      // pressure.single_tool_result_ratio 派生
+    preview_chars: usize,  // pressure.persisted_preview_ratio 派生
 ) -> String
 ```
 
 当工具结果超过 `max_chars` 时：
-1. 将完整内容写入 `{workspace}/tool-results/{tool_call_id}.txt`（原子写入）
-2. 返回引用字符串 + 预览（前 1200 字符）
+1. 将完整内容写入 `{workspace}/tool-results/{tool_call_id}.txt`（原子写入，已存在则不覆盖）
+2. 返回引用字符串 + 预览（前 `preview_chars` 字符）
 3. LLM 可通过引用路径读取完整内容
+
+原来的 `agent.max_tool_result_chars` 同时控制"落盘阈值"和"截断长度"，现在拆成两个窗口占比（见 `docs/config.md` 的 `pressure` 段）。
 
 ### 头尾截断
 
-通过 `utils::truncate_text_head_tail` 截断超长文本，保留头部和尾部各 2000 字符，中间用省略号代替。
+通过 `utils::truncate_text_head_tail` 截断超长文本，保留头部和尾部，中间用省略号代替；长度上限同样由窗口派生。
+
+### 上下文豁免：`context_exempt()`
+
+```rust
+fn context_exempt(&self) -> bool { false }  // 默认不豁免
+```
+
+工具自述自己是否可被上下文压力清理/截断，取代了中央白名单（`EXEMPT_TOOLS` / `COMPACTABLE_TOOLS`）。`ToolManager::is_context_exempt(name)` 查一次自述，`microcompact` 与 `apply_tool_result_budget` 两个阶段共用同一结果；未注册的工具默认不豁免。当前自述为 `true` 的有 `file_reader`、`memory_search`、`message`。
 
 ## 内置工具
 

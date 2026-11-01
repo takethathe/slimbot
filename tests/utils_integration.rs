@@ -2,8 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use slimbot::{
-    TOOL_RESULT_PREVIEW_CHARS, TOOL_RESULTS_DIR, build_persisted_reference,
-    truncate_text_head_tail, write_file_atomic,
+    TOOL_RESULTS_DIR, build_persisted_reference, truncate_text_head_tail, write_file_atomic,
 };
 
 // ── Text truncation ──
@@ -135,5 +134,4 @@ fn test_build_persisted_reference_preview_limit() {
 #[test]
 fn test_util_constants() {
     assert_eq!(TOOL_RESULTS_DIR, "tool-results");
-    assert_eq!(TOOL_RESULT_PREVIEW_CHARS, 1200);
 }

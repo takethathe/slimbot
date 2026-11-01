@@ -397,9 +397,7 @@ fn make_runner_with_tracer(
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         },
         workspace_dir,
@@ -986,7 +984,7 @@ fn test_format_tool_error() {
 fn test_persist_tool_result() {
     let tmp = tempfile::tempdir().unwrap();
     let long_content = "X".repeat(20_000);
-    let result = persist_tool_result(tmp.path(), "call-123", &long_content, 8000);
+    let result = persist_tool_result(tmp.path(), "call-123", &long_content, 8000, 1200);
     assert!(result.contains("[tool output persisted]"));
     assert!(result.contains("call-123.txt"));
     assert!(result.contains("Original size: 20000"));
@@ -1136,9 +1134,7 @@ async fn test_runner_persist_long_output() {
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: true,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         },
         workspace_dir.clone(),
@@ -1146,7 +1142,9 @@ async fn test_runner_persist_long_output() {
         None,
         4096,
         None,
-    );
+    )
+    // 4000-token window → 3000 chars per result, so this 20k-char result persists.
+    .with_pressure(crate::pressure::PressureAnchor::from_window(4_000));
     let task = make_task("test persist");
 
     let result = runner
@@ -1189,9 +1187,7 @@ async fn test_stop_sentinel_returns_cancelled() {
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         },
         wd,
@@ -1234,9 +1230,7 @@ async fn test_cancelled_token_before_run() {
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         },
         wd,
@@ -1324,9 +1318,7 @@ async fn test_cancel_in_loop_rolls_back_messages() {
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         },
         workspace_dir,
@@ -1547,9 +1539,7 @@ async fn test_llm_error_rolls_back_messages() {
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         },
         workspace_dir,
@@ -1628,8 +1618,8 @@ async fn test_snip_truncates_context_before_chat() {
     let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
 
     // Pre-fill session with messages to exceed budget
-    // budget = 1600 - 500 - 1024 = 76 tokens
-    // At ~5 tokens per message (20-30 chars), 50 pairs = ~250 tokens > 76, will snip
+    // budget = 700 - 500 - 128 (min safety floor) = 72 tokens
+    // At 4 tokens per message (15-20 chars), 50 pairs = ~400 tokens > 72, will snip
     {
         let mut sm_lock = sm.lock().await;
         for i in 0..50 {
@@ -1679,16 +1669,8 @@ async fn test_snip_truncates_context_before_chat() {
     }
 
     // Create runner to force snipping with limited budget.
-    // budget = context_window - max_output - SAFETY_BUFFER
-    // With 100 pairs (200 messages) at ~5 tokens each = ~1000 tokens needed
-    // budget = 2000 - 500 - 1024 = 476 tokens (will snip to ~95 messages)
-    // We need budget small enough that snipping reduces count to < 50
-    // budget = 1500 - 500 - 1024 = -24 -> 0 (won't snip!)
-    // budget = 1800 - 500 - 1024 = 276 tokens = ~55 messages (just under 50 is tight)
-    // budget = 1600 - 500 - 1024 = 76 tokens = ~15 messages (will definitely be < 50)
-    // But we still need to exceed the budget, so messages must be > budget
-    // 100 pairs at 5 tokens = 500 tokens > 76, will snip!
-    // Let's use: context=1600, output=500 -> budget = 76
+    // window=700, output=500 -> budget = 700 - 500 - 128 = 72 tokens, so the
+    // kept window is a ~18 messages: well under the 50 asserted below.
     let provider = Arc::new(CapturingProvider {
         received: received_clone,
     });
@@ -1700,9 +1682,7 @@ async fn test_snip_truncates_context_before_chat() {
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 1600, // Small enough to force snipping
             unknown: Default::default(),
         },
         wd,
@@ -1710,7 +1690,8 @@ async fn test_snip_truncates_context_before_chat() {
         None,
         500,
         None,
-    );
+    )
+    .with_pressure(crate::pressure::PressureAnchor::from_window(700));
 
     let task = make_task("new user message");
     let result = runner
@@ -1937,9 +1918,7 @@ where
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds: 120,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         })
         .workspace_dir(workspace_dir)
@@ -3095,9 +3074,7 @@ fn make_runner_with_run_deadline(
             provider: "test".to_string(),
             max_iterations: 40,
             timeout_seconds,
-            max_tool_result_chars: 8000,
             persist_tool_results: false,
-            context_window_tokens: 32768,
             unknown: Default::default(),
         })
     })

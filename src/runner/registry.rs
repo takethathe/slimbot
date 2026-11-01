@@ -318,6 +318,7 @@ mod tests {
                 "/tmp",
             ))),
             config: crate::config::AgentConfig::default(),
+            pressure: Default::default(),
             memory_service: Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryService::new(
                 std::path::Path::new("/tmp"),
             ))),

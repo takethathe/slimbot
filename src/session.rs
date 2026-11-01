@@ -673,8 +673,12 @@ impl SessionTask {
     }
 }
 
+/// Cold-start chars-per-token ratio used until a session observes real usage.
+///
+/// Kept in one place (`pressure::DEFAULT_CHAR_PER_TOKEN_RATIO`) so the derived
+/// length limits and the estimation track cannot drift apart.
 fn default_char_per_token_ratio() -> f64 {
-    4.0
+    crate::pressure::DEFAULT_CHAR_PER_TOKEN_RATIO
 }
 
 /// Session metadata persisted alongside messages in the JSONL file.
@@ -970,7 +974,7 @@ impl SessionManager {
                 m.char_per_token_ratio,
                 m.last_summary.clone(),
             ),
-            None => (0, 0, 4.0, None),
+            None => (0, 0, crate::pressure::DEFAULT_CHAR_PER_TOKEN_RATIO, None),
         };
 
         // Load messages from JSONL, skipping consolidated lines

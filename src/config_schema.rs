@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig,
-    MemoryConfig, OwnerConfig, ProviderConfig, SecretEntry, SubagentConfig, ToolEntry,
-    TraceBackendEntry, TraceConfig, TriggersConfig, WebFetchConfig,
+    MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig, SecretEntry, SubagentConfig,
+    ToolEntry, TraceBackendEntry, TraceConfig, TriggersConfig, WebFetchConfig,
 };
 use crate::config_macro::FieldMeta;
 
@@ -187,6 +187,12 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
             "Triggers",
             TriggersConfig::fields(),
             &to_value_map(&config.triggers),
+        ),
+        scalar_section(
+            "pressure",
+            "Pressure · Context",
+            PressureConfig::fields(),
+            &to_value_map(&config.pressure),
         ),
         providers_section(config),
         tools_section(config),
@@ -577,6 +583,7 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
         ["subagent", field] => set_subagent(config, field, value),
         ["triggers", field] => set_triggers(config, field, value),
         ["triggers", "secrets", idx, field] => set_secret_field(config, idx, field, value),
+        ["pressure", field] => set_pressure(config, field, value),
         _ => Err(format!("Unsupported patch path: {}", segs.join("."))),
     }
 }
@@ -635,6 +642,47 @@ fn set_secret_field(
     Ok(())
 }
 
+fn set_pressure(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
+    match field {
+        "single_tool_result_ratio" => {
+            config.pressure.single_tool_result_ratio =
+                value_f32(value, "pressure.single_tool_result_ratio")?
+        }
+        "persisted_preview_ratio" => {
+            config.pressure.persisted_preview_ratio =
+                value_f32(value, "pressure.persisted_preview_ratio")?
+        }
+        "snip_safety_ratio" => {
+            config.pressure.snip_safety_ratio = value_f32(value, "pressure.snip_safety_ratio")?
+        }
+        "consolidate_trigger_ratio" => {
+            config.pressure.consolidate_trigger_ratio =
+                value_f32(value, "pressure.consolidate_trigger_ratio")?
+        }
+        "consolidate_target_ratio" => {
+            config.pressure.consolidate_target_ratio =
+                value_f32(value, "pressure.consolidate_target_ratio")?
+        }
+        "summary_ratio" => {
+            config.pressure.summary_ratio = value_f32(value, "pressure.summary_ratio")?
+        }
+        "min_keep_messages" => {
+            config.pressure.min_keep_messages =
+                value_u32(value, "pressure.min_keep_messages")? as usize
+        }
+        "keep_recent_tool_results" => {
+            config.pressure.keep_recent_tool_results =
+                value_u32(value, "pressure.keep_recent_tool_results")? as usize
+        }
+        "tool_results_ttl_days" => {
+            config.pressure.tool_results_ttl_days =
+                value_u64(value, "pressure.tool_results_ttl_days")?
+        }
+        _ => return Err(format!("Unknown pressure field: {}", field)),
+    }
+    Ok(())
+}
+
 fn set_agent(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
     match field {
         "provider" => config.agent.provider = value_str(value, "agent.provider")?,
@@ -642,14 +690,8 @@ fn set_agent(config: &mut Config, field: &str, value: &serde_json::Value) -> Res
         "timeout_seconds" => {
             config.agent.timeout_seconds = value_u64(value, "agent.timeout_seconds")?
         }
-        "max_tool_result_chars" => {
-            config.agent.max_tool_result_chars = value_u32(value, "agent.max_tool_result_chars")?
-        }
         "persist_tool_results" => {
             config.agent.persist_tool_results = value_bool(value, "agent.persist_tool_results")?
-        }
-        "context_window_tokens" => {
-            config.agent.context_window_tokens = value_u32(value, "agent.context_window_tokens")?
         }
         _ => return Err(format!("Unknown agent field: {}", field)),
     }
@@ -677,6 +719,10 @@ fn set_provider_field(
             provider.temperature = value_f32(value, &format!("{}.temperature", prefix))?
         }
         "max_tokens" => provider.max_tokens = value_u32(value, &format!("{}.max_tokens", prefix))?,
+        "context_window_tokens" => {
+            provider.context_window_tokens =
+                value_u32(value, &format!("{}.context_window_tokens", prefix))?
+        }
         "prompt_cache_enabled" => {
             provider.prompt_cache_enabled =
                 value_bool(value, &format!("{}.prompt_cache_enabled", prefix))?
@@ -1073,6 +1119,7 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 temperature: 0.7,
                 max_tokens: 4096,
+                context_window_tokens: 32768,
                 prompt_cache_enabled: true,
                 disable_thinking: false,
                 unknown: Default::default(),
@@ -1093,9 +1140,7 @@ mod tests {
                 provider: "default".to_string(),
                 max_iterations: 40,
                 timeout_seconds: 120,
-                max_tool_result_chars: 8000,
                 persist_tool_results: true,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers,
@@ -1125,6 +1170,7 @@ mod tests {
             json_render: Default::default(),
             subagent: Default::default(),
             triggers: Default::default(),
+            pressure: Default::default(),
         }
     }
 
@@ -1162,6 +1208,7 @@ mod tests {
                 "memory",
                 "subagent",
                 "triggers",
+                "pressure",
                 "providers",
                 "tools",
                 "channels",
@@ -1252,6 +1299,95 @@ mod tests {
         assert_eq!(backend.allowed, vec!["markdown"]);
         assert_eq!(backend.path, "memory.backend");
         assert!(!backend.desc.is_empty());
+    }
+
+    #[test]
+    fn test_schema_pressure_section_exposes_ratios() {
+        let tree = serialize_schema(&make_config());
+        let pressure = section(&tree, "pressure");
+        let single = field(pressure, "single_tool_result_ratio");
+        assert_eq!(single.kind, "float");
+        assert_eq!(single.path, "pressure.single_tool_result_ratio");
+        assert!((single.value.as_f64().unwrap() - 0.25).abs() < 1e-6);
+        let summary = field(pressure, "summary_ratio").value.as_f64().unwrap();
+        assert!((summary - 0.02).abs() < 1e-6);
+        assert_eq!(field(pressure, "min_keep_messages").kind, "int");
+        assert_eq!(field(pressure, "tool_results_ttl_days").value, json!(7));
+    }
+
+    #[test]
+    fn test_schema_agent_section_drops_deprecated_limit_fields() {
+        let tree = serialize_schema(&make_config());
+        let agent = section(&tree, "agent");
+        assert!(
+            agent
+                .fields
+                .iter()
+                .all(|f| f.name != "max_tool_result_chars")
+        );
+        assert!(
+            agent
+                .fields
+                .iter()
+                .all(|f| f.name != "context_window_tokens")
+        );
+    }
+
+    #[test]
+    fn test_schema_providers_section_exposes_context_window() {
+        let tree = serialize_schema(&make_config());
+        let providers = section(&tree, "providers");
+        let item_fields = providers.item_fields.as_ref().unwrap();
+        let window = item_fields
+            .iter()
+            .find(|f| f.name == "context_window_tokens")
+            .expect("provider context window must be editable");
+        assert_eq!(window.kind, "int");
+        assert_eq!(window.value, json!(32_768));
+    }
+
+    #[test]
+    fn test_patch_provider_context_window_tokens() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "providers.default.context_window_tokens",
+                json!(128_000),
+            )],
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.providers["default"].context_window_tokens, 128_000);
+    }
+
+    #[test]
+    fn test_patch_pressure_ratio_applies_and_clamps() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "pressure.single_tool_result_ratio",
+                json!(0.5),
+            )],
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        assert!((config.pressure.single_tool_result_ratio - 0.5).abs() < f32::EPSILON);
+
+        // Out-of-range values are clamped, not rejected.
+        apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "pressure.single_tool_result_ratio",
+                json!(9.0),
+            )],
+        )
+        .unwrap();
+        assert!((config.pressure.single_tool_result_ratio - 0.90).abs() < 1e-6);
     }
 
     #[test]

@@ -6,9 +6,21 @@ define_config! {
         provider: String = "".to_string(), str_max(64), desc: "References a provider name in providers map",
         max_iterations: u32 = 40, range(1, 200), desc: "Max agent loop iterations before termination",
         timeout_seconds: u64 = 120, range(1, 600), desc: "Whole-run wall-clock deadline in seconds",
-        max_tool_result_chars: u32 = 8000, range(100, 100_000), desc: "Max characters for tool result before truncation",
         persist_tool_results: bool = true, none, desc: "Whether to persist oversized tool results to disk",
-        context_window_tokens: u32 = 32768, range(1024, 200_000), desc: "LLM context window size in tokens",
+    }
+}
+
+define_config! {
+    "pressure" => PressureConfig {
+        single_tool_result_ratio: f32 = 0.25, range(0.01, 0.90), desc: "Share of the context window one tool result may occupy (tokens, converted to chars)",
+        persisted_preview_ratio: f32 = 0.04, range(0.001, 0.50), desc: "Share of the context window kept as preview for a persisted tool result",
+        snip_safety_ratio: f32 = 0.03, range(0.001, 0.50), desc: "Share of the context window reserved for tokenizer estimation drift",
+        consolidate_trigger_ratio: f32 = 0.50, range(0.05, 0.95), desc: "Share of the context window that triggers consolidation",
+        consolidate_target_ratio: f32 = 0.60, range(0.05, 1.0), desc: "Share of the trigger point consolidation aims to reduce the prompt to",
+        summary_ratio: f32 = 0.02, range(0.001, 0.50), desc: "Share of the context window allowed for one consolidation summary",
+        min_keep_messages: usize = 4, range(1, 500), desc: "Floor on how many non-system messages snip keeps",
+        keep_recent_tool_results: usize = 10, range(1, 500), desc: "How many recent tool results residual cleanup leaves untouched",
+        tool_results_ttl_days: u64 = 7, range(1, 365), desc: "Retention for persisted tool results before Dream sweeps them",
     }
 }
 
@@ -21,6 +33,7 @@ define_config! {
         model: String = "gpt-4o".to_string(), str_max(128), desc: "Model identifier",
         temperature: f32 = 0.7, range(0.0, 2.0), desc: "LLM sampling temperature",
         max_tokens: u32 = 4096, range(1, 100_000), desc: "Max response tokens",
+        context_window_tokens: u32 = 32768, range(1024, 200_000), desc: "Model context window in tokens (the single anchor all context limits derive from)",
         prompt_cache_enabled: bool = true, none, desc: "Enable prompt caching via cache_control",
         disable_thinking: bool = false, none, desc: "Force-disable model thinking/reasoning mode for calls on this provider (injects enable_thinking=false)",
     }

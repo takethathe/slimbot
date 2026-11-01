@@ -78,7 +78,8 @@ cargo run -- -d /data/myapp setup
   "tools": [ ... ],
   "channels": { ... },
   "gateway": { ... },
-  "json_render": { ... }
+  "json_render": { ... },
+  "pressure": { ... }
 }
 ```
 
@@ -92,6 +93,7 @@ cargo run -- -d /data/myapp setup
 | `channels` | object | 否 | `{}` | 通信通道定义（键值映射） |
 | `gateway` | object | 否 | 见下文 | Gateway 模式配置 |
 | `json_render` | object | 否 | 见下文 | WebUI 卡片生成配置 |
+| `pressure` | object | 否 | 见下文 | 上下文压力占比（长度限制全部由 provider 窗口派生） |
 
 ### `channels` — 通信通道
 
@@ -194,9 +196,9 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `provider` | string | 归一化 | `""` → `"default"` | 要使用的 Provider 名称（引用 `providers` 中的一个键） |
 | `max_iterations` | uint | range(1, 200) | `40` | 每轮最大工具调用迭代次数 |
 | `timeout_seconds` | uint | range(1, 600) | `120` | 每轮 Agent 超时时间（秒） |
-| `max_tool_result_chars` | uint | range(100, 100000) | `8000` | 工具返回结果的最大字符数，超过此值会被截断 |
-| `persist_tool_results` | bool | — | `true` | 超大工具结果是否持久化到磁盘 |
-| `context_window_tokens` | uint | range(1024, 200000) | `32768` | LLM 上下文窗口大小（token），用于 Consolidator 预算检查 |
+| `persist_tool_results` | bool | — | `true` | 超大工具结果是否持久化到磁盘（阈值由 `pressure` 派生） |
+
+`agent` 段**不再**包含任何长度/窗口字段：窗口是模型属性（见 `providers.context_window_tokens`），长度是窗口的百分比（见 `pressure`）。
 
 ```json
 {
@@ -221,6 +223,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `model` | string | str_max(128) | `"gpt-4o"` | 模型标识符（加载时验证） |
 | `temperature` | float | range(0.0, 2.0) | `0.7` | 采样温度 |
 | `max_tokens` | uint | range(1, 100000) | `4096` | 单次最大响应 token 数 |
+| `context_window_tokens` | uint | range(1024, 200000) | `32768` | 该模型的上下文窗口（token）。上下文压力唯一的绝对锚，其余长度限制都是它的百分比 |
 | `prompt_cache_enabled` | bool | — | `true` | 是否启用 prompt 缓存 |
 | `disable_thinking` | bool | — | `false` | 强制禁用该 provider 调用的思考/推理模式（请求体注入 `enable_thinking: false`，DashScope 兼容接口字段；卡片生成路径恒为 true） |
 
@@ -255,6 +258,51 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
     }
   }
 }
+```
+
+### `pressure` — 上下文压力占比
+
+上下文压力只有一个绝对锚：provider 的 `context_window_tokens`。其余每个长度限制都是该窗口的百分比（决策见 `docs/adr/0013-context-pressure-single-anchor.md`）。换更大的模型只需改 provider 的窗口，所有限制随之等比放大。
+
+| 字段 | 类型 | 约束 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `single_tool_result_ratio` | float | range(0.01, 0.90) | `0.25` | 单条工具结果最多占窗口的比例（换算为字符后用于截断） |
+| `persisted_preview_ratio` | float | range(0.001, 0.50) | `0.04` | 落盘结果在上下文中保留的预览长度（占窗口比例） |
+| `snip_safety_ratio` | float | range(0.001, 0.50) | `0.03` | 预留给 tokenizer 估算误差的比例 |
+| `consolidate_trigger_ratio` | float | range(0.05, 0.95) | `0.50` | prompt token 超过窗口的该比例时触发会话摘要 |
+| `consolidate_target_ratio` | float | range(0.05, 1.0) | `0.60` | 摘要把 prompt 压到触发点的该比例 |
+| `summary_ratio` | float | range(0.001, 0.50) | `0.02` | 单条摘要允许占窗口的比例（换算为字符） |
+| `min_keep_messages` | uint | range(1, 500) | `4` | snip 至少保留的非 system 消息条数（找不到 User 时的兜底） |
+| `keep_recent_tool_results` | uint | range(1, 500) | `10` | 最近多少条工具结果不参与残留清理 |
+| `tool_results_ttl_days` | uint | range(1, 365) | `7` | `tool-results/` 落盘文件的保留天数，由 Dream 成功收尾时清扫（无独立定时器） |
+
+```json
+{
+  "providers": {
+    "default": { "type": "openai", "api_key": "sk-...", "model": "gpt-4o", "context_window_tokens": 128000 }
+  },
+  "pressure": {
+    "single_tool_result_ratio": 0.25,
+    "consolidate_trigger_ratio": 0.5
+  }
+}
+```
+
+**冷启动比例：** 会话还没有真实用量时，字符/ token 换算比例默认取 `3.0`（中英混排的保守值）；首次收到 provider 返回的 `prompt_tokens` 后按会话实测值替换，并随会话元数据持久化。窗口为 `0` 时所有派生长度限制都退化为 `0`，各阶段（截断、清理、摘要）都不动手，而不是瞎猜。
+
+**绝对下限/上限：** 派生值仍会被夹住，避免极小窗口把限制压成不可用的数字——单条工具结果 1,000–64,000 字符、落盘预览 256–8,000 字符、snip 安全余量 128–8,192 token、摘要 256–8,192 字符。
+
+#### 迁移说明（两条 breaking change）
+
+1. `context_window_tokens` 从 `agent` 段移到 **provider** 段。启动时若发现旧的 `agent.context_window_tokens`，会以一行 `[config migration]` 日志说明迁移动作，把它搬到 `providers.<agent.provider>`（该 provider 已有自己的窗口值时保留 provider 的值），并在加载后从配置里删除旧键；`setup` 会把迁移结果写回文件。
+2. `agent.max_tool_result_chars` 已废弃。旧键会被忽略并给出同样的迁移日志；原来的一个字段现在拆成两个比例——"单条结果上限"（`pressure.single_tool_result_ratio`，也是落盘阈值）与"落盘预览长度"（`pressure.persisted_preview_ratio`）。
+
+```json
+// 旧配置（仍可启动，但会打印迁移日志）
+{ "agent": { "context_window_tokens": 65536, "max_tool_result_chars": 16000 }, "providers": { "default": { ... } } }
+
+// 迁移后
+{ "providers": { "default": { "context_window_tokens": 65536, ... } }, "pressure": { ... } }
 ```
 
 ### `tools` — 工具定义

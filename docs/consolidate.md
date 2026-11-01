@@ -13,22 +13,24 @@ pub struct Consolidator {
     provider: Arc<dyn Provider>,
     session_manager: SharedSessionManager,
     memory_service: SharedMemory,
-    context_window_tokens: u32,
-    max_completion_tokens: u32,
+    anchor: PressureAnchor,   // 窗口锚 + 占比表
+    cancel_token: CancellationToken,
 }
 ```
 
-构造函数：`new(provider, session_manager, memory_service, context_window_tokens, max_completion_tokens)`
+构造函数：`new(provider, session_manager, memory_service, context_window_tokens)`；`with_anchor(anchor)` 用配置里的 provider 窗口 + `pressure` 占比覆盖它（`AgentLoop` 就是这么接的）。
 
 ## 预算计算
 
+全部派生自同一个窗口锚（`pressure::PressureLimits`）：
+
 ```
-budget    = context_window_tokens - max_completion_tokens - SAFETY_BUFFER (512)
-target    = budget / 2
-tokens_to_remove = prompt_tokens - target  (当 prompt_tokens > budget 时)
+trigger = window × pressure.consolidate_trigger_ratio   (默认 0.50)
+target  = trigger × pressure.consolidate_target_ratio   (默认 0.60)
+summary_max_chars = window × pressure.summary_ratio × char_per_token_ratio
 ```
 
-当 `prompt_tokens > budget` 时触发摘要，目标是将 token 数降至 `target`。
+`prompt_tokens > trigger` 时触发摘要，目标是把 token 数降到 `target`；`trigger == 0`（窗口未知）时直接跳过。窗口翻倍，触发线与目标线同时翻倍——不需要改任何字段。
 
 ## Token 估算
 
@@ -37,7 +39,7 @@ pub fn estimate_message_tokens(msg: &Message, ratio: f64) -> u32
 ```
 
 - 使用 `session.char_per_token_ratio`（`total_chars / prompt_tokens`）估算，`chars / ratio`
-- 默认值为 `4.0`（4 字符/token），`Session::update_token_ratio()` 在每次 LLM 调用后更新该值，持久化到 `.meta.json`
+- 冷启动默认值为 `3.0`（中英混排的保守值，`pressure::DEFAULT_CHAR_PER_TOKEN_RATIO`），`Session::update_token_ratio()` 在每次 LLM 调用后用实测值更新，持久化到 `.meta.json`
 
 ## 消息选择策略
 
@@ -78,7 +80,7 @@ User msg → Assistant reply → Tool result → User msg (boundary)
 
 不因"可能已存在于长期记忆"而标记为 `[skip]`；Dream 会处理下游去重。
 
-摘要硬限制 512 字节，通过三层保障（指令约束 → 最多 2 次 LLM 压缩重试 → 强制 UTF-8 安全截断）。
+摘要长度由窗口派生（`summary_ratio`，默认 2% → 32768 窗口约 1965 字符），通过三层保障（prompt 里写明字符预算 → 最多 2 次 LLM 压缩重试 → 强制 UTF-8 安全截断）。不再有硬编码的 512 字节上限。
 
 摘要通过 `HistoryStore::append_history()` 追加，使用统一的游标管理。
 
@@ -90,7 +92,7 @@ ReAct turn 完成
   ├─ response.usage.prompt_tokens
   │
   ├─ maybe_consolidate(session_id, prompt_tokens)
-  │   ├─ 检查 budget: prompt_tokens <= budget? → 返回
+  │   ├─ 检查 trigger: prompt_tokens <= window × trigger_ratio? → 返回
   │   ├─ consolidate_one_round()
   │   │   ├─ 读取 SessionData（messages, ratio, cursor）
   │   │   ├─ pick_consolidation_boundary() → 找到 end_idx
@@ -113,7 +115,7 @@ ReAct turn 完成
 |------|------|------|
 | `last_consolidated_id` | `usize` | 已摘要消息的最大 ID，加载时跳过这些消息 |
 | `next_message_id` | `usize` | 下一个自增消息 ID，保证 ID 单调递增 |
-| `char_per_token_ratio` | `f64` (默认 4.0) | 平均每 token 的字符数，用于精确 token 估算 |
+| `char_per_token_ratio` | `f64` (默认 3.0) | 平均每 token 的字符数，用于精确 token 估算 |
 | `last_summary` | `Option<String>` | 最后一次摘要的文本，注入到 system prompt 的 `[Resumed Session]` 段落 |
 
 ## 上下文注入
@@ -130,10 +132,11 @@ ReAct turn 完成
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `agent.context_window_tokens` | 8192 | LLM 上下文窗口大小（token） |
-| 硬编码 `max_completion_tokens` | 4096 | 最大输出 token 数 |
-| 内部常量 `SAFETY_BUFFER` | 512 | 估算误差安全余量 |
-| 内部常量 `MAX_CHUNK_MESSAGES` | 60 | 单次摘要最多消息数 |
+| `providers.<agent.provider>.context_window_tokens` | 32768 | 唯一绝对锚（token） |
+| `pressure.consolidate_trigger_ratio` | 0.50 | 触发线 = 窗口 × 该比例 |
+| `pressure.consolidate_target_ratio` | 0.60 | 目标线 = 触发线 × 该比例 |
+| `pressure.summary_ratio` | 0.02 | 摘要字符预算 = 窗口 × 该比例 × 字符/token 比 |
+| 内部常量 `MAX_CHUNK_MESSAGES` | 60 | 单次摘要最多消息数（常量，不随窗口放大） |
 
 ## 集成方式
 

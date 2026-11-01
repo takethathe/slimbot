@@ -369,24 +369,33 @@ impl AgentLoop {
         }
         let providers = Arc::new(providers_map);
 
-        let consolidator = Arc::new(Consolidator::new(
-            provider.clone(),
-            session_manager_arc.clone(),
-            memory_service.clone(),
-            config.agent.context_window_tokens,
-        ));
+        // The window anchor lives on the provider section (ADR 0013): the
+        // consolidator, the trimming hooks and Dream all read the same value.
+        let pressure = crate::pressure::PressureAnchor::from_config(&config);
+        let consolidator = Arc::new(
+            Consolidator::new(
+                provider.clone(),
+                session_manager_arc.clone(),
+                memory_service.clone(),
+                pressure.window_tokens,
+            )
+            .with_anchor(pressure.clone()),
+        );
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
         // Build DreamService
-        let dream_service = Arc::new(crate::dream::DreamService::new(
-            paths.workspace_dir().to_path_buf(),
-            memory_service.clone(),
-            session_manager_arc.clone(),
-            config.gateway.dream.clone(),
-            providers.clone(),
-            provider.clone(),
-        ));
+        let dream_service = Arc::new(
+            crate::dream::DreamService::new(
+                paths.workspace_dir().to_path_buf(),
+                memory_service.clone(),
+                session_manager_arc.clone(),
+                config.gateway.dream.clone(),
+                providers.clone(),
+                provider.clone(),
+            )
+            .with_pressure(pressure.clone()),
+        );
 
         let provider_name = &config.agent.provider;
         let max_tokens = config
@@ -429,7 +438,8 @@ impl AgentLoop {
             Some(consolidator.clone()),
             max_tokens,
             tracer.clone(),
-        );
+        )
+        .with_pressure(pressure.clone());
 
         Ok(Self {
             owner_primary: Arc::new(crate::delivery::OwnerPrimaryStore::load(paths.data_dir())),
@@ -879,13 +889,12 @@ mod tests {
         // Create a minimal config file
         let config_path = data_dir.join("config.json");
         let config = crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -900,6 +909,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1095,13 +1105,12 @@ mod tests {
         let paths = make_test_paths(&tmp);
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1116,6 +1125,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1162,13 +1172,12 @@ mod tests {
         let paths = make_test_paths(&tmp);
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1183,6 +1192,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1248,13 +1258,12 @@ mod tests {
         let paths = make_test_paths(&tmp);
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1269,6 +1278,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1314,13 +1324,12 @@ mod tests {
         let paths = make_test_paths(&tmp);
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1335,6 +1344,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1380,13 +1390,12 @@ mod tests {
         let paths = make_test_paths(&tmp);
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1401,6 +1410,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1482,13 +1492,12 @@ mod tests {
         let paths = make_test_paths(tmp);
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1503,6 +1512,7 @@ mod tests {
                         model: "mock-model".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1553,13 +1563,12 @@ mod tests {
         let paths = make_test_paths(tmp);
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1574,6 +1583,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1652,13 +1662,12 @@ mod tests {
 
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: std::collections::HashMap::new(),
@@ -1728,13 +1737,12 @@ mod tests {
         let paths = make_test_paths(&tmp);
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "nonexistent".to_string(), // Provider doesn't exist
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1749,6 +1757,7 @@ mod tests {
                         model: "gpt-4o".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -1839,13 +1848,12 @@ mod tests {
         let paths = make_test_paths(&tmp);
         let (message_bus, receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -1860,6 +1868,7 @@ mod tests {
                         model: "mock-model".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),
@@ -2182,13 +2191,12 @@ mod tests {
         let paths = make_test_paths(&tmp);
         let (message_bus, receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
+            pressure: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
                 timeout_seconds: 30,
-                max_tool_result_chars: 8000,
                 persist_tool_results: false,
-                context_window_tokens: 32768,
                 unknown: Default::default(),
             },
             providers: {
@@ -2203,6 +2211,7 @@ mod tests {
                         model: "mock-model".to_string(),
                         temperature: 0.7,
                         max_tokens: 4096,
+                        context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
                         unknown: Default::default(),

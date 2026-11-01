@@ -56,6 +56,12 @@ impl Tool for MessageTool {
         })
     }
 
+    fn context_exempt(&self) -> bool {
+        // Delivery results must survive pressure: if the model forgets what it
+        // already sent, the user-visible failure mode is a duplicate message.
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> Result<String> {
         let content = args
             .get("content")
@@ -113,6 +119,13 @@ mod tests {
 
     fn make_callback() -> SendChannel {
         tokio::sync::mpsc::channel::<(String, String, String)>(1)
+    }
+
+    #[test]
+    fn test_message_tool_reports_context_exempt() {
+        // Losing a delivery result would let the model deliver the same
+        // message twice: a user-visible side effect, so it must survive.
+        assert!(MessageTool::new().context_exempt());
     }
 
     fn send_cb(tx: tokio::sync::mpsc::Sender<(String, String, String)>) -> SendCallback {

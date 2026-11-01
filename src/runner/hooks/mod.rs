@@ -43,3 +43,17 @@ pub(crate) fn has_tool_calls(response: &LLMResponse) -> bool {
         .as_ref()
         .is_some_and(|calls| !calls.is_empty())
 }
+
+/// Session-level chars-per-token ratio for the estimation track.
+///
+/// Falls back to the cold-start default when the session is unknown (first
+/// run) or its metadata has not been written yet. Both trimming stages read it
+/// so AfterTool and PreChat derive limits from the same ruler.
+pub(crate) async fn char_per_token_ratio(spec: &crate::runner::types::RunSpec) -> f64 {
+    spec.session_manager
+        .lock()
+        .await
+        .get_session_data(&spec.session_id)
+        .map(|data| data.char_per_token_ratio)
+        .unwrap_or(crate::pressure::DEFAULT_CHAR_PER_TOKEN_RATIO)
+}

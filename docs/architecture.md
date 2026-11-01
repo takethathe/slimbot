@@ -53,7 +53,7 @@
 顶层编排组件，持有 Provider、ToolManager、SessionManager、MemoryService、Consolidator 的引用：
 
 1. 从配置加载 Provider、ToolManager、SessionManager、MemoryService
-2. 创建 `Arc<Consolidator>`（基于 context_window_tokens 配置）
+2. 创建 `Arc<Consolidator>`（窗口锚取自 `providers.<agent.provider>.context_window_tokens`，占比取自 `pressure` 段）
 3. 调用 `start_inbound()` 启动后台监听任务
 4. 该任务通过 `SessionTaskBuilder` 构建任务（附带 Consolidator 的 Arc 引用），提交到 SessionRunner 顺序执行
 
