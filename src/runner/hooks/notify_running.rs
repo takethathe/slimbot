@@ -59,6 +59,7 @@ mod tests {
             channel: "cli".into(),
             chat_id: "c1".into(),
             runtime_ctx: "ctx".into(),
+            approvals: Default::default(),
             tracer: None,
         }
     }

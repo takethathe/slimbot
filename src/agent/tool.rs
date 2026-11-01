@@ -30,6 +30,11 @@ impl Tool for SubagentTool {
         "subagent"
     }
 
+    /// Risk class (ADR 0011): Runs a nested agent; its own actions are gated separately with unattended semantics.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "Start a subagent that runs one task in its own session with its own tools. Returns immediately with a run_id; the result arrives later as a [Subagent result] message."
     }

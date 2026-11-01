@@ -35,6 +35,11 @@ impl Tool for FindFilesTool {
         "find_files"
     }
 
+    /// Risk class (ADR 0011): Only walks workspace paths.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         "Find files by path fragment, glob, or file type. Use this before \
          file_reader when you need to locate files. Returns workspace-relative \

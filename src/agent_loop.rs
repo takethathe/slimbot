@@ -195,6 +195,8 @@ pub struct AgentLoop {
     /// The conversation the owner first established; the last-resort delivery
     /// target for sources that have no origin (heartbeat, an origin-less cron).
     owner_primary: Arc<crate::delivery::OwnerPrimaryStore>,
+    /// Shared pending approvals (never persisted; a restart fails closed).
+    approvals: Arc<crate::approval::ApprovalStore>,
 }
 
 /// Returned by `AgentLoop::run()` so the caller can publish input and
@@ -277,9 +279,9 @@ impl AgentLoop {
         let provider = Arc::new(OpenAIProvider::new(provider_config));
 
         let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
-        tool_manager.init_from_config(&config.tools);
+        tool_manager.init_from_config(&config.tools.entries);
         let mut catalog = ToolCatalog::new();
-        catalog.register_builtin_set(&config.tools, paths.workspace_dir());
+        catalog.register_builtin_set(&config.tools.entries, paths.workspace_dir());
 
         Self::from_parts(
             paths,
@@ -406,6 +408,13 @@ impl AgentLoop {
 
         let tracer = build_tracer(&config, paths.workspace_dir());
 
+        // One pending-approval store per process: a call proposed on one turn is
+        // redeemed on the next, and nothing survives a restart (ADR 0011). The
+        // policy is snapshotted here, so editing `tools.approval` needs a restart.
+        let approvals = Arc::new(crate::approval::ApprovalStore::new(
+            config.tools.approval.clone(),
+        ));
+
         // Subagent runtime: per-run tool managers are assembled from the
         // catalog, so the main loop's tool table and prompt cache never change.
         let catalog = Arc::new(catalog);
@@ -416,11 +425,12 @@ impl AgentLoop {
             session_manager_arc.clone(),
             memory_service.clone(),
             config.agent.clone(),
-            default_tool_set(&config.tools),
+            default_tool_set(&config.tools.entries),
             max_tokens,
             config.subagent.max_concurrent,
             tracer.clone(),
             message_bus.clone(),
+            approvals.clone(),
         ));
         // Only the main loop gets `subagent`; agent runs can never declare it.
         tool_manager.register(Box::new(SubagentTool::new(subagent_runtime.clone())));
@@ -439,10 +449,12 @@ impl AgentLoop {
             max_tokens,
             tracer.clone(),
         )
-        .with_pressure(pressure.clone());
+        .with_pressure(pressure.clone())
+        .with_approvals(approvals.clone());
 
         Ok(Self {
             owner_primary: Arc::new(crate::delivery::OwnerPrimaryStore::load(paths.data_dir())),
+            approvals,
             config,
             workspace_dir: paths.workspace_dir().to_path_buf(),
             provider,
@@ -471,6 +483,11 @@ impl AgentLoop {
     /// The owner's primary channel store (delivery seam, ticket 17).
     pub fn owner_primary(&self) -> Arc<crate::delivery::OwnerPrimaryStore> {
         self.owner_primary.clone()
+    }
+
+    /// The process-wide pending-approval store (ADR 0011).
+    pub fn approvals(&self) -> Arc<crate::approval::ApprovalStore> {
+        self.approvals.clone()
     }
 
     /// The provider used for agent turns. Card generation reuses this same
@@ -601,6 +618,7 @@ impl AgentLoop {
         let owner = Owner::from_config(&self.config.gateway.owner);
         let owner_id = owner.id().to_string();
         let owner_primary = self.owner_primary.clone();
+        let approvals = self.approvals.clone();
 
         let max_tokens = full_config
             .providers
@@ -732,6 +750,7 @@ impl AgentLoop {
                         .cancel_token(cancel_token)
                         .max_tokens(max_tokens)
                         .tracer(tracer.clone())
+                        .approvals(approvals.clone())
                         .build();
 
                         let mut guard = session_manager.lock().await;
@@ -917,7 +936,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1133,7 +1152,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1200,7 +1219,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1286,7 +1305,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1352,7 +1371,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1418,7 +1437,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1520,7 +1539,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1591,7 +1610,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1671,7 +1690,7 @@ mod tests {
                 unknown: Default::default(),
             },
             providers: std::collections::HashMap::new(),
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1765,7 +1784,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1876,7 +1895,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -2219,7 +2238,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),

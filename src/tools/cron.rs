@@ -158,6 +158,11 @@ impl Tool for CronTool {
         "cron"
     }
 
+    /// Risk class (ADR 0011): Writes scheduled jobs into the workspace.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "Low-level scheduler for fixed-time system jobs (e.g. dream maintenance). Actions: add, list, remove. For everyday reminders and anything condition-based, delegate to the `trigger` agent instead."
     }

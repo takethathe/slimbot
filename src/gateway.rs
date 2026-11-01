@@ -48,13 +48,13 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     // Build ToolManager with all tools including message + cron
     let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
-    tool_manager.init_from_config(&config.tools);
+    tool_manager.init_from_config(&config.tools.entries);
 
     // The catalog mirrors the main loop's tool set as factories, so each
     // subagent run can assemble its own ToolManager without touching the
     // shared one (which would break prompt caching and concurrent runs).
     let mut catalog = crate::agent::ToolCatalog::new();
-    catalog.register_builtin_set(&config.tools, paths.workspace_dir());
+    catalog.register_builtin_set(&config.tools.entries, paths.workspace_dir());
 
     // Create message tool with send callback
     let mut message_tool = MessageTool::new();
@@ -196,7 +196,10 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
                 .zip(job_clone.payload.to.as_deref())
                 .map(|(ch, cid)| format!("{}:{}", ch, cid));
             let hook = TaskHook::new(origin_session_id.as_deref().unwrap_or(session_id))
-                .with_events(event_tx);
+                .with_events(event_tx)
+                // Cron runs unattended: an `Ask` inside one is a refusal, never
+                // a pending list nobody can redeem (ADR 0011).
+                .with_turn_kind(crate::session::TurnKind::Cron);
             let content = format!(
                 "[Scheduled Task] Timer finished.\n\nTask '{}' has been triggered.\nScheduled instruction: {}",
                 job_clone.name, job_clone.payload.message
@@ -286,7 +289,9 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         let al = agent_loop_for_hb.clone();
         Box::pin(async move {
             let session_id = "heartbeat:system";
-            let hook = TaskHook::new(session_id);
+            let hook = TaskHook::new(session_id)
+                // Heartbeat is unattended: `Ask` is a refusal (ADR 0011).
+                .with_turn_kind(crate::session::TurnKind::Heartbeat);
             // Heartbeat doesn't use message tool; result is sent via on_notify to webui
             let result = al
                 .run_task(session_id, content, hook, None, None, None)
@@ -582,7 +587,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -804,7 +809,7 @@ mod tests {
                 unknown: Default::default(),
             },
             providers: std::collections::HashMap::new(),
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -947,7 +952,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1006,7 +1011,7 @@ mod tests {
                 unknown: Default::default(),
             },
             providers: std::collections::HashMap::new(),
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1224,7 +1229,7 @@ mod tests {
                 unknown: Default::default(),
             },
             providers: std::collections::HashMap::new(),
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1672,7 +1677,7 @@ mod tests {
                 );
                 map
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: std::collections::HashMap::new(),
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),

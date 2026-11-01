@@ -56,6 +56,11 @@ impl Tool for GrepTool {
         "grep"
     }
 
+    /// Risk class (ADR 0011): Only reads workspace file contents.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         "Search file contents with a regex pattern. Default output_mode is \
          files_with_matches (file paths only); use content mode for matching \

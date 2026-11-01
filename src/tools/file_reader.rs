@@ -27,6 +27,11 @@ impl Tool for FileReaderTool {
         "file_reader"
     }
 
+    /// Risk class (ADR 0011): Only reads workspace files.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         "Read the contents of a file. Path must be within the workspace directory."
     }

@@ -17,6 +17,12 @@ pub enum Message {
     Assistant { meta: MessageMeta, content: Option<Content>, tool_calls: Option<Vec<ToolCall>> },
     Tool { meta: MessageMeta, content: Content, tool_call_id: String, name: Option<String> },
 }
+
+pub struct MessageMeta {
+    pub timestamp: String,
+    /// Approval marker: the pending record this tool result is the guidance for.
+    pub approval_id: Option<String>,
+}
 ```
 
 每条消息有唯一的自增 `id`，用于 consolidation 游标跟踪。
@@ -30,7 +36,11 @@ Message::assistant(Some("hi".to_string()), None)
 Message::assistant(Some("reply".to_string()), Some(vec![tool_call]))
 Message::system("instructions".to_string())
 Message::tool("result".to_string(), "call-id".to_string(), Some("tool_name"))
+// A guidance result: same as tool(), plus the approval marker.
+Message::tool_marked("NOT EXECUTED…".to_string(), "call-id".to_string(), Some("shell"), approval_id)
 ```
+
+`approval_id` 是审批引导结果的**唯一标记**（`Message::approval_id()` 读取）。它只在 `merge_approval_rounds` 与裁剪保护里被使用：记录已兑现 ⇒ 该轮被折叠，记录不存在 ⇒ 该结果改写为执行失败。详见 `docs/runner.md` 的「审批生命周期」。
 
 ### SessionMeta
 
@@ -88,7 +98,13 @@ pub struct TaskHook {
     status_tx: Option<tokio::sync::mpsc::Sender<(String, TaskState)>>,  // 状态通道
     event_tx: Option<tokio::sync::broadcast::Sender<AgentEvent>>,       // AgentEvent 广播通道
     session_id: String,                                       // 所属 Session ID
+    turn_kind: TurnKind,                                      // 这次 run 是怎么被发起的
 }
+
+pub enum TurnKind { User, Cron, Heartbeat, Trigger, Subagent }
+```
+
+`TurnKind` 由装配处在调 `run()` 前设置（用户消息 = `User`，其余为无人值守），审批据此决定 `ask` 是否降级为 `deny`（`TurnKind::is_attended()`）。
 ```
 
 `TaskHook` 通过构建器模式组合：
@@ -112,6 +128,7 @@ pub enum AgentEvent {
     AssistantMessage { session_id: String, content: String },
     ToolCall { session_id: String, name: String, args: String },
     ToolResult { session_id: String, name: String, output: String },
+    ApprovalRedeemed { session_id: String, approval_id: String, tool: String, args: String, risk: String },
 }
 ```
 

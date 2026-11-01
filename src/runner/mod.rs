@@ -96,6 +96,7 @@ pub struct AgentRunnerBuilder {
     tracer: Option<Arc<Tracer>>,
     max_tokens: Option<u32>,
     pressure: Option<crate::pressure::PressureAnchor>,
+    approvals: Option<Arc<crate::approval::ApprovalStore>>,
     hooks: HookRegistry,
 }
 
@@ -112,6 +113,7 @@ impl AgentRunnerBuilder {
             tracer: None,
             max_tokens: None,
             pressure: None,
+            approvals: None,
             hooks: HookRegistry::new(),
         }
     }
@@ -172,12 +174,27 @@ impl AgentRunnerBuilder {
         self
     }
 
+    /// Attach the process-wide pending-approval store (ADR 0011).
+    ///
+    /// It must be shared by every run (and every entry point) so a call
+    /// proposed on one turn can be redeemed on the next. Unset means a fresh
+    /// default-policy store, which gates each run on its own — fine for tests,
+    /// wrong for a gateway.
+    pub fn approvals(mut self, store: Arc<crate::approval::ApprovalStore>) -> Self {
+        self.approvals = Some(store);
+        self
+    }
+
     /// Register the stock hooks that replicate the current `run()` behavior.
     /// Returns self so it can be chained with the dependency setters.
     pub fn with_defaults(mut self) -> Self {
         use crate::runner::hooks::*;
 
         // PreTurn
+        // Approval turn opening runs first: the lifecycle must be armed (TTL
+        // expiry + carried set) before anything reads it.
+        self.hooks
+            .add_pre_turn(Arc::new(ApprovalTurnStartHook), HookPosition::Append);
         self.hooks
             .add_pre_turn(Arc::new(WriteUserMessageHook), HookPosition::Append);
         self.hooks
@@ -187,6 +204,10 @@ impl AgentRunnerBuilder {
             .add_pre_chat(Arc::new(BuildContextHook), HookPosition::Append);
         self.hooks
             .add_pre_chat(Arc::new(GovernanceHook), HookPosition::Append);
+        // Approval transform last: it folds redeemed rounds onto their original
+        // call (and rewrites unredeemed guidance) on the copy handed to the model.
+        self.hooks
+            .add_pre_chat(Arc::new(ApprovalContextHook), HookPosition::Append);
         // AfterChat
         self.hooks
             .add_after_chat(Arc::new(HandleResponseHook), HookPosition::Append);
@@ -197,6 +218,10 @@ impl AgentRunnerBuilder {
         // PreTool
         self.hooks
             .add_pre_tool(Arc::new(FireToolCallEventHook), HookPosition::Append);
+        // The single enforcement point (ADR 0011) runs after the event so the
+        // channel has already been told which call the model is attempting.
+        self.hooks
+            .add_pre_tool(Arc::new(ApprovalHook), HookPosition::Append);
         // AfterTool
         self.hooks
             .add_after_tool(Arc::new(FireToolResultEventHook), HookPosition::Append);
@@ -212,6 +237,10 @@ impl AgentRunnerBuilder {
             .add_after_turn(Arc::new(FireTaskCompletedHook), HookPosition::Append);
         self.hooks
             .add_after_turn(Arc::new(TriggerConsolidationHook), HookPosition::Append);
+        // Close the approval turn last: consolidation has already run, and any
+        // record that was still carried now rolls off (audit `cleared`).
+        self.hooks
+            .add_after_turn(Arc::new(ApprovalTurnEndHook), HookPosition::Append);
         self
     }
 
@@ -270,6 +299,9 @@ impl AgentRunnerBuilder {
         let memory_service = self.memory_service.expect("memory_service required");
         let max_tokens = self.max_tokens.unwrap_or(4096);
         let pressure = self.pressure.unwrap_or_default();
+        let approvals = self
+            .approvals
+            .unwrap_or_else(|| Arc::new(crate::approval::ApprovalStore::default()));
 
         // Builders that never called `with_defaults` (or added no custom hooks)
         // still get the stock behavior out of the box.
@@ -292,6 +324,7 @@ impl AgentRunnerBuilder {
             tracer: self.tracer,
             max_tokens,
             pressure,
+            approvals,
             hooks,
         }
     }
@@ -308,6 +341,8 @@ pub struct AgentRunner {
     tracer: Option<Arc<Tracer>>,
     max_tokens: u32,
     pressure: crate::pressure::PressureAnchor,
+    /// Shared pending-approval state (in-memory, never persisted).
+    approvals: Arc<crate::approval::ApprovalStore>,
     hooks: HookRegistry,
 }
 
@@ -323,6 +358,12 @@ impl AgentRunner {
     /// window (the agent loop, Dream) override the default anchor here.
     pub fn with_pressure(mut self, pressure: crate::pressure::PressureAnchor) -> Self {
         self.pressure = pressure;
+        self
+    }
+
+    /// Replace the pending-approval store after construction.
+    pub fn with_approvals(mut self, approvals: Arc<crate::approval::ApprovalStore>) -> Self {
+        self.approvals = approvals;
         self
     }
 
@@ -453,6 +494,7 @@ impl AgentRunner {
             channel: tool_channel.clone(),
             chat_id: tool_chat_id.clone(),
             runtime_ctx,
+            approvals: self.approvals.clone(),
         };
 
         // Scope per-turn state (context + sent_in_turn) via a task-local so that
@@ -764,6 +806,13 @@ impl AgentRunner {
                                 state.fail(e.to_string());
                                 break;
                             }
+                        }
+                        // A PreTool hook may end the turn without another LLM
+                        // call (approval `Ask`): the tool results for this
+                        // iteration are written, and the run result is the
+                        // plain-text pending list the hook already set.
+                        if state.should_exit {
+                            break;
                         }
                         state.iterations += 1;
                         spec.task_hook.notify_status_change(&TaskState::Running {

@@ -17,7 +17,11 @@ impl AfterTurnHook for TriggerConsolidationHook {
         if let (Some(consolidator), Some(response)) =
             (spec.consolidator.as_ref(), state.response.as_ref())
             && let Ok(consolidated) = consolidator
-                .maybe_consolidate(&spec.session_id, response.usage.prompt_tokens)
+                .maybe_consolidate_protecting(
+                    &spec.session_id,
+                    response.usage.prompt_tokens,
+                    &spec.approvals.live_ids(&spec.session_id),
+                )
                 .await
         {
             state.consolidated = consolidated;
@@ -63,6 +67,7 @@ mod tests {
             channel: "cli".into(),
             chat_id: "c1".into(),
             runtime_ctx: "ctx".into(),
+            approvals: Default::default(),
             tracer: None,
         }
     }

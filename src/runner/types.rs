@@ -86,6 +86,9 @@ pub struct RunSpec {
     pub chat_id: String,
     /// Runtime context string generated once per turn for cache stability.
     pub runtime_ctx: String,
+    /// The in-memory pending-approval store shared by every run of this
+    /// process (ADR 0011). Never persisted: a restart fails closed.
+    pub approvals: Arc<crate::approval::ApprovalStore>,
 }
 
 impl RunSpec {
@@ -221,6 +224,7 @@ mod tests {
             channel: "webui".into(),
             chat_id: "c1".into(),
             runtime_ctx: "ctx".into(),
+            approvals: Default::default(),
         }
     }
 }

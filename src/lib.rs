@@ -1,5 +1,6 @@
 pub mod agent;
 pub(crate) mod agent_loop;
+pub(crate) mod approval;
 pub(crate) mod bootstrap;
 pub mod card;
 pub(crate) mod channel;
@@ -43,10 +44,12 @@ pub(crate) mod utils;
 pub(crate) mod worker;
 
 // Re-export key types for integration tests and binary usage.
+pub use approval::{ApprovalConfig, ApprovalStore, ControlLevel, PendingApproval, RiskLevel};
 pub use channel::{Channel, ChannelFactory, ChannelManager};
 pub use config::{
     ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, DreamConfig, GatewayConfig,
-    HeartbeatConfig, OwnerConfig, ToolEntry, TraceBackendEntry, TraceConfig, WebFetchConfig,
+    HeartbeatConfig, OwnerConfig, ToolEntry, ToolsConfig, TraceBackendEntry, TraceConfig,
+    WebFetchConfig,
 };
 pub use config_defs::{AgentConfig, PressureConfig, ProviderConfig};
 pub use config_macro::{FieldMeta, Normalizable};
@@ -67,7 +70,7 @@ pub use provider::{FinishReason, LLMResponse, OpenAIProvider, Provider, Usage};
 pub use runner::AgentRunner;
 pub use session::{
     AgentEvent, Content, Message, Session, SessionManager, SharedSessionManager, TaskHook,
-    TaskState,
+    TaskState, TurnKind,
 };
 pub use tool::{
     Tool, ToolCall, ToolDefinition, ToolManager, TurnContext, current_turn, current_turn_target,

@@ -40,6 +40,11 @@ impl Tool for MessageTool {
         "message"
     }
 
+    /// Risk class (ADR 0011): Delivers content to a channel the owner reads (and possibly to a third party).
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ExternalSend
+    }
+
     fn description(&self) -> &str {
         "Send a message to the user. This is the primary way to deliver results to a channel."
     }

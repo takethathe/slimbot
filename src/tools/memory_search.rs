@@ -94,6 +94,11 @@ impl crate::tool::Tool for MemorySearchTool {
         "memory_search"
     }
 
+    /// Risk class (ADR 0011): Searches memory documents without modifying them.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         "Search long-term memory documents for paragraphs relevant to a query \
          (Chinese and English are both supported). Returns the most relevant \

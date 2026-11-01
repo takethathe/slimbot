@@ -23,6 +23,11 @@ impl Tool for MakeDirTool {
         "make_dir"
     }
 
+    /// Risk class (ADR 0011): Creates directories inside the workspace only.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "Create a directory, including all parent directories. Path must be within the workspace directory."
     }

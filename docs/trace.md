@@ -97,6 +97,7 @@ pub struct Tracer {
 | 骨架调用 `tool.execute()` 处 | `execute_tool {name}` | `iteration` | 如 `execute_tool shell`；`gen_ai.operation.name=execute_tool` |
 | `CardService::generate()` 一次卡片生成 | `json_render.generate` | 无（独立 trace） | 卡片生成的父 span；`json_render.patch_count` + token usage |
 | 卡片调用 `provider.chat_stream()` 处 | `chat` | `json_render.generate` | 与 `iteration` 下的 `chat` 同一套语义；guard 传给 provider 写 body，被取消/停滞时以 `error.type=cancelled` 结束 |
+| `ApprovalHook` 每次决策 | `approval` | 无（独立 span） | 审批审计的唯一出口（ADR 0011）：`approval.decision`（`proposed`/`redeemed`/`expired`/`cleared`/`denied_by_policy`）+ `approval.decided_by`（`policy`/`redemption`/`ttl`/`round_end`）+ `approval.id`/`owner_id`/`session_id`/`run_id`/`turn_kind`/`tool`/`args`/`args_hash`/`risk`/`ts_ms`；一次性 span，不做父子挂载，避免被 snipping/consolidation 影响 |
 
 根 span 的 guard 生命周期覆盖整个 `run()` 的骨架作用域；`chat` / `execute_tool {name}` 的 guard 只包裹各自调用。
 

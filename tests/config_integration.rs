@@ -210,10 +210,13 @@ fn test_save_and_reload_round_trip() {
             unknown: Default::default(),
         },
         providers,
-        tools: vec![ToolEntry {
-            name: "shell".to_string(),
-            enabled: true,
-        }],
+        tools: slimbot::ToolsConfig {
+            entries: vec![ToolEntry {
+                name: "shell".to_string(),
+                enabled: true,
+            }],
+            approval: Default::default(),
+        },
         channels,
         gateway: GatewayConfig::default(),
         web_fetch: None,
@@ -230,6 +233,6 @@ fn test_save_and_reload_round_trip() {
     assert_eq!(reloaded.agent.provider, "my-provider");
     assert_eq!(reloaded.agent.max_iterations, 10);
     assert_eq!(reloaded.providers["my-provider"].model, "gpt-4");
-    assert_eq!(reloaded.tools.len(), 1);
+    assert_eq!(reloaded.tools.entries.len(), 1);
     assert_eq!(reloaded.channels.len(), 1);
 }

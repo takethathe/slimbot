@@ -116,6 +116,15 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// The tool's risk class, declared here and deliberately **not**
+    /// configurable (ADR 0011): configuration picks a control level *per risk
+    /// class*, so a new tool inherits the policy of the class it belongs to
+    /// instead of shipping with its own approval switch.
+    ///
+    /// There is no default on purpose: every implementation must state what it
+    /// can do to the host, the workspace, the network or a third party.
+    fn risk_level(&self) -> crate::approval::RiskLevel;
+
     async fn execute(&self, args: serde_json::Value) -> Result<String>;
 }
 
@@ -224,6 +233,18 @@ impl ToolManager {
             .get(name)
             .map(|tool| tool.context_exempt())
             .unwrap_or(false)
+    }
+
+    /// The risk class declared by the named tool, or `None` when no such tool
+    /// is registered.
+    ///
+    /// `None` means the call cannot run at all (`execute` fails with "Tool not
+    /// found"), so there is nothing to authorize; the approval hook lets it
+    /// through to fail on its own rather than asking the owner to approve a
+    /// tool that does not exist. Any tool that *is* registered has declared its
+    /// class on the trait, which is where the gate comes from.
+    pub fn risk_level(&self, name: &str) -> Option<crate::approval::RiskLevel> {
+        self.tools.get(name).map(|tool| tool.risk_level())
     }
 }
 
@@ -512,6 +533,9 @@ mod tests {
             }
             fn parameters(&self) -> serde_json::Value {
                 serde_json::json!({})
+            }
+            fn risk_level(&self) -> crate::approval::RiskLevel {
+                crate::approval::RiskLevel::ReadOnly
             }
             async fn execute(&self, _args: serde_json::Value) -> Result<String> {
                 Ok(String::new())

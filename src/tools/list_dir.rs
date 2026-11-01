@@ -23,6 +23,11 @@ impl Tool for ListDirTool {
         "list_dir"
     }
 
+    /// Risk class (ADR 0011): Only lists workspace directories.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         "List the contents of a directory. Returns entries prefixed with [D] for directories, [F] for files, [L] for links. Path must be within the workspace directory."
     }

@@ -13,7 +13,7 @@ fn default_config() -> Config {
     Config {
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: std::collections::HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -94,7 +94,7 @@ fn print_config_summary(config: &Config, paths: &PathManager) {
             provider.context_window_tokens,
         );
     }
-    eprintln!("  tools: {} entries", config.tools.len());
+    eprintln!("  tools: {} entries", config.tools.entries.len());
     eprintln!("  channels: {} entries", config.channels.len());
     eprintln!(
         "\nEdit {} to configure your API key and channels.",

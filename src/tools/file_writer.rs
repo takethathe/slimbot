@@ -23,6 +23,11 @@ impl Tool for FileWriterTool {
         "file_writer"
     }
 
+    /// Risk class (ADR 0011): Writes files inside the workspace only.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "Write content to a file, creating it if it does not exist. Path must be within the workspace directory."
     }

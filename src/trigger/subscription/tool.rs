@@ -274,6 +274,11 @@ impl Tool for TriggerTool {
         "trigger"
     }
 
+    /// Risk class (ADR 0011): Writes trigger rules inside the workspace.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "Manage durable rules: list, create, update, delete and test a trigger. A trigger watches data sources, judges a condition script, and acts on a new fire."
     }

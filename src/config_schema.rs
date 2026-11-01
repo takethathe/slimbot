@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::approval::ControlLevel;
 use crate::config::{
     AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig,
     MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig, SecretEntry, SubagentConfig,
@@ -196,6 +197,12 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
         ),
         providers_section(config),
         tools_section(config),
+        scalar_section(
+            "tools.approval",
+            "Tools · Approval",
+            crate::config_defs::approval_field_metas(),
+            &config.tools.approval.schema_values(),
+        ),
         channels_section(config),
         tracing_backends_section(config),
         trigger_secrets_section(config),
@@ -390,6 +397,7 @@ fn tools_section(config: &Config) -> SchemaSection {
 
     let items = config
         .tools
+        .entries
         .iter()
         .enumerate()
         .map(|(i, t)| SchemaItem {
@@ -607,6 +615,16 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
     match segs {
         ["agent", field] => set_agent(config, field, value),
         ["providers", name, field] => set_provider_field(config, name, field, value),
+        ["tools", "approval", level] if is_risk_level(level) => {
+            set_approval_level(config, level, value)
+        }
+        ["tools", "approval", "levels", level] => set_approval_level(config, level, value),
+        ["tools", "approval", "timeout_seconds"] => {
+            config.tools.approval.timeout_seconds =
+                value_u64(value, "tools.approval.timeout_seconds")?;
+            Ok(())
+        }
+        ["tools", "approval", "tools"] => set_approval_tool_overrides(config, value),
         ["tools", idx, field] => set_tool_field(config, idx, field, value),
         ["channels", name, "enabled"] => set_channel_enabled(config, name, value),
         ["channels", name, "extra"] => set_channel_extra(config, name, value),
@@ -780,6 +798,69 @@ fn set_provider_field(
     Ok(())
 }
 
+/// Risk-level names accepted under `tools.approval.levels`.
+const RISK_LEVEL_NAMES: &[&str] = &[
+    "read_only",
+    "workspace_write",
+    "exec",
+    "network_egress",
+    "external_send",
+];
+
+fn is_risk_level(name: &str) -> bool {
+    RISK_LEVEL_NAMES.contains(&name)
+}
+
+fn parse_control_level(value: &serde_json::Value, path: &str) -> Result<ControlLevel, String> {
+    let text = value_str(value, path)?;
+    match text.as_str() {
+        "allow" => Ok(ControlLevel::Allow),
+        "ask" => Ok(ControlLevel::Ask),
+        "deny" => Ok(ControlLevel::Deny),
+        other => Err(format!(
+            "{}: expected one of allow | ask | deny, got '{}'",
+            path, other
+        )),
+    }
+}
+
+/// Set one `tools.approval.levels.<risk>` knob.
+fn set_approval_level(
+    config: &mut Config,
+    level: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let path = format!("tools.approval.levels.{}", level);
+    let control = parse_control_level(value, &path)?;
+    let levels = &mut config.tools.approval.levels;
+    match level {
+        "read_only" => levels.read_only = control,
+        "workspace_write" => levels.workspace_write = control,
+        "exec" => levels.exec = control,
+        "network_egress" => levels.network_egress = control,
+        "external_send" => levels.external_send = control,
+        other => return Err(format!("{}: unknown risk level '{}'", path, other)),
+    }
+    Ok(())
+}
+
+/// Replace the per-tool override map (`tools.approval.tools`).
+fn set_approval_tool_overrides(
+    config: &mut Config,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err("tools.approval.tools: expected a JSON object".to_string());
+    };
+    let mut overrides = HashMap::new();
+    for (tool, control) in object {
+        let path = format!("tools.approval.tools.{}", tool);
+        overrides.insert(tool.clone(), parse_control_level(control, &path)?);
+    }
+    config.tools.approval.tools = overrides;
+    Ok(())
+}
+
 fn set_tool_field(
     config: &mut Config,
     idx: &str,
@@ -789,6 +870,7 @@ fn set_tool_field(
     let i = parse_index(idx)?;
     let tool = config
         .tools
+        .entries
         .get_mut(i)
         .ok_or_else(|| format!("tools.{}: index out of range", idx))?;
     match field {
@@ -978,7 +1060,7 @@ fn add_path(config: &mut Config, op: &PatchOp, segs: &[&str]) -> Result<(), Stri
                 .get("enabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            config.tools.push(ToolEntry { name, enabled });
+            config.tools.entries.push(ToolEntry { name, enabled });
             Ok(())
         }
         ["channels", name] => {
@@ -1018,10 +1100,10 @@ fn remove_path(config: &mut Config, segs: &[&str]) -> Result<(), String> {
         }
         ["tools", idx] => {
             let i = parse_index(idx)?;
-            if i >= config.tools.len() {
+            if i >= config.tools.entries.len() {
                 Err(format!("tools.{}: index out of range", idx))
             } else {
-                config.tools.remove(i);
+                config.tools.entries.remove(i);
                 Ok(())
             }
         }
@@ -1189,10 +1271,13 @@ mod tests {
                 unknown: Default::default(),
             },
             providers,
-            tools: vec![ToolEntry {
-                name: "shell".to_string(),
-                enabled: true,
-            }],
+            tools: crate::config::ToolsConfig {
+                entries: vec![ToolEntry {
+                    name: "shell".to_string(),
+                    enabled: true,
+                }],
+                approval: Default::default(),
+            },
             channels,
             gateway: crate::config::GatewayConfig {
                 owner: Default::default(),
@@ -1256,6 +1341,7 @@ mod tests {
                 "pressure",
                 "providers",
                 "tools",
+                "tools.approval",
                 "channels",
                 "tracing.backends",
                 "triggers.secrets",
@@ -1805,7 +1891,7 @@ mod tests {
         )
         .unwrap();
         assert!(errors.is_empty());
-        assert!(!config.tools[0].enabled);
+        assert!(!config.tools.entries[0].enabled);
     }
 
     // ── Patch engine: add / remove ──
@@ -1852,8 +1938,8 @@ mod tests {
         ];
         let errors = apply_config_patch(&mut config, &ops).unwrap();
         assert!(errors.is_empty());
-        assert_eq!(config.tools.len(), 1);
-        assert_eq!(config.tools[0].name, "grep");
+        assert_eq!(config.tools.entries.len(), 1);
+        assert_eq!(config.tools.entries[0].name, "grep");
     }
 
     #[test]
@@ -2020,6 +2106,112 @@ mod tests {
         .unwrap();
         assert!(errors.is_empty());
         assert_eq!(config.agent.max_iterations, 200);
+    }
+
+    #[test]
+    fn test_patch_sets_an_approval_level() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "tools.approval.levels.exec",
+                json!("allow"),
+            )],
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.tools.approval.levels.exec, ControlLevel::Allow);
+        // Other levels are untouched.
+        assert_eq!(
+            config.tools.approval.levels.external_send,
+            ControlLevel::Ask
+        );
+    }
+
+    #[test]
+    fn test_patch_rejects_an_unknown_approval_level_value() {
+        let mut config = make_config();
+        let err = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "tools.approval.levels.exec",
+                json!("sometimes"),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("expected one of allow | ask | deny"), "{err}");
+        assert_eq!(config.tools.approval.levels.exec, ControlLevel::Ask);
+    }
+
+    #[test]
+    fn test_patch_rejects_an_unknown_risk_level_name() {
+        let mut config = make_config();
+        let err = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "tools.approval.levels.telepathy",
+                json!("deny"),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown risk level"), "{err}");
+    }
+
+    #[test]
+    fn test_patch_sets_per_tool_overrides() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "tools.approval.tools",
+                json!({"shell": "deny", "web_fetch": "allow"}),
+            )],
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(
+            config.tools.approval.tools.get("shell"),
+            Some(&ControlLevel::Deny)
+        );
+        assert_eq!(
+            config.tools.approval.tools.get("web_fetch"),
+            Some(&ControlLevel::Allow)
+        );
+    }
+
+    #[test]
+    fn test_patch_rejects_per_tool_overrides_that_are_not_an_object() {
+        let mut config = make_config();
+        let err = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "tools.approval.tools",
+                json!(["shell"]),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("expected a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn test_patch_approval_timeout_is_clamped() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "tools.approval.timeout_seconds",
+                json!(999_999),
+            )],
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.tools.approval.timeout_seconds, 86_400);
     }
 
     #[test]

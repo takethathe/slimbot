@@ -23,8 +23,8 @@ pub use crate::config_defs::{
 pub struct Config {
     pub agent: AgentConfig,
     pub providers: HashMap<String, ProviderConfig>,
-    #[serde(default)]
-    pub tools: Vec<ToolEntry>,
+    #[serde(default, deserialize_with = "deserialize_tools")]
+    pub tools: ToolsConfig,
     #[serde(default, deserialize_with = "deserialize_channels")]
     pub channels: HashMap<String, ChannelConfig>,
     #[serde(default)]
@@ -87,6 +87,41 @@ pub struct ToolEntry {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// The `tools` section: the tool table plus the approval policy that gates it.
+///
+/// The approval policy is read once at startup and snapshotted into the
+/// in-memory pending store; editing it while the gateway runs does not change
+/// the policy in effect (restart to apply, ADR 0011).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ToolsConfig {
+    #[serde(default)]
+    pub entries: Vec<ToolEntry>,
+    #[serde(default)]
+    pub approval: crate::approval::ApprovalConfig,
+}
+
+/// Read `tools` from either the object shape (`{entries, approval}`) or the
+/// legacy bare array of tool entries, so existing config files keep loading.
+fn deserialize_tools<'de, D>(deserializer: D) -> std::result::Result<ToolsConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ToolsRepr {
+        Entries(Vec<ToolEntry>),
+        Section(ToolsConfig),
+    }
+
+    Ok(match ToolsRepr::deserialize(deserializer)? {
+        ToolsRepr::Entries(entries) => ToolsConfig {
+            entries,
+            approval: Default::default(),
+        },
+        ToolsRepr::Section(section) => section,
+    })
 }
 
 fn default_true() -> bool {
@@ -210,6 +245,7 @@ impl Config {
         self.subagent.clamp();
         self.triggers.clamp();
         self.pressure.clamp();
+        self.tools.approval.clamp();
         if let Some(wf) = &mut self.web_fetch {
             wf.clamp();
         }
@@ -218,7 +254,7 @@ impl Config {
     pub fn normalize(&mut self) {
         apply_normalize(self);
         // Remove entries with empty name/type
-        self.tools.retain(|t| !t.name.is_empty());
+        self.tools.entries.retain(|t| !t.name.is_empty());
         self.channels.retain(|name, _| !name.is_empty());
     }
 
@@ -654,7 +690,7 @@ mod tests {
                 unknown: Default::default(),
             },
             providers,
-            tools: vec![],
+            tools: Default::default(),
             channels: HashMap::new(),
             gateway: GatewayConfig::default(),
             web_fetch: None,
@@ -1149,11 +1185,11 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::load_for_preview(path.to_str().unwrap()).unwrap();
-        assert_eq!(cfg.tools.len(), 2);
-        assert_eq!(cfg.tools[0].name, "shell");
-        assert!(cfg.tools[0].enabled);
-        assert_eq!(cfg.tools[1].name, "file_reader");
-        assert!(!cfg.tools[1].enabled);
+        assert_eq!(cfg.tools.entries.len(), 2);
+        assert_eq!(cfg.tools.entries[0].name, "shell");
+        assert!(cfg.tools.entries[0].enabled);
+        assert_eq!(cfg.tools.entries[1].name, "file_reader");
+        assert!(!cfg.tools.entries[1].enabled);
     }
 
     #[test]

@@ -489,7 +489,9 @@ impl Dispatcher {
             .publish_inbound(BusRequest::owner(
                 dest,
                 compose_notice(fires),
-                TaskHook::new(dest),
+                // Trigger-driven turns are unattended: `Ask` is a refusal, never a
+                // pending list, because no owner is waiting to redeem it (ADR 0011).
+                TaskHook::new(dest).with_turn_kind(crate::session::TurnKind::Trigger),
             ))
             .await;
         None
@@ -808,6 +810,7 @@ mod tests {
                 max_concurrent,
                 None,
                 bus.clone(),
+                Default::default(),
             ));
             let dispatch = Dispatcher::new(
                 Some(runtime),

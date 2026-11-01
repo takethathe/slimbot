@@ -121,6 +121,11 @@ impl SessionRunner {
 pub struct MessageMeta {
     #[serde(default)]
     timestamp: String,
+    /// Marker for approval-related messages (the injected guidance tool result
+    /// and, when a provider produces them, the confirmation request/answer).
+    /// Serde default keeps existing JSONL readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) approval_id: Option<String>,
 }
 
 /// Content block for multi-modal messages.
@@ -261,6 +266,7 @@ impl Message {
         Message::User {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: Content::Plain(content),
             runtime_content: None,
@@ -276,6 +282,7 @@ impl Message {
         Message::Assistant {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content,
             tool_calls,
@@ -288,6 +295,7 @@ impl Message {
         Message::System {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content,
         }
@@ -297,10 +305,45 @@ impl Message {
         Message::Tool {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content,
             tool_call_id,
             name,
+        }
+    }
+
+    /// A tool result carrying an approval marker (the injected confirmation
+    /// guidance). The marker is what `merge_approval_rounds` keys on when the
+    /// context is built.
+    pub fn tool_marked(
+        content: String,
+        tool_call_id: String,
+        name: Option<String>,
+        approval_id: String,
+    ) -> Self {
+        let mut msg = Message::tool(content, tool_call_id, name);
+        msg.set_approval_id(Some(approval_id));
+        msg
+    }
+
+    /// The approval marker on this message, if any.
+    pub fn approval_id(&self) -> Option<&str> {
+        match self {
+            Message::System { meta, .. }
+            | Message::User { meta, .. }
+            | Message::Assistant { meta, .. }
+            | Message::Tool { meta, .. } => meta.approval_id.as_deref(),
+        }
+    }
+
+    /// Attach or clear the approval marker.
+    pub fn set_approval_id(&mut self, approval_id: Option<String>) {
+        match self {
+            Message::System { meta, .. }
+            | Message::User { meta, .. }
+            | Message::Assistant { meta, .. }
+            | Message::Tool { meta, .. } => meta.approval_id = approval_id,
         }
     }
 }
@@ -332,6 +375,39 @@ pub struct SessionTask {
     pub closure: Option<Box<dyn FnOnce() -> BoxFuture + Send>>,
 }
 
+/// How a run was started.
+///
+/// Only [`TurnKind::User`] has an owner in the loop who can answer a pending
+/// approval on the next turn; every other kind is unattended, so the approval
+/// hook turns `Ask` into `Deny` instead of writing a pending record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnKind {
+    #[default]
+    User,
+    Cron,
+    Heartbeat,
+    Trigger,
+    Subagent,
+}
+
+impl TurnKind {
+    /// True when a human owner can redeem a pending approval on the next turn.
+    pub fn is_attended(self) -> bool {
+        matches!(self, Self::User)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnKind::User => "user",
+            TurnKind::Cron => "cron",
+            TurnKind::Heartbeat => "heartbeat",
+            TurnKind::Trigger => "trigger",
+            TurnKind::Subagent => "subagent",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TaskHook {
     status_tx: Option<tokio::sync::mpsc::Sender<(String, TaskState)>>,
@@ -342,6 +418,8 @@ pub struct TaskHook {
     /// threaded through the task so approvals, audit and delivery never have to
     /// guess "whose" a run is.
     owner_id: String,
+    /// How this run was started (user vs. unattended source).
+    turn_kind: TurnKind,
 }
 
 /// Events broadcast through TaskHook for fine-grained channel notifications.
@@ -384,6 +462,15 @@ pub enum AgentEvent {
         session_id: String,
         iteration: u32,
     },
+    /// A redeemed approval is about to execute. Broadcast *before* the tool call
+    /// so the owner can `/stop` the run in the window.
+    ApprovalRedeemed {
+        session_id: String,
+        approval_id: String,
+        tool: String,
+        args: String,
+        risk: String,
+    },
 }
 
 impl AgentEvent {
@@ -397,6 +484,7 @@ impl AgentEvent {
             AgentEvent::ToolCall { session_id, .. } => session_id,
             AgentEvent::ToolResult { session_id, .. } => session_id,
             AgentEvent::PostIteration { session_id, .. } => session_id,
+            AgentEvent::ApprovalRedeemed { session_id, .. } => session_id,
         }
     }
 }
@@ -409,6 +497,7 @@ impl TaskHook {
             event_tx: None,
             run_id: uuid::Uuid::new_v4().to_string(),
             owner_id: crate::identity::DEFAULT_OWNER_ID.to_string(),
+            turn_kind: TurnKind::User,
         }
     }
 
@@ -430,6 +519,7 @@ impl TaskHook {
             event_tx: None,
             run_id: self.run_id,
             owner_id: self.owner_id,
+            turn_kind: self.turn_kind,
         }
     }
 
@@ -441,6 +531,7 @@ impl TaskHook {
             event_tx: Some(tx),
             run_id: self.run_id,
             owner_id: self.owner_id,
+            turn_kind: self.turn_kind,
         }
     }
 
@@ -452,7 +543,19 @@ impl TaskHook {
             event_tx: self.event_tx,
             run_id: run_id.to_string(),
             owner_id: self.owner_id,
+            turn_kind: self.turn_kind,
         }
+    }
+
+    /// Pin how this run was started (user vs. unattended source).
+    pub fn with_turn_kind(mut self, kind: TurnKind) -> Self {
+        self.turn_kind = kind;
+        self
+    }
+
+    /// How this run was started.
+    pub fn turn_kind(&self) -> TurnKind {
+        self.turn_kind
     }
 
     pub fn fire_event(&self, event: AgentEvent) {
@@ -498,6 +601,7 @@ pub struct SessionTaskBuilder {
     cancel_token: Option<CancellationToken>,
     max_tokens: Option<u32>,
     tracer: Option<Arc<crate::trace::Tracer>>,
+    approvals: Option<Arc<crate::approval::ApprovalStore>>,
 }
 
 impl SessionTaskBuilder {
@@ -518,6 +622,7 @@ impl SessionTaskBuilder {
             cancel_token: None,
             max_tokens: None,
             tracer: None,
+            approvals: None,
         }
     }
 
@@ -582,6 +687,13 @@ impl SessionTaskBuilder {
         self
     }
 
+    /// Attach the process-wide pending-approval store (ADR 0011). Without it
+    /// each built run would gate on its own store and never redeem across turns.
+    pub fn approvals(mut self, store: Arc<crate::approval::ApprovalStore>) -> Self {
+        self.approvals = Some(store);
+        self
+    }
+
     pub fn build(self) -> SessionTask {
         let session_manager = self.session_manager.expect("session_manager required");
         let tool_manager = self.tool_manager.expect("tool_manager required");
@@ -602,6 +714,7 @@ impl SessionTaskBuilder {
         let channel_inject = self.channel_inject;
         let cancel_token = self.cancel_token;
         let tracer = self.tracer;
+        let approvals = self.approvals;
 
         let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> = Box::new(move || {
             Box::pin(async move {
@@ -615,6 +728,7 @@ impl SessionTaskBuilder {
                     .consolidator(consolidator)
                     .tracer(tracer)
                     .max_tokens(max_tokens)
+                    .approvals(approvals.unwrap_or_default())
                     .build();
                 let run_id = hook.run_id().to_string();
                 let result = runner
@@ -1462,6 +1576,7 @@ mod tests {
         Message::User {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: Content::Plain(content.to_string()),
             runtime_content: None,
@@ -1472,6 +1587,7 @@ mod tests {
         Message::Assistant {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: Some(content.to_string()),
             tool_calls: None,
@@ -1993,6 +2109,7 @@ mod tests {
         let user = Message::User {
             meta: MessageMeta {
                 timestamp: "2026-10-24T00:00:00Z".to_string(),
+                approval_id: None,
             },
             content: Content::Plain("hi".to_string()),
             runtime_content: None,
@@ -2005,6 +2122,7 @@ mod tests {
         let asst = Message::Assistant {
             meta: MessageMeta {
                 timestamp: "ts-a".to_string(),
+                approval_id: None,
             },
             content: Some("done".to_string()),
             tool_calls: None,
@@ -2042,6 +2160,7 @@ mod tests {
         let user = Message::User {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: Content::Plain("hello".to_string()),
             runtime_content: None,
@@ -2056,6 +2175,7 @@ mod tests {
         let asst = Message::Assistant {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: Some("hi".to_string()),
             tool_calls: None,
@@ -2071,6 +2191,7 @@ mod tests {
         let system = Message::System {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: "sys".to_string(),
         };
@@ -2079,6 +2200,7 @@ mod tests {
         let tool = Message::Tool {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: "tool".to_string(),
             tool_call_id: "t1".to_string(),
@@ -2093,6 +2215,7 @@ mod tests {
         let empty_asst = Message::Assistant {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: Some("".to_string()),
             tool_calls: None,
@@ -2108,6 +2231,7 @@ mod tests {
         let whitespace_asst = Message::Assistant {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: Some("   \n\t  ".to_string()),
             tool_calls: None,
@@ -2123,6 +2247,7 @@ mod tests {
         let none_asst = Message::Assistant {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: None,
             tool_calls: None,
@@ -2651,6 +2776,7 @@ mod tests {
         let msg = Message::Assistant {
             meta: MessageMeta {
                 timestamp: String::new(),
+                approval_id: None,
             },
             content: Some("Let me check".to_string()),
             tool_calls: Some(vec![crate::tool::ToolCall {

@@ -14,11 +14,31 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> serde_json::Value;
+    /// The tool's non-configurable risk class (see below).
+    fn risk_level(&self) -> RiskLevel;
     async fn execute(&self, args: serde_json::Value) -> Result<String>;
 }
 ```
 
 实现此 trait 即可接入任意工具。
+
+### 风险级：`risk_level()`
+
+每个工具**必须**声明自己的风险级（`slimbot::RiskLevel`），没有默认实现：漏声明是编译错误，而不是静默放宽。风险级是**工具的事实**，不可配置；配置只能决定同一风险级受到多强的管控（见 `docs/config.md` 的 `tools.approval`）。
+
+| 风险级 | 含义 | 内置工具 |
+|--------|------|----------|
+| `ReadOnly` | 只读，不改动任何状态 | `file_reader`、`list_dir`、`grep`、`find_files`、`memory_search`、`memory_read` |
+| `WorkspaceWrite` | 只写工作区内文件 | `file_writer`、`file_editor`、`make_dir`、`cron`、`memory_write`、`memory_edit`、`subagent`、`trigger_source`、`trigger` |
+| `Exec` | 执行任意命令 | `shell` |
+| `NetworkEgress` | 内容离开本机到网络 | `web_fetch` |
+| `ExternalSend` | 向外部的人/通道发送 | `message` |
+
+约定：
+
+- **MCP 工具等外部来源一律按 `ExternalSend` 声明**（票 08）：新装一个 server 就等于新增一批对外能力，必须落在最严的那一档。
+- `ToolManager::risk_level(name)` 返回 `Option<RiskLevel>`：未注册的工具拿不到风险级，**也执行不了**（`execute` 报 `Tool not found`），因此审批层直接放行让它自己失败——不给 owner 展示"待确认一个不存在的工具"。
+- 风险级只在 `ApprovalHook` 里被读取；工具自己不做任何审批判断（一个能力一个入口）。
 
 ## TurnContext（per-turn 状态隔离）
 

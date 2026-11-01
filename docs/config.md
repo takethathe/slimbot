@@ -75,7 +75,7 @@ cargo run -- -d /data/myapp setup
 {
   "agent": { ... },
   "providers": { ... },
-  "tools": [ ... ],
+  "tools": { "entries": [ ... ], "approval": { ... } },
   "channels": { ... },
   "gateway": { ... },
   "json_render": { ... },
@@ -305,7 +305,11 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 { "providers": { "default": { "context_window_tokens": 65536, ... } }, "pressure": { ... } }
 ```
 
-### `tools` — 工具定义
+### `tools` — 工具定义与审批策略
+
+`tools` 有两个子段：`entries`（启用哪些工具）与 `approval`（风险级的管控档）。历史形态（直接把工具数组放在 `tools` 下）仍然可以加载，等价于 `{"entries": [...]}`。
+
+#### `tools.entries` — 工具定义
 
 列出 Agent 可用的工具。如果数组为空，默认启用全部内置工具。
 
@@ -316,13 +320,60 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 
 ```json
 {
-  "tools": [
-    { "name": "shell", "enabled": true },
-    { "name": "file_reader", "enabled": true },
-    { "name": "file_editor", "enabled": false }
-  ]
+  "tools": {
+    "entries": [
+      { "name": "shell", "enabled": true },
+      { "name": "file_reader", "enabled": true },
+      { "name": "file_editor", "enabled": false }
+    ]
+  }
 }
 ```
+
+#### `tools.approval` — 风险级的管控档
+
+每个工具自带一个**不可配置**的风险级（见 `docs/tool.md` 的 `risk_level()`）；这里配置的是每个风险级受到多强的管控。三者关系与完整流转见 `docs/adr/0011-approval-by-turn-end-redemption.md`。
+
+| 管控档 | 语义 |
+|--------|------|
+| `allow` | 直接执行 |
+| `ask` | 中止本次调用、记录一条待确认、结束本回合（下一轮重放同一调用即兑现） |
+| `deny` | 直接拒绝，返回固定拒绝文案，run 继续 |
+
+字段：
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `levels` | object | 否 | 见下 | 按风险级配置管控档，键为风险级名 |
+| `tools` | object | 否 | `{}` | 按工具名覆盖某个工具的风险级管控档，优先于 `levels` |
+| `timeout_seconds` | number | 否 | `1800` | 待确认记录的有效期（秒），夹取到 `1..=86400` |
+
+`levels` 的键即风险级名：`read_only`、`workspace_write`、`exec`、`network_egress`、`external_send`。默认值：
+
+```json
+{
+  "tools": {
+    "entries": [{ "name": "shell", "enabled": true }],
+    "approval": {
+      "levels": {
+        "read_only": "allow",
+        "workspace_write": "allow",
+        "exec": "ask",
+        "external_send": "ask"
+      },
+      "tools": { "web_fetch": "deny" },
+      "timeout_seconds": 1800
+    }
+  }
+}
+```
+
+约定与边界：
+
+- **不热重载**：策略在启动时读一次并快照进内存，改动需重启 gateway 才生效（待确认集合本身也只在内存里，重启即清空）。
+- **按风险级配置而非逐个工具**：新出现的工具（例如 MCP 连接器带来的工具）自动继承所在风险级的策略，不会因为"忘了配"而静默放开。
+- **无人值守按 `deny`**：cron / heartbeat / trigger / subagent 的 run 遇到 `ask` 一律拒绝，且不写待确认记录。
+- 审批只约束 agent 主动发起的动作；Agent 写配置文件不走审批（见 ADR 0002、票 02）。
 
 ## 最小配置
 

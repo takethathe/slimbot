@@ -455,6 +455,11 @@ impl Tool for WebFetchTool {
         "web_fetch"
     }
 
+    /// Risk class (ADR 0011): Leaves the machine to fetch a URL.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::NetworkEgress
+    }
+
     fn description(&self) -> &str {
         "Fetch a URL and extract readable content as markdown. Works for most web pages; may fail on login-walled or JS-heavy sites."
     }

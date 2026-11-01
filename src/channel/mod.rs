@@ -554,7 +554,7 @@ mod tests {
                 );
                 m
             },
-            tools: vec![],
+            tools: Default::default(),
             channels: HashMap::new(),
             gateway: crate::config::GatewayConfig::default(),
             web_fetch: None,

@@ -129,6 +129,11 @@ impl crate::tool::Tool for MemoryReadTool {
         "memory_read"
     }
 
+    /// Risk class (ADR 0011): Reads one memory document.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         &self.description
     }
@@ -180,6 +185,11 @@ impl MemoryWriteTool {
 impl crate::tool::Tool for MemoryWriteTool {
     fn name(&self) -> &str {
         "memory_write"
+    }
+
+    /// Risk class (ADR 0011): Writes one memory document inside the workspace.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
     }
 
     fn description(&self) -> &str {
@@ -249,6 +259,11 @@ impl MemoryEditTool {
 impl crate::tool::Tool for MemoryEditTool {
     fn name(&self) -> &str {
         "memory_edit"
+    }
+
+    /// Risk class (ADR 0011): Edits one memory document inside the workspace.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
     }
 
     fn description(&self) -> &str {

@@ -135,6 +135,29 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_tools_declare_their_risk_class() {
+        // Risk is a fact the tool states about itself; this table is the one
+        // place that would break if a tool's class drifted (ADR 0011).
+        let tmp = tempfile::tempdir().unwrap();
+        let risk = |name: &str| {
+            create_tool(name, tmp.path())
+                .unwrap_or_else(|| panic!("tool {name} not registered"))
+                .risk_level()
+        };
+
+        use crate::approval::RiskLevel::*;
+        assert_eq!(risk("file_reader"), ReadOnly);
+        assert_eq!(risk("list_dir"), ReadOnly);
+        assert_eq!(risk("grep"), ReadOnly);
+        assert_eq!(risk("find_files"), ReadOnly);
+        assert_eq!(risk("file_writer"), WorkspaceWrite);
+        assert_eq!(risk("file_editor"), WorkspaceWrite);
+        assert_eq!(risk("make_dir"), WorkspaceWrite);
+        assert_eq!(risk("shell"), Exec);
+        assert_eq!(risk("web_fetch"), NetworkEgress);
+    }
+
+    #[test]
     fn test_resolve_existing_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "hello").unwrap();

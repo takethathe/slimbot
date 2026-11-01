@@ -15,6 +15,7 @@
 | [架构概览](architecture.md) | 整体 | 系统架构、数据流、组件交互 |
 | [Agent 循环](agent_loop.md) | `agent_loop.rs` | 顶层编排、组件初始化 |
 | [ReAct 执行器](runner.md) | `runner.rs` | ReAct 循环核心：迭代控制、工具调用流程 |
+| [审批生命周期](runner.md#审批生命周期approval) | `approval/`, `runner/hooks/approval.rs` | 风险级 → 管控档 → `ApprovalHook`：Deny 续跑、Ask 结束回合、下一轮按 args 哈希兑现、裁剪保护、审计入 trace（ADR 0011） |
 | [上下文构建器](context.md) | `context.rs` | System Prompt 构建流程 |
 | [会话管理](session.md) | `session.rs` | 会话生命周期、任务队列、JSONL 持久化 |
 | [定时任务](cron.md) | `cron/` | 本地时间调度的 jobs.json、tick 语义、错过的一次性窗口只记 `skipped` |

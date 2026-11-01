@@ -108,6 +108,9 @@ pub struct SubagentRuntime {
     max_tokens: u32,
     tracer: Option<Arc<Tracer>>,
     bus: Arc<MessageBus>,
+    /// Shared pending-approval store; subagent runs are unattended, so every
+    /// `Ask` inside them is refused instead of proposed (ADR 0011).
+    approvals: Arc<crate::approval::ApprovalStore>,
     slots: Arc<Semaphore>,
     max_concurrent: usize,
     running: Arc<AtomicUsize>,
@@ -138,6 +141,7 @@ impl SubagentRuntime {
         max_concurrent: usize,
         tracer: Option<Arc<Tracer>>,
         bus: Arc<MessageBus>,
+        approvals: Arc<crate::approval::ApprovalStore>,
     ) -> Self {
         let max_concurrent = max_concurrent.max(1);
         Self {
@@ -151,6 +155,7 @@ impl SubagentRuntime {
             max_tokens,
             tracer,
             bus,
+            approvals,
             slots: Arc::new(Semaphore::new(max_concurrent)),
             max_concurrent,
             running: Arc::new(AtomicUsize::new(0)),
@@ -293,6 +298,7 @@ impl SubagentRuntime {
             .consolidator(None)
             .tracer(self.tracer.clone())
             .max_tokens(self.max_tokens)
+            .approvals(self.approvals.clone())
             .with_defaults()
             .build();
 
@@ -314,7 +320,9 @@ impl SubagentRuntime {
             timeout,
             runner.run(
                 plan.task.clone(),
-                TaskHook::new(&session_id),
+                // Subagents are unattended: no owner is in the loop to redeem
+                // an approval, so the hook turns every `Ask` into a refusal.
+                TaskHook::new(&session_id).with_turn_kind(crate::session::TurnKind::Subagent),
                 &session_id,
                 None,
                 None,
@@ -503,6 +511,7 @@ mod tests {
             max_concurrent,
             None,
             message_bus,
+            Default::default(),
         ));
 
         Fixture {

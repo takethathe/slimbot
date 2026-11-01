@@ -30,13 +30,22 @@ impl AfterToolHook for PersistToolMessageHook {
             .map(|(_, c)| c.clone())
             .unwrap_or_else(|| result.to_string());
 
+        // A result that answered a proposal carries its approval id, which is
+        // what the build-time transform keys on later (ADR 0011).
+        let message = match super::approval::mark_for(state, &tool_call.id) {
+            Some(approval_id) => Message::tool_marked(
+                content,
+                tool_call.id.clone(),
+                Some(tool_call.name.clone()),
+                approval_id,
+            ),
+            None => Message::tool(content, tool_call.id.clone(), Some(tool_call.name.clone())),
+        };
+
         let mut sm = spec.session_manager.lock().await;
-        sm.add_message(
-            &spec.session_id,
-            Message::tool(content, tool_call.id.clone(), Some(tool_call.name.clone())),
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to write tool message: {}", e))?;
+        sm.add_message(&spec.session_id, message)
+            .await
+            .map_err(|e| anyhow!("Failed to write tool message: {}", e))?;
         Ok(HookAction::Continue)
     }
 }
@@ -77,6 +86,7 @@ mod tests {
             channel: "cli".into(),
             chat_id: "c1".into(),
             runtime_ctx: "ctx".into(),
+            approvals: Default::default(),
             tracer: None,
         }
     }

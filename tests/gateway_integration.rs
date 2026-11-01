@@ -38,7 +38,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
             );
             map
         },
-        tools: vec![],
+        tools: Default::default(),
         channels: std::collections::HashMap::new(),
         gateway: slimbot::GatewayConfig {
             owner: Default::default(),

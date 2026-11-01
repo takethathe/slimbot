@@ -24,6 +24,11 @@ impl Tool for FileEditorTool {
         "file_editor"
     }
 
+    /// Risk class (ADR 0011): Edits files inside the workspace only (it can also read, but the write capability sets the class).
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "Edit a file by replacing an exact occurrence of old_string with new_string. old_string must appear exactly once in the file. Path must be within the workspace directory."
     }

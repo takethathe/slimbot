@@ -67,6 +67,10 @@ impl Tool for MockEchoTool {
         &self.name
     }
 
+    fn risk_level(&self) -> slimbot::RiskLevel {
+        slimbot::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         "Mock echo tool"
     }

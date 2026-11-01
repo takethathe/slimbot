@@ -7,6 +7,7 @@
 use crate::provider::LLMResponse;
 
 mod accumulate_usage;
+pub(crate) mod approval;
 mod build_context;
 mod fire_post_iteration;
 mod fire_task_completed;
@@ -22,6 +23,7 @@ mod trigger_consolidation;
 mod write_user_message;
 
 pub use accumulate_usage::AccumulateUsageHook;
+pub use approval::{ApprovalContextHook, ApprovalHook, ApprovalTurnEndHook, ApprovalTurnStartHook};
 pub use build_context::BuildContextHook;
 pub use fire_post_iteration::FirePostIterationEventHook;
 pub use fire_task_completed::FireTaskCompletedHook;

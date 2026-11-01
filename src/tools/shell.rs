@@ -27,6 +27,11 @@ impl Tool for ShellTool {
         "shell"
     }
 
+    /// Risk class (ADR 0011): Runs arbitrary commands with host permissions.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::Exec
+    }
+
     fn description(&self) -> &str {
         "Execute a shell command. Returns stdout and stderr. Use with caution."
     }

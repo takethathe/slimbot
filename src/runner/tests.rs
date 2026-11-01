@@ -77,6 +77,10 @@ impl Tool for MockEchoTool {
         &self.name
     }
 
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         "A mock tool for testing"
     }
@@ -102,6 +106,10 @@ struct TurnCaptureTool {
 impl Tool for TurnCaptureTool {
     fn name(&self) -> &str {
         "capture"
+    }
+
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
     }
     fn description(&self) -> &str {
         "capture turn context for tests"
@@ -181,6 +189,10 @@ impl Tool for MarkingTool {
         "marker"
     }
 
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
+    }
+
     fn description(&self) -> &str {
         "mark the turn as sent for tests"
     }
@@ -251,6 +263,10 @@ struct FailingTool;
 impl Tool for FailingTool {
     fn name(&self) -> &str {
         "fail_tool"
+    }
+
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
     }
 
     fn description(&self) -> &str {
@@ -1881,6 +1897,10 @@ impl CountingTool {
 impl Tool for CountingTool {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::ReadOnly
     }
 
     fn description(&self) -> &str {

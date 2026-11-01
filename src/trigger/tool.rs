@@ -171,6 +171,11 @@ impl Tool for TriggerSourceTool {
         "trigger_source"
     }
 
+    /// Risk class (ADR 0011): Writes trigger source definitions inside the workspace.
+    fn risk_level(&self) -> crate::approval::RiskLevel {
+        crate::approval::RiskLevel::WorkspaceWrite
+    }
+
     fn description(&self) -> &str {
         "Manage data sources for triggers. A source is a collector script that turns a channel (a file, an endpoint, a mailbox) into `{items: [...]}`. Actions: list, create, update, delete. `list` reports field names and types only, never sample values."
     }

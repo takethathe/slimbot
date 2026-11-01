@@ -15,7 +15,7 @@ fn test_default_config_structure() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -31,7 +31,7 @@ fn test_default_config_structure() {
 
     assert_eq!(config.agent.provider, "default");
     assert!(config.providers.contains_key("default"));
-    assert!(config.tools.is_empty());
+    assert!(config.tools.entries.is_empty());
     assert!(config.channels.is_empty());
 
     let provider = &config.providers["default"];
@@ -51,7 +51,7 @@ fn test_normalize_fills_empty_agent_provider() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -75,7 +75,7 @@ fn test_normalize_derives_url_from_base_url() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -107,7 +107,7 @@ fn test_normalize_preserves_existing_api_url() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -138,7 +138,7 @@ fn test_normalize_falls_back_to_default_url_when_no_base() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -169,7 +169,7 @@ fn test_normalize_trailing_slash_stripped_from_base_url() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -200,7 +200,7 @@ fn test_normalize_removes_empty_tools_and_channels() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -211,11 +211,11 @@ fn test_normalize_removes_empty_tools_and_channels() {
         triggers: Default::default(),
     };
 
-    config.tools.push(ToolEntry {
+    config.tools.entries.push(ToolEntry {
         name: String::new(),
         enabled: true,
     });
-    config.tools.push(ToolEntry {
+    config.tools.entries.push(ToolEntry {
         name: "valid".to_string(),
         enabled: true,
     });
@@ -229,8 +229,8 @@ fn test_normalize_removes_empty_tools_and_channels() {
 
     config.normalize();
 
-    assert_eq!(config.tools.len(), 1);
-    assert_eq!(config.tools[0].name, "valid");
+    assert_eq!(config.tools.entries.len(), 1);
+    assert_eq!(config.tools.entries[0].name, "valid");
     // Empty-named channels are removed during normalize
     assert!(!config.channels.contains_key(""));
 }
@@ -243,7 +243,7 @@ fn test_normalize_does_not_touch_api_key() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -269,7 +269,7 @@ fn test_normalize_max_iterations_and_timeout_via_clamp() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -301,7 +301,7 @@ fn test_write_default_config_creates_file() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -328,7 +328,7 @@ fn test_written_config_is_valid_json() {
         pressure: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
@@ -383,7 +383,7 @@ fn test_normalize_multiple_providers() {
             unknown: Default::default(),
         },
         providers,
-        tools: vec![],
+        tools: Default::default(),
         channels: HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,

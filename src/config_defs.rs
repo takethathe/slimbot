@@ -143,3 +143,80 @@ define_config! {
         backend: String = "markdown".to_string(), allowed(["markdown"]), desc: "Memory backend type (markdown | future: sqlite)",
     }
 }
+
+// ── `tools.approval` field metadata (hand-written) ──
+//
+// The approval policy lives in `src/approval/mod.rs` (it carries behavior:
+// levels, per-tool overrides, TTL). Only its editor metadata lives here, so the
+// WebUI can render one control per knob from `FieldMeta` alone. Field names are
+// dotted (`levels.exec`) because the nested levels map is flattened for editing.
+
+/// Editor metadata for the `tools.approval` section (ADR 0011).
+pub fn approval_field_metas() -> &'static [crate::config_macro::FieldMeta] {
+    use crate::config_macro::FieldMeta;
+
+    const LEVELS: &[&str] = &["allow", "ask", "deny"];
+    let level = |name: &'static str, default: &'static str, desc: &'static str| -> FieldMeta {
+        FieldMeta {
+            name,
+            path: "",
+            ty: "String",
+            default: serde_json::json!(default),
+            min: None,
+            max: None,
+            allowed: LEVELS,
+            desc,
+            secret: false,
+        }
+    };
+
+    Box::leak(Box::new([
+        level(
+            "levels.read_only",
+            "allow",
+            "Control level for read-only tools (file_reader, list_dir, grep, ...)",
+        ),
+        level(
+            "levels.workspace_write",
+            "allow",
+            "Control level for workspace writes (file_writer, file_editor, make_dir)",
+        ),
+        level(
+            "levels.exec",
+            "ask",
+            "Control level for command execution (`shell`)",
+        ),
+        level(
+            "levels.network_egress",
+            "allow",
+            "Control level for network fetches (`web_fetch`)",
+        ),
+        level(
+            "levels.external_send",
+            "ask",
+            "Control level for outbound sends (`message`, third-party writes)",
+        ),
+        FieldMeta {
+            name: "tools",
+            path: "",
+            ty: "json",
+            default: serde_json::json!({}),
+            min: None,
+            max: None,
+            allowed: &[],
+            desc: "Per-tool overrides, e.g. {\"shell\": \"ask\"}; a tool name wins over its risk level",
+            secret: false,
+        },
+        FieldMeta {
+            name: "timeout_seconds",
+            path: "",
+            ty: "u64",
+            default: serde_json::json!(1800),
+            min: Some(serde_json::json!(1)),
+            max: Some(serde_json::json!(86400)),
+            allowed: &[],
+            desc: "How long a pending approval stays redeemable (clamped to 24h)",
+            secret: false,
+        },
+    ]))
+}

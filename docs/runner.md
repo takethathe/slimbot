@@ -26,20 +26,24 @@ src/runner/
 
 | Phase | 触发时机 | 默认 Hook | 原逻辑 |
 |---|---|---|---|
-| PreTurn | 循环开始前 | `WriteUserMessageHook` | 写入用户消息 |
+| PreTurn | 循环开始前 | `ApprovalTurnStartHook` | 审批回合开启：TTL 过期结算 |
+| PreTurn | | `WriteUserMessageHook` | 写入用户消息 |
 | PreTurn | | `NotifyRunningHook` | TaskState::Running + TaskStarted 事件 |
 | PreChat | 每次 LLM 调用前 | `BuildContextHook` | ContextBuilder::build_messages() + PreIteration 事件 |
-| PreChat | | `GovernanceHook` | drop_orphan + backfill + microcompact + snip |
+| PreChat | | `GovernanceHook` | drop_orphan + backfill + microcompact + snip（pin 住待兑现审批） |
+| PreChat | | `ApprovalContextHook` | `merge_approval_rounds` 构建时变换 |
 | AfterChat | 每次 LLM 调用后 | `HandleResponseHook` | 检查 tool_calls，无则标记 should_exit + AssistantMessage 事件 |
 | AfterChat | | `PersistAssistantMsgHook` | 持久化 assistant 消息 + 更新 token ratio |
 | AfterChat | | `AccumulateUsageHook` | 累计 token 用量 |
 | PreTool | 每个 tool call 执行前 | `FireToolCallEventHook` | ToolCall 事件 |
+| PreTool | | `ApprovalHook` | 唯一审批决策点（Allow/Deny/Ask + 兑现） |
 | AfterTool | 每个 tool call 执行后 | `FireToolResultEventHook` | ToolResult 事件 |
 | AfterTool | | `ProcessToolResultHook` | ensure_nonempty + persist + truncate |
 | AfterTool | | `PersistToolMessageHook` | 持久化 tool 消息 |
 | PostIteration | 所有 tool call 完成后 | `FirePostIterationEventHook` | PostIteration 事件 |
 | AfterTurn | 循环退出后（无论成败） | `FireTaskCompletedHook` | 持久化/回滚 + TaskCompleted/TaskFailed 事件 |
-| AfterTurn | | `TriggerConsolidationHook` | 触发 consolidation |
+| AfterTurn | | `TriggerConsolidationHook` | 触发 consolidation（pin 住待兑现审批） |
+| AfterTurn | | `ApprovalTurnEndHook` | 审批回合收尾：清理未兑现的携入记录 |
 
 ### 流程控制
 
@@ -56,7 +60,7 @@ PreTool hook 特有：
 
 ### 上下文对象
 
-- **`RunSpec`**（不可变）：session_id、content、task_hook、max_iterations、max_tokens、cancel_token、workspace_dir、session_manager、tool_manager、config、memory_service、consolidator、initial_message_count、channel/chat_id、runtime_ctx
+- **`RunSpec`**（不可变）：session_id、content、task_hook、max_iterations、max_tokens、cancel_token、workspace_dir、session_manager、tool_manager、config、memory_service、consolidator、initial_message_count、channel/chat_id、runtime_ctx、approvals（进程级共享的待审批存储）
 - **`RunState`**（可变）：iterations、result、messages、tools、response、tool_results、turn_context、should_exit、rollback_to、extensions
 
 `RunState` 提供类型安全的扩展存储：`set_extension::<T>(key, value)` / `get_extension::<T>(key)`，用于跨 phase 传递自定义数据。
@@ -137,6 +141,46 @@ LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨�
 
 `HookRegistry` 的每个 `run_*` 方法在调用每个 hook 前检查 `cancel_token`，已取消则跳过后续 hook 返回 `HookRunError::Cancelled`。`run_after_turn` 不检查取消，始终执行（单个 hook 出错仅记录警告，不影响其余 hook）。
 
+## 审批生命周期（Approval）
+
+工具风险闸门只有一个执行点：`ApprovalHook`（PreTool）。三层职责严格分离——`RiskLevel`（工具的事实）→ control level（配置的策略）→ `ApprovalHook`（执行）。完整设计见 `docs/adr/0011-approval-by-turn-end-redemption.md`。
+
+### 三种决策
+
+| 决策 | 行为 | 回合 |
+|------|------|------|
+| `Allow` | 直接执行，不写任何记录 | 继续 |
+| `Deny` | 返回固定拒绝文案 + "不要换写法重试"的引导，run 继续 | 继续（由模型向用户解释） |
+| `Ask` | 中止本次调用，写入一条 pending 记录，注入引导 tool result | **结束**，以纯文本待确认清单作为 run 结果 |
+
+`Ask` 不阻塞回合：没有 `ask_user` / `confirm` 工具，也不存在挂起的 run 状态。清单只是一段文本（无按钮），模型下一轮重放同一个调用即兑现。
+
+### 兑现与作废
+
+- **兑现**：下一轮模型发出 `(tool, args_hash)` 都相同的调用 → 放行执行。执行前重新校验 risk 与 args_hash（fail-closed）。
+- **否决**：同工具但 args 不同 → 删除记录 + 固定拒绝文案（一次批准不能授权另一个操作）。
+- **滚动**：回合结束时清理的是"回合开始时已存在"的记录；**本回合内新产生的 `Ask` 滚动到下一轮**，否则确认轮里冒出的新动作永远等不到兑现。
+- **TTL**：默认 1800 秒（可配，上限 24 小时）。过期的记录在下一回合**开始时**作废，且不再出现在上下文里。
+- **重启**：pending 集合只在内存里（`ApprovalStore`），gateway 重启即清空，天然 fail-closed。
+- **无人值守**：`TurnKind` 为 `Cron` / `Heartbeat` / `Trigger` / `Subagent` 时，`Ask` 一律按 `Deny` 处理且**不写记录**——没有"下一轮"可以兑现它。
+
+### 会话历史的构建时变换
+
+`merge_approval_rounds`（`ApprovalContextHook`，PreChat）是纯函数式的构建时变换，**不重写 JSONL**（保持 append-only）：
+
+- 已兑现：保留第一轮 `assistant(tool_calls=[A])`，把确认轮的真实结果改挂到 A，删掉确认轮的 `assistant(tool_calls=[B])` 与 `user("确认")`——模型看到一轮完整跑完。逐条粒度，不是整轮粒度。
+- 未兑现：引导 tool result **改写为执行失败文案**而不是删除（否则留下没有结果的 `tool_call`，模型会当成被截断的调用而重试）。于是每个 `tool_call` 在历史里永远有一个真结果。
+- 幂等：重复执行结果一致，崩溃/重启安全。
+
+### 裁剪保护
+
+pending 记录存在期间，携带它的那个回合被 **pin 在历史尾部**：`GovernanceHook` 在 microcompact/snip 之前把它切出来、之后原样接回；`TriggerConsolidationHook` 通过 `maybe_consolidate_protecting` 把摘要边界收在该回合之前（整段被 pin 时本轮跳过摘要）。记录消失后回到普通裁剪范围。
+
+### 审计与补偿
+
+- 决策（`proposed` / `redeemed` / `expired` / `cleared` / `denied_by_policy`）写 **trace 的 `approval` span**，不写 session JSONL——对话历史会被裁剪，审计放在那里会跟着消失。
+- 兑现执行**前**先广播 `AgentEvent::ApprovalRedeemed`，owner 可在此期间 `/stop`；`ApprovalHook` 在广播后 `yield_now` 再检查取消，命中则整个 run `Abort`。
+
 ## 工具结果处理链
 
 每次工具执行后，结果依次经过以下处理（`ProcessToolResultHook`）：
@@ -208,5 +252,6 @@ ReAct 循环在关键节点通过 `TaskHook.fire_event()` 发出 `AgentEvent`，
 | `PostIteration` | 工具循环结束后（FirePostIterationEventHook） | session_id, iteration |
 | `TaskCompleted` | 循环成功完成（FireTaskCompletedHook） | session_id, result |
 | `TaskFailed` | 循环失败（FireTaskCompletedHook） | session_id, error |
+| `ApprovalRedeemed` | 审批兑现、工具真正执行前（ApprovalHook） | session_id, approval_id, tool, args, risk |
 
 事件通过 `broadcast::Sender<AgentEvent>` 广播到 `ChannelManager`，各 Channel 的 `write_event()` 方法负责将其送达客户端（WebUI 中通过 SSE 的 `agent_event` 事件类型）。
