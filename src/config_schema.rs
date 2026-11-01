@@ -753,8 +753,7 @@ fn set_gateway(
             config.gateway.heartbeat.interval_s = value_u64(value, "gateway.heartbeat.interval_s")?
         }
         ("heartbeat", "channel") => {
-            config.gateway.heartbeat.channel =
-                value_opt_str(value, "gateway.heartbeat.channel")?
+            config.gateway.heartbeat.channel = value_opt_str(value, "gateway.heartbeat.channel")?
         }
         ("heartbeat", "to") => {
             config.gateway.heartbeat.to = value_opt_str(value, "gateway.heartbeat.to")?

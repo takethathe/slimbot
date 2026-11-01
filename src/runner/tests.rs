@@ -3044,3 +3044,143 @@ async fn test_runner_root_span_error_on_cancelled_run() {
         Some(&serde_json::json!("cancelled"))
     );
 }
+
+// ---- run wall-clock deadline (ADR 0018) ----
+
+/// Provider that never answers: only the run deadline can end the turn.
+struct HangingProvider {
+    call_count: std::sync::atomic::AtomicU32,
+}
+
+impl HangingProvider {
+    fn new() -> Self {
+        Self {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn call_count(&self) -> u32 {
+        self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Provider for HangingProvider {
+    async fn chat(
+        &self,
+        _messages: &[&Message],
+        _tools: Option<&[ToolDefinition]>,
+        _recorder: Option<&dyn SpanRecorder>,
+    ) -> Result<LLMResponse> {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Longer than any deadline used by the tests, so only the deadline can
+        // end the turn.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        unreachable!("the run deadline must cut this call before it returns");
+    }
+}
+
+/// A runner whose `agent.timeout_seconds` is `timeout_seconds`.
+fn make_runner_with_run_deadline(
+    sm: SharedSessionManager,
+    tm: Arc<ToolManager>,
+    provider: Arc<dyn Provider>,
+    workspace_dir: PathBuf,
+    ms: Arc<tokio::sync::Mutex<MemoryService>>,
+    timeout_seconds: u64,
+) -> AgentRunner {
+    make_runner_with(sm, tm, provider, workspace_dir, ms, |b| {
+        b.config(AgentConfig {
+            provider: "test".to_string(),
+            max_iterations: 40,
+            timeout_seconds,
+            max_tool_result_chars: 8000,
+            persist_tool_results: false,
+            context_window_tokens: 32768,
+            unknown: Default::default(),
+        })
+    })
+}
+
+#[tokio::test]
+async fn test_run_exceeding_deadline_cancels_via_stop_path_and_rolls_back() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
+
+    // A turn that never finishes must not survive its messages.
+    sm.lock()
+        .await
+        .add_message("test-session", Message::user("prev".to_string()))
+        .await
+        .unwrap();
+    sm.lock()
+        .await
+        .add_message(
+            "test-session",
+            Message::assistant(Some("prev reply".to_string()), None, None, None),
+        )
+        .await
+        .unwrap();
+
+    let provider = Arc::new(HangingProvider::new());
+    let runner = make_runner_with_run_deadline(sm.clone(), tm, provider.clone(), wd, ms, 1);
+
+    let (event_tx, mut event_rx) = broadcast::channel::<AgentEvent>(16);
+    let hook = TaskHook::new("test-session").with_events(event_tx);
+    let cancel = CancellationToken::new();
+
+    let result = runner
+        .run(
+            "hang please".to_string(),
+            hook,
+            "test-session",
+            None,
+            Some(cancel.clone()),
+            None,
+            None,
+        )
+        .await;
+
+    assert!(!result.success, "an expired deadline must fail the run");
+    assert!(
+        result.content.contains("deadline"),
+        "the failure must name the deadline, got: {}",
+        result.content
+    );
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "the stuck call was attempted once"
+    );
+
+    // Reuses the /stop path: after-turn rollback still runs, so the turn leaves
+    // no half-written messages behind.
+    let msgs = sm.lock().await.get_messages("test-session").await;
+    assert_eq!(
+        msgs.len(),
+        2,
+        "rollback must restore the pre-turn message count, got {}",
+        msgs.len()
+    );
+
+    // The failure is reported through the normal after-turn event path.
+    let mut failed = None;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::TaskFailed { error, .. } = event {
+            failed = Some(error);
+        }
+    }
+    let failed = failed.expect("a failed run must emit TaskFailed");
+    assert!(
+        failed.contains("deadline"),
+        "TaskFailed must carry the deadline error, got: {failed}"
+    );
+
+    // The deadline cancels this run only: the session-wide /stop token stays
+    // usable so queued sibling turns of the same session are not collateral.
+    assert!(
+        !cancel.is_cancelled(),
+        "the deadline must not cancel the session-wide cancellation token"
+    );
+}

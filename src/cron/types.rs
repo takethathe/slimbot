@@ -11,6 +11,9 @@ pub enum CronSchedule {
     },
     Cron {
         expr: String,
+        /// Accepted for compatibility but **inert**: every schedule is read on
+        /// the machine's local clock, so a named timezone is never applied
+        /// (ADR 0018, no `chrono-tz` dependency).
         #[serde(default)]
         tz: Option<String>,
     },

@@ -5,7 +5,7 @@ define_config! {
     "agent" => AgentConfig {
         provider: String = "".to_string(), str_max(64), desc: "References a provider name in providers map",
         max_iterations: u32 = 40, range(1, 200), desc: "Max agent loop iterations before termination",
-        timeout_seconds: u64 = 120, range(1, 600), desc: "Per-request timeout in seconds",
+        timeout_seconds: u64 = 120, range(1, 600), desc: "Whole-run wall-clock deadline in seconds",
         max_tool_result_chars: u32 = 8000, range(100, 100_000), desc: "Max characters for tool result before truncation",
         persist_tool_results: bool = true, none, desc: "Whether to persist oversized tool results to disk",
         context_window_tokens: u32 = 32768, range(1024, 200_000), desc: "LLM context window size in tokens",

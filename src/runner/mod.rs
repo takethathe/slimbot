@@ -400,13 +400,23 @@ impl AgentRunner {
         // This ensures the timestamp doesn't change between iterations within the same turn.
         let runtime_ctx = crate::context::build_runtime_context(&tool_channel, &tool_chat_id);
 
+        // Derive a per-run cancellation token. The run still observes the
+        // caller's `/stop` cancellation (a child is cancelled with its parent),
+        // but cancelling this token — which the run deadline does — never touches
+        // the session-wide token that queued sibling turns of the same session
+        // hold, so one stuck turn cannot cancel its neighbours.
+        let run_cancel_token = match cancel_token.as_ref() {
+            Some(outer) => outer.child_token(),
+            None => CancellationToken::new(),
+        };
+
         let spec = RunSpec {
             session_id: session_id.to_string(),
             content,
             task_hook: hook,
             max_iterations: self.config.max_iterations,
             max_tokens: self.max_tokens,
-            cancel_token,
+            cancel_token: Some(run_cancel_token),
             workspace_dir: self.workspace_dir.clone(),
             session_manager: self.session_manager.clone(),
             tool_manager: self.tool_manager.clone(),
@@ -434,280 +444,334 @@ impl AgentRunner {
 
             let mut state = RunState::new(turn.clone());
 
-            // PreTurn hooks: write the user message and notify the running state.
-            // On abort/error/cancel the entire loop is skipped and we jump to AfterTurn.
-            let pre_turn_ok = match self.hooks.run_pre_turn(&spec, &mut state).await {
-                Ok(HookAction::Continue) => true,
-                Ok(HookAction::Abort { reason }) => {
-                    state.fail(reason);
-                    false
-                }
-                Err(HookRunError::Cancelled) => {
-                    state.fail("Task cancelled.".to_string());
-                    state.rollback_to = Some(spec.initial_message_count);
-                    false
-                }
-                Err(HookRunError::Hook(e)) => {
-                    state.fail(e.to_string());
-                    false
-                }
-            };
-
-            if pre_turn_ok {
-                'outer: loop {
-                // Exceeded max iterations.
-                if state.iterations >= spec.max_iterations {
-                    let err_msg = format!("Reached max iterations {}", spec.max_iterations);
-                    warn_log!("[AgentRunner] {}", err_msg);
-                    state.fail(err_msg);
-                    break;
-                }
-
-                // Iteration span wrapping the chat call + tool loop.
-                let iteration_span = if let Some(root) = &root_span {
-                    let span = self.start_span(Some(&root.context()), "iteration");
-                    span.set_attribute("iteration", serde_json::json!(state.iterations + 1));
-                    Some(span)
-                } else {
-                    None
-                };
-
-                // PreChat hooks: build context and apply governance.
-                match self.hooks.run_pre_chat(&spec, &mut state).await {
-                    Ok(HookAction::Continue) => {}
+            // A whole run is bounded by a wall-clock deadline
+            // (`agent.timeout_seconds`), so a stuck provider or tool call can no
+            // longer hang the turn forever. Only the run body is wrapped: the
+            // AfterTurn phase below stays outside so rollback/consolidation still
+            // happen when the deadline fires.
+            let deadline_secs = self.config.timeout_seconds;
+            let body = async {
+                // PreTurn hooks: write the user message and notify the running state.
+                // On abort/error/cancel the entire loop is skipped and we jump to AfterTurn.
+                let pre_turn_ok = match self.hooks.run_pre_turn(&spec, &mut state).await {
+                    Ok(HookAction::Continue) => true,
                     Ok(HookAction::Abort { reason }) => {
                         state.fail(reason);
-                        break;
+                        false
                     }
                     Err(HookRunError::Cancelled) => {
                         state.fail("Task cancelled.".to_string());
                         state.rollback_to = Some(spec.initial_message_count);
-                        break;
+                        false
                     }
                     Err(HookRunError::Hook(e)) => {
                         state.fail(e.to_string());
-                        break;
+                        false
                     }
-                }
+                };
 
-                // Request model. Cancellation may arrive after the last PreChat
-                // hook; check here so a cancelled run skips the LLM call and
-                // rolls back instead of firing a wasted request.
-                if spec.is_cancelled() {
-                    state.fail("Task cancelled.".to_string());
-                    state.rollback_to = Some(spec.initial_message_count);
-                    break;
-                }
-                debug!("[AgentRunner] Sending chat request to provider");
-                let messages_ref: Vec<&Message> = state.messages.iter().collect();
-
-                // chat span: an inference call. The provider records request
-                // details (provider/model/body) through the recorder, the runner
-                // records usage and the outcome afterwards.
-                let chat_span = iteration_span.as_ref().map(|iteration| {
-                    let span = self.start_span(Some(&iteration.context()), "chat");
-                    span.set_attribute("gen_ai.operation.name", serde_json::json!("chat"));
-                    span.set_attribute(
-                        "gen_ai.request.max_tokens",
-                        serde_json::json!(self.max_tokens),
-                    );
-                    span
-                });
-                let recorder: Option<&dyn SpanRecorder> =
-                    chat_span.as_ref().map(|s| s as &dyn SpanRecorder);
-                let response = match self
-                    .provider
-                    .chat(&messages_ref, state.tools.as_deref(), recorder)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        if let Some(span) = &chat_span {
-                            span.set_attribute("error.type", serde_json::json!("provider_error"));
-                            span.set_status(SpanStatus::Error(e.to_string()));
+                if pre_turn_ok {
+                    'outer: loop {
+                        // Exceeded max iterations.
+                        if state.iterations >= spec.max_iterations {
+                            let err_msg = format!("Reached max iterations {}", spec.max_iterations);
+                            warn_log!("[AgentRunner] {}", err_msg);
+                            state.fail(err_msg);
+                            break;
                         }
-                        let err_msg = format!("LLM API request failed - {}", e);
-                        warn_log!("[AgentRunner] {}", err_msg);
-                        state.fail(err_msg);
-                        state.rollback_to = Some(spec.initial_message_count);
-                        break;
-                    }
-                };
-                if let Some(span) = &chat_span {
-                    span.set_attribute(
-                        "gen_ai.usage.input_tokens",
-                        serde_json::json!(response.usage.prompt_tokens),
-                    );
-                    span.set_attribute(
-                        "gen_ai.usage.output_tokens",
-                        serde_json::json!(response.usage.completion_tokens),
-                    );
-                    span.set_attribute(
-                        "gen_ai.usage.cache_read.input_tokens",
-                        serde_json::json!(response.usage.prompt_cache_hit_tokens),
-                    );
-                    span.set_attribute(
-                        "gen_ai.response.finish_reasons",
-                        serde_json::json!([response.finish_reason.to_string()]),
-                    );
-                    if let Some(content) = &response.content {
-                        span.set_attribute(
-                            "gen_ai.response.content",
-                            serde_json::json!(content),
-                        );
-                    }
-                }
-                debug!(
-                    "[AgentRunner] Got response: content_len={}, tool_calls={}, prompt_tokens={}, cached_tokens={}, completion_tokens={}, total_tokens={}",
-                    response.content.as_ref().map(|s| s.len()).unwrap_or(0),
-                    response.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0),
-                    response.usage.prompt_tokens,
-                    response.usage.prompt_cache_hit_tokens,
-                    response.usage.completion_tokens,
-                    response.usage.total_tokens,
-                );
-                state.response = Some(response);
 
-                // AfterChat hooks: inspect response, persist assistant message, accumulate usage.
-                match self.hooks.run_after_chat(&spec, &mut state).await {
-                    Ok(HookAction::Continue) => {}
-                    Ok(HookAction::Abort { reason }) => {
-                        state.fail(reason);
-                        break;
-                    }
-                    Err(HookRunError::Cancelled) => {
-                        state.fail("Task cancelled.".to_string());
-                        state.rollback_to = Some(spec.initial_message_count);
-                        break;
-                    }
-                    Err(HookRunError::Hook(e)) => {
-                        state.fail(e.to_string());
-                        break;
-                    }
-                }
-                if state.should_exit {
-                    break;
-                }
+                        // Iteration span wrapping the chat call + tool loop.
+                        let iteration_span = if let Some(root) = &root_span {
+                            let span = self.start_span(Some(&root.context()), "iteration");
+                            span.set_attribute(
+                                "iteration",
+                                serde_json::json!(state.iterations + 1),
+                            );
+                            Some(span)
+                        } else {
+                            None
+                        };
 
-                // Execute tool calls.
-                let calls = state
-                    .response
-                    .as_ref()
-                    .and_then(|r| r.tool_calls.clone())
-                    .unwrap_or_default();
-                for call in &calls {
-                    debug!("[tool_call] name={}, args={}", call.name, call.args);
-                    // execute_tool span carrying the call id, arguments and (on
-                    // failure) the error, keyed under the iteration span.
-                    let tool_span = if let Some(iteration) = &iteration_span {
-                        let span = self.start_span(
-                            Some(&iteration.context()),
-                            &format!("execute_tool {}", call.name),
-                        );
-                        span.set_attribute(
-                            "gen_ai.operation.name",
-                            serde_json::json!("execute_tool"),
-                        );
-                        span.set_attribute("gen_ai.tool.name", serde_json::json!(call.name));
-                        span.set_attribute("gen_ai.agent.name", serde_json::json!(AGENT_NAME));
-                        span.set_attribute("gen_ai.tool.call.id", serde_json::json!(call.id));
-                        span.set_attribute(
-                            "gen_ai.tool.call.arguments",
-                            serde_json::json!(truncate_chars(
-                                &serde_json::to_string(&call.args).unwrap_or_default(),
-                                ARGS_MAX_CHARS,
-                            )),
-                        );
-                        Some(span)
-                    } else {
-                        None
-                    };
-                    let action = match self.hooks.run_pre_tool(&spec, &mut state, call).await {
-                        Ok(a) => a,
-                        Err(HookRunError::Cancelled) => {
+                        // PreChat hooks: build context and apply governance.
+                        match self.hooks.run_pre_chat(&spec, &mut state).await {
+                            Ok(HookAction::Continue) => {}
+                            Ok(HookAction::Abort { reason }) => {
+                                state.fail(reason);
+                                break;
+                            }
+                            Err(HookRunError::Cancelled) => {
+                                state.fail("Task cancelled.".to_string());
+                                state.rollback_to = Some(spec.initial_message_count);
+                                break;
+                            }
+                            Err(HookRunError::Hook(e)) => {
+                                state.fail(e.to_string());
+                                break;
+                            }
+                        }
+
+                        // Request model. Cancellation may arrive after the last PreChat
+                        // hook; check here so a cancelled run skips the LLM call and
+                        // rolls back instead of firing a wasted request.
+                        if spec.is_cancelled() {
                             state.fail("Task cancelled.".to_string());
                             state.rollback_to = Some(spec.initial_message_count);
-                            break 'outer;
+                            break;
                         }
-                        Err(HookRunError::Hook(e)) => {
-                            state.fail(e.to_string());
-                            break 'outer;
+                        debug!("[AgentRunner] Sending chat request to provider");
+                        let messages_ref: Vec<&Message> = state.messages.iter().collect();
+
+                        // chat span: an inference call. The provider records request
+                        // details (provider/model/body) through the recorder, the runner
+                        // records usage and the outcome afterwards.
+                        let chat_span = iteration_span.as_ref().map(|iteration| {
+                            let span = self.start_span(Some(&iteration.context()), "chat");
+                            span.set_attribute("gen_ai.operation.name", serde_json::json!("chat"));
+                            span.set_attribute(
+                                "gen_ai.request.max_tokens",
+                                serde_json::json!(self.max_tokens),
+                            );
+                            span
+                        });
+                        let recorder: Option<&dyn SpanRecorder> =
+                            chat_span.as_ref().map(|s| s as &dyn SpanRecorder);
+                        let response = match self
+                            .provider
+                            .chat(&messages_ref, state.tools.as_deref(), recorder)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if let Some(span) = &chat_span {
+                                    span.set_attribute(
+                                        "error.type",
+                                        serde_json::json!("provider_error"),
+                                    );
+                                    span.set_status(SpanStatus::Error(e.to_string()));
+                                }
+                                let err_msg = format!("LLM API request failed - {}", e);
+                                warn_log!("[AgentRunner] {}", err_msg);
+                                state.fail(err_msg);
+                                state.rollback_to = Some(spec.initial_message_count);
+                                break;
+                            }
+                        };
+                        if let Some(span) = &chat_span {
+                            span.set_attribute(
+                                "gen_ai.usage.input_tokens",
+                                serde_json::json!(response.usage.prompt_tokens),
+                            );
+                            span.set_attribute(
+                                "gen_ai.usage.output_tokens",
+                                serde_json::json!(response.usage.completion_tokens),
+                            );
+                            span.set_attribute(
+                                "gen_ai.usage.cache_read.input_tokens",
+                                serde_json::json!(response.usage.prompt_cache_hit_tokens),
+                            );
+                            span.set_attribute(
+                                "gen_ai.response.finish_reasons",
+                                serde_json::json!([response.finish_reason.to_string()]),
+                            );
+                            if let Some(content) = &response.content {
+                                span.set_attribute(
+                                    "gen_ai.response.content",
+                                    serde_json::json!(content),
+                                );
+                            }
                         }
-                    };
-                    let raw_result = match action {
-                        ToolHookAction::Execute => {
-                            match self
-                                .tool_manager
-                                .execute(&call.name, call.args.clone())
+                        debug!(
+                            "[AgentRunner] Got response: content_len={}, tool_calls={}, prompt_tokens={}, cached_tokens={}, completion_tokens={}, total_tokens={}",
+                            response.content.as_ref().map(|s| s.len()).unwrap_or(0),
+                            response.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0),
+                            response.usage.prompt_tokens,
+                            response.usage.prompt_cache_hit_tokens,
+                            response.usage.completion_tokens,
+                            response.usage.total_tokens,
+                        );
+                        state.response = Some(response);
+
+                        // AfterChat hooks: inspect response, persist assistant
+                        // message, accumulate usage.
+                        match self.hooks.run_after_chat(&spec, &mut state).await {
+                            Ok(HookAction::Continue) => {}
+                            Ok(HookAction::Abort { reason }) => {
+                                state.fail(reason);
+                                break;
+                            }
+                            Err(HookRunError::Cancelled) => {
+                                state.fail("Task cancelled.".to_string());
+                                state.rollback_to = Some(spec.initial_message_count);
+                                break;
+                            }
+                            Err(HookRunError::Hook(e)) => {
+                                state.fail(e.to_string());
+                                break;
+                            }
+                        }
+                        if state.should_exit {
+                            break;
+                        }
+
+                        // Execute tool calls.
+                        let calls = state
+                            .response
+                            .as_ref()
+                            .and_then(|r| r.tool_calls.clone())
+                            .unwrap_or_default();
+                        for call in &calls {
+                            debug!("[tool_call] name={}, args={}", call.name, call.args);
+                            // execute_tool span carrying the call id, arguments and (on
+                            // failure) the error, keyed under the iteration span.
+                            let tool_span = if let Some(iteration) = &iteration_span {
+                                let span = self.start_span(
+                                    Some(&iteration.context()),
+                                    &format!("execute_tool {}", call.name),
+                                );
+                                span.set_attribute(
+                                    "gen_ai.operation.name",
+                                    serde_json::json!("execute_tool"),
+                                );
+                                span.set_attribute(
+                                    "gen_ai.tool.name",
+                                    serde_json::json!(call.name),
+                                );
+                                span.set_attribute(
+                                    "gen_ai.agent.name",
+                                    serde_json::json!(AGENT_NAME),
+                                );
+                                span.set_attribute(
+                                    "gen_ai.tool.call.id",
+                                    serde_json::json!(call.id),
+                                );
+                                span.set_attribute(
+                                    "gen_ai.tool.call.arguments",
+                                    serde_json::json!(truncate_chars(
+                                        &serde_json::to_string(&call.args).unwrap_or_default(),
+                                        ARGS_MAX_CHARS,
+                                    )),
+                                );
+                                Some(span)
+                            } else {
+                                None
+                            };
+                            let action = match self
+                                .hooks
+                                .run_pre_tool(&spec, &mut state, call)
                                 .await
                             {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    if let Some(span) = &tool_span {
-                                        span.set_attribute(
-                                            "error.type",
-                                            serde_json::json!("tool_error"),
-                                        );
-                                        span.set_status(SpanStatus::Error(truncate_chars(
-                                            &e.to_string(),
-                                            ERROR_MAX_CHARS,
-                                        )));
+                                Ok(a) => a,
+                                Err(HookRunError::Cancelled) => {
+                                    state.fail("Task cancelled.".to_string());
+                                    state.rollback_to = Some(spec.initial_message_count);
+                                    break 'outer;
+                                }
+                                Err(HookRunError::Hook(e)) => {
+                                    state.fail(e.to_string());
+                                    break 'outer;
+                                }
+                            };
+                            let raw_result = match action {
+                                ToolHookAction::Execute => {
+                                    match self
+                                        .tool_manager
+                                        .execute(&call.name, call.args.clone())
+                                        .await
+                                    {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            if let Some(span) = &tool_span {
+                                                span.set_attribute(
+                                                    "error.type",
+                                                    serde_json::json!("tool_error"),
+                                                );
+                                                span.set_status(SpanStatus::Error(truncate_chars(
+                                                    &e.to_string(),
+                                                    ERROR_MAX_CHARS,
+                                                )));
+                                            }
+                                            format_tool_error(&e.to_string())
+                                        }
                                     }
-                                    format_tool_error(&e.to_string())
+                                }
+                                ToolHookAction::Skip { result } => result,
+                                ToolHookAction::Abort { reason } => {
+                                    state.fail(reason);
+                                    break 'outer;
+                                }
+                            };
+
+                            match self
+                                .hooks
+                                .run_after_tool(&spec, &mut state, call, &raw_result)
+                                .await
+                            {
+                                Ok(HookAction::Continue) => {}
+                                Ok(HookAction::Abort { reason }) => {
+                                    state.fail(reason);
+                                    break 'outer;
+                                }
+                                Err(HookRunError::Cancelled) => {
+                                    state.fail("Task cancelled.".to_string());
+                                    state.rollback_to = Some(spec.initial_message_count);
+                                    break 'outer;
+                                }
+                                Err(HookRunError::Hook(e)) => {
+                                    state.fail(e.to_string());
+                                    break 'outer;
                                 }
                             }
                         }
-                        ToolHookAction::Skip { result } => result,
-                        ToolHookAction::Abort { reason } => {
-                            state.fail(reason);
-                            break 'outer;
-                        }
-                    };
 
-                    match self
-                        .hooks
-                        .run_after_tool(&spec, &mut state, call, &raw_result)
-                        .await
-                    {
-                        Ok(HookAction::Continue) => {}
-                        Ok(HookAction::Abort { reason }) => {
-                            state.fail(reason);
-                            break 'outer;
+                        // PostIteration hooks: fire the PostIteration event.
+                        match self.hooks.run_post_iteration(&spec, &mut state).await {
+                            Ok(HookAction::Continue) => {}
+                            Ok(HookAction::Abort { reason }) => {
+                                state.fail(reason);
+                                break;
+                            }
+                            Err(HookRunError::Cancelled) => {
+                                state.fail("Task cancelled.".to_string());
+                                state.rollback_to = Some(spec.initial_message_count);
+                                break;
+                            }
+                            Err(HookRunError::Hook(e)) => {
+                                state.fail(e.to_string());
+                                break;
+                            }
                         }
-                        Err(HookRunError::Cancelled) => {
-                            state.fail("Task cancelled.".to_string());
-                            state.rollback_to = Some(spec.initial_message_count);
-                            break 'outer;
-                        }
-                        Err(HookRunError::Hook(e)) => {
-                            state.fail(e.to_string());
-                            break 'outer;
-                        }
+                        state.iterations += 1;
+                        spec.task_hook.notify_status_change(&TaskState::Running {
+                            current_iteration: state.iterations,
+                        });
                     }
                 }
+            };
+            let deadline_expired = if deadline_secs == 0 {
+                body.await;
+                false
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(deadline_secs), body)
+                    .await
+                    .is_err()
+            };
 
-                // PostIteration hooks: fire the PostIteration event.
-                match self.hooks.run_post_iteration(&spec, &mut state).await {
-                    Ok(HookAction::Continue) => {}
-                    Ok(HookAction::Abort { reason }) => {
-                        state.fail(reason);
-                        break;
-                    }
-                    Err(HookRunError::Cancelled) => {
-                        state.fail("Task cancelled.".to_string());
-                        state.rollback_to = Some(spec.initial_message_count);
-                        break;
-                    }
-                    Err(HookRunError::Hook(e)) => {
-                        state.fail(e.to_string());
-                        break;
-                    }
+            if deadline_expired {
+                // Expiry reuses the `/stop` cancellation path: cancel this run's
+                // token and roll the turn back, so AfterTurn below persists or
+                // consolidates exactly as it does for a user `/stop`.
+                warn_log!(
+                    "[AgentRunner] run deadline of {}s exceeded (session={}); cancelling",
+                    deadline_secs,
+                    session_id
+                );
+                if let Some(ct) = spec.cancel_token.as_ref() {
+                    ct.cancel();
                 }
-                state.iterations += 1;
-                spec.task_hook.notify_status_change(&TaskState::Running {
-                    current_iteration: state.iterations,
-                });
-            }
+                state.fail(format!(
+                    "Task cancelled: run deadline of {deadline_secs}s exceeded."
+                ));
+                state.rollback_to = Some(spec.initial_message_count);
             }
 
             // AfterTurn hooks: persist/rollback + fire completed/failed + consolidate.

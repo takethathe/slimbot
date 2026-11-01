@@ -57,10 +57,10 @@
 
 决策见票 11 + `docs/adr/0018`。姿态 = 复用既有机件补齐可预期性，不多造（无预算硬上限/无 /health/无 metrics/无补跑）。
 
-- [ ] **run 级挂钟 deadline** — 给 `AgentRunner::run()` 套 `tokio::time::timeout(agent.timeout_seconds)`，超时**走现成 CancellationToken 取消路径**（AfterTurn 回滚/consolidate 照常收尾）；`timeout_seconds` 从此被真正执行
+- [x] **run 级挂钟 deadline** — 给 `AgentRunner::run()` 套 `tokio::time::timeout(agent.timeout_seconds)`，超时**走现成 CancellationToken 取消路径**（AfterTurn 回滚/consolidate 照常收尾）；`timeout_seconds` 从此被真正执行（票 18 落地：只包 PreTurn+循环，AfterTurn 在 timeout 之外收尾；run 级 token = 派生的 child token，不误伤同会话排队任务）
 - [ ] **provider 超时入配置** — `openai.rs` 写死的 reqwest `.timeout(180s)` 改为 `ProviderConfig` 派生字段
-- [ ] **调度时区统一 Local** — `cron/service.rs::compute_next_cron` 从 `chrono::Utc` 改 `chrono::Local`，与 trigger 层 + `at` 解析对齐；不引 chrono-tz；`tz` 字段保留不参与计算（标注不生效）
-- [ ] **错过窗口记 skipped** — 过期 `At` 从“返回 None 静默禁用”改为显式写 `skipped` 状态进 run_history（不补跑）；`Every`/`Cron` 重算下一次保持现状
+- [x] **调度时区统一 Local** — `cron/service.rs::compute_next_cron` 从 `chrono::Utc` 改 `chrono::Local`，与 trigger 层 + `at` 解析对齐；不引 chrono-tz；`tz` 字段保留不参与计算（标注不生效）（票 18 落地：两路同锚点同值由 `test_cron_expression_resolves_same_wall_time_across_paths` 锁定，`tz` inert 另有测试，见 `docs/cron.md`）
+- [x] **错过窗口记 skipped** — 过期 `At` 从“返回 None 静默禁用”改为显式写 `skipped` 状态进 run_history（不补跑）；`Every`/`Cron` 重算下一次保持现状（票 18 落地：宽限 `ONE_SHOT_GRACE_MS = 5min`，`add_job`/`start`/`tick` 三个入口同一判定，作业停用但保留为审计痕迹）
 - [ ] **provider 瞬时错退避重试** — 只对 429（带 `Retry-After`）/5xx/连接超时有限次（2–3）指数退避重试；无 fallback provider；工具不框架重试（现状保持）
 - [ ] **provider 错误分类与投递** — 把 `bail!("API request failed: {status}-{body}")` 拆成按 `error.code`/`type` 分类；鉴权/计费/配额类不重试、本轮失败、**把 provider 原话提炼成通知经票 10 投递给 owner**；`context_length_exceeded` 交票 15；**只提结构化 code/message、响应体不落 session/日志**；重复硬错复用 trigger 告警合并
 - [ ] **验收** — 超 deadline 会话不半截；同一 cron 表达式两路解析同值；过期 At 记 skipped 可见；401/配额不重试且原话递 owner、日志无响应体明文；OTel trace 经 config 指向 collector 可查；无 /health/metrics

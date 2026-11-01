@@ -125,6 +125,8 @@ pub async fn run(&self, content, hook, session_id, _channel_inject, cancel_token
 7. 循环退出后 `run_after_turn()`（**始终执行**，即使取消或出错）
 8. `finalize()` 设置 `message_sent` 并返回
 
+> **run 级 deadline**：步骤 6 整个（PreTurn + 循环）被包在 `tokio::time::timeout(agent.timeout_seconds)` 里，到期走取消路径（见下文「超时处理」）；步骤 7–8 在 timeout 之外，所以超时也一定收尾。
+
 LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨架层处理，通过 `state.fail()` / `state.rollback_to` 传递，由 AfterTurn 的 `FireTaskCompletedHook` 统一执行持久化（或回滚）+ 完成/失败事件。
 
 > **PreTurn abort**：PreTurn hook 返回 `Abort`/错误/取消时，整个循环被跳过（不调用 provider），直接进入 AfterTurn。
@@ -163,6 +165,7 @@ LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨�
 | 模型返回无 tool_calls | `Completed` | 回复文本 |
 | hook 返回 `Abort` | `Failed` | abort reason |
 | LLM 调用错误 | `Failed`（回滚） | `"LLM API request failed - ..."` |
+| 超出 `agent.timeout_seconds` | `Failed`（回滚） | `"Task cancelled: run deadline of Ns exceeded."` |
 | 取消 | `Failed`（回滚） | `"Task cancelled."` |
 
 ## 并发安全
@@ -172,9 +175,18 @@ LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨�
 - `TaskHook.notify_status_change()` 使用 `try_send`，不会阻塞
 - `TurnContext` 通过 task-local 隔离，并发 run 互不干扰
 
-## 超时处理
+## 超时处理（run 级挂钟 deadline）
 
-`AgentConfig.timeout_seconds` 字段定义了每轮 Agent 的超时时间，但实际的超时控制应在 `AgentRunner.run()` 的调用层（通过 `tokio::time::timeout`）实现。当前实现依赖 `max_iterations` 作为内置的保护机制。
+`AgentConfig.timeout_seconds`（默认 120s，钳制 1–600）被真正执行：`run()` 把 **PreTurn + ReAct 循环**整体包进 `tokio::time::timeout(...)`。
+
+- 到期即**复用 `/stop` 取消路径**：取消本次 run 的 `CancellationToken`，`state.fail("Task cancelled: run deadline of Ns exceeded.")`，`rollback_to = initial_message_count`，然后 AfterTurn 照常跑（回滚会话、发 `TaskFailed`、必要时 consolidate）。
+- **只包 body**：AfterTurn（`FireTaskCompletedHook` / `TriggerConsolidationHook`）在 timeout 之外，所以超时也一定收尾，不会留下半截会话。
+- **run 级 token 是派生的 child token**：run 仍能观察到调用方的 `/stop` 取消（child 跟随 parent），但 deadline 取消的只是本次 run，不会误伤同一会话排队的其它任务。
+- `timeout_seconds = 0` 视为不设 deadline（配置钳制后不会出现，仅作为防御）。
+- 部分进度不丢：`state` 由 `run()` 持有（timeout 只丢弃 body 的 future），已累计的 iteration / usage 仍会记到 root span；`error.type` 沿用取消分类（`cancelled`）。
+- 子代理运行走同一个 `run()`，所以也受 `agent.timeout_seconds` 约束；agent 定义里的 `timeout_secs`（默认 600）仍是外层硬上限，两者取先到者。
+
+`max_iterations` 仍是另一道内置保护：它与 deadline 互补（一个限制轮数、一个限制挂钟）。
 
 ## Consolidation 集成
 

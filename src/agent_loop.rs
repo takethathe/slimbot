@@ -432,9 +432,7 @@ impl AgentLoop {
         );
 
         Ok(Self {
-            owner_primary: Arc::new(crate::delivery::OwnerPrimaryStore::load(
-                paths.data_dir(),
-            )),
+            owner_primary: Arc::new(crate::delivery::OwnerPrimaryStore::load(paths.data_dir())),
             config,
             workspace_dir: paths.workspace_dir().to_path_buf(),
             provider,

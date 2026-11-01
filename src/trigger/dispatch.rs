@@ -552,8 +552,7 @@ impl Dispatcher {
             None,
         )
         .target()
-        .map(|target| target.session_id())
-        else {
+        .map(|target| target.session_id()) else {
             crate::warn_log!(
                 "[trigger] alert for rule {} has no conversation to tell",
                 alert.id

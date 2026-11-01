@@ -174,6 +174,8 @@ SlimBot 的工具分四组：
 **行为：**
 - `every_seconds`、`cron_expr`、`at` 三选一
 - `at` 类型任务在执行后自动禁用
+- `cron_expr` 按**本机本地时间**解析（与触发器同一把表，见 [cron.md](cron.md)）；入参里的 `tz` 即使传了也不生效
+- 已过期的一次性任务（错过窗口超过 5 分钟：创建即过期、或停机期间错过）记为 `skipped` 并禁用，**不补跑**
 - 任务持久化到 `workspace/cron/jobs.json`
 - 不允许在 cron 任务执行内部再创建新 cron 任务（防止无限循环）
 

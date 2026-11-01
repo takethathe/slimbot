@@ -229,7 +229,10 @@ mod tests {
         // being misdelivered to the owner's primary channel.
         let unreachable_origin = DeliveryTarget::from_session_id("webui:");
         assert_eq!(unreachable_origin, None);
-        assert_eq!(resolve_target(None, unreachable_origin, None), Resolution::Nowhere);
+        assert_eq!(
+            resolve_target(None, unreachable_origin, None),
+            Resolution::Nowhere
+        );
     }
 
     #[test]
@@ -264,10 +267,7 @@ mod tests {
     #[test]
     fn test_heartbeat_target_prefers_config_override() {
         assert_eq!(
-            heartbeat_target(
-                Some(target("webui", "ops")),
-                Some(target("webui", "main"))
-            ),
+            heartbeat_target(Some(target("webui", "ops")), Some(target("webui", "main"))),
             Resolution::Deliver(target("webui", "ops"))
         );
     }
@@ -290,7 +290,11 @@ mod tests {
     #[test]
     fn test_cron_target_uses_the_creating_conversation() {
         assert_eq!(
-            cron_target(Some("webui"), Some("main"), Some(target("feishu", "oc_owner"))),
+            cron_target(
+                Some("webui"),
+                Some("main"),
+                Some(target("feishu", "oc_owner"))
+            ),
             Resolution::Deliver(target("webui", "main"))
         );
     }

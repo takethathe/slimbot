@@ -10,7 +10,9 @@ pub struct CronTool {
     cron_service: Arc<CronService>,
 }
 
-/// Parse an `at` datetime string into a UTC epoch millisecond timestamp.
+/// Parse an `at` datetime string into an epoch millisecond timestamp.
+/// A string without an explicit offset is read on the local clock, like every
+/// other schedule input.
 /// Returns `None` if the format is not recognized.
 fn parse_at_datetime(s: &str) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
@@ -18,11 +20,12 @@ fn parse_at_datetime(s: &str) -> Option<i64> {
     }
     for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f"] {
         if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-            let offset = *chrono::Local::now().offset();
-            return Some(
-                chrono::DateTime::<chrono::Utc>::from(ndt.and_local_timezone(offset).unwrap())
-                    .timestamp_millis(),
-            );
+            // `earliest` resolves a wall-clock reading on the local clock and
+            // yields `None` for a reading that does not exist (DST gap).
+            return ndt
+                .and_local_timezone(chrono::Local)
+                .earliest()
+                .map(|dt| dt.timestamp_millis());
         }
     }
     None
