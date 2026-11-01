@@ -20,7 +20,9 @@ use crate::warn_log;
 pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     WorkerPool::init_global(64);
 
-    let config = Arc::new(Config::load(paths.config_path().to_str().unwrap())?);
+    let config = Arc::new(Config::load_resolved(
+        paths.config_path().to_str().unwrap(),
+    )?);
     let (message_bus, receivers) = MessageBus::new();
     let outbound_rx = receivers.outbound;
     let inbound_rx = receivers.inbound;

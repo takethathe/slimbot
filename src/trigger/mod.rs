@@ -353,6 +353,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_trigger_secret_from_keychain_reaches_script_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(true);
+        // The file carries the name only; the value comes from the chain.
+        cfg.secrets = vec![crate::config::SecretEntry {
+            name: "token".to_string(),
+            value: String::new(),
+            ..Default::default()
+        }];
+        let store = crate::secrets::SecretStore::new(vec![(
+            crate::secrets::SourceKind::Keychain,
+            Box::new(crate::secrets::MapSource::new([(
+                "slimbot.trigger.token",
+                "from-keychain",
+            )])),
+        )]);
+        crate::secrets::resolve_trigger_secrets(&mut cfg, &store);
+
+        let service = TriggerService::new(&cfg, tmp.path(), Tracer::new(vec![]));
+        assert_eq!(
+            service.secrets().get("token").map(String::as_str),
+            Some("from-keychain")
+        );
+    }
+
+    #[tokio::test]
     async fn test_history_is_only_written_when_something_fires() {
         let h = Harness::new();
         h.service.tick().await;

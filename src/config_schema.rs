@@ -6,7 +6,7 @@
 //!   [`Config`] into a schema tree the frontend renders as a form. Secret
 //!   fields are masked (value is `null`) so keys are never sent back as
 //!   plaintext.
-//! - [`apply_config_patch`] applies `[{op, path, value}]` patches to a
+//! - [`apply_config_patch_with`] applies `[{op, path, value}]` patches to a
 //!   [`Config`] with the same clamp → normalize → validate pipeline as
 //!   `Config::load`. Validation failures are returned as per-field errors and
 //!   the caller must not persist the mutated config in that case.
@@ -186,7 +186,7 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
             "triggers",
             "Triggers",
             TriggersConfig::fields(),
-            &to_value_map(&config.triggers),
+            &triggers_value_map(config),
         ),
         scalar_section(
             "pressure",
@@ -288,6 +288,29 @@ fn scalar_section(
         item_fields: None,
         items: None,
     }
+}
+
+/// Values of the `triggers` scalar section.
+///
+/// The section only *advertises* the `secrets` collection (kind `list`, path
+/// `triggers.secrets`); the entries themselves are edited in their own section.
+/// The advertisement therefore carries names only: serializing the real array
+/// here would put every plaintext (or keychain-resolved) value into the schema
+/// sent to the editor.
+fn triggers_value_map(config: &Config) -> serde_json::Map<String, serde_json::Value> {
+    let mut values = to_value_map(&config.triggers);
+    values.insert(
+        "secrets".to_string(),
+        serde_json::Value::Array(
+            config
+                .triggers
+                .secrets
+                .iter()
+                .map(|entry| serde_json::json!({ "name": entry.name }))
+                .collect(),
+        ),
+    );
+    values
 }
 
 fn providers_section(config: &Config) -> SchemaSection {
@@ -530,13 +553,35 @@ fn trigger_secrets_section(config: &Config) -> SchemaSection {
 /// paths; returns `Ok(errors)` with per-field validation errors when the
 /// resulting config fails `Config::validate` (the caller must not persist in
 /// that case). A successful apply returns an empty error list.
+///
+/// Validation runs with no secret chain, so an empty `api_key` fails here even
+/// if the keychain holds one. Production callers — the WebUI editor, which
+/// validates whatever a real startup would see — use [`apply_config_patch_with`];
+/// this chain-less form exists for tests.
+#[cfg(test)]
 pub fn apply_config_patch(config: &mut Config, ops: &[PatchOp]) -> Result<Vec<FieldError>, String> {
+    apply_config_patch_with(config, ops, &crate::secrets::SecretStore::empty())
+}
+
+/// [`apply_config_patch`] with an injected secret chain.
+///
+/// The patched config keeps its file shape — a resolved key is never written
+/// into it — but validation runs on a resolved copy: the same thing a startup
+/// would see. That is what lets a config whose `api_key` lives in the keychain
+/// still be edited.
+pub fn apply_config_patch_with(
+    config: &mut Config,
+    ops: &[PatchOp],
+    store: &crate::secrets::SecretStore,
+) -> Result<Vec<FieldError>, String> {
     for op in ops {
         apply_op(config, op)?;
     }
     config.clamp();
     config.normalize();
-    match config.validate() {
+    let mut candidate = config.clone();
+    candidate.resolve_secrets(store);
+    match candidate.validate() {
         Ok(()) => Ok(Vec::new()),
         Err(e) => Ok(validate_to_field_errors(&e.to_string())),
     }
@@ -1457,6 +1502,52 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_masks_secret_fields_resolved_from_keychain() {
+        // A value that came from the keychain (or env) lives in the in-memory
+        // config exactly like a file value; the display path must mask it.
+        let mut config = make_config();
+        config.providers.get_mut("default").unwrap().api_key = "sk-from-keychain".to_string();
+        config.triggers.secrets.push(SecretEntry {
+            name: "github".to_string(),
+            value: "ghp-from-keychain".to_string(),
+            unknown: Default::default(),
+        });
+
+        let tree = serialize_schema(&config);
+        let rendered = serde_json::to_string(&tree).unwrap();
+        assert!(!rendered.contains("sk-from-keychain"));
+        assert!(!rendered.contains("ghp-from-keychain"));
+
+        let providers = section(&tree, "providers");
+        let provider = &providers.items.as_ref().unwrap()[0];
+        let api_key = provider
+            .fields
+            .iter()
+            .find(|f| f.name == "api_key")
+            .unwrap();
+        assert_eq!(api_key.value, json!(null));
+
+        let secrets = section(&tree, "triggers.secrets");
+        let value = secrets.items.as_ref().unwrap()[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "value")
+            .unwrap();
+        assert_eq!(value.value, json!(null));
+
+        // The `triggers` scalar section advertises the collection by name only.
+        let triggers = section(&tree, "triggers");
+        let listed = triggers
+            .fields
+            .iter()
+            .find(|f| f.name == "secrets")
+            .unwrap();
+        assert_eq!(listed.kind, "list");
+        assert_eq!(listed.path, "triggers.secrets");
+        assert_eq!(listed.value, json!([{"name": "github"}]));
+    }
+
+    #[test]
     fn test_schema_collection_structure() {
         let tree = serialize_schema(&make_config());
         let providers = section(&tree, "providers");
@@ -1965,6 +2056,32 @@ mod tests {
         .unwrap();
         assert!(!errors.is_empty());
         assert_eq!(errors[0].path, "providers.default.api_key");
+    }
+
+    #[test]
+    fn test_patch_validate_accepts_api_key_resolved_from_keychain() {
+        // The file carries no key; the chain does. An unrelated edit must be
+        // accepted, and the resolved value must not end up in the saved config.
+        let mut config = make_config();
+        config.providers.get_mut("default").unwrap().api_key = String::new();
+        let store = crate::secrets::SecretStore::new(vec![(
+            crate::secrets::SourceKind::Keychain,
+            Box::new(crate::secrets::MapSource::new([(
+                "slimbot.default",
+                "sk-from-keychain",
+            )])),
+        )]);
+
+        let errors = apply_config_patch_with(
+            &mut config,
+            &[op(PatchOpKind::Set, "agent.max_iterations", json!(20))],
+            &store,
+        )
+        .unwrap();
+
+        assert!(errors.is_empty());
+        assert_eq!(config.agent.max_iterations, 20);
+        assert_eq!(config.providers["default"].api_key, "");
     }
 
     #[test]

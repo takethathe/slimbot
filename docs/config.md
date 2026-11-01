@@ -219,7 +219,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `type` | string | allowed(["openai", "anthropic", "custom"]) | `"openai"` | Provider 类型标识符 |
 | `api_url` | string | str_max(512), 归一化 | 见下文 | 完整 API 端点 URL |
 | `base_url` | string | str_max(512) | `"https://api.openai.com"` | Provider 基础 URL |
-| `api_key` | string | secret（掩码，不截断） | `""` | API 认证密钥（加载时验证；WebUI 中掩码显示，留空 = 不变） |
+| `api_key` | string | secret（掩码，不截断） | `""` | API 认证密钥（加载时验证；WebUI 中掩码显示，留空 = 不变。留空时会去 keychain / 环境变量查找，见「密钥与凭证」） |
 | `model` | string | str_max(128) | `"gpt-4o"` | 模型标识符（加载时验证） |
 | `temperature` | float | range(0.0, 2.0) | `0.7` | 采样温度 |
 | `max_tokens` | uint | range(1, 100000) | `4096` | 单次最大响应 token 数 |
@@ -342,13 +342,85 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 }
 ```
 
+## 密钥与凭证（keychain → env → 配置文件）
+
+provider 的 `api_key` 和 `triggers.secrets` 里的值都走同一条解析链，**顺序严格**：
+
+1. **OS keychain**（macOS Keychain / Windows Credential Manager / Secret Service）
+2. **环境变量**
+3. **配置文件里的值**（最后回退，兼容旧明文）
+
+先命中的非空值获胜：keychain 有值就压过环境变量，环境变量有值就压过配置文件。
+反过来说，**配置文件里的值不会“赢过” keychain/env** —— 只要 keychain 或环境变量里
+存在同名键，配置里写的那份就被忽略（不会被删除、也不会被改写，只是不生效）。
+某个来源不可用（比如无头机器上没有 keychain）时静默回退到下一级，不会让启动失败。
+
+### 键名
+
+| 用途 | 键 | keychain（service / account） | 环境变量 |
+|------|-----|------------------------------|----------|
+| provider API key | `slimbot.<provider-name>` | service = 键，account = `slimbot` | `SLIMBOT_<PROVIDER-NAME>` |
+| 触发器密钥 | `slimbot.trigger.<secret-name>` | service = 键，account = `slimbot` | `SLIMBOT_TRIGGER_<SECRET-NAME>` |
+
+环境变量名由键推导：全部大写，非字母数字字符替换为 `_`。例如 provider `default` →
+`slimbot.default` → `SLIMBOT_DEFAULT`；触发器密钥 `github-token` →
+`slimbot.trigger.github-token` → `SLIMBOT_TRIGGER_GITHUB_TOKEN`。
+
+### 写入 keychain
+
+```bash
+# macOS（service = 键，account 恒为 slimbot）
+security add-generic-password -s slimbot.default -a slimbot -w 'sk-...'
+security add-generic-password -s slimbot.trigger.github -a slimbot -w 'ghp_...'
+
+# 删除
+security delete-generic-password -s slimbot.default -a slimbot
+```
+
+Linux 的 Secret Service（`secret-tool`）与 Windows Credential Manager 需要先启用对应
+crate 特性（见下方平台限制），v1 尚未启用。
+
+> **平台限制（v1）**：`keyring` 只开了 `apple-native` 特性，因此 keychain 这一级只在
+> macOS/iOS 真正生效；Linux / Windows 目前没有启用的原生后端（会退化为“无条目”），
+> 密钥走环境变量或配置文件。补上 `windows-native` / `sync-secret-service` 特性是后续工作。
+
+### 文件权限（0600）
+
+- 含密钥值的 `config.json`（`api_key` 或 `triggers.secrets[].value` 非空）在**写出时**
+  被设为 `0600`（仅 owner 可读写）；已存在的宽权限文件会在加载时被收紧。
+- 不含密钥值的配置文件不动权限（你给的 mode 保持原样）。
+- 权限收紧只操作 `config.json` 本身，不动目录；日志只记路径，不记内容。
+
+### setup 与迁移
+
+- `slimbot setup` 只用 `load_for_preview` 读盘，**不会**把 keychain/env 里的值拷进
+  `config.json`：密钥留在它原本待的地方。
+- 已有明文 `api_key` **不会**被自动删除或迁移到 keychain，也不会被自动清空。想迁走就
+  自己写进 keychain 或环境变量，然后把字段留空（留空的字段在 WebUI 编辑器里等价于
+  “不变”，需要清空时请直接改文件或经 `triggers.secrets` 删除条目）。
+- 留空字段不会让 `slimbot setup` 失败（setup 不做 `api_key` 校验）；但正常启动会校验，
+  解析链全部缺失时报错信息会把三条路径都列出来：
+
+  ```text
+  provider 'default'.api_key must not be empty. Set it in your config file,
+  export SLIMBOT_DEFAULT, or store it in the OS keychain as `slimbot.default`.
+  ```
+
+### 脱敏
+
+- 解析路径只在 debug 日志里记 **键 + 来源**（`resolved slimbot.default from keychain`），
+  永不记值；值在内部以 `Secret` 包装，`Debug`/`Display` 恒为 `***`。
+- WebUI 配置编辑器对 `secret` 字段的 value 恒为 `null`；`triggers` 段只声明
+  `secrets` 集合的名字，条目的值只在专门的 `triggers.secrets` 段里以掩码形态出现。
+- 触发器脚本读到值后由 `Redactor` 负责抹掉回显（见 [codemode.md](codemode.md)）。
+
 ## 验证规则
 
 加载配置时强制执行以下验证：
 
 - `agent.provider` 不能为空
 - 引用的 Provider 必须存在于 `providers` 中
-- 引用的 Provider 的 `api_key` 不能为空
+- 引用的 Provider 的 `api_key` 不能为空（keychain / 环境变量 / 配置文件全部缺失时才报错）
 - 引用的 Provider 的 `model` 不能为空
 
 如果验证失败，应用程序将打印错误消息并退出。
@@ -371,7 +443,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 - 对每个 Provider：
   - 空 `api_url` 且设置了 `base_url` → 根据 `base_url` 结尾推导（见上方 URL 解析逻辑）
   - `api_url` 和 `base_url` 都为空 → `https://api.openai.com/v1/chat/completions`
-  - `api_key` **永不**被规范化或覆盖
+  - `api_key` **永不**被规范化或覆盖（解析链的覆盖是另一回事：它发生在 clamp/normalize 之后的解析步骤）
 - `name` 为空的 tools 条目会被移除；channels 按空键名过滤
 
 规范化在 clamp 之后执行，确保归一化过程产生的值也经过约束检查。
@@ -384,9 +456,12 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 
 初始化后自动启动文件系统监听（基于 `notify` crate，macOS 使用 FSEvents）。当 `config.json` 被修改时：
 
-1. 重新读取文件，执行 clamp + normalize + validate
+1. 重新读取文件，执行 clamp + normalize + 密钥解析 + validate
 2. 计算新旧配置差异（diff），生成 `ConfigChange { paths, old_values, new_values }`
 3. 通知匹配的订阅者（基于路径前缀匹配）
+
+重新读取走的是与启动相同的解析入口，因此 keychain / 环境变量里的密钥在重载时也会
+重新解析（keychain 里轮换了密钥，改一下 `config.json` 触发重载即可生效）。
 
 ### 订阅机制
 
@@ -412,8 +487,8 @@ Gateway 模式的 WebUI 提供可视化配置编辑页面（入口 `/config`，�
 
 - **Schema 自动生成** — 后端把 `define_config!` 宏生成的字段元数据（`FieldMeta`）序列化为 config schema（`src/config_schema.rs::serialize_schema`），前端按 schema 的 `kind` 渲染控件（bool 开关 / int/float 数字框带 min/max / string 文本框带 maxlength / select 下拉 / secret 密码框 / optional_string / 集合编辑器）。新增/修改 Rust 配置字段后表单自动跟随。
 - **集合编辑** — `providers`（键值映射，结构化增删改/重命名）、`tracing.backends`（数组）、`tools`（名称下拉 + enabled 开关）、`channels`（enabled 开关 + extra 裸 JSON）。
-- **写入语义** — 提交时把脏字段编译为 `[{op, path, value}]`（`set`/`add`/`remove`，dot-path 如 `agent.max_iterations`、`providers.<name>.temperature`、`gateway.cron.enabled`），服务端读取当前 `config.json` → 应用 patch → 按与 `Config::load` 相同的顺序执行 clamp → normalize → validate → 写回。校验失败**不写盘**，返回逐字段错误供前端高亮。未知 JSON 字段在 patch 写入中保留。重命名 provider 时 `add` 操作携带 `from`（源 key），服务端从源条目继承掩码字段（如 `api_key`）与未知字段，避免重命名丢密钥。
-- **密钥保护** — `api_key` 等 `secret` 字段在 schema 中 value 恒为 `null`，绝不回明文；编辑时留空 = 不变，填入新值即轮换密钥。
+- **写入语义** — 提交时把脏字段编译为 `[{op, path, value}]`（`set`/`add`/`remove`，dot-path 如 `agent.max_iterations`、`providers.<name>.temperature`、`gateway.cron.enabled`），服务端读取当前 `config.json` → 应用 patch → 按与 `Config::load` 相同的顺序执行 clamp → normalize → validate → 写回。校验失败**不写盘**，返回逐字段错误供前端高亮。校验用的是“解析链之后”的副本（跟一次真实启动看到的一样），所以 `api_key` 存在 keychain / 环境变量里、文件里留空时，编辑其他字段不会被误报；但写回的仍是文件形态，解析出来的值不会被持久化。未知 JSON 字段在 patch 写入中保留。重命名 provider 时 `add` 操作携带 `from`（源 key），服务端从源条目继承掩码字段（如 `api_key`）与未知字段，避免重命名丢密钥。
+- **密钥保护** — `api_key` 等 `secret` 字段在 schema 中 value 恒为 `null`，绝不回明文；编辑时留空 = 不变，填入新值即轮换密钥。`triggers` 段只列出 `secrets` 集合的名字（`[{name}]`），条目的值是 `secret` 字段，同样恒为 `null`。
 - **重启生效** — 改动写回 `config.json` 后需重启 Gateway 才生效（v1 不做进程内热重载，见 `docs/adr/0002`）。页面顶部常驻提示。
 
 ## 完整示例

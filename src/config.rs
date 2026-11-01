@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::config_normalize::apply_normalize;
+use crate::secrets::SecretStore;
 
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
@@ -232,9 +233,13 @@ impl Config {
             )
         })?;
         if provider.api_key.is_empty() {
+            // Same error family as before, but it now names the whole
+            // resolution chain: keychain → env → config file.
             anyhow::bail!(
-                "provider '{}'.api_key must not be empty. Set it in your config file.",
-                self.agent.provider
+                "provider '{}'.api_key must not be empty. Set it in your config file, export {}, or store it in the OS keychain as `{}`.",
+                self.agent.provider,
+                crate::secrets::env_var_name(&crate::secrets::provider_key(&self.agent.provider)),
+                crate::secrets::provider_key(&self.agent.provider)
             );
         }
         if provider.model.is_empty() {
@@ -244,21 +249,73 @@ impl Config {
     }
 
     pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path).context("Failed to read config file")?;
-        let mut config = Self::parse(&content)?;
-        config.clamp();
-        config.normalize();
+        let config = Self::read(path)?;
         config.validate()?;
         Ok(config)
     }
 
     /// Load config without validation (for setup preview where api_key may be empty).
     pub fn load_for_preview(path: &str) -> Result<Self> {
+        Self::read(path)
+    }
+
+    /// Load config and resolve every secret-typed field through the chain
+    /// (OS keychain → environment → config file). Production entry point;
+    /// [`Self::load`] stays the plain file reader so previews, the WebUI editor
+    /// and tests never consult the keychain.
+    pub fn load_resolved(path: &str) -> Result<Self> {
+        Self::load_resolved_with(path, &SecretStore::system())
+    }
+
+    /// [`Self::load_resolved`] with an injected store (tests, embedders).
+    pub fn load_resolved_with(path: &str, store: &SecretStore) -> Result<Self> {
+        let mut config = Self::read(path)?;
+        config.resolve_secrets(store);
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Read + parse + clamp + normalize. Also tightens the file mode to `0600`
+    /// when the file carries secret-typed values (Unix only).
+    fn read(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("Failed to read config file")?;
         let mut config = Self::parse(&content)?;
         config.clamp();
         config.normalize();
+        config.restrict_secret_file_mode(path);
         Ok(config)
+    }
+
+    /// Tighten `config.json` to `0600` when it carries secret-typed values. The
+    /// mode is a property of the file, so a failure is logged (with the path
+    /// only) rather than propagated: an unwritable mode must not make a
+    /// readable config look broken.
+    fn restrict_secret_file_mode(&self, path: &str) {
+        if !self.contains_secrets() {
+            return;
+        }
+        match crate::secrets::restrict_owner_only(Path::new(path)) {
+            Ok(true) => crate::debug!("[secrets] {} restricted to 0600 (holds secrets)", path),
+            Ok(false) => {}
+            Err(e) => crate::warn_log!("[secrets] cannot restrict {} to 0600: {}", path, e),
+        }
+    }
+
+    /// True when a secret-typed field (provider `api_key`, `triggers.secrets`
+    /// value) carries a value. Drives the `0600` file mode.
+    pub fn contains_secrets(&self) -> bool {
+        self.providers.values().any(|p| !p.api_key.is_empty())
+            || self.triggers.secrets.iter().any(|s| !s.value.is_empty())
+    }
+
+    /// Replace secret-typed fields with the result of the resolution chain.
+    ///
+    /// Keychain wins over environment, which wins over the value already in the
+    /// file. Nothing here logs a value: the resolution report carries only the
+    /// key and the source it came from.
+    pub fn resolve_secrets(&mut self, store: &SecretStore) {
+        crate::secrets::resolve_provider_secrets(&mut self.providers, store);
+        crate::secrets::resolve_trigger_secrets(&mut self.triggers, store);
     }
 
     /// Parse a config document, applying the legacy-key migrations first.
@@ -281,6 +338,9 @@ impl Config {
         }
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
+        // A file that holds secrets is readable by its owner only; a file
+        // without secrets keeps whatever mode the user gave it.
+        self.restrict_secret_file_mode(path);
         Ok(())
     }
 }
@@ -330,7 +390,7 @@ struct ConfigInner {
 
 impl Config {
     pub fn init(path: &str) -> Result<()> {
-        let config = Self::load(path)?;
+        let config = Self::load_resolved(path)?;
         let inner = Arc::new(RwLock::new(ConfigInner {
             config,
             config_path: path.to_string(),
@@ -398,7 +458,9 @@ impl Config {
             guard.config_path.clone()
         };
 
-        let new_config = Self::load(&path)?;
+        // Reload re-resolves the chain, so a key rotated in the keychain or the
+        // environment is picked up without a restart.
+        let new_config = Self::load_resolved(&path)?;
 
         let change = {
             let guard = inner.read();
@@ -677,6 +739,163 @@ mod tests {
     fn test_config_validate_pass() {
         let cfg = make_test_config();
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── Secret resolution chain ──
+
+    use crate::secrets::{MapSource, SecretStore, SourceKind};
+
+    /// Injected sources only: no test ever touches the real OS keychain.
+    fn secret_store(keychain: &[(&str, &str)], env: &[(&str, &str)]) -> SecretStore {
+        SecretStore::new(vec![
+            (
+                SourceKind::Keychain,
+                Box::new(MapSource::new(keychain.iter().copied())),
+            ),
+            (
+                SourceKind::Env,
+                Box::new(MapSource::new(env.iter().copied())),
+            ),
+        ])
+    }
+
+    fn write_config_file(tmp: &std::path::Path, api_key: &str) -> std::path::PathBuf {
+        let path = tmp.join("config.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"agent":{{"provider":"default"}},"providers":{{"default":{{"type":"openai","api_key":"{}","model":"gpt-4o"}}}}}}"#,
+                api_key
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn test_resolve_secrets_keychain_hit_beats_env_and_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path(), "from-config");
+        let store = secret_store(
+            &[("slimbot.default", "from-keychain")],
+            &[("slimbot.default", "from-env")],
+        );
+
+        let config = Config::load_resolved_with(path.to_str().unwrap(), &store).unwrap();
+        assert_eq!(config.providers["default"].api_key, "from-keychain");
+    }
+
+    #[test]
+    fn test_resolve_secrets_env_hit_beats_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path(), "from-config");
+        let store = secret_store(&[], &[("slimbot.default", "from-env")]);
+
+        let config = Config::load_resolved_with(path.to_str().unwrap(), &store).unwrap();
+        assert_eq!(config.providers["default"].api_key, "from-env");
+    }
+
+    #[test]
+    fn test_resolve_secrets_falls_back_to_config_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path(), "from-config");
+
+        let config =
+            Config::load_resolved_with(path.to_str().unwrap(), &SecretStore::empty()).unwrap();
+        assert_eq!(config.providers["default"].api_key, "from-config");
+    }
+
+    #[test]
+    fn test_resolve_secrets_fills_trigger_secret_from_keychain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"agent":{"provider":"default"},"providers":{"default":{"type":"openai","api_key":"k","model":"gpt-4o"}},"triggers":{"secrets":[{"name":"github","value":""}]}}"#,
+        )
+        .unwrap();
+        let store = secret_store(&[("slimbot.trigger.github", "ghp-from-keychain")], &[]);
+
+        let config = Config::load_resolved_with(path.to_str().unwrap(), &store).unwrap();
+        assert_eq!(config.triggers.secrets[0].value, "ghp-from-keychain");
+    }
+
+    #[test]
+    fn test_load_resolved_missing_everywhere_keeps_api_key_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path(), "");
+
+        let err = Config::load_resolved_with(path.to_str().unwrap(), &SecretStore::empty())
+            .expect_err("empty api_key with no source must fail");
+        let message = err.to_string();
+        // Same error family as before; the message now names the other sources.
+        assert!(message.contains("provider 'default'.api_key must not be empty"));
+        assert!(message.contains("slimbot.default"));
+        assert!(message.contains("SLIMBOT_DEFAULT"));
+    }
+
+    #[test]
+    fn test_config_contains_secrets_tracks_secret_fields() {
+        let mut cfg = make_test_config();
+        assert!(cfg.contains_secrets());
+        cfg.providers.get_mut("default").unwrap().api_key = String::new();
+        assert!(!cfg.contains_secrets());
+        cfg.triggers.secrets.push(crate::config::SecretEntry {
+            name: "token".to_string(),
+            value: "v".to_string(),
+            ..Default::default()
+        });
+        assert!(cfg.contains_secrets());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_config_save_with_secrets_restricts_mode_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        // An existing, broadly readable file must be tightened on write.
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        make_test_config().save(path.to_str().unwrap()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_config_save_without_secrets_keeps_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut cfg = make_test_config();
+        cfg.providers.get_mut("default").unwrap().api_key = String::new();
+        cfg.save(path.to_str().unwrap()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_config_load_with_secrets_tightens_world_readable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config_file(tmp.path(), "sk-plaintext");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        Config::load(path.to_str().unwrap()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

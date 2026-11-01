@@ -563,7 +563,14 @@ async fn config_update_handler(
         crate::error!("[webui] Failed to load config for update: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let errors = crate::config_schema::apply_config_patch(&mut config, &ops).map_err(|e| {
+    // Validate against the secret chain: an api_key that lives in the keychain
+    // is what a real startup would use, so the editor must not reject it.
+    let errors = crate::config_schema::apply_config_patch_with(
+        &mut config,
+        &ops,
+        &crate::secrets::SecretStore::system(),
+    )
+    .map_err(|e| {
         crate::error!("[webui] Config patch rejected: {}", e);
         StatusCode::BAD_REQUEST
     })?;
