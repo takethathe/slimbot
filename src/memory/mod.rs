@@ -744,6 +744,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_corpus_excludes_daily_documents_and_history() {
+        // The retrieval corpus is memory documents only: `Daily` has no writer
+        // and is not a search category, and the append-only history log is an
+        // event log, not a fact store (ADR 0012 / ticket 05).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        store
+            .set(&MemoryCategory::Core, None, "deploywindow closes at 18:00")
+            .await
+            .unwrap();
+        std::fs::write(
+            tmp.path().join("memory").join("2026-11-02.md"),
+            "dailyonlytoken was logged today",
+        )
+        .unwrap();
+        store
+            .append_history("historyonlytoken was said in a turn")
+            .unwrap();
+
+        assert!(
+            store
+                .search("dailyonlytoken", None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "date-named Daily documents must not be searchable"
+        );
+        assert!(
+            store
+                .search("historyonlytoken", None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "session history must not be part of the retrieval corpus"
+        );
+
+        let hits = store.search("deploywindow", None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.source, "memory/MEMORY.md");
+
+        assert!(
+            !SEARCH_CATEGORIES.contains(&MemoryCategory::Daily),
+            "Daily is deliberately not a search category"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_empty_query_and_no_match_are_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = make_store(tmp.path());

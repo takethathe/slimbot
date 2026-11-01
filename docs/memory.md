@@ -9,6 +9,22 @@
 - **category 文档操作** 经可插拔的 `MemoryBackend` trait（当前仅 markdown backend）
 - **历史操作**（`history.jsonl` + Dream 游标）由独立的 `HistoryStore` 承担
 
+## 写侧：单文件漏斗（ADR 0012）
+
+主循环**没有**记忆写工具：`src/tools/mod.rs::create_tool` 里没有、`AgentLoop` 装配时也不注册（由 `test_tool_factory_registers_no_memory_write_tool` 与 `test_agent_visible_tools_are_read_only_for_memory` 守住）。agent 落记忆的方式只有一件事 —— 用既有的 `file_writer` / `file_editor` 改 `{workspace}/memory/MEMORY.md`。
+
+```
+对话现场（主模型）      Dream（唯一分类者）
+MEMORY.md  ──────────▶  SOUL / USER / AGENTS / TOOLS / skills/<name>/SKILL.md / memory/<name>.md
+（即时、只用 file 工具）    （整理、合并、晋升）
+```
+
+- **可写集只有一篇文档**：`memory/MEMORY.md`（Core）。分类（这条事实是 soul、user 还是操作细节）需要全量上下文，交给 Dream 比交给正在对话的模型可靠；工具数量本身是幻觉预算。
+- **保护路径由代码强制**（不是提示词）：`bootstrap::protected_documents()`（AGENTS/USER/SOUL/TOOLS + `agents/trigger.md`，从 bootstrap 列表派生、去掉 MEMORY.md）加上 `skills/*/SKILL.md`、`memory/*.md`（MEMORY.md 除外），命中即由 `src/tools/protected.rs` 返回 `REFUSED:` 文案，**不退回合、不报错**。运行文件（`cron/jobs.json`、`sessions/*.jsonl`、`HEARTBEAT.md`、`memory/history.jsonl`）照常可写 —— 把功能阉割当安全不是保护。细节见 [Tool System](tool.md) 的「受保护文档」一节。
+- **provenance 是写法约定，不是字段**：模板与 memory skill 要求每条 bullet 自带 `(source · YYYY-MM-DD)`。派生索引**不解析**它、代码也**不做门禁**（`test_memory_skill_documents_the_provenance_convention` 锁的是这段提示词文本）。给来源赋予机器语义就等于承诺一个守不住的校验：写入路径是普通文本编辑。
+- **原文不入记忆**：外部内容进上下文的唯一入口是有界 evidence（ADR 0009，`text ≤ 200` 字符 / ≤ 5 条），原文留在引用路径（`tool-results/<id>.txt`），`MEMORY.md` 只收消化后的表述 + 来源。**残余风险**：`web_fetch` 与 owner 对话没有上限，这两条路径上「只写消化表述」靠提示词与 Dream 事后审查，代码不拦（同理 `shell` 可以直接改任何文件）。
+- **`Daily` 不建设**：无写者、不进检索语料；`history.jsonl` 同样不进语料 —— 未经整理的一轮对话不是事实。由 `test_search_corpus_excludes_daily_documents_and_history` 守住。
+
 ## Memory category
 
 记忆按语义 category 寻址，每个 category 对应一个文档：
@@ -20,7 +36,7 @@
 | `Agent` | `{workspace}/AGENTS.md` | Agent 工作指令 |
 | `Tools` | `{workspace}/TOOLS.md` | 工具使用指南 |
 | `Core` | `{workspace}/memory/MEMORY.md` | 长期事实：项目上下文、架构、战略决策 |
-| `Daily` | `{workspace}/memory/YYYY-MM-DD.md` | 每日日志（预留，暂无写入方） |
+| `Daily` | `{workspace}/memory/YYYY-MM-DD.md` | 每日日志——**v1 不建设**：无写者、不进检索语料（ADR 0012） |
 | `Skill` | `{workspace}/skills/<name>/SKILL.md` | 可复用工作流模板（`name` 必填） |
 | `Custom` | `{workspace}/memory/<name>.md` | 用户自定义 category（`name` 必填） |
 
@@ -114,7 +130,7 @@ pub type SharedMemory = Arc<tokio::sync::Mutex<MemoryService>>;
 
 ## Dream 工具
 
-Dream 通过 memory 工具（而非文件工具）维护记忆。`category` 为白名单 `soul` / `user` / `core` / `skill`，`name` 仅在 `category=skill` 时必填：
+Dream 通过 memory 工具（而非文件工具）维护记忆。这套注册**只属于 Dream 沙箱**（`DreamService::build_tools`），不进 agent 的工具表：主模型只通过 `file_editor` 改 `MEMORY.md`，不存在第二个写入入口。`category` 为白名单 `soul` / `user` / `core` / `skill`，`name` 仅在 `category=skill` 时必填：
 
 | 工具 | 说明 |
 |------|------|

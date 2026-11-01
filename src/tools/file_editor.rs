@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::tool::Tool;
-use crate::tools::resolve_workspace_path;
+use crate::tools::{protected, resolve_workspace_path};
 
 /// Tool that performs search-and-replace in a file.
 /// Requires old_string to appear exactly once in the file.
@@ -66,6 +66,12 @@ impl Tool for FileEditorTool {
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: new_string"))?;
 
         let resolved = resolve_workspace_path(path_str, &self.workspace_dir)?;
+
+        // Protected documents are refused by code, not by prompt text (ADR
+        // 0012). The refusal is a normal tool result so the run continues.
+        if let Some(refusal) = protected::refusal_for_write(&resolved, &self.workspace_dir) {
+            return Ok(refusal);
+        }
 
         if !resolved.is_file() {
             return Err(anyhow::anyhow!("Not a file: {}", path_str));
@@ -229,6 +235,87 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Not a file"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_protected_document_is_refused_and_file_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("USER.md"), "owner: Takethat")
+            .await
+            .unwrap();
+
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "USER.md",
+                "old_string": "Takethat",
+                "new_string": "nobody"
+            }))
+            .await
+            .expect("a refusal is a tool result, not a failed run");
+
+        assert!(result.contains("REFUSED"), "result was: {result}");
+        assert!(result.contains("USER.md"));
+        assert!(result.contains("owner-only"));
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("USER.md"))
+                .await
+                .unwrap(),
+            "owner: Takethat"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_memory_document_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("memory"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("memory/MEMORY.md"), "- a\n")
+            .await
+            .unwrap();
+
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "memory/MEMORY.md",
+                "old_string": "- a\n",
+                "new_string": "- a\n- b (owner said · 2026-11-02)\n"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("1 replacement"), "result was: {result}");
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("memory/MEMORY.md"))
+                .await
+                .unwrap(),
+            "- a\n- b (owner said · 2026-11-02)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_dream_owned_skill_document_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("skills/release"))
+            .await
+            .unwrap();
+        let skill = tmp.path().join("skills/release/SKILL.md");
+        tokio::fs::write(&skill, "# Release\n").await.unwrap();
+
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "skills/release/SKILL.md",
+                "old_string": "# Release",
+                "new_string": "# Pwned"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("REFUSED"), "result was: {result}");
+        assert_eq!(
+            tokio::fs::read_to_string(&skill).await.unwrap(),
+            "# Release\n"
+        );
     }
 
     #[tokio::test]

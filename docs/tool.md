@@ -170,6 +170,30 @@ fn context_exempt(&self) -> bool { false }  // 默认不豁免
 
 工具自述自己是否可被上下文压力清理/截断，取代了中央白名单（`EXEMPT_TOOLS` / `COMPACTABLE_TOOLS`）。`ToolManager::is_context_exempt(name)` 查一次自述，`microcompact` 与 `apply_tool_result_budget` 两个阶段共用同一结果；未注册的工具默认不豁免。当前自述为 `true` 的有 `file_reader`、`memory_search`、`message`。
 
+## 受保护文档：写工具的代码级拒写（ADR 0012）
+
+主模型的记忆写侧是「单文件漏斗」：只用 `file_writer` / `file_editor` 改 `memory/MEMORY.md`。为防它静默改掉自己的人格或对主人的描述，这些文档由**代码**拒写（`src/tools/protected.rs`），不是提示词约束：
+
+| 保护集 | 来源 | 理由 |
+|--------|------|------|
+| `AGENTS.md`、`USER.md`、`SOUL.md`、`TOOLS.md`、`agents/trigger.md` | `bootstrap::protected_documents()`（从 bootstrap 列表派生后再去掉 `MEMORY.md`，不维护第二份硬编码清单） | 身份与工作指令，只有 owner 能改 |
+| `skills/*/SKILL.md`、`memory/*.md`（`MEMORY.md` 除外） | 路径规则 | Dream 的产出区，由 Dream 写 |
+
+命中即返回**工具结果文本**（不是 `Err`，不退回合、不 panic）：
+
+```
+REFUSED: `AGENTS.md` is a protected identity document -- edits to it are owner-only. Nothing was written.
+Do not retry with another tool or path; record durable facts in `memory/MEMORY.md` and tell the owner what you wanted to change.
+```
+
+约定与边界：
+
+- 判定在 `resolve_workspace_path` **之后**：`sub/../SOUL.md`、指向 `SOUL.md` 的符号链接都会落到同一个判定上；比较是 ASCII 大小写不敏感（macOS 默认文件系统不区分大小写，`soul.md` 不能当绕过）。
+- 仅 `file_writer` / `file_editor` 接入。`make_dir` 只建目录（对已存在的文件会报错），改不了既有文档内容，因此不接。
+- `shell` **是明写的缺口**：它能绕开任何工具级保护。保护的目标是「误改」，不是防范恶意模型；单 owner 下真正的边界仍然是审批与 trace。
+- 运行文件不保护：`cron/jobs.json`、`sessions/*.jsonl`、`HEARTBEAT.md`、`memory/history.jsonl` 照常可写。
+- Dream 不受影响：它的 `memory_write` / `memory_edit` 走 memory backend，不经过本模块。
+
 ## 内置工具
 
 详见 [内置工具](tools.md)。

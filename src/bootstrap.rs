@@ -1,5 +1,9 @@
 use crate::embed::{EMBEDDED_FILES, get_content_by_dest};
 
+/// Workspace-relative path of the one memory document the reacting model may
+/// write. Every other bootstrapped document is owner-only (ADR 0012).
+pub const MEMORY_DOCUMENT: &str = "memory/MEMORY.md";
+
 /// The memory document templates written into a new workspace, plus the one
 /// built-in agent definition.
 /// Returns (workspace-relative dest, content): AGENTS, USER, SOUL, TOOLS in
@@ -18,6 +22,18 @@ pub fn bootstrap_files() -> impl Iterator<Item = (&'static str, &'static str)> {
     ]
     .into_iter()
     .filter_map(|(dest, template)| get_content_by_dest(template).map(|content| (dest, content)))
+}
+
+/// Bootstrapped documents that an agent-issued file write must never touch.
+///
+/// Derived from [`bootstrap_files`] rather than a second hardcoded list, minus
+/// [`MEMORY_DOCUMENT`] -- the one document the reacting model writes through
+/// the ordinary file tools. `src/tools/protected.rs` turns this set into the
+/// code-level refusal; nothing here is prompt text.
+pub fn protected_documents() -> impl Iterator<Item = &'static str> {
+    bootstrap_files()
+        .map(|(dest, _)| dest)
+        .filter(|dest| *dest != MEMORY_DOCUMENT)
 }
 
 /// Embedded skill files (dest is workspace/skills/).
@@ -72,6 +88,67 @@ mod tests {
         assert_eq!(names.len(), 6);
         assert!(!names.contains(&"identity.md"));
         assert!(!names.contains(&"dream.md"));
+    }
+
+    #[test]
+    fn test_protected_documents_are_the_bootstrapped_identity_docs() {
+        // One list, not two: the protected set is the bootstrap list minus the
+        // single document the reacting model may write (ADR 0012).
+        let protected: Vec<_> = protected_documents().collect();
+        for doc in ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"] {
+            assert!(protected.contains(&doc), "{doc} must be protected");
+        }
+        assert!(
+            !protected.contains(&MEMORY_DOCUMENT),
+            "MEMORY.md is the writable funnel, not a protected document"
+        );
+
+        let bootstrapped: Vec<_> = bootstrap_files().map(|(dest, _)| dest).collect();
+        assert!(bootstrapped.contains(&MEMORY_DOCUMENT));
+        for doc in &protected {
+            assert!(
+                bootstrapped.contains(doc),
+                "{doc} is protected but not bootstrapped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_skill_documents_the_provenance_convention() {
+        // The provenance note is a writing convention carried by the prompt
+        // surface; no parser enforces it, so this text is the whole contract.
+        let (_, skill, _) = skill_files()
+            .find(|(_, _, dest)| *dest == "skills/memory/SKILL.md")
+            .expect("the memory skill must be bootstrapped");
+        assert!(
+            skill.contains("MEMORY.md"),
+            "the skill must name the funnel"
+        );
+        assert!(
+            skill.contains("provenance"),
+            "the skill must document the provenance note"
+        );
+        assert!(
+            skill.contains("YYYY-MM-DD"),
+            "the provenance note must carry a date format"
+        );
+        assert!(
+            skill.contains("digest"),
+            "the skill must ask for digested text, not raw content"
+        );
+    }
+
+    #[test]
+    fn test_memory_template_is_the_agent_writable_landing_document() {
+        let (_, template) = bootstrap_files()
+            .find(|(dest, _)| *dest == MEMORY_DOCUMENT)
+            .expect("MEMORY.md must be bootstrapped");
+        assert!(
+            !template.contains("Do NOT edit"),
+            "the template must not forbid the write path it exists for"
+        );
+        assert!(template.contains("MEMORY.md"));
+        assert!(template.contains("provenance"));
     }
 
     #[test]

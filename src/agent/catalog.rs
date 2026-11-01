@@ -178,6 +178,25 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_visible_tools_are_read_only_for_memory() {
+        // ADR 0012: the agent's only memory tool is the read-only
+        // `memory_search`; writes go through the ordinary file tools onto
+        // MEMORY.md. `memory_write` / `memory_edit` belong to Dream's sandbox
+        // registry, which never reaches this list.
+        let names = known_tool_names();
+        assert!(names.iter().any(|n| n == "memory_search"));
+        assert!(names.iter().any(|n| n == "file_editor"));
+        for name in &names {
+            if name.starts_with("memory_") {
+                assert_eq!(
+                    name, "memory_search",
+                    "`{name}` would be a second way to write memory"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_build_tool_manager_only_contains_requested_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let mut catalog = ToolCatalog::new();

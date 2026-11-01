@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::tool::Tool;
-use crate::tools::resolve_workspace_path;
+use crate::tools::{protected, resolve_workspace_path};
 
 /// Tool that writes content to a file (creates or overwrites).
 pub struct FileWriterTool {
@@ -58,6 +58,12 @@ impl Tool for FileWriterTool {
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: content"))?;
 
         let target = resolve_workspace_path(path_str, &self.workspace_dir)?;
+
+        // Protected documents are refused by code, not by prompt text (ADR
+        // 0012). The refusal is a normal tool result so the run continues.
+        if let Some(refusal) = protected::refusal_for_write(&target, &self.workspace_dir) {
+            return Ok(refusal);
+        }
 
         // Ensure parent directory exists
         if let Some(parent) = target.parent() {
@@ -183,6 +189,107 @@ mod tests {
                 .to_string()
                 .contains("Missing required argument: content")
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_protected_document_is_refused_and_file_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("AGENTS.md");
+        tokio::fs::write(&target, "owner rules").await.unwrap();
+
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let result = writer
+            .execute(serde_json::json!({
+                "path": "AGENTS.md",
+                "content": "agent rewrite"
+            }))
+            .await
+            .expect("a refusal is a tool result, not a failed run");
+
+        assert!(result.contains("REFUSED"), "result was: {result}");
+        assert!(result.contains("AGENTS.md"), "must name the document");
+        assert!(result.contains("owner-only"), "must state the rule");
+        assert!(result.contains("Nothing was written"));
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "owner rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_every_bootstrap_document_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        for doc in ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"] {
+            let result = writer
+                .execute(serde_json::json!({"path": doc, "content": "x"}))
+                .await
+                .unwrap();
+            assert!(result.contains("REFUSED"), "{doc}: {result}");
+            assert!(!tmp.path().join(doc).exists(), "{doc} must not be created");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_protected_document_through_traversal_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("sub"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("SOUL.md"), "old soul")
+            .await
+            .unwrap();
+
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let result = writer
+            .execute(serde_json::json!({
+                "path": "sub/../SOUL.md",
+                "content": "new soul"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("REFUSED"), "result was: {result}");
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+                .await
+                .unwrap(),
+            "old soul"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_memory_document_succeeds() {
+        // The single-file funnel: MEMORY.md is the one document the reacting
+        // model writes, and it must stay writable.
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let result = writer
+            .execute(serde_json::json!({
+                "path": "memory/MEMORY.md",
+                "content": "- fact (owner said · 2026-11-02)\n"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.contains("REFUSED"), "result was: {result}");
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("memory/MEMORY.md"))
+                .await
+                .unwrap(),
+            "- fact (owner said · 2026-11-02)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_runtime_files_stay_writable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        for path in ["cron/jobs.json", "HEARTBEAT.md", "memory/history.jsonl"] {
+            let result = writer
+                .execute(serde_json::json!({"path": path, "content": "{}"}))
+                .await
+                .unwrap();
+            assert!(!result.contains("REFUSED"), "{path}: {result}");
+        }
     }
 
     #[tokio::test]

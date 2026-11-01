@@ -62,6 +62,7 @@ SlimBot 的工具分四组：
 **行为：**
 - 如果文件不存在则创建，已存在则覆盖。
 - 自动创建父目录。
+- **受保护文档拒写**：`AGENTS.md` / `USER.md` / `SOUL.md` / `TOOLS.md`（及 bootstrap 的 `agents/trigger.md`）、`skills/*/SKILL.md`、`memory/*.md`（`MEMORY.md` 除外）命中时返回 `REFUSED:` 工具结果，不写盘、不报错（见 [Tool System](tool.md) 的「受保护文档」）。`memory/MEMORY.md` 与运行文件（`cron/jobs.json` 等）照写入。
 
 **示例：**
 ```json
@@ -83,6 +84,7 @@ SlimBot 的工具分四组：
 **行为：**
 - 如果未找到 `old_string` 或出现多次，拒绝该编辑。
 - 这确保了精确操作——不会意外批量替换。
+- **受保护文档拒写**：与 `file_writer` 同一保护集（`src/tools/protected.rs`），命中即返回 `REFUSED:` 工具结果且文件不变。主模型的记忆写侧正是靠这个工具改 `memory/MEMORY.md`。
 
 **示例：**
 ```json
