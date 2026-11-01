@@ -602,6 +602,8 @@ pub struct SessionTaskBuilder {
     max_tokens: Option<u32>,
     tracer: Option<Arc<crate::trace::Tracer>>,
     approvals: Option<Arc<crate::approval::ApprovalStore>>,
+    owner_primary: Option<Arc<crate::delivery::OwnerPrimaryStore>>,
+    owner_alerts: Option<Arc<crate::owner_alert::OwnerAlertDedup>>,
 }
 
 impl SessionTaskBuilder {
@@ -623,6 +625,8 @@ impl SessionTaskBuilder {
             max_tokens: None,
             tracer: None,
             approvals: None,
+            owner_primary: None,
+            owner_alerts: None,
         }
     }
 
@@ -694,6 +698,22 @@ impl SessionTaskBuilder {
         self
     }
 
+    /// Attach the owner-primary store so a hard provider failure (auth/quota)
+    /// can alert the owner through the delivery seam (票 19). Without it the
+    /// classified error still fails the turn, but nobody beyond the session
+    /// is told.
+    pub fn owner_primary(mut self, store: Arc<crate::delivery::OwnerPrimaryStore>) -> Self {
+        self.owner_primary = Some(store);
+        self
+    }
+
+    /// Attach the owner-alert dedupe store. Unset falls back to the
+    /// process-wide store so production tasks share one failure streak.
+    pub fn owner_alerts(mut self, dedup: Arc<crate::owner_alert::OwnerAlertDedup>) -> Self {
+        self.owner_alerts = Some(dedup);
+        self
+    }
+
     pub fn build(self) -> SessionTask {
         let session_manager = self.session_manager.expect("session_manager required");
         let tool_manager = self.tool_manager.expect("tool_manager required");
@@ -706,6 +726,7 @@ impl SessionTaskBuilder {
 
         let sid1 = self.session_id.clone();
         let sid2 = self.session_id.clone();
+        let sid3 = self.session_id.clone();
         let sid_for_task = self.session_id;
         let content = self.content;
         let hook = self.hook;
@@ -715,9 +736,13 @@ impl SessionTaskBuilder {
         let cancel_token = self.cancel_token;
         let tracer = self.tracer;
         let approvals = self.approvals;
+        let owner_primary = self.owner_primary;
+        let owner_alerts = self.owner_alerts;
 
         let exec_closure: Box<dyn FnOnce() -> BoxFuture + Send> = Box::new(move || {
             Box::pin(async move {
+                let approvals_store = approvals.unwrap_or_default();
+                let consolidator_for_alert = consolidator.clone();
                 let runner = AgentRunner::builder()
                     .session_manager(session_manager)
                     .tool_manager(tool_manager)
@@ -728,7 +753,7 @@ impl SessionTaskBuilder {
                     .consolidator(consolidator)
                     .tracer(tracer)
                     .max_tokens(max_tokens)
-                    .approvals(approvals.unwrap_or_default())
+                    .approvals(approvals_store.clone())
                     .build();
                 let run_id = hook.run_id().to_string();
                 let result = runner
@@ -756,6 +781,44 @@ impl SessionTaskBuilder {
                         content,
                     })
                     .await;
+
+                // Post-run routing of classified provider failures (票 19):
+                // a hard auth/quota error alerts the owner once per streak
+                // through the delivery seam; a context-length error relieves
+                // pressure so the next turn fits. Both act on the classified
+                // error only — the raw response body is not carried anywhere.
+                if let Some(pe) = &result.provider_error {
+                    match pe.kind {
+                        crate::provider::ProviderErrorKind::AuthQuota => {
+                            if let Some(store) = &owner_primary {
+                                let dedup = owner_alerts
+                                    .as_deref()
+                                    .unwrap_or(crate::owner_alert::global_dedup());
+                                crate::owner_alert::deliver_provider_alert(
+                                    &outbound_tx,
+                                    store,
+                                    dedup,
+                                    pe,
+                                )
+                                .await;
+                            }
+                        }
+                        crate::provider::ProviderErrorKind::ContextLength => {
+                            if let Some(consolidator) = &consolidator_for_alert {
+                                let protect = approvals_store.live_ids(&sid3);
+                                if let Err(e) =
+                                    consolidator.force_consolidate(&sid3, &protect).await
+                                {
+                                    crate::warn_log!(
+                                        "[session] context-length relief failed for {}: {e}",
+                                        sid3
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             })
         });
 
@@ -1570,6 +1633,10 @@ pub fn parse_session_origin(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use crate::memory::MemoryService;
+
     use super::*;
 
     fn user_msg(content: &str) -> Message {
@@ -2916,6 +2983,185 @@ mod tests {
             session.history.len() <= 120,
             "history should be limited to 120, got {}",
             session.history.len()
+        );
+    }
+
+    // ── 票 19: post-run routing of classified provider failures ──
+
+    /// One-shot scripted HTTP server: serves `(status, body)` per connection,
+    /// then stops accepting. Same shape as the provider seam's test server.
+    async fn spawn_one_shot_server(script: Vec<(u16, String)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status, body) in script {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status} R\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+                drop(sock);
+            }
+        });
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    fn openai_provider_for(url: &str) -> Arc<crate::provider::OpenAIProvider> {
+        let cfg = crate::config_defs::ProviderConfig {
+            r#type: "openai".to_string(),
+            api_url: url.to_string(),
+            base_url: String::new(),
+            api_key: "test-key".to_string(),
+            model: "gpt-4".to_string(),
+            temperature: 0.7,
+            max_tokens: 4096,
+            context_window_tokens: 32768,
+            prompt_cache_enabled: false,
+            disable_thinking: false,
+            timeout_seconds: 5,
+            unknown: Default::default(),
+        };
+        Arc::new(crate::provider::OpenAIProvider::new(&cfg))
+    }
+
+    #[tokio::test]
+    async fn test_provider_auth_failure_alerts_owner_and_raw_body_absent_everywhere() {
+        // A 401 with a body carrying a sensitive-looking audit blob: only the
+        // structured error.message may travel. The raw body must appear in
+        // neither the session JSONL nor any outbound message (票 19).
+        let body = r#"{"error":{"message":"Invalid API key provided","code":"invalid_api_key"},"audit_blob":"LEAK-RAW-BODY-SENTINEL","request_id":"req-secret-42"}"#;
+        WorkerPool::init_global(2);
+        let url = spawn_one_shot_server(vec![(401, body.to_string())]).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mut sm = SessionManager::new(session_dir.clone()).unwrap();
+        sm.get_or_create("webui:main").await.unwrap();
+        let shared = Arc::new(Mutex::new(sm));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusResult>(8);
+        let owner_store = Arc::new(crate::delivery::OwnerPrimaryStore::load(tmp.path()));
+        owner_store.record_first(&crate::delivery::DeliveryTarget::new("webui", "main").unwrap());
+        let dedup = Arc::new(crate::owner_alert::OwnerAlertDedup::new());
+
+        let task = SessionTaskBuilder::new(
+            "webui:main".to_string(),
+            "hi".to_string(),
+            TaskHook::new("webui:main"),
+        )
+        .session_manager(shared.clone())
+        .tool_manager(Arc::new(ToolManager::new(workspace_dir.clone())))
+        .provider(openai_provider_for(&url))
+        .config(AgentConfig::default())
+        .workspace_dir(workspace_dir)
+        .memory_service(Arc::new(Mutex::new(MemoryService::new(tmp.path()))))
+        .outbound_tx(tx)
+        .owner_primary(owner_store)
+        .owner_alerts(dedup)
+        .build();
+
+        shared.lock().await.submit_task(task).await.unwrap();
+
+        // First outbound: the failed turn, carrying the provider's message.
+        let turn = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("turn result arrives")
+            .expect("one result");
+        assert!(turn.content.starts_with("Error:"), "{}", turn.content);
+        assert!(
+            turn.content.contains("Invalid API key provided"),
+            "the provider's own message passes through verbatim: {}",
+            turn.content
+        );
+        // Second outbound: the owner alert through the delivery seam.
+        let alert = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("owner alert arrives")
+            .expect("second result");
+        assert!(alert.run_id.starts_with("owner-alert-"));
+        assert!(
+            alert.content.contains("[Provider alert]"),
+            "{}",
+            alert.content
+        );
+        assert!(alert.content.contains("Invalid API key provided"));
+        // A third hard failure in the same streak merges into silence.
+        assert!(rx.try_recv().is_err(), "repeats must not flood");
+
+        // Privacy: the raw response body appears in no outbound message and
+        // nowhere in the persisted session JSONL.
+        for msg in [&turn.content, &alert.content] {
+            assert!(
+                !msg.contains("LEAK-RAW-BODY-SENTINEL"),
+                "body leaked: {msg}"
+            );
+            assert!(!msg.contains("req-secret-42"), "body leaked: {msg}");
+        }
+        // The run persists the session before finishing; give it a beat.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let jsonl = tokio::fs::read_to_string(&session_dir.join("webui:main.jsonl"))
+            .await
+            .unwrap_or_default();
+        assert!(!jsonl.contains("LEAK-RAW-BODY-SENTINEL"), "body in JSONL");
+        assert!(!jsonl.contains("req-secret-42"), "body in JSONL");
+    }
+
+    #[tokio::test]
+    async fn test_provider_context_length_failure_fails_turn_without_owner_alert() {
+        // Context-length errors route into pressure handling, not the owner's
+        // notices: the only outbound message is the failed turn itself.
+        let body = r#"{"error":{"message":"This model's maximum context length is 8191 tokens.","code":"context_length_exceeded"},"audit_blob":"LEAK-CTX-SENTINEL"}"#;
+        WorkerPool::init_global(2);
+        let url = spawn_one_shot_server(vec![(400, body.to_string())]).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("sessions");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("webui:main").await.unwrap();
+        let shared = Arc::new(Mutex::new(sm));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusResult>(8);
+        let owner_store = Arc::new(crate::delivery::OwnerPrimaryStore::load(tmp.path()));
+        owner_store.record_first(&crate::delivery::DeliveryTarget::new("webui", "main").unwrap());
+
+        let task = SessionTaskBuilder::new(
+            "webui:main".to_string(),
+            "hi".to_string(),
+            TaskHook::new("webui:main"),
+        )
+        .session_manager(shared.clone())
+        .tool_manager(Arc::new(ToolManager::new(workspace_dir.clone())))
+        .provider(openai_provider_for(&url))
+        .config(AgentConfig::default())
+        .workspace_dir(workspace_dir)
+        .memory_service(Arc::new(Mutex::new(MemoryService::new(tmp.path()))))
+        .outbound_tx(tx)
+        .owner_primary(owner_store)
+        .build();
+
+        shared.lock().await.submit_task(task).await.unwrap();
+
+        let turn = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("turn result arrives")
+            .expect("one result");
+        assert!(turn.content.starts_with("Error:"), "{}", turn.content);
+        assert!(turn.content.contains("maximum context length"));
+        assert!(!turn.content.contains("LEAK-CTX-SENTINEL"));
+        // No owner alert for context-length — it is pressure, not the owner's
+        // to fix; and with no consolidator attached nothing else happens.
+        assert!(
+            rx.try_recv().is_err(),
+            "context length must not alert owner"
         );
     }
 }

@@ -332,7 +332,11 @@ impl Provider for FailingProvider {
         _tools: Option<&[ToolDefinition]>,
         _recorder: Option<&dyn SpanRecorder>,
     ) -> Result<LLMResponse> {
-        Err(anyhow::anyhow!("Simulated LLM API failure"))
+        Err(crate::provider::ProviderError::new(
+            crate::provider::ProviderErrorKind::Other,
+            "Simulated LLM API failure",
+        )
+        .into())
     }
 }
 
@@ -1577,7 +1581,13 @@ async fn test_llm_error_rolls_back_messages() {
         )
         .await;
     assert!(!result.success);
-    assert!(result.content.contains("LLM API request failed"));
+    // The provider's own message is surfaced verbatim (no wrapper, no raw body).
+    assert!(result.content.contains("Simulated LLM API failure"));
+    assert_eq!(
+        result.provider_error.as_ref().map(|e| e.kind),
+        Some(crate::provider::ProviderErrorKind::Other),
+        "the classified kind rides on the result for the caller to route"
+    );
 
     // User message should be rolled back.
     let msgs = sm.lock().await.get_messages("test-session").await;
@@ -1601,6 +1611,7 @@ async fn test_agent_result_accumulate() {
         completion_tokens: 0,
         iterations: 0,
         message_sent: false,
+        provider_error: None,
     };
 
     let usage1 = Usage {
@@ -2633,13 +2644,13 @@ async fn test_runner_root_span_error_on_llm_failure() {
     let root_end = backend.end_for(&root);
     match &root_end.status {
         Some(crate::trace::SpanStatus::Error(msg)) => {
-            assert!(msg.contains("LLM API request failed"));
+            assert!(msg.contains("Simulated LLM API failure"));
         }
         other => panic!("expected error status, got {other:?}"),
     }
     assert_eq!(
         root_end.attributes.get("error.type"),
-        Some(&serde_json::json!("provider_error"))
+        Some(&serde_json::json!("provider_other"))
     );
     // The failing chat span is also marked error (with the raw error).
     let chat = backend.start_named("chat");
@@ -2652,7 +2663,7 @@ async fn test_runner_root_span_error_on_llm_failure() {
     }
     assert_eq!(
         chat_end.attributes.get("error.type"),
-        Some(&serde_json::json!("provider_error"))
+        Some(&serde_json::json!("provider_other"))
     );
 }
 

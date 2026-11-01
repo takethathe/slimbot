@@ -80,6 +80,8 @@ pub struct SessionTask {
 }
 ```
 
+`SessionTaskBuilder::build()` 的执行闭包在 run 结束后除投递常规结果（成功原文 / `Error: …`）外，还按 `AgentResult.provider_error` 的分类做路由（票 19）：`AuthQuota` → 经 `resolve_target(…, owner_primary)` 发出合并去重的 owner 告警（`src/owner_alert.rs`）；`ContextLength` → `Consolidator::force_consolidate` 腾出窗口。两者只携带结构化分类结果，原始响应体不落 session/日志。
+
 ### TaskState
 
 ```rust

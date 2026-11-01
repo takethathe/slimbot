@@ -1,7 +1,9 @@
+mod error;
 #[cfg(test)]
 mod mock;
 mod openai;
 
+pub use error::{ProviderError, ProviderErrorKind};
 pub use openai::OpenAIProvider;
 
 #[cfg(test)]

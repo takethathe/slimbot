@@ -8,7 +8,13 @@ use crate::session::Message;
 use crate::tool::ToolDefinition;
 use crate::trace::SpanRecorder;
 
+use super::error::{ProviderError, ProviderErrorKind, classify};
 use super::{FinishReason, LLMResponse, StreamSignal, Usage};
+
+/// Total attempts for a single provider call, counting the first try. Only
+/// transient failures consume another attempt; a bounded count keeps a sustained
+/// outage from turning one turn into an unbounded retry storm (票 11).
+const MAX_ATTEMPTS: usize = 3;
 
 pub struct OpenAIProvider {
     client: reqwest::Client,
@@ -20,8 +26,11 @@ pub struct OpenAIProvider {
 impl OpenAIProvider {
     pub fn new(config: &ProviderConfig) -> Self {
         let api_url = Self::resolve_api_url(config);
+        // The single-call timeout is read from config (票 19): a slow model is
+        // not killed by a hardcoded value, and a hung endpoint is not given an
+        // infinite lease.
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(180))
+            .timeout(std::time::Duration::from_secs(config.timeout_seconds))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -46,6 +55,61 @@ impl OpenAIProvider {
             return format!("{}/v1/chat/completions", base);
         }
         "https://api.openai.com/v1/chat/completions".to_string()
+    }
+
+    /// Send the request, retrying only transient failures with a bounded
+    /// exponential backoff. A success returns the raw [`reqwest::Response`];
+    /// every other outcome returns a [`ProviderError`] carrying the classified
+    /// kind and the provider's own message — never the raw response body.
+    ///
+    /// `make_request` rebuilds the request each attempt (the builder is
+    /// consumed by `send`), so the retry replays an identical call.
+    async fn send_with_retry<F>(&self, mut make_request: F) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let resp = make_request().send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => return Ok(r),
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    // Read the body to classify, but carry only the structured
+                    // message forward — the raw bytes never leave this function.
+                    let body = r.text().await.unwrap_or_default();
+                    let err = classify(status, &body);
+                    if err.kind.is_retryable() && attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Self::backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+                Err(e) => {
+                    // Transport-level failure (connection reset, DNS, the
+                    // client timeout firing): a blip to retry, not the
+                    // provider refusing. reqwest's Display names the URL and
+                    // kind, never a response body, so it is safe to carry.
+                    let err = ProviderError::new(
+                        ProviderErrorKind::Transient,
+                        format!("request transport error: {e}"),
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Self::backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+    }
+
+    /// Exponential backoff: 100ms, 200ms, 400ms ... — small enough that a test
+    /// exercising the retry path does not stall, long enough to matter live.
+    fn backoff(attempt: usize) -> std::time::Duration {
+        let ms = 100u64 << (attempt.saturating_sub(1)).min(6);
+        std::time::Duration::from_millis(ms)
     }
 }
 
@@ -410,19 +474,14 @@ impl crate::provider::Provider for OpenAIProvider {
         }
 
         let resp = self
-            .client
-            .post(&self.api_url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
+            .send_with_retry(|| {
+                self.client
+                    .post(&self.api_url)
+                    .header("Authorization", format!("Bearer {}", self.config.api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+            })
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await?;
-            anyhow::bail!("API request failed: {} - {}", status, body);
-        }
 
         let api_resp: ApiResponse = resp.json().await.context("Failed to parse API response")?;
 
@@ -542,19 +601,14 @@ impl crate::provider::Provider for OpenAIProvider {
         }
 
         let resp = self
-            .client
-            .post(&self.api_url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
+            .send_with_retry(|| {
+                self.client
+                    .post(&self.api_url)
+                    .header("Authorization", format!("Bearer {}", self.config.api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+            })
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await?;
-            anyhow::bail!("API request failed: {} - {}", status, text);
-        }
 
         use futures::StreamExt;
         let mut reader = SseLineReader::default();
@@ -713,6 +767,7 @@ mod tests {
             context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
+            timeout_seconds: 180,
             unknown: Default::default(),
         }
     }
@@ -1220,6 +1275,7 @@ mod tests {
             context_window_tokens: 32768,
             prompt_cache_enabled: false,
             disable_thinking: false,
+            timeout_seconds: 180,
             unknown: Default::default(),
         };
 
@@ -1309,6 +1365,7 @@ mod tests {
             context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
+            timeout_seconds: 180,
             unknown: Default::default(),
         };
 
@@ -1510,6 +1567,7 @@ mod tests {
                 context_window_tokens: 32768,
                 prompt_cache_enabled: false,
                 disable_thinking: false,
+                timeout_seconds: 180,
                 unknown: Default::default(),
             };
             let provider = OpenAIProvider::new(&config);
@@ -1690,6 +1748,7 @@ mod tests {
             context_window_tokens: 32768,
             prompt_cache_enabled: false,
             disable_thinking: false,
+            timeout_seconds: 180,
             unknown: Default::default(),
         };
 
@@ -2273,5 +2332,177 @@ mod tests {
             .expect("request body recorded even on failure");
         let body_str = body.as_str().expect("body stored as a string attribute");
         serde_json::from_str(body_str).unwrap()
+    }
+
+    // ── Retry / classification behavior at the Provider::chat seam (票 19) ──
+    //
+    // A tiny scripted HTTP server: each accepted connection replies with the
+    // next canned (status, body) and the request count is observed, so tests
+    // assert the *external* outcome (how many tries, which classification) rather
+    // than internal wiring.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const OK_BODY: &str =
+        r#"{"choices":[{"message":{"content":"ok","tool_calls":null},"finish_reason":"stop"}]}"#;
+
+    /// Serve `script` responses one per connection, then stop accepting. Returns
+    /// the bound addr and a counter of requests received.
+    async fn spawn_server(
+        script: Vec<(u16, String)>,
+    ) -> (
+        String,
+        std::sync::Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let count_cloned = count.clone();
+        let handle = tokio::spawn(async move {
+            for (status, body) in script {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                count_cloned.fetch_add(1, Ordering::SeqCst);
+                // Drain the request head so reqwest is not blocked writing.
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status} R\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+                drop(sock);
+            }
+        });
+        (format!("http://{addr}/v1/chat/completions"), count, handle)
+    }
+
+    fn provider_for(url: &str, timeout_seconds: u64) -> OpenAIProvider {
+        let mut cfg = make_config(url, "");
+        cfg.timeout_seconds = timeout_seconds;
+        OpenAIProvider::new(&cfg)
+    }
+
+    #[tokio::test]
+    async fn test_transient_5xx_is_retried_then_succeeds() {
+        let (url, count, _h) = spawn_server(vec![
+            (500, "upstream".to_string()),
+            (200, OK_BODY.to_string()),
+        ])
+        .await;
+        let provider = provider_for(&url, 5);
+        let user = Message::user("hi".to_string());
+        let msgs: Vec<&Message> = vec![&user];
+        let resp = provider
+            .chat(&msgs, None, None)
+            .await
+            .expect("second try succeeds");
+        assert_eq!(resp.content.as_deref(), Some("ok"));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "a transient failure is retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_error_is_never_retried() {
+        let (url, count, _h) = spawn_server(vec![(
+            401,
+            r#"{"error":{"message":"Invalid API key","type":"authentication_error"}}"#.to_string(),
+        )])
+        .await;
+        let provider = provider_for(&url, 5);
+        let user = Message::user("hi".to_string());
+        let msgs: Vec<&Message> = vec![&user];
+        let err = provider.chat(&msgs, None, None).await.unwrap_err();
+        let pe = err
+            .downcast_ref::<super::super::error::ProviderError>()
+            .expect("classified provider error");
+        assert_eq!(pe.kind, super::super::error::ProviderErrorKind::AuthQuota);
+        // The provider's own message reaches the caller verbatim (for passthrough).
+        assert_eq!(pe.message, "Invalid API key");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "auth/quota errors are never retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_length_exceeded_is_classified_not_retried() {
+        let (url, count, _h) = spawn_server(vec![(
+            400,
+            r#"{"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}"#
+                .to_string(),
+        )])
+        .await;
+        let provider = provider_for(&url, 5);
+        let user = Message::user("hi".to_string());
+        let msgs: Vec<&Message> = vec![&user];
+        let err = provider.chat(&msgs, None, None).await.unwrap_err();
+        let pe = err
+            .downcast_ref::<super::super::error::ProviderError>()
+            .expect("classified provider error");
+        assert_eq!(
+            pe.kind,
+            super::super::error::ProviderErrorKind::ContextLength
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1, "pressure is not retried");
+    }
+
+    #[tokio::test]
+    async fn test_raw_response_body_never_surfaces_in_the_error() {
+        // A transient body carrying a sensitive-looking blob must not leak into
+        // the carried message once retries are exhausted.
+        let secret_body = r#"{"error":{"message":"try later","secret":"sk-live-DO-NOT-LOG"}}"#;
+        let (url, _count, _h) = spawn_server(vec![
+            (429, secret_body.to_string()),
+            (429, secret_body.to_string()),
+            (429, secret_body.to_string()),
+        ])
+        .await;
+        let provider = provider_for(&url, 5);
+        let user = Message::user("hi".to_string());
+        let msgs: Vec<&Message> = vec![&user];
+        let err = provider.chat(&msgs, None, None).await.unwrap_err();
+        let pe = err
+            .downcast_ref::<super::super::error::ProviderError>()
+            .unwrap();
+        assert_eq!(pe.message, "try later");
+        assert!(
+            !err.to_string().contains("sk-live"),
+            "raw body must not be carried in the error string"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_call_timeout_is_read_from_config() {
+        // A server that accepts but never answers forces the client timeout.
+        // With timeout_seconds = 1 the call fails within a handful of seconds
+        // rather than hanging; the hardcoded value is gone.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _holder = tokio::spawn(async move {
+            // Accept and hold connections without ever writing a response.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let url = format!("http://{addr}/v1/chat/completions");
+        let provider = provider_for(&url, 1);
+        let user = Message::user("hi".to_string());
+        let msgs: Vec<&Message> = vec![&user];
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.chat(&msgs, None, None),
+        )
+        .await
+        .expect("the configured timeout bounds the call; it does not hang");
+        assert!(result.is_err(), "an unanswered server fails the call");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

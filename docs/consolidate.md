@@ -142,6 +142,8 @@ ReAct turn 完成
 
 `Consolidator` 在 `AgentLoop` 初始化时创建为 `Arc<Consolidator>`，传入 `AgentRunner`。Runner 在每次 ReAct turn 结束后，若配置了 consolidator 则调用 `maybe_consolidate()`。不传入 consolidator 时（`None`）跳过摘要检查。
 
+另一条路由入口（票 19）：provider 返回 `context_length_exceeded` 时没有可用的 prompt_tokens 判触发，`SessionTaskBuilder` 的 run 后闭包改调 `force_consolidate(session_id, protect)`——只看锚（窗口 − 目标 = 本轮要腾掉的量）强制走一轮 `consolidate_one_round()`，为下一轮腾出窗口；带 `protect` 的待确认审批消息仍不被摘要。
+
 ## 设计考量
 
 - 每次 ReAct turn 完成后触发一次摘要检查（非循环重试），下一轮 LLM 调用时重新测量

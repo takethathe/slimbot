@@ -1,6 +1,6 @@
 # Provider
 
-对应模块：`src/provider/mod.rs` + `src/provider/openai.rs`
+对应模块：`src/provider/mod.rs` + `src/provider/openai.rs` + `src/provider/error.rs`
 
 ## 概述
 
@@ -115,6 +115,7 @@ OpenAIProvider::new(provider_config)
 - `model` — 模型名称
 - `temperature` — 采样温度
 - `max_tokens` — 最大响应 token 数
+- `timeout_seconds` — 单次 provider 调用超时（票 19，默认 180，可配 1–3600；不再是写死值）
 - `prompt_cache_enabled` — 是否启用 prompt 缓存（默认 `true`）
 
 ### URL 解析逻辑
@@ -166,6 +167,24 @@ else → "https://api.openai.com/v1/chat/completions"
 ### 认证
 
 通过 `Authorization: Bearer {api_key}` 请求头传递 API Key。
+
+## 错误分类、重试与 owner 透传（票 19）
+
+非 2xx 响应不再 `bail!("...{status} - {body}")`（旧行为会把原始响应体灌进日志/session）。`src/provider/error.rs` 按 provider 的**结构化 `error.code`/`error.type` + HTTP status** 分类为 `ProviderErrorKind`：
+
+| kind | 判定 | 处理 |
+|------|------|------|
+| `Transient` | 408/409/425/429、5xx、连接/超时错误 | `send_with_retry` 最多 3 次指数退避（100ms 起，`100 << n`）；耗尽后本轮失败 |
+| `AuthQuota` | 401/402/403、`insufficient_quota` code | 零重试；本轮失败；**provider 原话经投递路径告警 owner**（见下） |
+| `ContextLength` | `context_length_exceeded` / `string_above_max_length` | 零重试；路由进上下文压力处理（`Consolidator::force_consolidate` 在 run 后执行一轮压缩，为下一轮腾窗口） |
+| `ContentFilter` | `content_filter` | 零重试；透传给调用方 |
+| `Other` | 其余 | 零重试；本轮失败 |
+
+**隐私（硬约束）**：`ProviderError` 只携带 kind + 结构化 `error.message`（缺失时退化为 `provider returned HTTP {status}`），**原始响应体永不进入** message、trace、session JSONL 或日志。
+
+**owner 告警**（`src/owner_alert.rs`）：`AuthQuota` 类硬错误在 run 结束后由 `SessionTaskBuilder` 的投递闭包经 `resolve_target(None, None, owner_primary)` 发出 `[Provider alert]`（票 17 投递接缝）；`OwnerAlertDedup` 按 kind 在 10 分钟窗口内去重——**重复硬错只发一条合并告警，不刷屏**。无 owner 主通道时降级 warn 日志。
+
+runner 侧：失败的 chat 调用把分类结果放入 `AgentResult.provider_error`，trace 的 `error.type` 记 `provider_<kind>`（低基数），下游路由只看 kind 不看字符串。
 
 ## 扩展自定义 Provider
 

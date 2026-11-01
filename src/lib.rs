@@ -27,6 +27,7 @@ pub(crate) mod log;
 pub(crate) mod macros;
 pub(crate) mod memory;
 pub(crate) mod message_bus;
+pub(crate) mod owner_alert;
 pub(crate) mod path;
 pub mod pressure;
 pub(crate) mod provider;
@@ -63,10 +64,13 @@ pub use memory::backend::{EditOutcome, MemoryBackend, MemoryBackendKind};
 pub use memory::category::MemoryCategory;
 pub use memory::{MemoryService, SharedMemory};
 pub use message_bus::{BusRequest, BusResult, MessageBus};
+pub use owner_alert::{OwnerAlertDedup, deliver_provider_alert, provider_alert_text};
 pub use path::PathManager;
 pub use path::expand_home;
 pub use pressure::{PressureAnchor, PressureLimits};
-pub use provider::{FinishReason, LLMResponse, OpenAIProvider, Provider, Usage};
+pub use provider::{
+    FinishReason, LLMResponse, OpenAIProvider, Provider, ProviderError, ProviderErrorKind, Usage,
+};
 pub use runner::AgentRunner;
 pub use session::{
     AgentEvent, Content, Message, Session, SessionManager, SharedSessionManager, TaskHook,

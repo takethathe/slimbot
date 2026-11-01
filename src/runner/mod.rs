@@ -42,17 +42,20 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Map a failed run's message to a low-cardinality `error.type` per the
-/// GenAI semantic conventions (fallback `_OTHER`).
-fn classify_run_error(message: &str) -> &'static str {
-    if message.contains("LLM API request failed") {
-        "provider_error"
-    } else if message.contains("Reached max iterations") {
-        "max_iterations"
+/// Map a failed run to a low-cardinality `error.type` per the GenAI semantic
+/// conventions (fallback `_OTHER`). A classified provider failure maps to
+/// `provider_<kind>`; other failures are keyed on their message.
+fn classify_run_error(result: &AgentResult) -> String {
+    if let Some(pe) = &result.provider_error {
+        return format!("provider_{}", pe.kind);
+    }
+    let message = &result.content;
+    if message.contains("Reached max iterations") {
+        "max_iterations".to_string()
     } else if message.contains("Task cancelled") {
-        "cancelled"
+        "cancelled".to_string()
     } else {
-        "_OTHER"
+        "_OTHER".to_string()
     }
 }
 
@@ -69,6 +72,11 @@ pub struct AgentResult {
     /// True if the message tool was used to deliver output this turn.
     /// When true, the caller should suppress the final response to avoid duplicates.
     pub message_sent: bool,
+    /// Set when the run ended on a provider failure, carrying the classified
+    /// kind and the provider's own (safe) message. The caller uses it to route
+    /// context-length failures into pressure and to alert the owner on hard
+    /// auth/quota failures — never the raw response body (票 19 / ADR 0018).
+    pub provider_error: Option<crate::provider::ProviderError>,
 }
 
 impl AgentResult {
@@ -609,16 +617,35 @@ impl AgentRunner {
                         {
                             Ok(r) => r,
                             Err(e) => {
+                                // Classify at the seam: carry the provider's
+                                // structured kind + message, never the raw body.
+                                let provider_err =
+                                    e.downcast_ref::<crate::provider::ProviderError>().cloned();
+                                let kind = provider_err.as_ref().map(|pe| pe.kind);
+                                let safe_msg = provider_err
+                                    .as_ref()
+                                    .map(|pe| pe.message.clone())
+                                    .unwrap_or_else(|| e.to_string());
                                 if let Some(span) = &chat_span {
+                                    let error_type = match kind {
+                                        Some(k) => format!("provider_{k}"),
+                                        None => "provider_error".to_string(),
+                                    };
                                     span.set_attribute(
                                         "error.type",
-                                        serde_json::json!("provider_error"),
+                                        serde_json::json!(error_type),
                                     );
-                                    span.set_status(SpanStatus::Error(e.to_string()));
+                                    span.set_status(SpanStatus::Error(safe_msg.clone()));
                                 }
-                                let err_msg = format!("LLM API request failed - {}", e);
-                                warn_log!("[AgentRunner] {}", err_msg);
-                                state.fail(err_msg);
+                                warn_log!(
+                                    "[AgentRunner] provider call failed ({}): {}",
+                                    kind.map(|k| k.to_string()).unwrap_or_default(),
+                                    safe_msg
+                                );
+                                // Fail the turn with the provider's own message
+                                // verbatim (privacy: no raw response body).
+                                state.result.provider_error = provider_err;
+                                state.fail(safe_msg);
                                 state.rollback_to = Some(spec.initial_message_count);
                                 break;
                             }
@@ -881,7 +908,7 @@ impl AgentRunner {
                 } else {
                     root.set_attribute(
                         "error.type",
-                        serde_json::json!(classify_run_error(&result.content)),
+                        serde_json::json!(classify_run_error(&result)),
                     );
                     SpanStatus::Error(result.content.clone())
                 });

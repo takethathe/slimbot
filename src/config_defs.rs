@@ -38,6 +38,7 @@ define_config! {
         temperature: f32 = 0.7, range(0.0, 2.0), desc: "LLM sampling temperature",
         max_tokens: u32 = 4096, range(1, 100_000), desc: "Max response tokens",
         context_window_tokens: u32 = 32768, range(1024, 200_000), desc: "Model context window in tokens (the single anchor all context limits derive from)",
+        timeout_seconds: u64 = 180, range(1, 3600), desc: "Single provider call timeout in seconds (wall-clock bound on one HTTP request)",
         prompt_cache_enabled: bool = true, none, desc: "Enable prompt caching via cache_control",
         disable_thinking: bool = false, none, desc: "Force-disable model thinking/reasoning mode for calls on this provider (injects enable_thinking=false)",
     }

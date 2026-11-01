@@ -195,6 +195,9 @@ pub struct AgentLoop {
     /// The conversation the owner first established; the last-resort delivery
     /// target for sources that have no origin (heartbeat, an origin-less cron).
     owner_primary: Arc<crate::delivery::OwnerPrimaryStore>,
+    /// Owner-alert dedupe: one alert per hard-provider-failure streak, shared
+    /// across every task this loop builds (票 19).
+    owner_alerts: Arc<crate::owner_alert::OwnerAlertDedup>,
     /// Shared pending approvals (never persisted; a restart fails closed).
     approvals: Arc<crate::approval::ApprovalStore>,
 }
@@ -480,6 +483,7 @@ impl AgentLoop {
 
         Ok(Self {
             owner_primary: Arc::new(crate::delivery::OwnerPrimaryStore::load(paths.data_dir())),
+            owner_alerts: Arc::new(crate::owner_alert::OwnerAlertDedup::new()),
             approvals,
             config,
             workspace_dir: paths.workspace_dir().to_path_buf(),
@@ -644,6 +648,7 @@ impl AgentLoop {
         let owner = Owner::from_config(&self.config.gateway.owner);
         let owner_id = owner.id().to_string();
         let owner_primary = self.owner_primary.clone();
+        let owner_alerts = self.owner_alerts.clone();
         let approvals = self.approvals.clone();
 
         let max_tokens = full_config
@@ -777,6 +782,8 @@ impl AgentLoop {
                         .max_tokens(max_tokens)
                         .tracer(tracer.clone())
                         .approvals(approvals.clone())
+                        .owner_primary(owner_primary.clone())
+                        .owner_alerts(owner_alerts.clone())
                         .build();
 
                         let mut guard = session_manager.lock().await;
@@ -957,6 +964,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1173,6 +1181,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1240,6 +1249,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1326,6 +1336,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1392,6 +1403,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1458,6 +1470,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1560,6 +1573,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1631,6 +1645,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1805,6 +1820,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -1916,6 +1932,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );
@@ -2259,6 +2276,7 @@ mod tests {
                         context_window_tokens: 32768,
                         prompt_cache_enabled: false,
                         disable_thinking: false,
+                        timeout_seconds: 180,
                         unknown: Default::default(),
                     },
                 );

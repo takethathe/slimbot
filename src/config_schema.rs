@@ -801,6 +801,9 @@ fn set_provider_field(
             provider.context_window_tokens =
                 value_u32(value, &format!("{}.context_window_tokens", prefix))?
         }
+        "timeout_seconds" => {
+            provider.timeout_seconds = value_u64(value, &format!("{}.timeout_seconds", prefix))?
+        }
         "prompt_cache_enabled" => {
             provider.prompt_cache_enabled =
                 value_bool(value, &format!("{}.prompt_cache_enabled", prefix))?
@@ -1264,6 +1267,7 @@ mod tests {
                 context_window_tokens: 32768,
                 prompt_cache_enabled: true,
                 disable_thinking: false,
+                timeout_seconds: 180,
                 unknown: Default::default(),
             },
         );

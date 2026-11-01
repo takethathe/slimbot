@@ -678,6 +678,7 @@ mod tests {
                 context_window_tokens: 32768,
                 prompt_cache_enabled: true,
                 disable_thinking: false,
+                timeout_seconds: 180,
                 unknown: Default::default(),
             },
         );
@@ -1167,6 +1168,7 @@ mod tests {
                 context_window_tokens: 32768,
                 prompt_cache_enabled: false,
                 disable_thinking: false,
+                timeout_seconds: 180,
                 unknown: Default::default(),
             },
         );
@@ -1297,6 +1299,7 @@ mod tests {
             context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
+            timeout_seconds: 180,
             unknown: Default::default(),
         };
         let json = serde_json::to_string(&provider).unwrap();
@@ -1504,6 +1507,7 @@ mod tests {
             context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
+            timeout_seconds: 180,
             unknown: Default::default(),
         };
         assert_eq!(provider.r#type, "openai");
@@ -1551,6 +1555,7 @@ mod tests {
                 context_window_tokens: 32768,
                 prompt_cache_enabled: false,
                 disable_thinking: false,
+                timeout_seconds: 180,
                 unknown: Default::default(),
             },
         );
@@ -1766,6 +1771,7 @@ mod tests {
             context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
+            timeout_seconds: 180,
             unknown: Default::default(),
         };
         // Verify unknown fields are empty by default

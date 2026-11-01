@@ -432,6 +432,31 @@ If nothing noteworthy happened, output: (nothing)")
         Ok(consolidated.is_some())
     }
 
+    /// Relieve context pressure after the provider refused a request for
+    /// exceeding the window (`context_length_exceeded`, 票 19). Runs one
+    /// consolidation round to bring the session from the full window down to
+    /// the consolidation target, so the next turn fits — the routing that maps
+    /// a `context_length` provider error onto context-pressure handling rather
+    /// than treating it as a hard failure.
+    pub async fn force_consolidate(
+        &self,
+        session_id: &str,
+        protect: &std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        let limits = self.anchor.limits(DEFAULT_CHAR_PER_TOKEN_RATIO);
+        let tokens_to_remove = self
+            .anchor
+            .window_tokens
+            .saturating_sub(limits.consolidate_target_tokens);
+        if tokens_to_remove == 0 {
+            return Ok(false);
+        }
+        let out = self
+            .consolidate_one_round(session_id, tokens_to_remove, protect)
+            .await?;
+        Ok(out.is_some())
+    }
+
     /// Signal the consolidator to cancel any ongoing consolidation.
     /// Does not wait for in-progress work — the cancellation is cooperative.
     pub fn shutdown(&self) {
@@ -792,6 +817,41 @@ mod tests {
         assert!(
             narrow.maybe_consolidate(&session_id, 20_000).await.unwrap(),
             "20000 tokens is above half of a 32k window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_consolidate_runs_one_round_without_reported_tokens() {
+        // 票 19: a `context_length_exceeded` provider refusal arrives with no
+        // usable prompt_tokens — relief is driven by the anchor alone, so the
+        // round still runs and still respects the summary budget.
+        let provider = Arc::new(SequenceMockProvider::new(vec![(
+            "- summary of the whole session".to_string(),
+            FinishReason::Stop,
+        )]));
+        let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
+
+        let did = consolidator
+            .force_consolidate(&session_id, &std::collections::HashSet::new())
+            .await
+            .unwrap();
+        assert!(did, "a full session gets one forced round");
+
+        // A session with nothing to remove stays untouched without a call.
+        let empty = Consolidator::new(
+            Arc::new(SequenceMockProvider::new(vec![])),
+            Arc::new(tokio::sync::Mutex::new(
+                SessionManager::new(_tmp.path().join("empty_sessions")).unwrap(),
+            )),
+            consolidator.memory_service.clone(),
+            32768,
+        );
+        let did = empty
+            .force_consolidate("missing", &std::collections::HashSet::new())
+            .await;
+        assert!(
+            !did.unwrap_or(true),
+            "nothing to consolidate means no round"
         );
     }
 

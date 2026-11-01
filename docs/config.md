@@ -226,6 +226,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `context_window_tokens` | uint | range(1024, 200000) | `32768` | 该模型的上下文窗口（token）。上下文压力唯一的绝对锚，其余长度限制都是它的百分比 |
 | `prompt_cache_enabled` | bool | — | `true` | 是否启用 prompt 缓存 |
 | `disable_thinking` | bool | — | `false` | 强制禁用该 provider 调用的思考/推理模式（请求体注入 `enable_thinking: false`，DashScope 兼容接口字段；卡片生成路径恒为 true） |
+| `timeout_seconds` | uint | range(1, 3600) | `180` | 单次 provider 调用超时（秒，票 19）；瞬时类失败（429/5xx/连接超时）在此基础上最多 3 次指数退避重试 |
 
 **URL 解析逻辑（归一化）：** `api_url` 优先级更高。如果为空，则从 `base_url` 推导：
 - `base_url` 以 `/chat/completions` 结尾 → 直接使用
