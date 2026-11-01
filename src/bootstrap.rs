@@ -125,12 +125,14 @@ mod tests {
             "the skill must name the funnel"
         );
         assert!(
-            skill.contains("provenance"),
-            "the skill must document the provenance note"
+            skill.contains("source"),
+            "the skill must document the provenance source note"
         );
+        // Ticket 06 #7: provenance keeps the source but never a date — age is
+        // derived from snapshots, so a written date would be a restatable lie.
         assert!(
-            skill.contains("YYYY-MM-DD"),
-            "the provenance note must carry a date format"
+            !skill.contains("YYYY-MM-DD"),
+            "the provenance note must no longer prescribe a date format"
         );
         assert!(
             skill.contains("digest"),

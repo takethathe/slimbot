@@ -21,7 +21,7 @@ MEMORY.md  ──────────▶  SOUL / USER / AGENTS / TOOLS / ski
 
 - **可写集只有一篇文档**：`memory/MEMORY.md`（Core）。分类（这条事实是 soul、user 还是操作细节）需要全量上下文，交给 Dream 比交给正在对话的模型可靠；工具数量本身是幻觉预算。
 - **保护路径由代码强制**（不是提示词）：`bootstrap::protected_documents()`（AGENTS/USER/SOUL/TOOLS + `agents/trigger.md`，从 bootstrap 列表派生、去掉 MEMORY.md）加上 `skills/*/SKILL.md`、`memory/*.md`（MEMORY.md 除外），命中即由 `src/tools/protected.rs` 返回 `REFUSED:` 文案，**不退回合、不报错**。运行文件（`cron/jobs.json`、`sessions/*.jsonl`、`HEARTBEAT.md`、`memory/history.jsonl`）照常可写 —— 把功能阉割当安全不是保护。细节见 [Tool System](tool.md) 的「受保护文档」一节。
-- **provenance 是写法约定，不是字段**：模板与 memory skill 要求每条 bullet 自带 `(source · YYYY-MM-DD)`。派生索引**不解析**它、代码也**不做门禁**（`test_memory_skill_documents_the_provenance_convention` 锁的是这段提示词文本）。给来源赋予机器语义就等于承诺一个守不住的校验：写入路径是普通文本编辑。
+- **provenance 是写法约定，不是字段**：模板与 memory skill 要求每条 bullet 自带来源 `(source)`——**只留来源、不留日期**（票 06 #7 推翻了旧的 `(source · YYYY-MM-DD)`）。派生索引**不解析**它、代码也**不做门禁**。给来源赋予机器语义就等于承诺一个守不住的校验：写入路径是普通文本编辑。**条目时间不进文档**：`strip_age_markers` 在读写两侧剥掉 `← Nd` / `[Nd]` / `(N days old)` 之类的年龄标记，年龄只由快照序列反推、只喂 Dream（见「记忆生命周期」一节）。
 - **原文不入记忆**：外部内容进上下文的唯一入口是有界 evidence（ADR 0009，`text ≤ 200` 字符 / ≤ 5 条），原文留在引用路径（`tool-results/<id>.txt`），`MEMORY.md` 只收消化后的表述 + 来源。**残余风险**：`web_fetch` 与 owner 对话没有上限，这两条路径上「只写消化表述」靠提示词与 Dream 事后审查，代码不拦（同理 `shell` 可以直接改任何文件）。
 - **`Daily` 不建设**：无写者、不进检索语料；`history.jsonl` 同样不进语料 —— 未经整理的一轮对话不是事实。由 `test_search_corpus_excludes_daily_documents_and_history` 守住。
 
@@ -81,9 +81,13 @@ pub trait MemoryBackend: Send + Sync {
 
 ```rust
 pub struct MemoryService {
+    workspace_dir: PathBuf,
     memory_dir: PathBuf,
     backend: Arc<dyn MemoryBackend>,
     history: HistoryStore,
+    snapshots: SnapshotStore,
+    audit: Option<Arc<MemoryWriteAudit>>,   // attached only during a Dream pass
+    doc_budget: Option<MemoryDocBudget>,     // set only during a Dream pass
 }
 
 pub type SharedMemory = Arc<tokio::sync::Mutex<MemoryService>>;
@@ -99,6 +103,32 @@ pub type SharedMemory = Arc<tokio::sync::Mutex<MemoryService>>;
 | `get_effective(category, name)` | 注入用有效内容：缺失 / 空 / 等于模板 → `None` |
 | `sync_all()` | 落盘：`backend.sync()`（文档 fsync）+ `history.sync()`（`history.jsonl` 与游标 fsync） |
 | `append_history` / `read_*` / 游标 / `compact_history_after_dream` | 历史操作，委托 `HistoryStore` |
+
+## 记忆生命周期：写前快照与年龄反推（ADR 0014）
+
+票 06 / 票 24 的落地面。压缩后原始对话会物理消失，所以**能回滚的对象只有记忆文档**——快照、审计、年龄反推都围着它。
+
+### 写前快照（`src/memory/snapshots.rs`）
+
+- 每条写路径在**实际改写文档前**把旧内容复制到 `memory/.snapshots/{run 时间戳}/{文档}`；`capture_before_write` 对非受管文档 / 首次写入（文件不存在）返回 `None`，不产生噪声快照。
+- 两条写入路径各接一次：Dream 走 `MemoryService::set`/`edit`/`remove`（facade 内 `capture_before_write`），主模型走 `file_writer`/`file_editor`（工具内算出 `relative_document` 后调自由函数 `capture_before_write`）。快照目录**不进检索语料**。
+- **分层轮转**（`SnapshotPolicy`，来自 `pressure.memory_snapshot_*`）：最近 `recent_days`（默认 30）全留 → 之后每篇每天一份 → 更久每月一份，外加每篇 `max_per_document`（默认 120）硬上限。轮转挂在 **Dream 成功分支**的 `rotate_snapshots`，与 `tool-results/` TTL 同点，不起独立定时器。
+- `restore` 把文档整体回到选定快照（回滚粒度 = 整篇 × 单次 Dream）；稳定的逐条目 id 被票 05 否决，故不做条目级回滚。
+
+### 指纹级审计进 trace（`src/memory/audit.rs`）
+
+- Dream 跑前 `attach_audit(Some(audit))`、跑后 `attach_audit(None)`，`set`/`edit` 把「旧内容指纹 + 新内容指纹 + 文档 + `EditOutcome`」记进 `MemoryWriteAudit`，**不存全文 diff、不建独立审计文件**（`~/.slimbot/workspace` 是 owner 手改领域，第二份账必然漂移）。
+- Dream 发出一个 `dream.memory.audit` span，属性 = `memory.writes`（逐文档指纹）+ `memory.changed`（内容真的动过的文档，仅 `Applied` 且指纹不同才算）。默认 `tracing.reset_on_start` → 审计深度只到本次进程运行期，长期回溯靠快照。
+
+### 条目年龄：从快照序列反推，绝不进文档
+
+- **年龄标记清洗**（`strip_age_markers`）：读写两侧剥掉 `← Nd` / `[Nd]` / `(N days old)` 这类行尾年龄标记，只认这三种已知形态、不碰句中；`memory_edit` / `file_editor` 的 `old_string` **匹配前**就剔（文档存的是干净文本，回显的标记会 miss）。`memory_read` 返回零注解。
+- **年龄反推**（`SnapshotStore::entry_ages`）：逐快照 diff 算出一条**正文行**首次出现的版本 → 年龄 = `now - 该 run 时间`。标题行的新增/移动**不改年龄**；序列里缺档则标「未知」、不外推；改写一条 bullet 措辞会被算成新条目（已知误差）。
+- **只喂 Dream**：`build_prompt` 把年龄渲染成提示侧信道（「以下条目首次出现于 N 天前 / 本轮新增」），**不进记忆文档、不进 `memory_search` 结果、不进 WebUI**——推导值一旦进检索结果就会被模型当事实复述，正是取消日期要避免的幻觉。
+
+### Dream 结构判定成功
+
+`audit.success(result.success)`：run 正常结束（`result.success`，未超 `max_iterations` / 无传输错误 / 未超时取消）**且**本轮无失败写入（`WriteOutcome::Failed`）。零写入合法（「记忆本已正确」）；不再用英文子串匹配判定，cursor 推进与快照轮转同处这一个成功分支。
 
 ## HistoryStore（历史子系统）
 

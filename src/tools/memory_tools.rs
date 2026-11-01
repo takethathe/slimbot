@@ -223,6 +223,22 @@ impl crate::tool::Tool for MemoryWriteTool {
                 .await?
                 .is_some_and(|c| !c.trim().is_empty())
         };
+
+        // Dream-side budget guard (ADR 0013 / ticket 06 #5): the memory-document
+        // budget is anchored on the *primary* provider window and only set while
+        // Dream runs. A write that would blow past it is refused so Dream has to
+        // compact instead of silently crowding out the main model's context.
+        if let Some(budget) = self.memory.lock().await.doc_budget() {
+            let chars = content.chars().count();
+            if chars > budget.doc_chars {
+                return Ok(format!(
+                    "REFUSED: {label} would be {chars} characters, over the {}-character \
+                     memory-document budget. Merge or drop entries and write a shorter version.",
+                    budget.doc_chars
+                ));
+            }
+        }
+
         self.memory
             .lock()
             .await
@@ -303,6 +319,37 @@ impl crate::tool::Tool for MemoryEditTool {
             .ok_or_else(|| anyhow::anyhow!("Missing required argument: new_string"))?;
 
         let label = target_label(&category, name.as_deref());
+
+        // Dream-side budget guard (ADR 0013 / ticket 06 #5): project the size
+        // after the single replacement and refuse when it would overflow the
+        // primary-anchored document budget. Only an edit that would actually
+        // land (old_string present exactly once) is judged.
+        let projected = {
+            let ms = self.memory.lock().await;
+            match ms.doc_budget() {
+                None => None,
+                Some(budget) => {
+                    let current = ms.get(&category, name.as_deref()).await?;
+                    current
+                        .filter(|c| c.matches(old).count() == 1)
+                        .map(|c| {
+                            c.chars()
+                                .count()
+                                .saturating_sub(old.chars().count())
+                                .saturating_add(new.chars().count())
+                        })
+                        .filter(|size| *size > budget.doc_chars)
+                        .map(|size| (size, budget.doc_chars))
+                }
+            }
+        };
+        if let Some((size, limit)) = projected {
+            return Ok(format!(
+                "REFUSED: editing {label} would make it {size} characters, over the {limit}-character \
+                 memory-document budget. Make the replacement shorter.",
+            ));
+        }
+
         let outcome = self
             .memory
             .lock()
@@ -584,6 +631,68 @@ mod tests {
         assert!(err.to_string().contains("content"));
     }
 
+    #[tokio::test]
+    async fn test_write_over_doc_budget_is_refused_and_unchanged() {
+        // Dream-side hard reject (ADR 0013): a write past the primary-anchored
+        // document budget is refused and nothing lands.
+        let (memory, _tmp) = make_memory().await;
+        memory
+            .lock()
+            .await
+            .set_doc_budget(Some(crate::pressure::MemoryDocBudget {
+                window_tokens: 1000,
+                doc_tokens: 4,
+                doc_chars: 10,
+            }));
+        memory
+            .lock()
+            .await
+            .set(&MemoryCategory::Core, None, "short")
+            .await
+            .unwrap();
+
+        let tool = MemoryWriteTool::new(memory.clone(), &[]);
+        let out = tool
+            .execute(args(
+                json!({ "category": "core", "content": "far too long to fit" }),
+            ))
+            .await
+            .unwrap();
+        assert!(out.contains("REFUSED"), "result was: {out}");
+        assert!(out.contains("memory-document budget"));
+
+        let stored = memory
+            .lock()
+            .await
+            .get(&MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("short"),
+            "refused write must not land"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_under_doc_budget_is_allowed() {
+        let (memory, _tmp) = make_memory().await;
+        memory
+            .lock()
+            .await
+            .set_doc_budget(Some(crate::pressure::MemoryDocBudget {
+                window_tokens: 1000,
+                doc_tokens: 4,
+                doc_chars: 100,
+            }));
+        let tool = MemoryWriteTool::new(memory.clone(), &[]);
+        let out = tool
+            .execute(args(json!({ "category": "core", "content": "fits fine" })))
+            .await
+            .unwrap();
+        assert!(out.starts_with("Created core"), "result was: {out}");
+    }
+
     // -- memory_edit --------------------------------------------------------
 
     #[tokio::test]
@@ -681,6 +790,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "Edited skill:s1.");
+    }
+
+    #[tokio::test]
+    async fn test_edit_over_doc_budget_is_refused_and_unchanged() {
+        // Dream-side hard reject (ADR 0013): an edit that would push a document
+        // past the primary-anchored budget is refused and nothing lands.
+        let (memory, _tmp) = make_memory().await;
+        memory
+            .lock()
+            .await
+            .set(&MemoryCategory::Soul, None, "be concise")
+            .await
+            .unwrap();
+        memory
+            .lock()
+            .await
+            .set_doc_budget(Some(crate::pressure::MemoryDocBudget {
+                window_tokens: 1000,
+                doc_tokens: 4,
+                doc_chars: 12,
+            }));
+
+        let tool = MemoryEditTool::new(memory.clone(), &[]);
+        let out = tool
+            .execute(args(json!({
+                "category": "soul",
+                "old_string": "be concise",
+                "new_string": "be extremely concise at all times"
+            })))
+            .await
+            .unwrap();
+        assert!(out.contains("REFUSED"), "result was: {out}");
+        assert!(out.contains("memory-document budget"));
+
+        let stored = memory
+            .lock()
+            .await
+            .get(&MemoryCategory::Soul, None)
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("be concise"));
     }
 
     // -- descriptions -------------------------------------------------------

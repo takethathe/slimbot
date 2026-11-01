@@ -135,9 +135,18 @@ impl HistoryStore {
     }
 
     /// Compact history entries after Dream processing.
-    /// Only compacts when history exceeds HISTORY_MAX_ENTRIES.
-    /// Keeps the most recent DREAM_KEEP_MINIMUM entries.
-    /// Adjusts dream_cursor after compaction based on deleted line count.
+    ///
+    /// Deletion is restricted to the **contiguous prefix Dream has already
+    /// processed** (`0..dream_cursor`): unprocessed entries are never dropped,
+    /// so a backlog can only grow, never silently disappear. Within that
+    /// prefix, the newest `DREAM_KEEP_MINIMUM` entries are still kept as
+    /// context, so compaction never empties the log.
+    ///
+    /// The cursor is then rewritten to the index of the first unprocessed
+    /// entry in the compacted file — subtracting the deleted count from the old
+    /// cursor — which is exactly the mirror of what was removed. Because the
+    /// removed count never exceeds the cursor, it cannot saturate to zero and
+    /// make processed entries look unprocessed (the old bug).
     pub fn compact_history_after_dream(&mut self) -> Result<()> {
         let entries = self.read_entries();
 
@@ -150,15 +159,20 @@ impl HistoryStore {
             return Ok(());
         }
 
-        // Keep only the most recent DREAM_KEEP_MINIMUM entries
-        let keep_start = entries.len().saturating_sub(Self::DREAM_KEEP_MINIMUM);
-        let deleted_count = keep_start;
-        let filtered: Vec<HistoryEntry> = entries.into_iter().skip(keep_start).collect();
+        let cursor = self.get_last_dream_cursor().min(entries.len());
+        // Never delete past the first unprocessed entry...
+        // ...and never delete into the newest `DREAM_KEEP_MINIMUM` entries.
+        let keep_from = entries.len().saturating_sub(Self::DREAM_KEEP_MINIMUM);
+        let drop_count = cursor.min(keep_from);
+        if drop_count == 0 {
+            return Ok(());
+        }
 
-        // Adjust dream_cursor: subtract the number of deleted lines
-        let old_cursor = self.get_last_dream_cursor();
-        let new_cursor = old_cursor.saturating_sub(deleted_count);
-        self.set_last_dream_cursor(new_cursor)?;
+        let filtered: Vec<HistoryEntry> = entries.into_iter().skip(drop_count).collect();
+
+        // The old entry at index `cursor` is now at `cursor - drop_count`, and
+        // that is still the first unprocessed entry.
+        self.set_last_dream_cursor(cursor - drop_count)?;
 
         self.write_entries(filtered)
     }
@@ -327,35 +341,100 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_history_after_dream_compacts_over_limit() {
+    fn test_compact_history_after_dream_drops_only_the_contiguous_processed_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = make_store(tmp.path());
 
-        // Create 2100 entries (over HISTORY_MAX_ENTRIES limit of 2000)
+        // 2100 entries, 2000 of them already processed by Dream.
         for i in 1..=2100 {
             store.append_history(&format!("entry {}", i)).unwrap();
         }
-
-        // Set dream_cursor to 2000 (meaning 2000 lines processed)
         store.set_last_dream_cursor(2000).unwrap();
 
-        // Call compact_history_after_dream - should compact
         store.compact_history_after_dream().unwrap();
 
-        // Verify: only 50 entries remain (DREAM_KEEP_MINIMUM)
+        // Every unprocessed entry survives: nothing recent is lost.
         let entries = store.read_entries();
-        assert_eq!(entries.len(), 50, "Should compact to DREAM_KEEP_MINIMUM");
+        assert_eq!(entries.len(), 100, "only the processed prefix is dropped");
+        assert_eq!(entries[0].content, "entry 2001");
+        assert_eq!(entries[99].content, "entry 2100");
 
-        // Dream cursor should be adjusted: 2000 - 2050 deleted = 0 (saturating)
+        // The cursor still points at the first unprocessed entry.
+        assert_eq!(store.get_last_dream_cursor(), 0);
+        let cursor = store.get_last_dream_cursor();
         assert_eq!(
-            store.get_last_dream_cursor(),
-            0,
-            "Dream cursor should be adjusted to 0"
+            store.read_unprocessed_history(cursor)[0].content,
+            "entry 2001"
         );
+    }
 
-        // First entry should be "entry 2051"
+    #[test]
+    fn test_compact_history_after_dream_keeps_a_keep_minimum_inside_the_processed_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        // Everything is processed and there is no backlog: the newest
+        // DREAM_KEEP_MINIMUM entries stay as context.
+        for i in 1..=2100 {
+            store.append_history(&format!("entry {}", i)).unwrap();
+        }
+        store.set_last_dream_cursor(2100).unwrap();
+
+        store.compact_history_after_dream().unwrap();
+
+        let entries = store.read_entries();
+        assert_eq!(entries.len(), HistoryStore::DREAM_KEEP_MINIMUM);
         assert_eq!(entries[0].content, "entry 2051");
         assert_eq!(entries[49].content, "entry 2100");
+        assert_eq!(
+            store.get_last_dream_cursor(),
+            50,
+            "the cursor follows the removed prefix instead of saturating to 0"
+        );
+        assert!(
+            store.read_unprocessed_history(50).is_empty(),
+            "everything Dream processed stays processed"
+        );
+    }
+
+    #[test]
+    fn test_compact_history_after_dream_with_no_processed_prefix_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+
+        for i in 1..=2100 {
+            store.append_history(&format!("entry {}", i)).unwrap();
+        }
+        assert_eq!(store.get_last_dream_cursor(), 0, "nothing processed yet");
+
+        store.compact_history_after_dream().unwrap();
+
+        assert_eq!(store.read_entries().len(), 2100);
+        assert_eq!(store.get_last_dream_cursor(), 0);
+    }
+
+    #[test]
+    fn test_compact_history_after_dream_never_reruns_processed_entries() {
+        // Regression guard for the cursor-saturation bug: a compaction that
+        // removed more lines than the cursor used to reset it to 0, so the
+        // surviving entries were re-processed and rewritten into memory.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = make_store(tmp.path());
+        for i in 1..=2100 {
+            store.append_history(&format!("entry {}", i)).unwrap();
+        }
+        store.set_last_dream_cursor(2050).unwrap();
+
+        store.compact_history_after_dream().unwrap();
+
+        let cursor = store.get_last_dream_cursor();
+        let unprocessed = store.read_unprocessed_history(cursor);
+        assert_eq!(
+            unprocessed.len(),
+            50,
+            "exactly the entries Dream had not seen remain unprocessed"
+        );
+        assert_eq!(unprocessed[0].content, "entry 2051");
     }
 
     #[test]

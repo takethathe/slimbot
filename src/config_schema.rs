@@ -741,6 +741,21 @@ fn set_pressure(config: &mut Config, field: &str, value: &serde_json::Value) -> 
             config.pressure.tool_results_ttl_days =
                 value_u64(value, "pressure.tool_results_ttl_days")?
         }
+        "memory_doc_ratio" => {
+            config.pressure.memory_doc_ratio = value_f32(value, "pressure.memory_doc_ratio")?
+        }
+        "memory_snapshot_recent_days" => {
+            config.pressure.memory_snapshot_recent_days =
+                value_u64(value, "pressure.memory_snapshot_recent_days")?
+        }
+        "memory_snapshot_daily_days" => {
+            config.pressure.memory_snapshot_daily_days =
+                value_u64(value, "pressure.memory_snapshot_daily_days")?
+        }
+        "memory_snapshot_max" => {
+            config.pressure.memory_snapshot_max =
+                value_u32(value, "pressure.memory_snapshot_max")? as usize
+        }
         _ => return Err(format!("Unknown pressure field: {}", field)),
     }
     Ok(())

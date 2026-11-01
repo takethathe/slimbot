@@ -21,6 +21,10 @@ define_config! {
         min_keep_messages: usize = 4, range(1, 500), desc: "Floor on how many non-system messages snip keeps",
         keep_recent_tool_results: usize = 10, range(1, 500), desc: "How many recent tool results residual cleanup leaves untouched",
         tool_results_ttl_days: u64 = 7, range(1, 365), desc: "Retention for persisted tool results before Dream sweeps them",
+        memory_doc_ratio: f32 = 0.075, range(0.001, 0.50), desc: "Share of the primary model window one memory document may occupy (tokens, converted to chars)",
+        memory_snapshot_recent_days: u64 = 30, range(1, 3650), desc: "Keep every pre-write memory snapshot younger than this many days",
+        memory_snapshot_daily_days: u64 = 365, range(1, 3650), desc: "Beyond the recent window, thin memory snapshots to one per day until this age, then one per month",
+        memory_snapshot_max: usize = 120, range(1, 10_000), desc: "Hard bound on retained pre-write snapshots per memory document",
     }
 }
 

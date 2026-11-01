@@ -2,22 +2,37 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::DreamConfig;
+use chrono::Local;
+
+use crate::config::{AgentConfig, DreamConfig};
 use crate::memory::SharedMemory;
-use crate::pressure::PressureAnchor;
+use crate::memory::audit::MemoryWriteAudit;
+use crate::pressure::{MemoryDocBudget, PressureAnchor};
 use crate::provider::Provider;
 use crate::session::SharedSessionManager;
 use crate::tool::ToolManager;
 use crate::tools::memory_tools::{MemoryEditTool, MemoryReadTool, MemoryWriteTool};
+use crate::trace::{SpanRecorder, SpanStatus, Tracer};
 
 pub struct DreamService {
     workspace_dir: PathBuf,
     memory_service: SharedMemory,
     session_manager: SharedSessionManager,
     config: DreamConfig,
+    /// Real agent configuration (max_iterations, timeout), never a default:
+    /// Dream must obey the same window/iteration limits as the main agent.
+    agent_config: AgentConfig,
     providers: Arc<HashMap<String, Arc<dyn Provider>>>,
     default_provider: Arc<dyn Provider>,
-    /// Window anchor: Dream only needs its cleanup knobs (tool-result TTL).
+    /// Trace sink so a Dream pass is observable (its memory writes become tool
+    /// spans plus a fingerprint audit span). `None` disables tracing entirely.
+    tracer: Option<Arc<Tracer>>,
+    /// Per-document budget Dream enforces, anchored on the **primary** provider
+    /// window (ADR 0013: two separate anchors).
+    doc_budget: MemoryDocBudget,
+    /// Dream's *own* window anchor (its resolved `model_override` window): drives
+    /// the runner's context/truncation limits and the tool-result TTL sweep.
+    /// Separate from `doc_budget`, which stays on the primary window.
     pressure: PressureAnchor,
 }
 
@@ -28,27 +43,36 @@ pub struct DreamResult {
 }
 
 impl DreamService {
+    // The 9-argument signature wires a full service (memory, sessions, providers,
+    // tracing, budgets); a spec struct would only move the coupling around.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workspace_dir: PathBuf,
         memory_service: SharedMemory,
         session_manager: SharedSessionManager,
         config: DreamConfig,
+        agent_config: AgentConfig,
         providers: Arc<HashMap<String, Arc<dyn Provider>>>,
         default_provider: Arc<dyn Provider>,
+        tracer: Option<Arc<Tracer>>,
+        doc_budget: MemoryDocBudget,
     ) -> Self {
         Self {
             workspace_dir,
             memory_service,
             session_manager,
             config,
+            agent_config,
             providers,
             default_provider,
+            tracer,
+            doc_budget,
             pressure: PressureAnchor::default(),
         }
     }
 
-    /// Attach the configured window anchor (tool-result TTL lives under
-    /// `pressure`), so Dream's housekeeping follows the same config section.
+    /// Attach Dream's own window anchor: it drives the runner's truncation
+    /// limits and the tool-result TTL sweep, both from the same `pressure`.
     pub fn with_pressure(mut self, pressure: PressureAnchor) -> Self {
         self.pressure = pressure;
         self
@@ -74,22 +98,61 @@ impl DreamService {
         let history_text = batch
             .iter()
             .map(|e| {
-                let content = if e.content.len() > 500 {
-                    &e.content[..500]
-                } else {
-                    &e.content
-                };
+                // Character-safe truncation: `content.len()` is bytes and the
+                // slice must land on a char boundary, or a multibyte summary
+                // panics here and wedges every later tick (cursor never moves).
+                let content = truncate_chars(&e.content, 500);
                 format!("[{}] {}", e.timestamp, content)
             })
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Entry-age side channel (ticket 06 #7): reconstruct each landing-document
+        // entry's age from the snapshot sequence and hand it to Dream as prompt
+        // context only. It is never written back into the document — the age is a
+        // derived value with real uncertainty, and a restatable date is the very
+        // hallucination the no-dates rule removes.
+        let age_hint = self.entry_age_hint(&ms).await;
         drop(ms);
 
         let template = crate::embed::get_content("dream.md")?;
         let prompt = template.replace("{history_text}", &history_text);
+        let prompt = if age_hint.is_empty() {
+            prompt
+        } else {
+            format!("{prompt}\n\n{age_hint}")
+        };
 
         Some((prompt, lines_processed))
+    }
+
+    /// Render the current landing document's entry ages as a Dream-only hint.
+    /// Empty when there is no document, no snapshots, or the read fails — a
+    /// missing age is never extrapolated into a claim.
+    async fn entry_age_hint(&self, ms: &crate::memory::MemoryService) -> String {
+        let Ok(Some(content)) = ms.get(&crate::MemoryCategory::Core, None).await else {
+            return String::new();
+        };
+        let Ok(ages) =
+            ms.snapshots()
+                .entry_ages(crate::bootstrap::MEMORY_DOCUMENT, &content, Local::now())
+        else {
+            return String::new();
+        };
+        let mut lines = Vec::new();
+        for age in ages {
+            match age.age_days {
+                Some(days) => lines.push(format!("- {} · 首次出现于 {days} 天前", age.text)),
+                None => lines.push(format!("- {} · 本轮新增（时间未知）", age.text)),
+            }
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+        format!(
+            "条目年龄（仅供你判断新旧，切勿把天数写回文档）:\n{}",
+            lines.join("\n")
+        )
     }
 
     /// Build the Dream sandbox tool set: only the memory tools, so Dream can
@@ -153,20 +216,39 @@ impl DreamService {
         let tools = self.build_tools().await;
         let tool_manager = Arc::new(tools);
 
-        // Use the same agent config as the main agent
-        let agent_config = crate::config::AgentConfig::default();
+        // Attach the fingerprint audit sink and the primary-anchored document
+        // budget to the facade for this pass only; both are detached in the
+        // cleanup below so no other caller inherits them.
+        let audit = Arc::new(MemoryWriteAudit::new());
+        {
+            let mut ms = self.memory_service.lock().await;
+            ms.attach_audit(Some(audit.clone()));
+            ms.set_doc_budget(Some(self.doc_budget));
+        }
+
+        // Dream's pass is observable (ticket 06 #4): each memory write becomes a
+        // tool span through the runner's tracer, and this dedicated span carries
+        // the aggregated fingerprint audit. A `None` tracer yields a no-op guard.
+        let audit_span = self
+            .tracer
+            .as_ref()
+            .map(|t| t.start_span("dream.memory.audit", None));
 
         let runner = crate::runner::AgentRunner::new(
             tool_manager,
             provider,
             self.session_manager.clone(),
-            agent_config,
+            self.agent_config.clone(),
             self.workspace_dir.clone(),
             self.memory_service.clone(),
             None, // No consolidator for dream
             4096,
-            None, // Dream runs are not traced (out of scope)
-        );
+            self.tracer.clone(),
+        )
+        // Dream's own context/truncation limits ride on its resolved window
+        // (`model_override` when set), separate from the primary-anchored
+        // document budget (ticket 06 #5, ADR 0013 — two anchors kept apart).
+        .with_pressure(self.pressure.clone());
 
         let hook = crate::session::TaskHook::new("system:dream");
         let result = runner
@@ -183,17 +265,41 @@ impl DreamService {
 
         let elapsed_ms = start.elapsed().as_millis() as i64;
 
-        // Check if dream completed successfully
-        // Success: LLM returned without tool_calls (normal completion) or finish_reason is Stop
-        let success = result.success
-            && !result.content.to_lowercase().contains("error")
-            && !result.content.to_lowercase().contains("failed");
+        // Structural success (ticket 06 #9): the run finished normally **and** no
+        // write errored. Never derived from the emitted text, and never from a
+        // change count — zero changes is a legitimate, successful pass.
+        let success = audit.success(result.success);
+
+        // Detach the pass-scoped facade hooks, then shape the audit span from
+        // the still-held local `audit` Arc.
+        {
+            let mut ms = self.memory_service.lock().await;
+            ms.attach_audit(None);
+            ms.set_doc_budget(None);
+        }
+        if let Some(span) = &audit_span {
+            for (key, value) in audit.span_attributes() {
+                span.set_attribute(&key, value);
+            }
+            span.set_status(if success {
+                SpanStatus::Ok
+            } else {
+                SpanStatus::Error(result.content.clone())
+            });
+        }
 
         if success {
-            // Advance dream cursor
+            // Cursor advance rides in the same branch as the writes it certifies,
+            // so a crash mid-pass leaves the cursor on unprocessed work rather
+            // than falsely ahead of it (ticket 06 #9).
             let mut ms = self.memory_service.lock().await;
             if let Err(e) = ms.set_last_dream_cursor(lines_processed) {
                 crate::error!("[DreamService] Failed to set dream cursor: {}", e);
+            }
+            // Snapshot retention rotates on this same success branch, alongside
+            // the tool-results TTL sweep, never a separate timer (ticket 06 #6).
+            if let Err(e) = ms.rotate_snapshots(Local::now()) {
+                crate::error!("[DreamService] Failed to rotate snapshots: {}", e);
             }
             drop(ms);
 
@@ -239,6 +345,15 @@ impl DreamService {
         if let Err(e) = ms.compact_history_after_dream() {
             crate::error!("[DreamService] Failed to compact history: {}", e);
         }
+    }
+}
+
+/// First `max_chars` characters of `s`, returned as a `&str` slice that always
+/// lands on a UTF-8 char boundary (never a byte count, which panics on CJK).
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
     }
 }
 
@@ -300,8 +415,11 @@ mod tests {
             memory_service,
             session_manager,
             config,
+            crate::config::AgentConfig::default(),
             providers,
             default_provider,
+            None,
+            MemoryDocBudget::default(),
         );
 
         (service, tmp_dir)
@@ -491,8 +609,11 @@ mod tests {
             memory_service,
             session_manager,
             config,
+            crate::config::AgentConfig::default(),
             Arc::new(providers),
             default_provider,
+            None,
+            MemoryDocBudget::default(),
         );
 
         let provider = service.build_provider();
@@ -518,14 +639,64 @@ mod tests {
 
         let mut ms = service.memory_service.lock().await;
         let entries = ms.read_entries();
-        // Should compact to DREAM_KEEP_MINIMUM (50)
-        assert_eq!(entries.len(), 50);
-        // First entry content
-        assert_eq!(entries[0].content, "entry 2051");
+        // Only the contiguous processed prefix is dropped, and never past the
+        // newest DREAM_KEEP_MINIMUM (50): with a 2000-cursor over 2100 entries
+        // the drop count is min(2000, 2100-50) = 2000, so the 100 unprocessed
+        // entries (2001..=2100) all survive. Unprocessed work is never lost.
+        assert_eq!(entries.len(), 100);
+        // First kept entry is the first one past the processed prefix.
+        assert_eq!(entries[0].content, "entry 2001");
         // Last entry content
-        assert_eq!(entries[49].content, "entry 2100");
-        // Dream cursor should be adjusted: 2000 - 2050 = 0 (saturating)
+        assert_eq!(entries[99].content, "entry 2100");
+        // Cursor rewrites to the index of the first unprocessed entry: 2000-2000.
         assert_eq!(ms.get_last_dream_cursor(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_prompt_appends_entry_age_side_channel() {
+        // The age is reconstructed from the snapshot sequence and handed to
+        // Dream as prompt context only (ticket 06 #7).
+        let (service, _tmp_dir) = make_service().await;
+        service
+            .memory_service
+            .lock()
+            .await
+            .set_last_dream_cursor(0)
+            .unwrap();
+        service
+            .memory_service
+            .lock()
+            .await
+            .append_history("a fact to consolidate")
+            .unwrap();
+        // Two writes leave the landing document with a body entry and a prior
+        // snapshot, so an age can be reconstructed from the sequence.
+        service
+            .memory_service
+            .lock()
+            .await
+            .set(&crate::MemoryCategory::Core, None, "- seed fact")
+            .await
+            .unwrap();
+        service
+            .memory_service
+            .lock()
+            .await
+            .set(
+                &crate::MemoryCategory::Core,
+                None,
+                "- seed fact\n- newer fact",
+            )
+            .await
+            .unwrap();
+
+        let (prompt, _) = service.build_prompt().await.expect("prompt built");
+        assert!(
+            prompt.contains("条目年龄"),
+            "age side channel must be appended"
+        );
+        assert!(prompt.contains("seed fact"));
+        assert!(prompt.contains("切勿把天数写回文档"));
     }
 
     /// Backdate a file's mtime so TTL tests do not sleep.

@@ -88,15 +88,15 @@
 
 ## 记忆生命周期实现切片（票 06 裁决，2026-10-31）
 
-决策见票 06 + `docs/adr/0014`；实现待 spec 落稿后展开。本票发现的实现级缺陷（先于新功能修）：
+决策见票 06 + `docs/adr/0014`；票 24 已落地写前快照、分层轮转、Dream trace 审计、结构判定、年龄反推与标记清洗。本票发现的实现级缺陷（先于新功能修）：
 
-- [ ] **两个 panic 修复** — `dream.rs` `build_prompt` 的 `&e.content[..500]` 是字节切片，中文非 char boundary 会 panic 导致 cursor 不推进、每 tick 重跑同一批再崩（永久卡死）；`consolidate.rs` summary 保头截断必须走 `is_char_boundary` 循环（同仓库已有参考）
-- [ ] **cursor 归零重复整理** — `compact_history_after_dream` 的 `saturating_sub(deleted_count)` 在被删数大于游标时归 0，剩下条目被当全部未处理→重复写入；删除范围限定为“已处理的连续前缀”，cursor 删后仍指向第一条未处理
+- [x] **两个 panic 修复** — `dream.rs` `build_prompt` 的 `&e.content[..500]` 字节切片改为 `truncate_chars`（`char_indices().nth` 落到 char 边界）；`consolidate.rs` summary 保头截断走 `is_char_boundary` 循环（已完成）
+- [x] **cursor 归零重复整理** — `compact_history_after_dream` 删除范围限定为“已处理的连续前缀”（`min(cursor, len-keep)`），cursor 删后仍指向第一条未处理，不再 `saturating_sub` 归零
 - [~] **summary 预算改占比** — `MAX_SUMMARY_BYTES = 512` 已由票 20 改为 `pressure.summary_ratio`（窗口 2%，256–8192 字符夹取）；剩余：`[skip]` 行进 `history.jsonl` 前在代码里过滤掉
-- [ ] **Dream 接 trace + 改读真实配置** — 接上 `None` 的 tracer（session `system:dream`）；删掉 `AgentConfig::default()` 轻径，改读 provider/agent；两锚分离（截断类取自身窗口、文档预算取主 agent 窗口）
-- [ ] **成功判定换结构判定** — 英文子串 `contains("error"/"failed")` 改为：run 正常结束（无 error finish_reason、未超 `max_iterations`）且是否有写入；cursor 推进与快照写成功同一判定分支
-- [ ] **写前快照与分层轮转** — memory 工具改写前复制旧内容到 `memory/.snapshots/{run 时间戳}/{文档}`（只含本轮真动过的）；最近 30 天全留、之后每篇每日一、更久每月一；清理挂 Dream 成功分支（与 `tool-results/` TTL 同点）
-- [ ] **年龄反推与标记清洗** — 逐快照 diff 算出正文行首次出现版本→只附进 Dream 提示侧信道（标题行不计年龄、缺档标未知不外推）；`memory_read` 零注解，读写两侧剔年龄标记（`memory_edit` 的 `old_string` **匹配前**就剔）；覆盖 `file_writer`/`file_editor` 写 MEMORY.md 路径；清洗动作记 trace
+- [x] **Dream 接 trace + 改读真实配置** — `DreamService` 现接收 `agent_config`/`tracer`/`doc_budget`（`agent_loop` 于 `build_tracer` 之后构造并注入），删掉 `AgentConfig::default()` 轻径；两锚分离：截断类取自身窗口、文档预算永远取主 agent provider 窗口（`MemoryBudgetAnchor::primary_from_config`）
+- [x] **成功判定换结构判定** — 英文子串改为 `audit.success(result.success)`：run 正常结束**且**本轮无失败写入（零写入合法）；cursor 推进与快照轮转同处成功分支
+- [x] **写前快照与分层轮转** — `facade`（Dream 路径）与 `file_writer`/`file_editor`（主模型路径）改写前经 `capture_before_write` 复制旧内容到 `memory/.snapshots/{run}/{文档}`；`SnapshotPolicy` 分层轮转（最近全留→每日→每月 + 硬上限）在 Dream 成功分支 `rotate_snapshots` 触发
+- [x] **年龄反推与标记清洗** — `strip_age_markers` 读写两侧剔 `← Nd`/`[Nd]`/`(N days old)`（`memory_edit`/`file_editor` 的 `old_string` **匹配前**就剔）；`entry_ages` 逐快照 diff 反推正文行年龄，只附进 Dream 提示侧信道（标题行不计、缺档标未知、绝不写回文档）
 
 ## personal agent 触发器（实现切片，2026-10-31 起）
 

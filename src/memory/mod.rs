@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod backend;
 pub mod category;
 pub mod factory;
@@ -6,18 +7,23 @@ mod fs;
 pub mod history;
 mod index;
 pub mod markdown;
+pub mod snapshots;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Local};
 
+use crate::pressure::MemoryDocBudget;
+use audit::{MemoryWriteAudit, WriteOutcome};
 use backend::{EditOutcome, MemoryBackend, MemoryBackendKind};
 use category::MemoryCategory;
 use factory::create_backend;
 pub use history::{HistoryEntry, HistoryStore};
 pub use index::{DEFAULT_LIMIT, MAX_LIMIT, ScoredEntry};
 use index::{DocumentSnapshot, KeywordIndex, MemoryIndex, SEARCH_CATEGORIES, source_path};
+pub use snapshots::SnapshotStore;
 
 /// Shared access to the memory facade.
 pub type SharedMemory = Arc<tokio::sync::Mutex<MemoryService>>;
@@ -29,9 +35,21 @@ pub type SharedMemory = Arc<tokio::sync::Mutex<MemoryService>>;
 /// Category operations go through the backend trait; history operations stay
 /// on the concrete store by design (see `history.rs`).
 pub struct MemoryService {
+    workspace_dir: PathBuf,
     memory_dir: PathBuf,
     backend: Arc<dyn MemoryBackend>,
     history: HistoryStore,
+    /// Pre-write snapshot store: rollback target, rotation, and the sequence
+    /// entry ages are reconstructed from (ADR 0014).
+    snapshots: SnapshotStore,
+    /// When `Some` (Dream attaches it before a pass), every `set`/`edit` records
+    /// a fingerprint-level [`DocumentWrite`] here for the trace audit.
+    audit: Option<Arc<MemoryWriteAudit>>,
+    /// Per-document length budget, anchored on the **primary** provider window
+    /// (never Dream's own). `Some` only while Dream runs; it gates the Dream-side
+    /// memory tools. The reacting model writes through the file tools, which
+    /// snapshot and clean but do not enforce this budget (no over-write receipt).
+    doc_budget: Option<MemoryDocBudget>,
     /// Lazily built derived entry index; `None` until the first search.
     index: Option<KeywordIndex>,
     /// Content fingerprint of the documents the cached index was built from.
@@ -57,12 +75,16 @@ impl MemoryService {
     pub fn with_backend(workspace_dir: &Path, backend: Arc<dyn MemoryBackend>) -> Self {
         let memory_dir = workspace_dir.join("memory");
         Self {
+            workspace_dir: workspace_dir.to_path_buf(),
             memory_dir: memory_dir.clone(),
             backend,
             history: HistoryStore::new(
                 memory_dir.join("history.jsonl"),
                 memory_dir.join(".dream_cursor"),
             ),
+            snapshots: SnapshotStore::new(workspace_dir),
+            audit: None,
+            doc_budget: None,
             index: None,
             index_fingerprint: None,
             #[cfg(test)]
@@ -75,9 +97,42 @@ impl MemoryService {
         self.backend.as_ref()
     }
 
+    /// The pre-write snapshot store (rotation, restore, entry ages).
+    pub fn snapshots(&self) -> &SnapshotStore {
+        &self.snapshots
+    }
+
+    /// The workspace directory the facade (and its snapshots) is rooted in.
+    pub fn workspace_dir(&self) -> &Path {
+        &self.workspace_dir
+    }
+
     /// Ensure the memory directory exists.
     pub fn init(&self) -> Result<()> {
         std::fs::create_dir_all(&self.memory_dir).context("Failed to create memory directory")
+    }
+
+    /// Attach an audit sink so Dream's writes are recorded as fingerprint-level
+    /// [`DocumentWrite`]s. Pass `None` to stop recording after a pass.
+    pub fn attach_audit(&mut self, audit: Option<Arc<MemoryWriteAudit>>) {
+        self.audit = audit;
+    }
+
+    /// Set the per-document budget Dream enforces (anchored on the primary
+    /// window). `None` disables the Dream-side reject.
+    pub fn set_doc_budget(&mut self, budget: Option<MemoryDocBudget>) {
+        self.doc_budget = budget;
+    }
+
+    /// The active document budget, if any (read by the Dream memory tools).
+    pub fn doc_budget(&self) -> Option<MemoryDocBudget> {
+        self.doc_budget
+    }
+
+    /// Apply snapshot retention at `now`, returning how many were removed.
+    /// Rides on Dream's success branch, never a separate timer.
+    pub fn rotate_snapshots(&self, now: DateTime<Local>) -> Result<usize> {
+        self.snapshots.rotate(now)
     }
 
     // -- category operations (through the backend) --------------------------
@@ -90,15 +145,49 @@ impl MemoryService {
         self.backend.get(category, name).await
     }
 
+    /// Overwrite a memory document: clean echoed age markers, take a pre-write
+    /// snapshot of the old content, write, and record the fingerprint pair.
     pub async fn set(
         &self,
         category: &MemoryCategory,
         name: Option<&str>,
         content: &str,
     ) -> Result<()> {
-        self.backend.set(category, name, content).await
+        let document = source_path(category, name);
+        let cleaned = snapshots::strip_age_markers(content).0;
+        let content = cleaned.as_str();
+        self.snapshots.capture_before_write(&document)?;
+        let before = self.backend.get(category, name).await?;
+        match self.backend.set(category, name, content).await {
+            Ok(()) => {
+                if let Some(audit) = &self.audit {
+                    audit.record_contents(
+                        &document,
+                        before.as_deref(),
+                        Some(content),
+                        WriteOutcome::Applied,
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(audit) = &self.audit {
+                    audit.record_contents(
+                        &document,
+                        before.as_deref(),
+                        None,
+                        WriteOutcome::Failed(e.to_string()),
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
+    /// Edit a memory document. Age markers are stripped from **both** strings
+    /// before the backend matches (an echoed marker in `old_string` would
+    /// otherwise miss and fail the edit), then the same snapshot + audit dance
+    /// as [`set`](Self::set) runs around the replacement.
     pub async fn edit(
         &self,
         category: &MemoryCategory,
@@ -106,10 +195,49 @@ impl MemoryService {
         old: &str,
         new: &str,
     ) -> Result<EditOutcome> {
-        self.backend.edit(category, name, old, new).await
+        let document = source_path(category, name);
+        let old_clean = snapshots::strip_age_markers(old).0;
+        let new_clean = snapshots::strip_age_markers(new).0;
+        self.snapshots.capture_before_write(&document)?;
+        let before = self.backend.get(category, name).await?;
+        match self
+            .backend
+            .edit(category, name, &old_clean, &new_clean)
+            .await
+        {
+            Ok(outcome) => {
+                if let Some(audit) = &self.audit {
+                    let after = if outcome == EditOutcome::Replaced {
+                        self.backend.get(category, name).await.ok().flatten()
+                    } else {
+                        None
+                    };
+                    audit.record_contents(
+                        &document,
+                        before.as_deref(),
+                        after.as_deref(),
+                        WriteOutcome::from_edit(outcome),
+                    );
+                }
+                Ok(outcome)
+            }
+            Err(e) => {
+                if let Some(audit) = &self.audit {
+                    audit.record_contents(
+                        &document,
+                        before.as_deref(),
+                        None,
+                        WriteOutcome::Failed(e.to_string()),
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn remove(&self, category: &MemoryCategory, name: Option<&str>) -> Result<bool> {
+        let document = source_path(category, name);
+        self.snapshots.capture_before_write(&document)?;
         self.backend.remove(category, name).await
     }
 
@@ -317,6 +445,90 @@ mod tests {
 
         store.init().unwrap();
         assert!(workspace_dir.join("memory").exists());
+    }
+
+    // -- lifecycle: snapshot + audit wired into the write path --------------
+
+    #[tokio::test]
+    async fn test_set_snapshots_old_content_and_records_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mut store = MemoryService::new(&workspace_dir);
+        store.init().unwrap();
+        let audit = Arc::new(audit::MemoryWriteAudit::new());
+        store.attach_audit(Some(audit.clone()));
+
+        // First write: the document does not exist yet, so nothing to preserve.
+        store
+            .set(&MemoryCategory::Core, None, "first")
+            .await
+            .unwrap();
+        // Second write: the previous content is snapshotted before it is lost.
+        store
+            .set(&MemoryCategory::Core, None, "second")
+            .await
+            .unwrap();
+
+        let snaps = store.snapshots().snapshots("memory/MEMORY.md").unwrap();
+        assert_eq!(
+            snaps.len(),
+            1,
+            "only the real overwrite produced a snapshot"
+        );
+        assert_eq!(
+            store.snapshots().read(&snaps[0]).unwrap().as_deref(),
+            Some("first"),
+            "the snapshot holds the pre-write content, so a rollback target exists"
+        );
+
+        let writes = audit.writes();
+        assert_eq!(writes.len(), 2, "every set is audited");
+        assert_eq!(writes[1].document, "memory/MEMORY.md");
+        assert!(writes[1].changed());
+        // No separate audit file was written: the audit lives only in memory
+        // (shaped as trace attributes by the caller).
+        assert!(
+            !workspace_dir.join("memory").join("audit.jsonl").exists(),
+            "audit must not create a second source of truth on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_strips_echoed_age_marker_from_old_string_before_matching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let store = MemoryService::new(&workspace_dir);
+        store.init().unwrap();
+        // The document itself is clean (markers are never stored in it).
+        store
+            .set(&MemoryCategory::Core, None, "- Prefers bullets\n")
+            .await
+            .unwrap();
+
+        // Dream echoes an age marker back in `old_string`; it must be stripped
+        // before the match, or the edit would report NotFound every pass.
+        let outcome = store
+            .edit(
+                &MemoryCategory::Core,
+                None,
+                "- Prefers bullets ← 21d",
+                "- Prefers bullet points",
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Replaced);
+        let stored = store
+            .get(&MemoryCategory::Core, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, "- Prefers bullet points\n");
+        assert!(
+            !stored.contains('←'),
+            "no age marker lands in the document: {stored}"
+        );
     }
 
     // -- facade category API ------------------------------------------------

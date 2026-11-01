@@ -15,7 +15,7 @@ Every other memory document is **protected by code**. `AGENTS.md`, `SOUL.md`, `U
 ## The write convention (read by humans, not parsed)
 
 1. **One fact per bullet, digested in your own words.** `MEMORY.md` is your understanding, never a transcript.
-2. **Every bullet carries provenance: source + date**, as `(source · YYYY-MM-DD)`. Never invent a source or a date — use the date you were given, and mark inferred facts `(unknown source · YYYY-MM-DD)`.
+2. **Every bullet carries a source, never a date**, as `(source)`. The system derives an entry's age from its own snapshot history; a date you write (or invent) becomes a false fact the model later restates. Mark inferred facts `(unknown source)` — still without a date.
 
 ## Raw external content never goes into memory
 

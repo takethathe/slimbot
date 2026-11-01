@@ -386,17 +386,45 @@ impl AgentLoop {
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-        // Build DreamService
+        // Built before Dream so a Dream pass is observable through the same
+        // tracer the main loop uses (ticket 06 #4).
+        let tracer = build_tracer(&config, paths.workspace_dir());
+
+        // The memory-document budget is anchored on the **primary** agent
+        // provider window (ADR 0013): Dream may run on a `model_override` with
+        // its own window, but the documents are read by the primary model, so
+        // their length limit never follows Dream's provider. Two anchors, kept
+        // separate on purpose.
+        let doc_budget = crate::pressure::MemoryBudgetAnchor::primary_from_config(&config)
+            .derive(crate::pressure::DEFAULT_CHAR_PER_TOKEN_RATIO);
+
+        // Dream's *own* truncation anchor follows the window it actually runs
+        // on, mirroring `DreamService::build_provider`: `model_override` only
+        // when it resolves to a configured provider, else the primary one.
+        // Kept distinct from `doc_budget` above (ticket 06 #5, ADR 0013).
+        let dream_override = config
+            .gateway
+            .dream
+            .model_override
+            .as_deref()
+            .filter(|name| config.providers.contains_key(*name));
+        let dream_pressure = crate::pressure::PressureAnchor::for_provider(&config, dream_override);
+
+        // Build DreamService with the real agent config, the tracer, and the
+        // primary-anchored budget — no silent defaults.
         let dream_service = Arc::new(
             crate::dream::DreamService::new(
                 paths.workspace_dir().to_path_buf(),
                 memory_service.clone(),
                 session_manager_arc.clone(),
                 config.gateway.dream.clone(),
+                config.agent.clone(),
                 providers.clone(),
                 provider.clone(),
+                tracer.clone(),
+                doc_budget,
             )
-            .with_pressure(pressure.clone()),
+            .with_pressure(dream_pressure.clone()),
         );
 
         let provider_name = &config.agent.provider;
@@ -405,8 +433,6 @@ impl AgentLoop {
             .get(provider_name)
             .map(|p| p.max_tokens)
             .unwrap_or(4096);
-
-        let tracer = build_tracer(&config, paths.workspace_dir());
 
         // One pending-approval store per process: a call proposed on one turn is
         // redeemed on the next, and nothing survives a restart (ADR 0011). The

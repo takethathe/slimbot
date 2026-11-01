@@ -77,6 +77,30 @@ impl Tool for FileEditorTool {
             return Err(anyhow::anyhow!("Not a file: {}", path_str));
         }
 
+        // The memory funnel (ADR 0014): when this edit lands on a memory
+        // document, strip any echoed age marker from both sides *before*
+        // matching (the file is stored clean, so an echoed marker in
+        // `old_string` would otherwise fail to match), and keep a pre-write
+        // snapshot for rollback. Both are no-ops for ordinary workspace files.
+        let relative = crate::memory::snapshots::relative_document(&self.workspace_dir, &resolved);
+        let managed = relative
+            .as_deref()
+            .is_some_and(crate::memory::snapshots::is_managed_document);
+        let old_clean;
+        let new_clean;
+        let old_string: &str = if managed {
+            old_clean = crate::memory::snapshots::strip_age_markers(old_string).0;
+            &old_clean
+        } else {
+            old_string
+        };
+        let new_string: &str = if managed {
+            new_clean = crate::memory::snapshots::strip_age_markers(new_string).0;
+            &new_clean
+        } else {
+            new_string
+        };
+
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", path_str, e))?;
@@ -97,6 +121,10 @@ impl Tool for FileEditorTool {
         }
 
         let new_content = content.replacen(old_string, new_string, 1);
+
+        if let Some(rel) = relative.as_deref() {
+            crate::memory::snapshots::capture_before_write(&self.workspace_dir, rel)?;
+        }
 
         tokio::fs::write(&resolved, &new_content)
             .await
@@ -376,5 +404,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "你好Rust");
+    }
+
+    #[tokio::test]
+    async fn test_edit_memory_document_strips_echoed_marker_before_matching() {
+        // The document is stored clean, so an age marker the model echoes into
+        // `old_string` must be stripped *before* matching (ticket 06 #12), and
+        // any marker in `new_string` is stripped before it lands.
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("memory"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("memory/MEMORY.md"), "- deploy via CI\n")
+            .await
+            .unwrap();
+        let tool = FileEditorTool::new(tmp.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "memory/MEMORY.md",
+                "old_string": "- deploy via CI ← 3d",
+                "new_string": "- deploy via CI (canary) ← 1d"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("1 replacement"), "result was: {result}");
+        let content = tokio::fs::read_to_string(tmp.path().join("memory/MEMORY.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "- deploy via CI (canary)\n");
+
+        // The pre-edit content was snapshotted for rollback.
+        let store = crate::memory::snapshots::SnapshotStore::new(tmp.path());
+        let snapshots = store.snapshots("memory/MEMORY.md").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            store.read(&snapshots[0]).unwrap().as_deref(),
+            Some("- deploy via CI\n")
+        );
     }
 }

@@ -40,6 +40,10 @@ pub const MAX_SNIP_SAFETY_TOKENS: u32 = 8_192;
 pub const MIN_SUMMARY_CHARS: usize = 256;
 pub const MAX_SUMMARY_CHARS: usize = 8_192;
 
+/// Absolute clamps for the memory-document budget (chars).
+pub const MIN_MEMORY_DOC_CHARS: usize = 512;
+pub const MAX_MEMORY_DOC_CHARS: usize = 32_000;
+
 /// The single window anchor plus the ratio table that hangs off it.
 ///
 /// `Default` is the historical window (32k) with the documented default
@@ -81,9 +85,22 @@ impl PressureAnchor {
     /// Anchor from a loaded config: the window is a property of the provider
     /// referenced by `agent.provider`, not of the agent.
     pub fn from_config(config: &Config) -> Self {
+        Self::for_provider(config, None)
+    }
+
+    /// Anchor on one named provider's window.
+    ///
+    /// `None` selects `agent.provider` (the primary anchor). A name that is not
+    /// in `providers` falls back to [`DEFAULT_CONTEXT_WINDOW_TOKENS`] instead of
+    /// failing, matching [`from_config`](Self::from_config). This is how a
+    /// component that runs on its own model (Dream via `model_override`) gets
+    /// its own context anchor while the memory-document budget stays on the
+    /// primary window — two anchors, deliberately separate.
+    pub fn for_provider(config: &Config, provider: Option<&str>) -> Self {
+        let name = provider.unwrap_or(&config.agent.provider);
         let window_tokens = config
             .providers
-            .get(&config.agent.provider)
+            .get(name)
             .map(|p| p.context_window_tokens)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
         Self {
@@ -95,6 +112,95 @@ impl PressureAnchor {
     /// Derive every limit for a session with the given chars-per-token ratio.
     pub fn limits(&self, char_per_token_ratio: f64) -> PressureLimits {
         PressureLimits::derive(self.window_tokens, char_per_token_ratio, &self.config)
+    }
+}
+
+/// Anchor for the memory-document budget.
+///
+/// Deliberately its own anchor: the memory documents are read by the **primary**
+/// model, so their length budget derives from the primary agent provider's
+/// window even when the writer (Dream) runs on a `model_override` with a
+/// different window. Keeping the two anchors separate is what makes the size
+/// math predictable; see `docs/adr/0013-context-pressure-single-anchor.md` and
+/// `docs/adr/0014-memory-entry-age-derived-from-snapshots.md`.
+#[derive(Clone, Debug)]
+pub struct MemoryBudgetAnchor {
+    /// Primary agent provider window in tokens (never Dream's own window).
+    pub window_tokens: u32,
+    /// Share of that window one memory document may occupy.
+    pub ratio: f32,
+}
+
+impl Default for MemoryBudgetAnchor {
+    fn default() -> Self {
+        Self {
+            window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+            ratio: PressureConfig::default().memory_doc_ratio,
+        }
+    }
+}
+
+impl MemoryBudgetAnchor {
+    /// Anchor on the primary agent provider, with `pressure.memory_doc_ratio`.
+    pub fn primary_from_config(config: &Config) -> Self {
+        Self::for_primary_provider(config, &config.agent.provider)
+    }
+
+    /// Same as [`primary_from_config`](Self::primary_from_config) with an
+    /// explicit primary provider name (used by tests and by callers that
+    /// resolve the agent provider themselves).
+    pub fn for_primary_provider(config: &Config, primary_provider: &str) -> Self {
+        let window_tokens = config
+            .providers
+            .get(primary_provider)
+            .map(|p| p.context_window_tokens)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+        Self {
+            window_tokens,
+            ratio: config.pressure.memory_doc_ratio,
+        }
+    }
+
+    /// Derive the document budget for the given chars-per-token ratio.
+    pub fn derive(&self, char_per_token_ratio: f64) -> MemoryDocBudget {
+        MemoryDocBudget::derive(self.window_tokens, self.ratio, char_per_token_ratio)
+    }
+}
+
+/// One memory document's length budget, derived from the primary window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryDocBudget {
+    /// Window the budget was derived from (tokens).
+    pub window_tokens: u32,
+    /// Budget in tokens (`window × ratio`, rounded down).
+    pub doc_tokens: u32,
+    /// Budget in chars (`doc_tokens × chars-per-token`, clamped).
+    pub doc_chars: usize,
+}
+
+impl Default for MemoryDocBudget {
+    fn default() -> Self {
+        MemoryBudgetAnchor::default().derive(DEFAULT_CHAR_PER_TOKEN_RATIO)
+    }
+}
+
+impl MemoryDocBudget {
+    /// Derive a document budget. A zero window keeps the token budget at zero
+    /// ("no limit known") while the char budget falls to the absolute floor,
+    /// so callers that only render the number never print a zero-length doc.
+    pub fn derive(window_tokens: u32, ratio: f32, char_per_token_ratio: f64) -> Self {
+        let ratio_used = if char_per_token_ratio > 0.0 {
+            char_per_token_ratio
+        } else {
+            DEFAULT_CHAR_PER_TOKEN_RATIO
+        };
+        let doc_tokens = ratio_tokens(window_tokens, ratio);
+        let doc_chars = ((doc_tokens as f64) * ratio_used) as usize;
+        Self {
+            window_tokens,
+            doc_tokens,
+            doc_chars: doc_chars.clamp(MIN_MEMORY_DOC_CHARS, MAX_MEMORY_DOC_CHARS),
+        }
     }
 }
 
@@ -229,10 +335,7 @@ mod tests {
 
     fn config_with(window_tokens: u32) -> Config {
         let mut config = Config::default();
-        let provider = config
-            .providers
-            .entry("default".to_string())
-            .or_insert_with(Default::default);
+        let provider = config.providers.entry("default".to_string()).or_default();
         provider.context_window_tokens = window_tokens;
         config.agent.provider = "default".to_string();
         config
@@ -379,5 +482,114 @@ mod tests {
         let limits = PressureAnchor::from_window(32_768).limits(2.0);
         assert_eq!(limits.estimate_tokens(10), 5);
         assert_eq!(limits.estimate_tokens(1), 4, "minimum of 4 tokens per unit");
+    }
+
+    // -- two anchors: context pressure vs memory-document budget ------------
+
+    #[test]
+    fn test_pressure_anchor_for_provider_uses_the_named_provider_window() {
+        let mut config = config_with(32_768);
+        config.providers.insert(
+            "big".to_string(),
+            crate::config::ProviderConfig {
+                context_window_tokens: 200_000,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            PressureAnchor::for_provider(&config, None).window_tokens,
+            32_768,
+            "None selects the primary agent provider"
+        );
+        assert_eq!(
+            PressureAnchor::for_provider(&config, Some("big")).window_tokens,
+            200_000
+        );
+        assert_eq!(
+            PressureAnchor::for_provider(&config, Some("missing")).window_tokens,
+            DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "an unknown provider must not fail the run"
+        );
+    }
+
+    #[test]
+    fn test_memory_budget_derives_from_the_primary_window_not_dream_override() {
+        // The memory documents are read by the primary model, so their budget
+        // must not follow Dream's own (possibly much larger) window.
+        let mut config = config_with(32_768);
+        config.providers.insert(
+            "huge".to_string(),
+            crate::config::ProviderConfig {
+                context_window_tokens: 1_000_000,
+                ..Default::default()
+            },
+        );
+        config.gateway.dream.model_override = Some("huge".to_string());
+
+        let dream_anchor =
+            PressureAnchor::for_provider(&config, config.gateway.dream.model_override.as_deref());
+        let memory_budget =
+            MemoryBudgetAnchor::primary_from_config(&config).derive(DEFAULT_CHAR_PER_TOKEN_RATIO);
+
+        assert_eq!(dream_anchor.window_tokens, 1_000_000);
+        assert_eq!(memory_budget.window_tokens, 32_768);
+        assert_eq!(
+            memory_budget,
+            MemoryDocBudget::derive(
+                32_768,
+                config.pressure.memory_doc_ratio,
+                DEFAULT_CHAR_PER_TOKEN_RATIO
+            ),
+            "the budget is the primary window times the configured ratio, not a magic number"
+        );
+    }
+
+    #[test]
+    fn test_memory_budget_scales_with_the_primary_window() {
+        let small = MemoryDocBudget::derive(32_768, 0.075, 3.0);
+        let large = MemoryDocBudget::derive(65_536, 0.075, 3.0);
+
+        assert_eq!(small.doc_tokens, 2_457, "32768 × 0.075, rounded down");
+        assert_eq!(small.doc_chars, 7_371, "2457 tokens × 3.0 chars/token");
+        // Doubling the window doubles the pre-rounding product, so the derived
+        // budget is proportional up to the single truncation carried across.
+        assert_eq!(large.doc_tokens, 4_915, "65536 × 0.075, rounded down");
+        assert_eq!(large.doc_chars, 14_745, "4915 tokens × 3.0 chars/token");
+    }
+
+    #[test]
+    fn test_memory_budget_honours_the_configured_ratio() {
+        let config = PressureConfig {
+            memory_doc_ratio: 0.2,
+            ..Default::default()
+        };
+        let mut with_default_config = Config {
+            pressure: config,
+            ..Default::default()
+        };
+        let provider = with_default_config
+            .providers
+            .entry("default".to_string())
+            .or_default();
+        provider.context_window_tokens = 32_768;
+        with_default_config.agent.provider = "default".to_string();
+
+        let budget = MemoryBudgetAnchor::primary_from_config(&with_default_config)
+            .derive(DEFAULT_CHAR_PER_TOKEN_RATIO);
+        assert_eq!(budget.doc_tokens, 6_553, "32768 × 0.2");
+    }
+
+    #[test]
+    fn test_memory_budget_is_clamped_at_both_ends() {
+        assert_eq!(
+            MemoryDocBudget::derive(0, 0.075, 3.0).doc_chars,
+            MIN_MEMORY_DOC_CHARS
+        );
+        assert_eq!(
+            MemoryDocBudget::derive(200_000, 0.5, 3.0).doc_chars,
+            MAX_MEMORY_DOC_CHARS
+        );
+        assert_eq!(MemoryDocBudget::derive(0, 0.075, 3.0).doc_tokens, 0);
     }
 }

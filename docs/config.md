@@ -275,6 +275,10 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `min_keep_messages` | uint | range(1, 500) | `4` | snip 至少保留的非 system 消息条数（找不到 User 时的兜底） |
 | `keep_recent_tool_results` | uint | range(1, 500) | `10` | 最近多少条工具结果不参与残留清理 |
 | `tool_results_ttl_days` | uint | range(1, 365) | `7` | `tool-results/` 落盘文件的保留天数，由 Dream 成功收尾时清扫（无独立定时器） |
+| `memory_doc_ratio` | float | range(0.001, 0.50) | `0.075` | 单篇记忆文档允许占**主 agent provider 窗口**的比例（换算为字符；Dream 侧硬拒超限写入） |
+| `memory_snapshot_recent_days` | uint | range(1, 3650) | `30` | 早于该天数的写前记忆快照全部保留 |
+| `memory_snapshot_daily_days` | uint | range(1, 3650) | `365` | 越过最近窗口后，快照薄化为每篇每天一份，直到该天数后再降为每月一份 |
+| `memory_snapshot_max` | uint | range(1, 10000) | `120` | 每篇文档保留写前快照的硬上限 |
 
 ```json
 {
@@ -290,7 +294,14 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 
 **冷启动比例：** 会话还没有真实用量时，字符/ token 换算比例默认取 `3.0`（中英混排的保守值）；首次收到 provider 返回的 `prompt_tokens` 后按会话实测值替换，并随会话元数据持久化。窗口为 `0` 时所有派生长度限制都退化为 `0`，各阶段（截断、清理、摘要）都不动手，而不是瞎猜。
 
-**绝对下限/上限：** 派生值仍会被夹住，避免极小窗口把限制压成不可用的数字——单条工具结果 1,000–64,000 字符、落盘预览 256–8,000 字符、snip 安全余量 128–8,192 token、摘要 256–8,192 字符。
+**绝对下限/上限：** 派生值仍会被夹住，避免极小窗口把限制压成不可用的数字——单条工具结果 1,000–64,000 字符、落盘预览 256–8,000 字符、snip 安全余量 128–8,192 token、摘要 256–8,192 字符、记忆文档 512–32,000 字符。
+
+**两个锚（Dream）：** Dream 读**真实**的 provider/agent 配置（不再有 `AgentConfig::default()` 轻径），但故意保留**两个彼此分离的锚**：
+
+- Dream **自己的**上下文 / 截断类限制取它实际运行的 provider 窗口（`dream.model_override` 命中则取该 provider，否则取主 agent provider）。
+- **记忆文档预算永远取主 agent provider 的窗口**（`memory_doc_ratio × 主 provider 窗口`）——文档是给主模型读的、不是给 Dream 读的，所以它的长度上限不能跟着 Dream 的 override 窗口跑。两者由 `MemoryBudgetAnchor::primary_from_config` 与 `PressureAnchor::for_provider` 分别派生，永远分开。
+
+决策见 `docs/adr/0013-context-pressure-single-anchor.md` 与 `docs/adr/0014-memory-entry-age-derived-from-snapshots.md`。
 
 #### 迁移说明（两条 breaking change）
 

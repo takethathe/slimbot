@@ -65,6 +65,26 @@ impl Tool for FileWriterTool {
             return Ok(refusal);
         }
 
+        // The memory funnel (ADR 0014): when this write lands on a memory
+        // document, strip any echoed age marker from the content and keep a
+        // pre-write snapshot so a bad rewrite has a rollback target. Both are
+        // no-ops for ordinary workspace files (`capture_before_write` returns
+        // `None` for documents the memory system does not own).
+        let relative = crate::memory::snapshots::relative_document(&self.workspace_dir, &target);
+        let managed = relative
+            .as_deref()
+            .is_some_and(crate::memory::snapshots::is_managed_document);
+        let cleaned;
+        let content: &str = if managed {
+            cleaned = crate::memory::snapshots::strip_age_markers(content).0;
+            &cleaned
+        } else {
+            content
+        };
+        if let Some(rel) = relative.as_deref() {
+            crate::memory::snapshots::capture_before_write(&self.workspace_dir, rel)?;
+        }
+
         // Ensure parent directory exists
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -290,6 +310,55 @@ mod tests {
                 .unwrap();
             assert!(!result.contains("REFUSED"), "{path}: {result}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_write_memory_document_strips_echoed_age_marker() {
+        // Age markers are a Dream side-channel only; the document on disk is
+        // always stored clean (ticket 06 #11). A marker the model echoes back
+        // into the written content must be stripped before it lands.
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        let _ = writer
+            .execute(serde_json::json!({
+                "path": "memory/MEMORY.md",
+                "content": "- deploy via CI ← 3d\n"
+            }))
+            .await
+            .unwrap();
+        let stored = tokio::fs::read_to_string(tmp.path().join("memory/MEMORY.md"))
+            .await
+            .unwrap();
+        assert_eq!(stored, "- deploy via CI\n", "age marker must be stripped");
+    }
+
+    #[tokio::test]
+    async fn test_write_memory_document_keeps_pre_write_snapshot() {
+        // Rewriting MEMORY.md must snapshot the prior on-disk content so a bad
+        // rewrite has a rollback target (ticket 06 #6). The first write has no
+        // predecessor; the second captures the first.
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = FileWriterTool::new(tmp.path().to_path_buf());
+        writer
+            .execute(serde_json::json!({
+                "path": "memory/MEMORY.md",
+                "content": "- original\n"
+            }))
+            .await
+            .unwrap();
+        writer
+            .execute(serde_json::json!({
+                "path": "memory/MEMORY.md",
+                "content": "- rewritten\n"
+            }))
+            .await
+            .unwrap();
+
+        let store = crate::memory::snapshots::SnapshotStore::new(tmp.path());
+        let snapshots = store.snapshots("memory/MEMORY.md").unwrap();
+        assert_eq!(snapshots.len(), 1, "one rewrite must capture one snapshot");
+        let restored = store.read(&snapshots[0]).unwrap();
+        assert_eq!(restored.as_deref(), Some("- original\n"));
     }
 
     #[tokio::test]
