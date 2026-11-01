@@ -15,6 +15,7 @@ use crate::session::{AgentEvent, TaskHook};
 use crate::tool::{Tool, ToolManager};
 use crate::tools::cron::CronTool;
 use crate::tools::message::MessageTool;
+use crate::warn_log;
 
 pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     WorkerPool::init_global(64);
@@ -161,6 +162,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     );
 
     // Set up cron service callback
+    let owner_primary_for_cron = agent_loop.owner_primary();
     let agent_loop_for_cron = agent_loop.clone();
     let mb_for_cron = message_bus.clone();
     let event_tx_for_cron = event_tx.clone();
@@ -182,6 +184,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         let mb = mb_for_cron.clone();
         let job_clone = job.clone();
         let event_tx = event_tx_for_cron.clone();
+        let owner_primary = owner_primary_for_cron.clone();
         Box::pin(async move {
             let session_id = "system:cron";
             // Use origin session_id for event routing so cron execution
@@ -205,15 +208,32 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             let sm = al.session_manager();
             sm.lock().await.cap_messages(session_id, 2000).await;
 
-            // Deliver result to user channel if configured (only if message tool wasn't used)
-            if job_clone.payload.deliver && !result.message_sent
-                && let (Some(channel), Some(chat_id)) = (&job_clone.payload.channel, &job_clone.payload.to) {
-                    mb.publish_outbound(BusResult {
-                        session_id: format!("{}:{}", channel, chat_id),
-                        run_id: uuid::Uuid::new_v4().to_string(),
-                        content: result.content,
-                    }).await;
+            // Deliver the result to the conversation the job was created in, by
+            // the one shared delivery rule. `deliver: false` is the only policy
+            // silence; a job with no origin falls back to the owner's primary
+            // channel, and a missing one degrades to log-only rather than
+            // inventing a destination (only when the message tool wasn't used).
+            if job_clone.payload.deliver && !result.message_sent {
+                match crate::delivery::cron_target(
+                    job_clone.payload.channel.as_deref(),
+                    job_clone.payload.to.as_deref(),
+                    owner_primary.current(),
+                ) {
+                    crate::delivery::Resolution::Deliver(target) => {
+                        mb.publish_outbound(BusResult {
+                            session_id: target.session_id(),
+                            run_id: uuid::Uuid::new_v4().to_string(),
+                            content: result.content,
+                        }).await;
+                    }
+                    crate::delivery::Resolution::Nowhere => {
+                        warn_log!(
+                            "[gateway] cron job {} has no delivery target; result kept in the session only",
+                            job_clone.name
+                        );
+                    }
                 }
+            }
         })
     }));
 
@@ -273,17 +293,37 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         })
     }));
 
+    // Heartbeat has no origin: it is started by config, standing in no
+    // conversation. Its notice goes to the configured override, else the
+    // owner's primary channel, else nowhere (log-only).
     let mb_for_notify = message_bus.clone();
+    let owner_primary_for_hb = agent_loop.owner_primary();
+    let heartbeat_override = crate::delivery::DeliveryTarget::from_pair(
+        config.gateway.heartbeat.channel.as_deref(),
+        config.gateway.heartbeat.to.as_deref(),
+    );
     heartbeat.set_on_notify(Arc::new(move |response| {
         let mb = mb_for_notify.clone();
         let resp = response.clone();
+        let override_target = heartbeat_override.clone();
+        let owner_primary = owner_primary_for_hb.current();
         Box::pin(async move {
-            mb.publish_outbound(BusResult {
-                session_id: "webui:webui_main".to_string(),
-                run_id: uuid::Uuid::new_v4().to_string(),
-                content: resp,
-            })
-            .await;
+            match crate::delivery::heartbeat_target(override_target, owner_primary) {
+                crate::delivery::Resolution::Deliver(target) => {
+                    mb.publish_outbound(BusResult {
+                        session_id: target.session_id(),
+                        run_id: uuid::Uuid::new_v4().to_string(),
+                        content: resp,
+                    })
+                    .await;
+                }
+                crate::delivery::Resolution::Nowhere => {
+                    warn_log!(
+                        "[gateway] heartbeat notice has no delivery target yet \
+                         (the owner has not talked on any channel); kept in the log only"
+                    );
+                }
+            }
         })
     }));
 
@@ -549,6 +589,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -768,6 +810,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -908,6 +952,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -966,6 +1012,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1183,6 +1231,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1629,6 +1679,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: true,
                     interval_s: 300,
                     unknown: Default::default(),

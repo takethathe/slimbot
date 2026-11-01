@@ -192,6 +192,9 @@ pub struct AgentLoop {
     dream_service: Arc<crate::dream::DreamService>,
     /// Subagent runtime, shared with the trigger dispatcher.
     subagent_runtime: Arc<SubagentRuntime>,
+    /// The conversation the owner first established; the last-resort delivery
+    /// target for sources that have no origin (heartbeat, an origin-less cron).
+    owner_primary: Arc<crate::delivery::OwnerPrimaryStore>,
 }
 
 /// Returned by `AgentLoop::run()` so the caller can publish input and
@@ -429,6 +432,9 @@ impl AgentLoop {
         );
 
         Ok(Self {
+            owner_primary: Arc::new(crate::delivery::OwnerPrimaryStore::load(
+                paths.data_dir(),
+            )),
             config,
             workspace_dir: paths.workspace_dir().to_path_buf(),
             provider,
@@ -452,6 +458,11 @@ impl AgentLoop {
 
     pub fn session_manager(&self) -> SharedSessionManager {
         self.session_manager.clone()
+    }
+
+    /// The owner's primary channel store (delivery seam, ticket 17).
+    pub fn owner_primary(&self) -> Arc<crate::delivery::OwnerPrimaryStore> {
+        self.owner_primary.clone()
     }
 
     /// The provider used for agent turns. Card generation reuses this same
@@ -581,6 +592,7 @@ impl AgentLoop {
         // authorize anything (ADR 0010 / 票 01).
         let owner = Owner::from_config(&self.config.gateway.owner);
         let owner_id = owner.id().to_string();
+        let owner_primary = self.owner_primary.clone();
 
         let max_tokens = full_config
             .providers
@@ -621,6 +633,15 @@ impl AgentLoop {
                                 })
                                 .await;
                             continue;
+                        }
+
+                        // The first conversation the owner talks on becomes the
+                        // owner's primary channel: the last-resort delivery
+                        // target for sources with no origin (ticket 17).
+                        if let Some(target) =
+                            crate::delivery::DeliveryTarget::from_session_id(&request.session_id)
+                        {
+                            owner_primary.record_first(&target);
                         }
 
                         // Check for /dream command (needs dream_service)
@@ -897,6 +918,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1111,6 +1134,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1176,6 +1201,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1260,6 +1287,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1324,6 +1353,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1388,6 +1419,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1488,6 +1521,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1557,6 +1592,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1636,6 +1673,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1728,6 +1767,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -1837,6 +1878,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),
@@ -2178,6 +2221,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: crate::config::HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: false,
                     interval_s: 60,
                     unknown: Default::default(),

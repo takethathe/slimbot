@@ -110,6 +110,20 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 - **作者信任**：入站 `BusRequest.author` 为 `Author::Owner`（本机 CLI / WebUI、owner 本人私聊、由 owner 配置启动的系统注入）或 `Author::Bystander`。`Bystander` 的入站消息在 `AgentLoop` 入站口被**直接拒绝**并回一条固定说明——它不能授权任何动作、不能写记忆；v1 无群聊，因此不需要「不可信但可读」的中间态。
 - **WebUI 边界**：只监听 loopback（非 loopback 直接启动失败、无 override），无认证、无 token，本机即 owner；补偿控制是四条浏览器侧中间件（Host 白名单 / 同源 Origin / `application/json` / `Sec-Fetch-Site`）+ 零 CORS 头。本机任意进程仍可全权操作 WebUI，这一点显式接受。
 
+### 出站投递（投递目标解析）
+
+主动消息（cron / heartbeat / trigger / alert）的目标由**唯一一条规则**决定（`src/delivery.rs::resolve_target`）：
+
+```
+显式 deliver-to  >  创建任务的 Origin session  >  Owner primary channel
+```
+
+- `DeliveryTarget{channel, chat_id}` 两段式；任一为空即「不存在」，不会被就近兜底。
+- `Owner primary channel` = owner 首次交互的会话，落在 `{data_dir}/owner-primary.json`（一条目标，不是投递账本），重启后仍可投递；未建立时降级 log-only。
+- **trigger 永不兜底到 owner**：它恒有 origin，origin 不可达即 book-only（不误投）。
+- **`deliver:false` 是唯一策略性静默**；「目标不存在」是降级兜底，两者在调用点区分。
+- 无持久 outbox、无全局投递账本、重启不补投。
+
 ### Connector / Executor（外部接口层）
 
 连接器 = codemode 可直接调用的、非基础原语、非内置工具的外部能力封装（同一连接器既读又动）；MCP server 是 v1 唯一实例（见 `GLOSSARY.md` `### Connector`）。它把「agent 对外部系统的能力」抽象成一个可寻址的服务单元，与 Channel（会话/传输面）正交，区别于宿主内置工具（file/shell/message）与 codemode 基础原语（时间、`ctx.http`）。

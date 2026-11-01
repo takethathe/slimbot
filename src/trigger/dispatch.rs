@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::{AcquireMode, StartReject, StartRequest, SubagentRuntime};
 use crate::debug;
+use crate::delivery::{DeliveryTarget, Resolution};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::TaskHook;
 use crate::trace::{SpanRecorder, SpanStatus, Tracer};
@@ -135,8 +136,10 @@ pub fn group_fires(fires: Vec<Fire>, max_merge: usize) -> Vec<Work> {
             ActionKind::Record => works.push(Work::Book { fire, error: None }),
             ActionKind::Agent => works.push(Work::Run { fire }),
             ActionKind::Notify => match destination(&fire) {
-                Some(dest) => push_notice(&mut works, dest, fire, max_merge),
-                None => {
+                Resolution::Deliver(target) => {
+                    push_notice(&mut works, target.session_id(), fire, max_merge)
+                }
+                Resolution::Nowhere => {
                     crate::warn_log!(
                         "[trigger] rule {} has nowhere to notify: it declares no channel/to and \
                          was not created in a conversation; the fire is booked only",
@@ -179,31 +182,21 @@ fn push_notice(works: &mut Vec<Work>, dest: String, fire: Fire, max_merge: usize
     });
 }
 
-/// Where a `notify` goes: an explicit channel and target, else the conversation
-/// the rule was created in. Never a fallback session — with neither there is
-/// nowhere to send, and silence is recoverable while a wrong destination is not.
-fn destination(fire: &Fire) -> Option<String> {
+/// Where a `notify` goes, resolved by the shared delivery seam: an explicit
+/// channel and target, else the conversation the rule was created in.
+///
+/// Triggers never fall back to the owner's primary channel — they always carry
+/// an origin, and an unreachable origin stays book-only rather than being
+/// misdelivered (`delivery::resolve_target`).
+fn destination(fire: &Fire) -> Resolution {
     let action = &fire.action;
-    let explicit = match (action.channel.as_deref(), action.to.as_deref()) {
-        (Some(channel), Some(to)) if !channel.trim().is_empty() && !to.trim().is_empty() => {
-            Some(format!("{}:{}", channel.trim(), to.trim()))
-        }
-        _ => None,
-    };
-    explicit.or_else(|| {
+    crate::delivery::resolve_target(
+        DeliveryTarget::from_pair(action.channel.as_deref(), action.to.as_deref()),
         fire.origin
             .as_ref()
-            .map(|origin| origin.session_id())
-            .filter(|dest| routable(dest))
-    })
-}
-
-/// A session id routes only when both halves are there: `webui:` would be
-/// handed to a channel that has no such conversation.
-fn routable(session_id: &str) -> bool {
-    session_id
-        .split_once(':')
-        .is_some_and(|(channel, target)| !channel.is_empty() && !target.is_empty())
+            .and_then(|origin| DeliveryTarget::from_session_id(&origin.session_id())),
+        None,
+    )
 }
 
 /// The fixed text of an operations alert: which rule broke, how often, and the
@@ -388,7 +381,8 @@ impl Dispatcher {
         let routable = alert
             .origin
             .as_ref()
-            .is_some_and(|origin| routable(&origin.session_id()));
+            .and_then(|origin| DeliveryTarget::from_session_id(&origin.session_id()))
+            .is_some();
         if !routable || alert.action.kind == ActionKind::Record {
             return false;
         }
@@ -549,11 +543,16 @@ impl Dispatcher {
     /// The one exception in this chain that bypasses the main loop: fixed text,
     /// nothing to summarize, no model call.
     async fn send_alert(&self, alert: &Alert) {
-        let Some(dest) = alert
-            .origin
-            .as_ref()
-            .map(|origin| origin.session_id())
-            .filter(|dest| routable(dest))
+        let Some(dest) = crate::delivery::resolve_target(
+            None,
+            alert
+                .origin
+                .as_ref()
+                .and_then(|origin| DeliveryTarget::from_session_id(&origin.session_id())),
+            None,
+        )
+        .target()
+        .map(|target| target.session_id())
         else {
             crate::warn_log!(
                 "[trigger] alert for rule {} has no conversation to tell",

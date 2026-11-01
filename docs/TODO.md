@@ -46,11 +46,11 @@
 
 决策见票 10。大部分投递链路已存在，本切片 = codify 约定 + 去硬编码 + 提炼共享件；不新建 DeliveryTarget 网络 / 持久 outbox / 全局投递账本。
 
-- [ ] **提炼 `resolve_target` 公共件** — 把 trigger `dispatch.rs::destination()` 上升为 `resolve_target(explicit, origin, owner_primary) -> Option<DeliveryTarget>`，优先级 **显式 deliver-to > origin 会话 > owner 主通道**；`DeliveryTarget{channel, chat_id}` 两段式（不加 thread/topic/priority）
-- [ ] **三源共用** — cron / trigger / heartbeat 的投递都改走 `resolve_target`；trigger `destination()` 迁移到它（行为逐字不变，由既有测试锁定）
-- [ ] **owner 主通道来源** — 运行时记录 owner 首次交互的 `{channel}:{chat_id}`（飞书 owner p2p）作为最后兜底；未建立时降级 log-only
-- [ ] **heartbeat 去硬编码** — 删除 `gateway.rs` 写死的 `webui:webui_main`；无创建对话 → 落 owner 主通道；可 `gateway.heartbeat.channel`/`to` 覆盖
-- [ ] **静默语义** — `deliver:false` 是唯一策略静默条件；与“目标不存在”的 log-only 兜底区分
+- [x] **提炼 `resolve_target` 公共件** — 把 trigger `dispatch.rs::destination()` 上升为 `resolve_target(explicit, origin, owner_primary) -> Option<DeliveryTarget>`，优先级 **显式 deliver-to > origin 会话 > owner 主通道**；`DeliveryTarget{channel, chat_id}` 两段式（不加 thread/topic/priority）
+- [x] **三源共用** — cron / trigger / heartbeat 的投递都改走 `resolve_target`；trigger `destination()` 迁移到它（行为逐字不变，由既有测试锁定）
+- [x] **owner 主通道来源** — 运行时记录 owner 首次交互的 `{channel}:{chat_id}`（飞书 owner p2p）作为最后兜底；未建立时降级 log-only
+- [x] **heartbeat 去硬编码** — 删除 `gateway.rs` 写死的 `webui:webui_main`；无创建对话 → 落 owner 主通道；可 `gateway.heartbeat.channel`/`to` 覆盖
+- [x] **静默语义** — `deliver:false` 是唯一策略静默条件；与“目标不存在”的 log-only 兜底区分
 - [ ] **验收** — 在 webui 建的“发到飞书”job → 落飞书（显式优先）；无 target 的系统事件 → 落 owner 主通道；`deliver:false` → 静默；重启不重复投；日志/session 无投递正文泄露（对齐票 09 隐私）
 
 ## 可靠性与预算（票 11 裁决的实现切片，待 spec 落稿后展开）
@@ -69,7 +69,7 @@
 
 决策见票 12。触发器已落地，本切片 = 与 v1 底座的集成，非新建。
 
-- [ ] **迁移 `destination()`→`resolve_target`** — `trigger/dispatch.rs` 的两级投递（显式→origin→book-only）接进票 10 共享 `resolve_target`；**行为逐字不变**（既有 trigger dispatch 测试锁定）：owner 兜底只对无 origin 源生效，trigger origin 不可达时仍 book-only
+- [x] **迁移 `destination()`→`resolve_target`** — `trigger/dispatch.rs` 的两级投递（显式→origin→book-only）接进票 10 共享 `resolve_target`；**行为逐字不变**（既有 trigger dispatch 测试锁定）：owner 兜底只对无 origin 源生效，trigger origin 不可达时仍 book-only
 - [ ] **spec/architecture 交叉引用** — 在 `docs/architecture.md`/spec 补一段“投递（票10）/可靠性（票11）同样 govern trigger 的出站与失败处理”；无新配置/工具/术语
 - [ ] **验收** — trigger 三源（notify/agent/record）投递语义迁移后不变；主 cron UTC→Local 改动不影响 trigger 到期判定（自带 Local）；无人值守 subagent 中/高风险工具 Deny、不阻塞
 

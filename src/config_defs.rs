@@ -68,6 +68,8 @@ define_config! {
     "gateway.heartbeat" => HeartbeatConfig {
         enabled: bool = true, none, desc: "Whether periodic heartbeat checks are enabled",
         interval_s: u64 = crate::config::default_heartbeat_interval(), none, desc: "Heartbeat check interval in seconds (default 30 minutes)",
+        channel: Option<String> = None::<String>, none, desc: "Optional delivery channel for heartbeat notices (default: the owner's primary channel)",
+        to: Option<String> = None::<String>, none, desc: "Optional chat id paired with `channel` for heartbeat notices",
     }
 }
 

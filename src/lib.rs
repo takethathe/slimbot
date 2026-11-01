@@ -14,6 +14,7 @@ pub(crate) mod config_schema;
 pub(crate) mod consolidate;
 pub(crate) mod context;
 pub(crate) mod cron;
+pub mod delivery;
 pub(crate) mod dream;
 pub(crate) mod embed;
 pub(crate) mod gateway;
@@ -47,6 +48,7 @@ pub use config::{
 pub use config_defs::{AgentConfig, ProviderConfig};
 pub use config_macro::{FieldMeta, Normalizable};
 pub use consolidate::Consolidator;
+pub use delivery::{DeliveryTarget, OwnerPrimaryStore, Resolution, resolve_target};
 pub use context::{ContextBuilder, RunContext, build_runtime_context};
 pub use cron::{CronJob, CronPayload, CronSchedule, CronService};
 pub use identity::{Author, DEFAULT_OWNER_ID, Owner};

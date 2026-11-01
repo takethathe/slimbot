@@ -752,6 +752,13 @@ fn set_gateway(
         ("heartbeat", "interval_s") => {
             config.gateway.heartbeat.interval_s = value_u64(value, "gateway.heartbeat.interval_s")?
         }
+        ("heartbeat", "channel") => {
+            config.gateway.heartbeat.channel =
+                value_opt_str(value, "gateway.heartbeat.channel")?
+        }
+        ("heartbeat", "to") => {
+            config.gateway.heartbeat.to = value_opt_str(value, "gateway.heartbeat.to")?
+        }
         ("dream", "enabled") => {
             config.gateway.dream.enabled = value_bool(value, "gateway.dream.enabled")?
         }
@@ -1105,6 +1112,8 @@ mod tests {
                     unknown: Default::default(),
                 },
                 heartbeat: HeartbeatConfig {
+                    channel: Default::default(),
+                    to: Default::default(),
                     enabled: true,
                     interval_s: 1800,
                     unknown: Default::default(),

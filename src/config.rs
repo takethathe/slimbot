@@ -1506,6 +1506,8 @@ mod tests {
     #[test]
     fn test_config_heartbeat_config_custom_interval() {
         let heartbeat_config = crate::config::HeartbeatConfig {
+            channel: Default::default(),
+            to: Default::default(),
             enabled: true,
             interval_s: 300,
             unknown: Default::default(),
@@ -1523,6 +1525,8 @@ mod tests {
                 unknown: Default::default(),
             },
             heartbeat: crate::config::HeartbeatConfig {
+                channel: Default::default(),
+                to: Default::default(),
                 enabled: true,
                 interval_s: 120,
                 unknown: Default::default(),

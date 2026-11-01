@@ -48,6 +48,8 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
                 unknown: Default::default(),
             },
             heartbeat: slimbot::HeartbeatConfig {
+                channel: Default::default(),
+                to: Default::default(),
                 enabled: false,
                 interval_s: 60,
                 unknown: Default::default(),
