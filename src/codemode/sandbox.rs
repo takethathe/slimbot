@@ -1,7 +1,8 @@
 //! The script execution layer.
 //!
-//! Two very different scripts — a data-source collector and a trigger
-//! condition — share one evaluator. Each execution gets:
+//! Three very different scripts — a data-source collector, a trigger condition,
+//! and a model-authored agent program — share one evaluator. Each execution
+//! gets:
 //!
 //! * a dedicated OS thread per execution, which exits with the script: the
 //!   result travels back over a channel, so no thread ever outlives its run,
@@ -30,9 +31,11 @@ use super::host::{HostBindings, HostEnv};
 use super::redact::Redactor;
 
 /// Name of the function the caller expects the script to define. `collect`
-/// returns `{items: [...]}`, `judge` returns `{fire, evidence?, detail?}`.
+/// returns `{items: [...]}`, `judge` returns `{fire, evidence?, detail?}`,
+/// `main` (the agent entry, ticket 25) returns arbitrary JSON.
 pub const ENTRY_COLLECT: &str = "collect";
 pub const ENTRY_JUDGE: &str = "judge";
+pub const ENTRY_AGENT: &str = "main";
 
 /// Budgets for one execution.
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +63,17 @@ impl Limits {
             timeout: Duration::from_millis(500),
             memory_bytes: 16 * 1024 * 1024,
             max_output_bytes: 8 * 1024,
+        }
+    }
+
+    /// Agent-entry scripts orchestrate real tool calls, so they need real time:
+    /// 30 seconds total, 64MB, and a 64KB result (the return lands in model
+    /// context, where pressure trims anything oversized anyway).
+    pub fn agent() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            memory_bytes: 64 * 1024 * 1024,
+            max_output_bytes: 64 * 1024,
         }
     }
 
@@ -794,5 +808,8 @@ mod tests {
         assert_eq!(Limits::judge().timeout, Duration::from_millis(500));
         assert_eq!(Limits::judge().memory_bytes, 16 * 1024 * 1024);
         assert!(Limits::judge().max_output_bytes <= 8 * 1024);
+        // The agent entry orchestrates real tool calls, so it gets real time.
+        assert_eq!(Limits::agent().timeout, Duration::from_secs(30));
+        assert_eq!(Limits::agent().memory_bytes, 64 * 1024 * 1024);
     }
 }

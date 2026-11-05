@@ -18,7 +18,7 @@ frontmatter 只声明**增量**，正文原样作为 system prompt：
 | `deliver` | `true` | 结果是否投回来源会话 |
 | `timeout_secs` | `600` | 单次运行硬超时 |
 
-**默认工具集** = `config.tools`（未配置则九个内置工具）+ `message` + `memory_search`，再减去保留工具。`cron` 与 `subagent` 是保留的（`FORBIDDEN_AGENT_TOOLS`）：前者会让任务绕过触发器层偷偷建定时器，后者会让并发上限自己乘自己。声明不存在的工具或保留工具 → **整个定义被拒绝**，而不是降级成半残的 agent：一个中途缺工具的 agent 看起来像模型不会用工具。
+**默认工具集** = `config.tools`（未配置则十个内置工具）+ `message` + `memory_search`，再减去保留工具。`cron` 与 `subagent` 是保留的（`FORBIDDEN_AGENT_TOOLS`）：前者会让任务绕过触发器层偷偷建定时器，后者会让并发上限自己乘自己。声明不存在的工具或保留工具 → **整个定义被拒绝**，而不是降级成半残的 agent：一个中途缺工具的 agent 看起来像模型不会用工具。
 
 ## ToolCatalog
 

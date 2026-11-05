@@ -139,6 +139,8 @@ fn test_store_matching_requires_tool_and_args_hash() {
     let mut rec = record("a", "shell", 1_000);
     rec.args_hash = args_hash(&serde_json::json!({"command": "ls"}));
     store.propose(rec);
+    // Only a record carried into this turn is redeemable.
+    store.begin_turn("s1");
 
     assert!(
         store
@@ -167,6 +169,25 @@ fn test_store_matching_requires_tool_and_args_hash() {
             )
             .is_none()
     );
+}
+
+#[test]
+fn test_store_same_turn_proposal_is_not_redeemable() {
+    // The approval-authority bug: a proposal made during this turn must not be
+    // redeemed by a replay inside the same turn, or a batch of two identical
+    // calls (or a script calling twice) would approve itself.
+    let (store, _now) = store_with_clock(1_000);
+    store.begin_turn("s1");
+    let rec = record("a", "shell", 1_000);
+    let hash = rec.args_hash.clone();
+    store.propose(rec);
+
+    assert!(store.matching("s1", "shell", &hash).is_none());
+    assert!(store.mismatching("s1", "shell", "other").is_empty());
+
+    // Next turn the same record is redeemable.
+    store.begin_turn("s1");
+    assert!(store.matching("s1", "shell", &hash).is_some());
 }
 
 #[test]

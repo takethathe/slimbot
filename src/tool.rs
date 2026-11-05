@@ -30,6 +30,10 @@ pub struct TurnContext {
     channel: String,
     chat_id: String,
     sent_in_turn: AtomicBool,
+    /// The run's nested tool-call authority (ticket 25). Present for every
+    /// runner-built turn; `None` when the tool executes outside a run loop
+    /// (unit tests, direct host calls), where codemode has nothing to gate.
+    tool_exec: Option<Arc<crate::runner::gate::RunToolExec>>,
 }
 
 impl TurnContext {
@@ -38,7 +42,14 @@ impl TurnContext {
             channel,
             chat_id,
             sent_in_turn: AtomicBool::new(false),
+            tool_exec: None,
         }
+    }
+
+    /// Attach the run's tool-executor handle.
+    pub(crate) fn with_tool_exec(mut self, exec: Arc<crate::runner::gate::RunToolExec>) -> Self {
+        self.tool_exec = Some(exec);
+        self
     }
 
     pub fn channel(&self) -> &str {
@@ -89,6 +100,13 @@ pub fn current_turn_target() -> (String, String) {
         Some(t) => (t.channel().to_string(), t.chat_id().to_string()),
         None => (String::new(), String::new()),
     }
+}
+
+/// The current run's nested tool-call authority (ticket 25), or `None` when
+/// outside a runner-built turn. The codemode tool needs this to execute
+/// `tools.*` host calls under the run's own approval gate.
+pub(crate) fn current_tool_exec() -> Option<Arc<crate::runner::gate::RunToolExec>> {
+    current_turn().and_then(|t| t.tool_exec.clone())
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +210,10 @@ impl ToolManager {
             },
             ToolEntry {
                 name: "web_fetch".into(),
+                enabled: true,
+            },
+            ToolEntry {
+                name: "codemode".into(),
                 enabled: true,
             },
         ];

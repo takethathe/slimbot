@@ -5,7 +5,7 @@ pub mod factory;
 pub(crate) mod frontmatter;
 mod fs;
 pub mod history;
-mod index;
+pub(crate) mod index;
 pub mod markdown;
 pub mod snapshots;
 

@@ -1,3 +1,4 @@
+pub mod codemode;
 pub mod cron;
 pub mod file_editor;
 pub mod file_reader;
@@ -108,6 +109,7 @@ pub fn create_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
                 web_fetch_config.as_ref(),
             )))
         }
+        "codemode" => Some(Box::new(codemode::CodemodeTool)),
         _ => None,
     }
 }

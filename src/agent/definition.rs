@@ -380,8 +380,8 @@ mod tests {
         assert!(set.contains(&"memory_search".to_string()));
         assert!(!set.contains(&"cron".to_string()));
         assert!(!set.contains(&"subagent".to_string()));
-        // Nine built-ins + the two always-available tools.
-        assert_eq!(set.len(), 11);
+        // Ten built-ins + the two always-available tools.
+        assert_eq!(set.len(), 12);
     }
 
     #[test]
@@ -414,6 +414,6 @@ mod tests {
         let def = reg.get("a").unwrap();
         let names = def.tool_names(&default_tool_set(&[]));
         assert!(names.contains(&"web_fetch".to_string()));
-        assert_eq!(names.len(), 11, "increments deduplicate against defaults");
+        assert_eq!(names.len(), 12, "increments deduplicate against defaults");
     }
 }

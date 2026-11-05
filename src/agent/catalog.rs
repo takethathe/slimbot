@@ -29,6 +29,7 @@ const STATIC_TOOL_NAMES: &[&str] = &[
     "grep",
     "find_files",
     "web_fetch",
+    "codemode",
     "message",
     "memory_search",
     "trigger",
@@ -132,7 +133,7 @@ pub fn known_tool_names() -> Vec<String> {
     names
 }
 
-/// The nine built-in tools enabled when `config.tools` is empty.
+/// The ten built-in tools enabled when `config.tools` is empty.
 pub(crate) fn effective_builtin_names(entries: &[crate::config::ToolEntry]) -> Vec<String> {
     const DEFAULT_NAMES: &[&str] = &[
         "shell",
@@ -144,6 +145,7 @@ pub(crate) fn effective_builtin_names(entries: &[crate::config::ToolEntry]) -> V
         "grep",
         "find_files",
         "web_fetch",
+        "codemode",
     ];
     if entries.is_empty() {
         return DEFAULT_NAMES.iter().map(|s| s.to_string()).collect();
@@ -213,8 +215,8 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_builtin_names_defaults_to_nine() {
-        assert_eq!(effective_builtin_names(&[]).len(), 9);
+    fn test_effective_builtin_names_defaults_to_ten() {
+        assert_eq!(effective_builtin_names(&[]).len(), 10);
     }
 
     #[test]

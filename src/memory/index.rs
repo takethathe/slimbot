@@ -283,7 +283,7 @@ fn flush_cjk(tokens: &mut Vec<String>, run: &mut Vec<char>) {
 /// other character; tokens shorter than two chars are dropped. CJK runs are
 /// indexed as adjacent-character bigrams; a run of exactly one character
 /// yields a unigram so single-character queries can fall back to it.
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut latin = String::new();
     let mut run: Vec<char> = Vec::new();

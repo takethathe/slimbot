@@ -143,7 +143,7 @@ LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨�
 
 ## 审批生命周期（Approval）
 
-工具风险闸门只有一个执行点：`ApprovalHook`（PreTool）。三层职责严格分离——`RiskLevel`（工具的事实）→ control level（配置的策略）→ `ApprovalHook`（执行）。完整设计见 `docs/adr/0011-approval-by-turn-end-redemption.md`。
+工具风险闸门只有一个决策核心：`src/runner/gate.rs` 的 `decide()`（风险级 → 管控档 → 决策 + 兑现/否决/审计）。顶层由 `ApprovalHook`（PreTool）调用它，codemode 脚本里的嵌套 `tools.*` 调用由 `RunToolExec` 走同一个决策核心（票 25，见 `docs/codemode.md`）。三层职责严格分离——`RiskLevel`（工具的事实）→ control level（配置的策略）→ gate（执行）。完整设计见 `docs/adr/0011-approval-by-turn-end-redemption.md`。
 
 ### 三种决策
 
@@ -157,7 +157,7 @@ LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨�
 
 ### 兑现与作废
 
-- **兑现**：下一轮模型发出 `(tool, args_hash)` 都相同的调用 → 放行执行。执行前重新校验 risk 与 args_hash（fail-closed）。
+- **兑现**：下一轮模型发出 `(tool, args_hash)` 都相同的调用 → 放行执行。只认 **carried** 记录（本轮开始时已遗留的）：**本轮内刚提出的申请不能靠本轮重放兑现**，否则顶层一批两个相同 tool_call、或脚本里连调两次同 args 就等于自己批准自己（兑现与下面的否决用同一个 carried 口径）。执行前重新校验 risk 与 args_hash（fail-closed）。
 - **否决**：同工具但 args 不同 → 删除记录 + 固定拒绝文案（一次批准不能授权另一个操作）。
 - **滚动**：回合结束时清理的是"回合开始时已存在"的记录；**本回合内新产生的 `Ask` 滚动到下一轮**，否则确认轮里冒出的新动作永远等不到兑现。
 - **TTL**：默认 1800 秒（可配，上限 24 小时）。过期的记录在下一回合**开始时**作废，且不再出现在上下文里。

@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 /// Agent name reported on GenAI spans via `gen_ai.agent.name`.
 const AGENT_NAME: &str = "slimbot";
 
+pub(crate) mod gate;
 mod hooks;
 mod registry;
 mod traits;
@@ -507,7 +508,13 @@ impl AgentRunner {
 
         // Scope per-turn state (context + sent_in_turn) via a task-local so that
         // concurrent runs sharing one Arc<ToolManager> each see their own state.
-        let turn = Arc::new(TurnContext::new(tool_channel, tool_chat_id));
+        // The turn also carries the run's nested tool-call authority (ticket 25):
+        // the codemode agent entry executes `tools.*` calls through the same
+        // approval gate this loop's hook chain uses.
+        let tool_exec = Arc::new(crate::runner::gate::RunToolExec::new(
+            hooks::approval::gate_context(&spec),
+        ));
+        let turn = Arc::new(TurnContext::new(tool_channel, tool_chat_id).with_tool_exec(tool_exec));
         with_turn_context(turn.clone(), async {
             // Every exit must carry the sent_in_turn flag: callers suppress the
             // final response only when the message tool already delivered to the

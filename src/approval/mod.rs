@@ -393,11 +393,19 @@ impl ApprovalStore {
         record
     }
 
-    /// The record a replay redeems: same tool + same args hash, still pending.
+    /// The record a replay redeems: same tool + same args hash, and **carried**
+    /// into this turn (proposed on an earlier turn). A record proposed *during*
+    /// this turn is never redeemable in it — otherwise a script or a tool-call
+    /// batch could approve itself by replaying the same call (ADR 0011: the
+    /// owner's answer arrives as next turn's replay). Mirrors `mismatching`.
     pub fn matching(&self, session_id: &str, tool: &str, hash: &str) -> Option<PendingApproval> {
         let inner = self.inner.read();
-        inner.get(session_id)?.pending.values().find_map(|record| {
-            (record.tool == tool && record.args_hash == hash).then(|| record.clone())
+        let state = inner.get(session_id)?;
+        state.pending.values().find_map(|record| {
+            (state.carried.contains(&record.approval_id)
+                && record.tool == tool
+                && record.args_hash == hash)
+                .then(|| record.clone())
         })
     }
 

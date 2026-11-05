@@ -2,7 +2,7 @@
 
 SlimBot 的工具分四组：
 
-- **内置工具（9 个）** —— Shell 执行、文件读写编辑、目录操作、搜索与 `web_fetch`。它们在 `config.json` 的 `tools` 数组中逐个启用/禁用，数组为空时全部启用。
+- **内置工具（10 个）** —— Shell 执行、文件读写编辑、目录操作、搜索、`web_fetch` 与 `codemode`（沙箱 JS 程序）。它们在 `config.json` 的 `tools` 数组中逐个启用/禁用，数组为空时全部启用。
 - **运行期装配工具** —— `memory_search`（主循环，只读）、`subagent`（仅主循环）、`message` / `cron`（gateway 模式）。它们由代码在装配时注册，**不**进 `tools` 数组，也无法在那里禁用。
 - **目录限定工具（catalog-only）** —— `trigger_source` / `trigger`。只在 `ToolCatalog` 注册，主循环不可见，仅当 agent 定义显式声明时装配给子代理。
 - **Dream 专用工具** —— `memory_read` / `memory_write` / `memory_edit`，只在 Dream 沙箱内存在，沙箱没有任何文件或 shell 工具。
@@ -332,11 +332,33 @@ SlimBot 的工具分四组：
 
 - **路径验证**：每个文件路径都相对于 `workspace_dir` 解析，并使用规范绝对路径进行验证。试图通过 `../`、符号链接等方式逃逸工作目录的路径会被拒绝。
 - **Shell 隔离**：`shell` 工具不受目录限制，但受 30 秒超时约束。
+### `codemode`
+
+在沙箱里运行一段模型写的 JS 程序（票 25，机制见 [Codemode](codemode.md)）。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `script` | string | 是 | 定义 `async function main(ctx)` 的 JS 源码 |
+| `ctx` | object | 否 | 合入脚本 `ctx` 参数的纯数据 |
+
+**行为：**
+- 脚本能做的事只有一件装好的工具面：`await ctx.tools.<name>(args)` + `await ctx.searchTools(query)`；目录里没有的工具在命名空间里结构性缺失
+- 每次 `tools.*` 调用走与普通 tool_call 相同的审批闸（`src/runner/gate.rs`）：Deny/Ask 的拒绝与指引文本作为调用的返回文本给脚本，不中断脚本，也没有中途弹窗；attended 轮的嵌套 Ask 写入 pending，下一轮重放同一脚本按 redemption 放行
+- 返回脚本返回值的 JSON + `[script logs]`；超时 30s / 内存 64MB / 输出 64KB，失败报 `Error [code]: message`
+- 自身风险等级 `ReadOnly`（载体只计算，副作用都在被门控的内层调用上）；运行在 runner 轮次之外时报错退出（无审批上下文可门控）
+
+**示例：**
+```json
+{ "script": "async function main(ctx) { const hits = JSON.parse(await ctx.searchTools('read file')); return { tool: hits[0].name }; }" }
+```
+
+---
+
 - **读取大小限制**：`file_reader` 输出上限为 50,000 字符。
 
 ## 配置
 
-工具在 `config.json` 的 `tools` 数组中配置，数组为空时 9 个内置工具全部启用。`tools` 数组只能构造 `create_tool()` 支持的内置工具——`memory_search`、`subagent`、`message`、`cron`、catalog-only 的 `trigger_source` / `trigger` 与 Dream 的三个记忆工具在代码中装配，不在其中。
+工具在 `config.json` 的 `tools` 数组中配置，数组为空时 10 个内置工具全部启用。`tools` 数组只能构造 `create_tool()` 支持的内置工具——`memory_search`、`subagent`、`message`、`cron`、catalog-only 的 `trigger_source` / `trigger` 与 Dream 的三个记忆工具在代码中装配，不在其中。
 
 ```json
 {

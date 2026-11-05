@@ -15,20 +15,20 @@
 //! a redeemed round onto its original call and rewrites unredeemed guidance to
 //! failure text. Nothing here ever writes a decision into the session: the
 //! audit goes to the trace `approval` span.
+//!
+//! The decision itself lives in [`crate::runner::gate`], shared verbatim with
+//! the codemode agent entry (ticket 25) so a nested `tools.*` call meets the
+//! same policy as a top-level one. This file keeps only the `RunState` side
+//! effects: marking the tool message, ending the turn, answering the hook.
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::json;
 
-use crate::approval::{
-    ControlLevel, PendingApproval, RiskLevel, args_hash, denied_text, merge_approval_rounds,
-    pending_guidance_text, unattended_denied_text, vetoed_text,
-};
+use crate::approval::{PendingApproval, merge_approval_rounds};
+use crate::runner::gate::{GateContext, GateDecision};
 use crate::runner::traits::{AfterTurnHook, PreChatHook, PreToolHook, PreTurnHook};
 use crate::runner::types::{HookAction, RunSpec, RunState, ToolHookAction};
-use crate::session::AgentEvent;
 use crate::tool::ToolCall;
-use crate::trace::{SpanRecorder, SpanStatus};
 
 /// Run-state extension key: `HashMap<tool_call_id, approval_id>` for the calls
 /// this run turned into pending approvals. `PersistToolMessageHook` reads it to
@@ -52,39 +52,21 @@ pub(crate) fn mark_for(state: &RunState, call_id: &str) -> Option<String> {
         .and_then(|marks| marks.get(call_id).cloned())
 }
 
-/// Write one audit event to the trace `approval` span.
-///
-/// Decisions go to the trace and not to the session JSONL: conversation history
-/// is trimmed by snip/consolidate, so an audit there would eventually vanish.
-/// Who/what decided: the audit needs to distinguish "the policy refused" from
-/// "the owner redeemed" from "the clock ran out" without decoding the decision.
-fn decided_by(decision: &str) -> &'static str {
-    match decision {
-        "redeemed" => "redemption",
-        "expired" => "ttl",
-        "cleared" => "round_end",
-        _ => "policy",
-    }
+/// Write one audit event to the trace `approval` span (see `runner::gate`).
+fn audit(spec: &RunSpec, decision: &str, record: &PendingApproval) {
+    crate::runner::gate::audit(spec.tracer.as_ref(), decision, record);
 }
 
-fn audit(spec: &RunSpec, decision: &str, record: &PendingApproval) {
-    let Some(tracer) = spec.tracer.as_ref() else {
-        return;
-    };
-    let span = tracer.start_span("approval", None);
-    span.set_attribute("approval.decision", json!(decision));
-    span.set_attribute("approval.decided_by", json!(decided_by(decision)));
-    span.set_attribute("approval.id", json!(record.approval_id));
-    span.set_attribute("approval.owner_id", json!(record.owner_id));
-    span.set_attribute("approval.session_id", json!(record.session_id));
-    span.set_attribute("approval.run_id", json!(record.run_id));
-    span.set_attribute("approval.turn_kind", json!(record.turn_kind.as_str()));
-    span.set_attribute("approval.tool", json!(record.tool));
-    span.set_attribute("approval.args", json!(record.trace_args()));
-    span.set_attribute("approval.args_hash", json!(record.args_hash));
-    span.set_attribute("approval.risk", json!(record.risk.as_str()));
-    span.set_attribute("approval.ts_ms", json!(record.created_ms));
-    span.set_status(SpanStatus::Ok);
+/// Snapshot the run's gate inputs; cheap Arc clones, no `RunState` access.
+pub(crate) fn gate_context(spec: &RunSpec) -> GateContext {
+    GateContext {
+        session_id: spec.session_id.clone(),
+        task_hook: spec.task_hook.clone(),
+        tool_manager: spec.tool_manager.clone(),
+        approvals: spec.approvals.clone(),
+        tracer: spec.tracer.clone(),
+        cancel_token: spec.cancel_token.clone(),
+    }
 }
 
 /// Open the policy turn: expire past-TTL records, then arm redemption.
@@ -126,7 +108,7 @@ impl PreChatHook for ApprovalContextHook {
     }
 }
 
-/// The only place a tool call is allowed, refused or deferred.
+/// The only place a top-level tool call is allowed, refused or deferred.
 pub struct ApprovalHook;
 
 #[async_trait]
@@ -137,66 +119,16 @@ impl PreToolHook for ApprovalHook {
         state: &mut RunState,
         tool_call: &ToolCall,
     ) -> Result<ToolHookAction> {
-        // An unregistered tool cannot execute, so there is nothing to authorize.
-        let Some(risk) = spec.tool_manager.risk_level(&tool_call.name) else {
-            return Ok(ToolHookAction::Execute);
-        };
-        let control = spec.approvals.control_for(&tool_call.name, risk);
-        let hash = args_hash(&tool_call.args);
-
-        // 1. Redemption: a replayed call with the same tool + args hash is the
-        //    approval the owner gave on the previous turn.
-        if let Some(record) = spec
-            .approvals
-            .matching(&spec.session_id, &tool_call.name, &hash)
-        {
-            return redeem(spec, record, risk, &hash).await;
-        }
-
-        // 2. Veto: a carried proposal for this tool with different args means the
-        //    model replays something else than what was approved. Fail closed.
-        let mismatched = spec
-            .approvals
-            .mismatching(&spec.session_id, &tool_call.name, &hash);
-        if !mismatched.is_empty() {
-            for record in &mismatched {
-                spec.approvals.take(&spec.session_id, &record.approval_id);
-                audit(spec, "denied_by_policy", record);
-            }
-            return Ok(ToolHookAction::Skip {
-                result: vetoed_text(&tool_call.name, &mismatched[0].approval_id),
-            });
-        }
-
-        match control {
-            ControlLevel::Allow => Ok(ToolHookAction::Execute),
-            ControlLevel::Deny => {
-                let record = proposal(spec, tool_call, risk, &hash, control);
-                audit(spec, "denied_by_policy", &record);
-                Ok(ToolHookAction::Skip {
-                    result: denied_text(&tool_call.name, risk),
-                })
-            }
-            ControlLevel::Ask => {
-                // Nobody is online to redeem an unattended run, so `Ask` is a
-                // refusal there: fail closed and never write a pending record.
-                if !spec.task_hook.turn_kind().is_attended() {
-                    let record = proposal(spec, tool_call, risk, &hash, control);
-                    audit(spec, "denied_by_policy", &record);
-                    return Ok(ToolHookAction::Skip {
-                        result: unattended_denied_text(
-                            &tool_call.name,
-                            risk,
-                            spec.task_hook.turn_kind(),
-                        ),
-                    });
-                }
-
-                let record = spec
-                    .approvals
-                    .propose(proposal(spec, tool_call, risk, &hash, control));
-                audit(spec, "proposed", &record);
-                mark_call(state, &tool_call.id, &record.approval_id);
+        let ctx = gate_context(spec);
+        match crate::runner::gate::decide(&ctx, tool_call).await {
+            GateDecision::Execute => Ok(ToolHookAction::Execute),
+            GateDecision::Refuse { result } => Ok(ToolHookAction::Skip { result }),
+            GateDecision::Cancelled { reason } => Ok(ToolHookAction::Abort { reason }),
+            GateDecision::Pending {
+                result,
+                approval_id,
+            } => {
+                mark_call(state, &tool_call.id, &approval_id);
 
                 // End the turn: the owner reads a plain-text list, and the same
                 // call replays next turn to redeem it.
@@ -204,88 +136,10 @@ impl PreToolHook for ApprovalHook {
                 state.result.success = true;
                 state.result.iterations = state.iterations;
                 state.result.content = spec.approvals.pending_list_text(&spec.session_id);
-                Ok(ToolHookAction::Skip {
-                    result: pending_guidance_text(&record),
-                })
+                Ok(ToolHookAction::Skip { result })
             }
         }
     }
-}
-
-/// Redeem a matching pending record: broadcast, re-validate, then execute.
-async fn redeem(
-    spec: &RunSpec,
-    record: PendingApproval,
-    risk: RiskLevel,
-    hash: &str,
-) -> Result<ToolHookAction> {
-    // Pre-execution re-validation of the two code-side gates (ADR 0011/6): the
-    // risk class and the args hash are recomputed against the live call.
-    let revalidated = record.risk == risk && record.args_hash == hash;
-    if !revalidated {
-        spec.approvals.take(&spec.session_id, &record.approval_id);
-        audit(spec, "denied_by_policy", &record);
-        return Ok(ToolHookAction::Skip {
-            result: vetoed_text(&record.tool, &record.approval_id),
-        });
-    }
-
-    // Consume first, then announce: a redeemed approval is never redeemable twice.
-    spec.approvals.take(&spec.session_id, &record.approval_id);
-    audit(spec, "redeemed", &record);
-
-    // Compensation control: tell the origin channel what is about to run, then
-    // give the owner a scheduling window to `/stop` before it does.
-    spec.task_hook.fire_event(AgentEvent::ApprovalRedeemed {
-        session_id: spec.session_id.clone(),
-        approval_id: record.approval_id.clone(),
-        tool: record.tool.clone(),
-        args: record.args_text(),
-        risk: record.risk.as_str().to_string(),
-    });
-    tokio::task::yield_now().await;
-
-    if spec.is_cancelled() {
-        return Ok(ToolHookAction::Abort {
-            reason: format!(
-                "Task cancelled: /stop arrived before `{}` executed.",
-                record.tool
-            ),
-        });
-    }
-    Ok(ToolHookAction::Execute)
-}
-
-/// Build the record a decision would produce. Only `Ask` stores it.
-fn proposal(
-    spec: &RunSpec,
-    tool_call: &ToolCall,
-    risk: RiskLevel,
-    hash: &str,
-    control: ControlLevel,
-) -> PendingApproval {
-    let owner_id = spec.task_hook.owner_id().to_string();
-    PendingApproval {
-        approval_id: new_approval_id(control),
-        owner_id,
-        session_id: spec.session_id.clone(),
-        run_id: spec.task_hook.run_id().to_string(),
-        turn_kind: spec.task_hook.turn_kind(),
-        tool: tool_call.name.clone(),
-        args: tool_call.args.clone(),
-        args_hash: hash.to_string(),
-        risk,
-        created_ms: spec.approvals.now_ms(),
-    }
-}
-
-/// Deterministic-ish id, prefixed with the decision so a trace is readable.
-fn new_approval_id(control: ControlLevel) -> String {
-    format!(
-        "appr-{}-{}",
-        control.as_str(),
-        uuid::Uuid::new_v4().simple()
-    )
 }
 
 #[cfg(test)]
@@ -294,14 +148,20 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use serde_json::json;
     use tokio::sync::broadcast;
 
     use super::*;
-    use crate::approval::{ApprovalConfig, ApprovalStore, DEFAULT_APPROVAL_TIMEOUT_SECONDS};
+    use crate::approval::{
+        ApprovalConfig, ApprovalStore, ControlLevel, DEFAULT_APPROVAL_TIMEOUT_SECONDS, RiskLevel,
+        args_hash,
+    };
     use crate::memory::MemoryService;
     use crate::provider::{FinishReason, LLMResponse, Provider, Usage};
     use crate::runner::AgentRunnerBuilder;
-    use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook, TurnKind};
+    use crate::session::{
+        AgentEvent, Message, SessionManager, SharedSessionManager, TaskHook, TurnKind,
+    };
     use crate::tool::{Tool, ToolDefinition, ToolManager, TurnContext};
     use crate::trace::Tracer;
 
@@ -580,6 +440,29 @@ mod tests {
         let call = h.call("tc-1", "shell", json!({"command": "make deploy"}));
         h.decide(&call).await;
         h.spec.approvals.pending_for("s1")[0].clone()
+    }
+
+    #[tokio::test]
+    async fn test_approval_hook_same_turn_replay_does_not_redeem() {
+        // Two identical calls inside one turn (a tool-call batch, or a codemode
+        // script retrying) must not approve themselves: the proposal belongs to
+        // the *next* turn's replay.
+        let mut h = Harness::new(ApprovalConfig::default(), TurnKind::User);
+        propose(&mut h).await;
+
+        let replay = h.call("tc-9", "shell", json!({"command": "make deploy"}));
+        match h.decide(&replay).await {
+            ToolHookAction::Skip { result } => {
+                assert!(result.starts_with("NOT EXECUTED"), "{result}");
+            }
+            other => panic!("expected a second pending Skip, got {other:?}"),
+        }
+        assert_eq!(h.runs(), 0, "the tool never ran");
+        assert_eq!(
+            h.store.pending_for("s1").len(),
+            1,
+            "the duplicate proposal collapses onto the same record"
+        );
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@
 //! model-written code run unattended without a shell, without a network of its
 //! own, and without ever reaching the process environment.
 
+pub mod agent;
 pub mod error;
 pub mod host;
 pub mod redact;
@@ -19,4 +20,6 @@ pub use host::{HostBindings, HostEnv, LogSink, NoHost};
 #[allow(unused_imports)]
 pub use redact::Redactor;
 #[allow(unused_imports)]
-pub use sandbox::{ENTRY_COLLECT, ENTRY_JUDGE, Limits, RunRequest, execute, execute_async};
+pub use sandbox::{
+    ENTRY_AGENT, ENTRY_COLLECT, ENTRY_JUDGE, Limits, RunRequest, execute, execute_async,
+};
