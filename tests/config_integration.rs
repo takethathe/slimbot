@@ -183,6 +183,7 @@ fn test_save_and_reload_round_trip() {
             context_window_tokens: 32768,
             prompt_cache_enabled: true,
             disable_thinking: false,
+            timeout_seconds: 180,
             unknown: Default::default(),
         },
     );

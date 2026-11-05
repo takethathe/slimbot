@@ -33,6 +33,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
                     context_window_tokens: 32768,
                     prompt_cache_enabled: false,
                     disable_thinking: false,
+                    timeout_seconds: 180,
                     unknown: Default::default(),
                 },
             );
