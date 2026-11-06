@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use crate::config::{McpServerConfig, ProviderConfig, TriggersConfig};
+use crate::config::{ChannelConfig, McpServerConfig, ProviderConfig, TriggersConfig};
 
 /// Keyring *account* every slimbot credential is stored under; the secret key
 /// is the keyring *service*.
@@ -52,6 +52,13 @@ pub fn trigger_key(secret: &str) -> String {
 /// Config key of one MCP connector credential: `slimbot.mcp.<server>.<name>`.
 pub fn mcp_key(server: &str, name: &str) -> String {
     format!("{}.mcp.{}.{}", KEYRING_ACCOUNT, server, name)
+}
+
+/// Config key of one channel credential: `slimbot.channel.<channel>.<field>`.
+/// An IM channel (a Feishu app secret) is not a structured config section, so
+/// its secrets live under this namespace rather than a typed field.
+pub fn channel_key(channel: &str, field: &str) -> String {
+    format!("{}.channel.{}.{}", KEYRING_ACCOUNT, channel, field)
 }
 
 /// Environment variable carrying the secret for `key`: upper-cased, with every
@@ -340,14 +347,19 @@ const PLACEHOLDER_PREFIX: &str = "${secret:";
 
 /// Replace every `${secret:<key>}` in `value` with the chain's answer for that
 /// key (keychain → env). Keys written without the `slimbot.` prefix are
-/// resolved as [`mcp_key`] for the owning server, so an entry can say
-/// `${secret:token}` instead of repeating its own address.
+/// resolved through `fallback_key`, so an entry can say `${secret:token}`
+/// instead of repeating its own address.
 ///
-/// A key the chain does not have leaves the placeholder verbatim: the connector
+/// A key the chain does not have leaves the placeholder verbatim: the consumer
 /// then fails its handshake with that text visible to the owner, which is a
 /// better diagnosis than silently starting with an empty credential. Only the
-/// key is ever logged.
-fn substitute(value: &str, server: &str, store: &SecretStore) -> String {
+/// key is ever logged, tagged with `label` ("connector" / "channel").
+fn substitute(
+    value: &str,
+    store: &SecretStore,
+    fallback_key: &dyn Fn(&str) -> String,
+    label: &str,
+) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     loop {
@@ -367,7 +379,7 @@ fn substitute(value: &str, server: &str, store: &SecretStore) -> String {
         let key = if written.starts_with("slimbot.") {
             written.to_string()
         } else {
-            mcp_key(server, written)
+            fallback_key(written)
         };
         match store.resolve(&key) {
             Some(resolved) => {
@@ -375,7 +387,7 @@ fn substitute(value: &str, server: &str, store: &SecretStore) -> String {
                 report(&resolved);
             }
             None => {
-                crate::debug!("[secrets] no source for connector key {key} (server {server})");
+                crate::debug!("[secrets] no source for {label} key {key}");
                 out.push_str(&rest[start..=start + PLACEHOLDER_PREFIX.len() + end]);
             }
         }
@@ -388,14 +400,37 @@ fn substitute(value: &str, server: &str, store: &SecretStore) -> String {
 /// credential written straight into the `0600` config file keeps working.
 pub fn resolve_mcp_secrets(servers: &mut [McpServerConfig], store: &SecretStore) {
     for server in servers.iter_mut() {
+        let name = server.name.clone();
+        let fallback = |suffix: &str| mcp_key(&name, suffix);
         for value in server.env.values_mut() {
             if value.contains(PLACEHOLDER_PREFIX) {
-                *value = substitute(value, &server.name, store);
+                *value = substitute(value, store, &fallback, "connector");
             }
         }
         for value in server.headers.values_mut() {
             if value.contains(PLACEHOLDER_PREFIX) {
-                *value = substitute(value, &server.name, store);
+                *value = substitute(value, store, &fallback, "connector");
+            }
+        }
+    }
+}
+
+/// Fill every `${secret:...}` placeholder in a channel's open `extra` map from
+/// the chain. An IM channel holds credentials (a Feishu app secret) that belong
+/// to the resolution chain, not the `0600` file; a bare `${secret:app_secret}`
+/// resolves under [`channel_key`] for the owning channel. Values without a
+/// placeholder pass through untouched, so a credential written straight into
+/// the config file keeps working.
+pub fn resolve_channel_secrets(channels: &mut HashMap<String, ChannelConfig>, store: &SecretStore) {
+    for (name, entry) in channels.iter_mut() {
+        let fallback = |suffix: &str| channel_key(name, suffix);
+        for value in entry.extra.values_mut() {
+            // Only strings carry placeholders; port numbers and flags pass
+            // through untouched.
+            let Some(text) = value.as_str() else { continue };
+            if text.contains(PLACEHOLDER_PREFIX) {
+                let resolved = substitute(text, store, &fallback, "channel");
+                *value = serde_json::Value::String(resolved);
             }
         }
     }
@@ -622,6 +657,62 @@ mod tests {
         // server that fails on an empty credential.
         assert_eq!(servers[0].env["MISSING"], "${secret:nope}");
         assert_eq!(servers[0].env["UNTERMINATED"], "${secret:oops");
+    }
+
+    #[test]
+    fn test_resolve_channel_secrets_expands_short_key_under_the_channel() {
+        let store = store(
+            &[("slimbot.channel.feishu.app_secret", "secret-from-keychain")],
+            &[],
+        );
+        let mut channels = HashMap::new();
+        channels.insert(
+            "feishu".to_string(),
+            ChannelConfig {
+                enabled: true,
+                extra: HashMap::from([(
+                    "app_secret".to_string(),
+                    serde_json::json!("${secret:app_secret}"),
+                )]),
+            },
+        );
+
+        resolve_channel_secrets(&mut channels, &store);
+
+        assert_eq!(
+            channels["feishu"].extra["app_secret"],
+            serde_json::json!("secret-from-keychain")
+        );
+    }
+
+    #[test]
+    fn test_resolve_channel_secrets_keeps_literals_nonstrings_and_missing() {
+        let mut channels = HashMap::new();
+        channels.insert(
+            "feishu".to_string(),
+            ChannelConfig {
+                enabled: true,
+                extra: HashMap::from([
+                    ("app_id".to_string(), serde_json::json!("cli_plain")),
+                    ("port".to_string(), serde_json::json!(8080)),
+                    ("gone".to_string(), serde_json::json!("${secret:nope}")),
+                ]),
+            },
+        );
+
+        resolve_channel_secrets(&mut channels, &store(&[], &[]));
+
+        assert_eq!(
+            channels["feishu"].extra["app_id"],
+            serde_json::json!("cli_plain")
+        );
+        // A number is not a placeholder carrier and passes through untouched.
+        assert_eq!(channels["feishu"].extra["port"], serde_json::json!(8080));
+        assert_eq!(
+            channels["feishu"].extra["gone"],
+            serde_json::json!("${secret:nope}"),
+            "an unresolved key stays verbatim so the misconfiguration is visible"
+        );
     }
 
     #[cfg(unix)]

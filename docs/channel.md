@@ -188,6 +188,14 @@ WebUI 是**纯本机入口**：无认证、无 token，本机即 owner。
 
 本机任意进程仍可全权操作 WebUI（含写配置）——显式接受，不做缓解。
 
+## Feishu 通道
+
+首个 IM 通道（票 27，仅 Gateway 模式）：企业自建应用 + 单条 WebSocket 长连接，
+`owner_open_id` 配置绑 owner，只处理 p2p 文本往返；`Channel` trait 未改动，
+经 `register_factory("feishu", …)` 在 `src/gateway.rs` 装配。网络隔离在
+`FeishuTransport` / `FeishuSender` 两个接缝 trait 后，决策逻辑离线可测。
+详见 `docs/feishu.md`（隐私护栏见 ADR 0017）。
+
 ## 添加新通道类型
 
 1. 实现 `Channel` trait（包括 `start` 和 `send_output`）

@@ -395,11 +395,25 @@ impl Config {
     }
 
     /// True when a secret-typed field (provider `api_key`, `triggers.secrets`
-    /// value, connector env/header) carries a value. Drives the `0600` file mode.
+    /// value, connector env/header, channel credential field) carries a value,
+    /// or a channel field holds a `${secret:}` placeholder. Drives the `0600`
+    /// file mode.
     pub fn contains_secrets(&self) -> bool {
         self.providers.values().any(|p| !p.api_key.is_empty())
             || self.triggers.secrets.iter().any(|s| !s.value.is_empty())
             || self.mcp.servers.iter().any(|s| s.holds_secret())
+            || self.channels.values().any(|c| {
+                c.extra.iter().any(|(k, v)| {
+                    let Some(text) = v.as_str() else { return false };
+                    if text.is_empty() {
+                        return false;
+                    }
+                    // A placeholder means the chain is involved; a literal in
+                    // a known credential field is a raw secret sitting in the
+                    // config file — both say the file must be owner-only.
+                    text.contains("${secret:") || is_secret_field_name(k)
+                })
+            })
     }
 
     /// Replace secret-typed fields with the result of the resolution chain.
@@ -411,6 +425,7 @@ impl Config {
         crate::secrets::resolve_provider_secrets(&mut self.providers, store);
         crate::secrets::resolve_trigger_secrets(&mut self.triggers, store);
         crate::secrets::resolve_mcp_secrets(&mut self.mcp.servers, store);
+        crate::secrets::resolve_channel_secrets(&mut self.channels, store);
     }
 
     /// Parse a config document, applying the legacy-key migrations first.
@@ -455,6 +470,17 @@ pub struct ConfigChange {
     pub paths: Vec<String>,
     pub old_values: BTreeMap<String, ConfigValue>,
     pub new_values: BTreeMap<String, ConfigValue>,
+}
+
+/// Channel `extra` field names that are known to hold a credential. The open
+/// `extra` map has no schema to consult, so the list mirrors what the adapters
+/// read: a literal in one of these fields is a raw secret in the config file
+/// and must trigger the `0600` tightening, exactly like an inline provider key.
+fn is_secret_field_name(key: &str) -> bool {
+    matches!(
+        key,
+        "app_secret" | "verification_token" | "encrypt_key" | "client_secret" | "api_key" | "token"
+    )
 }
 
 fn config_value_from_json(v: &serde_json::Value) -> ConfigValue {
@@ -976,6 +1002,44 @@ mod tests {
             ..Default::default()
         });
         assert!(cfg.contains_secrets());
+        cfg.triggers.secrets.clear();
+        // A channel placeholder pulls in the secret chain (0600)...
+        cfg.channels.insert(
+            "feishu".to_string(),
+            ChannelConfig {
+                enabled: true,
+                extra: [(
+                    "app_secret".to_string(),
+                    serde_json::json!("${secret:app_secret}"),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        assert!(cfg.contains_secrets());
+        // ...and so does a literal credential in a known secret field, the
+        // same stance as an inline provider api_key.
+        cfg.channels.insert(
+            "feishu".to_string(),
+            ChannelConfig {
+                enabled: true,
+                extra: [("app_secret".to_string(), serde_json::json!("raw-secret"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        assert!(cfg.contains_secrets());
+        // A non-secret channel field is not.
+        cfg.channels.insert(
+            "feishu".to_string(),
+            ChannelConfig {
+                enabled: true,
+                extra: [("owner_open_id".to_string(), serde_json::json!("ou_x"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        assert!(!cfg.contains_secrets());
     }
 
     #[cfg(unix)]

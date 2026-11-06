@@ -111,6 +111,7 @@ cargo run -- -d /data/myapp setup
 可用通道类型：
 
 - **`webui`** — Web 界面通道，内置 HTTP 服务器（基于 axum），支持 SSE 流式输出。配置字段见下表。
+- **`feishu`** — 飞书 IM 通道（仅 Gateway 模式，见 `docs/feishu.md` 与 ADR 0017）。配置字段见下表。
 
 #### WebUI 通道配置
 
@@ -136,6 +137,34 @@ WebUI 为补偿「无认证」在 HTTP 层强制四条护栏（全局中间件�
 ```
 
 **向后兼容：** 仍支持旧的数组格式（`[{ "type": "cli", ... }]`），加载时会自动转换为 HashMap 格式。旧格式中的 `type` 字段会被忽略，配置键即为通道类型。
+
+#### Feishu 通道配置
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `app_id` | string | 是 | — | 企业自建应用的 App ID |
+| `app_secret` | string | 是 | — | App Secret；推荐写 `${secret:app_secret}` 占位符走密钥解析链 |
+| `owner_open_id` | string | 是 | — | owner 的 `open_id`（`ou_…`）；只有该人的私聊会被当作 owner 输入，其余私聊静默忽略 |
+| `base_url` | string | 否 | 飞书开放平台 | API 根地址（Lark 国际版等部署可覆盖） |
+| `verification_token` | string | 否 | `""` | 事件校验 token（webhook 场景；长连接模式下可不填） |
+| `encrypt_key` | string | 否 | `""` | 事件加密 key（同上） |
+
+```json
+{
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "app_id": "cli_xxx",
+      "app_secret": "${secret:app_secret}",
+      "owner_open_id": "ou_xxx"
+    }
+  }
+}
+```
+
+缺少任一必填字段时 gateway 启动失败；`enabled: false` 的条目不校验、不建通道。
+密钥解析：裸名占位符按所属通道补全为 `slimbot.channel.feishu.app_secret`（详见
+「密钥与凭证」节）。群组消息 v1 整体关闭；session id 为两段式 `feishu:{chat_id}`。
 
 ### `gateway` — Gateway 模式配置
 
@@ -479,6 +508,7 @@ provider 的 `api_key` 和 `triggers.secrets` 里的值都走同一条解析链�
 | provider API key | `slimbot.<provider-name>` | service = 键，account = `slimbot` | `SLIMBOT_<PROVIDER-NAME>` |
 | 触发器密钥 | `slimbot.trigger.<secret-name>` | service = 键，account = `slimbot` | `SLIMBOT_TRIGGER_<SECRET-NAME>` |
 | MCP 连接器凭证 | `slimbot.mcp.<server>.<name>` | service = 键，account = `slimbot` | `SLIMBOT_MCP_<SERVER>_<NAME>` |
+| 通道凭证（如飞书 app_secret） | `slimbot.channel.<channel>.<field>` | service = 键，account = `slimbot` | `SLIMBOT_CHANNEL_<CHANNEL>_<FIELD>` |
 
 环境变量名由键推导：全部大写，非字母数字字符替换为 `_`。例如 provider `default` →
 `slimbot.default` → `SLIMBOT_DEFAULT`；触发器密钥 `github-token` →

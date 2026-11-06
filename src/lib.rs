@@ -47,7 +47,7 @@ pub(crate) mod worker;
 
 // Re-export key types for integration tests and binary usage.
 pub use approval::{ApprovalConfig, ApprovalStore, ControlLevel, PendingApproval, RiskLevel};
-pub use channel::{Channel, ChannelFactory, ChannelManager};
+pub use channel::{Channel, ChannelFactory, ChannelManager, FeishuChannelFactory};
 pub use config::{
     ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, DreamConfig, GatewayConfig,
     HeartbeatConfig, OwnerConfig, ToolEntry, ToolsConfig, TraceBackendEntry, TraceConfig,

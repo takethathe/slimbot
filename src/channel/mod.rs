@@ -1,5 +1,8 @@
+mod feishu;
 mod webui;
 
+#[allow(unused_imports)]
+pub use feishu::FeishuChannelFactory;
 #[allow(unused_imports)]
 pub use webui::WebuiChannelFactory;
 

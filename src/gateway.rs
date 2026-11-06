@@ -410,6 +410,20 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         );
     }
 
+    // Feishu is a gateway-only channel: it holds a single WebSocket long
+    // connection per app, so only the gateway process may register it (ADR
+    // 0017). The factory is registered unconditionally; it is exercised only
+    // when `channels.feishu` is present and enabled in `init()` below. The
+    // shutdown broadcast lets the connection task end on graceful shutdown
+    // instead of stalling the ChannelManager's join.
+    channel_manager.register_factory(
+        "feishu",
+        Box::new(crate::channel::FeishuChannelFactory::new(
+            message_bus.clone(),
+            channel_shutdown_tx.clone(),
+        )),
+    );
+
     channel_manager.init().await?;
     channel_manager.start_channels().await;
 
