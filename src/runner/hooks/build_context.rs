@@ -33,7 +33,8 @@ impl PreChatHook for BuildContextHook {
             spec.tool_manager.clone(),
             spec.workspace_dir.clone(),
             spec.memory_service.clone(),
-        );
+        )
+        .with_connectors(spec.connectors.clone());
         let ctx = context_builder
             .build_messages(
                 &spec.session_id,
@@ -100,6 +101,7 @@ mod tests {
             chat_id: "c1".into(),
             runtime_ctx: "ctx".into(),
             approvals: Default::default(),
+            connectors: None,
             tracer: None,
         }
     }

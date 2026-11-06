@@ -106,6 +106,7 @@ pub struct AgentRunnerBuilder {
     max_tokens: Option<u32>,
     pressure: Option<crate::pressure::PressureAnchor>,
     approvals: Option<Arc<crate::approval::ApprovalStore>>,
+    connectors: Option<Arc<crate::mcp::McpService>>,
     hooks: HookRegistry,
 }
 
@@ -123,6 +124,7 @@ impl AgentRunnerBuilder {
             max_tokens: None,
             pressure: None,
             approvals: None,
+            connectors: None,
             hooks: HookRegistry::new(),
         }
     }
@@ -191,6 +193,16 @@ impl AgentRunnerBuilder {
     /// wrong for a gateway.
     pub fn approvals(mut self, store: Arc<crate::approval::ApprovalStore>) -> Self {
         self.approvals = Some(store);
+        self
+    }
+
+    /// Attach the gateway's MCP connector pool (ticket 26).
+    ///
+    /// Unset means the run has no connector tools at all: the script's
+    /// `searchTools` and `tools.*` surface is just the run's own tools. Shared
+    /// across runs like the approval store, because connections are per process.
+    pub fn connectors(mut self, pool: Arc<crate::mcp::McpService>) -> Self {
+        self.connectors = Some(pool);
         self
     }
 
@@ -311,6 +323,7 @@ impl AgentRunnerBuilder {
         let approvals = self
             .approvals
             .unwrap_or_else(|| Arc::new(crate::approval::ApprovalStore::default()));
+        let connectors = self.connectors;
 
         // Builders that never called `with_defaults` (or added no custom hooks)
         // still get the stock behavior out of the box.
@@ -334,6 +347,7 @@ impl AgentRunnerBuilder {
             max_tokens,
             pressure,
             approvals,
+            connectors,
             hooks,
         }
     }
@@ -352,6 +366,10 @@ pub struct AgentRunner {
     pressure: crate::pressure::PressureAnchor,
     /// Shared pending-approval state (in-memory, never persisted).
     approvals: Arc<crate::approval::ApprovalStore>,
+    /// Gateway connector pool, when any MCP server is configured (ticket 26).
+    /// Never a model-facing tool source: only scripts reach it, and then through
+    /// the same approval gate as every other tool call.
+    connectors: Option<Arc<crate::mcp::McpService>>,
     hooks: HookRegistry,
 }
 
@@ -373,6 +391,14 @@ impl AgentRunner {
     /// Replace the pending-approval store after construction.
     pub fn with_approvals(mut self, approvals: Arc<crate::approval::ApprovalStore>) -> Self {
         self.approvals = approvals;
+        self
+    }
+
+    /// Replace the connector pool after construction (see `with_approvals`).
+    /// `None` is the honest "no connectors configured" and is what a caller
+    /// holding an `Option<Arc<McpService>>` hands over.
+    pub fn with_connectors(mut self, connectors: Option<Arc<crate::mcp::McpService>>) -> Self {
+        self.connectors = connectors;
         self
     }
 
@@ -504,6 +530,7 @@ impl AgentRunner {
             chat_id: tool_chat_id.clone(),
             runtime_ctx,
             approvals: self.approvals.clone(),
+            connectors: self.connectors.clone(),
         };
 
         // Scope per-turn state (context + sent_in_turn) via a task-local so that

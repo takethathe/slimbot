@@ -602,6 +602,9 @@ pub struct SessionTaskBuilder {
     max_tokens: Option<u32>,
     tracer: Option<Arc<crate::trace::Tracer>>,
     approvals: Option<Arc<crate::approval::ApprovalStore>>,
+    /// Gateway connector pool for this run (ticket 26). `None` when no MCP
+    /// server is configured.
+    connectors: Option<Arc<crate::mcp::McpService>>,
     owner_primary: Option<Arc<crate::delivery::OwnerPrimaryStore>>,
     owner_alerts: Option<Arc<crate::owner_alert::OwnerAlertDedup>>,
 }
@@ -625,6 +628,7 @@ impl SessionTaskBuilder {
             max_tokens: None,
             tracer: None,
             approvals: None,
+            connectors: None,
             owner_primary: None,
             owner_alerts: None,
         }
@@ -698,6 +702,15 @@ impl SessionTaskBuilder {
         self
     }
 
+    /// Attach the gateway connector pool so a codemode script in this run can
+    /// discover and call connector tools (ticket 26). The pool is per process,
+    /// exactly like the approval store, so every run shares the same
+    /// connections; a run without it simply has no connector surface.
+    pub fn connectors(mut self, pool: Arc<crate::mcp::McpService>) -> Self {
+        self.connectors = Some(pool);
+        self
+    }
+
     /// Attach the owner-primary store so a hard provider failure (auth/quota)
     /// can alert the owner through the delivery seam (票 19). Without it the
     /// classified error still fails the turn, but nobody beyond the session
@@ -736,6 +749,7 @@ impl SessionTaskBuilder {
         let cancel_token = self.cancel_token;
         let tracer = self.tracer;
         let approvals = self.approvals;
+        let connectors = self.connectors;
         let owner_primary = self.owner_primary;
         let owner_alerts = self.owner_alerts;
 
@@ -743,7 +757,7 @@ impl SessionTaskBuilder {
             Box::pin(async move {
                 let approvals_store = approvals.unwrap_or_default();
                 let consolidator_for_alert = consolidator.clone();
-                let runner = AgentRunner::builder()
+                let mut builder = AgentRunner::builder()
                     .session_manager(session_manager)
                     .tool_manager(tool_manager)
                     .provider(provider)
@@ -753,8 +767,11 @@ impl SessionTaskBuilder {
                     .consolidator(consolidator)
                     .tracer(tracer)
                     .max_tokens(max_tokens)
-                    .approvals(approvals_store.clone())
-                    .build();
+                    .approvals(approvals_store.clone());
+                if let Some(pool) = connectors {
+                    builder = builder.connectors(pool);
+                }
+                let runner = builder.build();
                 let run_id = hook.run_id().to_string();
                 let result = runner
                     .run(

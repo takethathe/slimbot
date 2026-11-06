@@ -63,6 +63,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
         subagent: Default::default(),
         triggers: Default::default(),
         pressure: Default::default(),
+        mcp: Default::default(),
     }
 }
 
@@ -185,4 +186,69 @@ async fn test_gateway_tool_manager_creation() {
     // Verify built-in tools are registered
     let tools = tm.to_openai_functions();
     assert!(tools.len() >= 6); // At least shell, file_reader, file_writer, file_editor, list_dir, make_dir
+}
+
+/// Build a loop from a written config, optionally carrying MCP servers.
+/// The temp dir comes back with it: the loop's paths point inside it.
+async fn loop_with_config(
+    servers: Option<serde_json::Value>,
+) -> (slimbot::AgentLoop, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let workspace_dir = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let mut raw = serde_json::to_value(make_test_config(&data_dir)).unwrap();
+    if let Some(servers) = servers {
+        raw["mcp"] = serde_json::json!({ "servers": servers });
+    }
+    let config_path = data_dir.join("config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+    let config = std::sync::Arc::new(Config::load(config_path.to_str().unwrap()).unwrap());
+
+    let paths = PathManager::resolve(
+        Some(config_path.to_str().unwrap()),
+        Some(data_dir.to_str().unwrap()),
+        Some(workspace_dir.to_str().unwrap()),
+    )
+    .unwrap();
+    let (mb, receivers) = MessageBus::new();
+    let loop_ = slimbot::AgentLoop::from_config(&paths, mb, receivers.inbound, config)
+        .await
+        .unwrap();
+    (loop_, tmp)
+}
+
+/// The gateway-level assembly of ticket 26: configured servers produce a pool
+/// that the loop owns and starts, and an empty `mcp.servers` produces no pool at
+/// all — a script then simply has no connector surface.
+#[tokio::test]
+async fn test_gateway_brings_up_the_configured_connector_pool() {
+    let dead_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let servers = serde_json::json!([{
+        "name": "github",
+        "transport": "http",
+        "url": format!("http://127.0.0.1:{dead_port}/mcp"),
+    }]);
+    let (loop_, _tmp) = loop_with_config(Some(servers)).await;
+
+    let pool = loop_
+        .connectors()
+        .expect("a configured server must produce a pool");
+    // Observable through the service: the server is named before it is reached,
+    // and an unreachable one never blocks the loop from being built.
+    let servers = pool.servers();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].0, "github");
+    loop_.shutdown_for_cli().await;
+}
+
+#[tokio::test]
+async fn test_gateway_without_mcp_servers_has_no_connector_pool() {
+    let (loop_, _tmp) = loop_with_config(None).await;
+    assert!(loop_.connectors().is_none());
+    loop_.shutdown_for_cli().await;
 }

@@ -79,7 +79,8 @@ cargo run -- -d /data/myapp setup
   "channels": { ... },
   "gateway": { ... },
   "json_render": { ... },
-  "pressure": { ... }
+  "pressure": { ... },
+  "mcp": { "servers": [ ... ] }
 }
 ```
 
@@ -94,6 +95,7 @@ cargo run -- -d /data/myapp setup
 | `gateway` | object | 否 | 见下文 | Gateway 模式配置 |
 | `json_render` | object | 否 | 见下文 | WebUI 卡片生成配置 |
 | `pressure` | object | 否 | 见下文 | 上下文压力占比（长度限制全部由 provider 窗口派生） |
+| `mcp` | object | 否 | 空池 | MCP 连接器（`mcp.servers[]`）与连接预算 |
 
 ### `channels` — 通信通道
 
@@ -387,6 +389,58 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 - **无人值守按 `deny`**：cron / heartbeat / trigger / subagent 的 run 遇到 `ask` 一律拒绝，且不写待确认记录。
 - 审批只约束 agent 主动发起的动作；Agent 写配置文件不走审批（见 ADR 0002、票 02）。
 
+### `mcp` — MCP 连接器
+
+声明可从 codemode 脚本里调用的外部 MCP server。**这一节只描述连接，不是工具白名单**：连接器工具永不进入模型的 tool schema，只在脚本里经 `searchTools()` 发现、`tools.mcp__<server>__<tool>()` 调用（[ADR 0016](adr/0016-mcp-through-codemode-only.md)）。机制与隐私规则见 [mcp.md](mcp.md)。
+
+```json
+{
+  "mcp": {
+    "servers": [
+      {
+        "name": "github",
+        "transport": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": { "Authorization": "Bearer ${secret:token}" }
+      },
+      {
+        "name": "fs",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        "env": { "SOME_TOKEN": "${secret:some-token}" }
+      }
+    ],
+    "call_timeout_seconds": 20,
+    "connect_timeout_seconds": 15,
+    "probe_interval_seconds": 30,
+    "backoff_initial_ms": 500,
+    "backoff_max_seconds": 300
+  }
+}
+```
+
+预算字段（都可省略，取默认值）：`call_timeout_seconds` 1–300（默认 20，一次工具调用）、`connect_timeout_seconds` 1–300（默认 15，一次连接 + 握手）、`probe_interval_seconds` 1–3600（默认 30，在线 server 的活体探测间隔）、`backoff_initial_ms` 50–60000（默认 500）与 `backoff_max_seconds` 1–3600（默认 300，退避上限）。
+
+`mcp.servers[]` 每个条目：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `name` | string | `""` | 连接器 id，成为 `mcp__<name>__` 可调用前缀；**必须唯一**，非 `[A-Za-z0-9_]` 字符会被替换为 `_` |
+| `transport` | `stdio` / `http` | `"stdio"` | 传输方式；白名单外的值在 `clamp()` 里回落为默认 `stdio` |
+| `enabled` | bool | `true` | 关掉保留配置但永不尝试连接（状态读作 `disabled`） |
+| `command` / `args` / `env` | string / array / map | — | stdio：要启动的可执行文件与参数；`env` 是子进程**唯一**能拿到的环境（其余由 gateway 继承而来的一律清掉，只放回 `PATH`、`HOME`） |
+| `url` / `headers` | string / map | — | http：streamable-HTTP 端点与静态请求头（通常就是一条 `Authorization`） |
+
+`env` 与 `headers` 的值里可以写 `${secret:<key>}`：缺 `slimbot.` 前缀时按所属 server 展开为 `slimbot.mcp.<server>.<name>`，走与 `api_key` 同一条解析链（见下文）。占位符解不出来时**原样送去**，让握手失败理由带着它，而不是拿着空凭证启动。
+
+行为要点：
+
+- 启动不等待：每台 server 一个独立 supervisor，`start()` 立即返回，连不上的 server 不会拖住 gateway 起来；重试指数退避到 `backoff_max_seconds` 封顶。
+- 离线即摘除：server 掉线时它的工具从 `searchTools()` 的可搜面消失，调用立刻回一条干净错误（不是每次调用一个错误风暴）；重连成功后回添。
+- 风险级 fail-closed：server 自述的 `readOnlyHint` / `destructiveHint` **不参与定级**，任何连接器工具都按 `ExternalSend` 走审批（`McpService::risk_for`）。一个声称只读、实际会写的 server 因此无法给自己开绿灯；常用读工具要免审批，请逐个可调用名写 `tools.approval.overrides`，不要放宽整档。
+- 日志不含凭证：状态行与告警只记 server 名、无凭证的端点（scheme + host + port + path，query 剥掉）与重试秒数；离线理由只保留我们自己的类别（JSON-RPC 错误只留 code，压平并截断），server 原文不进日志；server 的 stderr 只计字节数。
+
 ## 最小配置
 
 仅需配置 `agent.provider` 及其引用的 Provider 的 `api_key` 和 `model`：
@@ -424,10 +478,15 @@ provider 的 `api_key` 和 `triggers.secrets` 里的值都走同一条解析链�
 |------|-----|------------------------------|----------|
 | provider API key | `slimbot.<provider-name>` | service = 键，account = `slimbot` | `SLIMBOT_<PROVIDER-NAME>` |
 | 触发器密钥 | `slimbot.trigger.<secret-name>` | service = 键，account = `slimbot` | `SLIMBOT_TRIGGER_<SECRET-NAME>` |
+| MCP 连接器凭证 | `slimbot.mcp.<server>.<name>` | service = 键，account = `slimbot` | `SLIMBOT_MCP_<SERVER>_<NAME>` |
 
 环境变量名由键推导：全部大写，非字母数字字符替换为 `_`。例如 provider `default` →
 `slimbot.default` → `SLIMBOT_DEFAULT`；触发器密钥 `github-token` →
 `slimbot.trigger.github-token` → `SLIMBOT_TRIGGER_GITHUB_TOKEN`。
+
+MCP 连接器的键由所属 server 推导（`mcp_key`）：配置里写 `${secret:token}` 且该条目名为
+`github` 时，查的键是 `slimbot.mcp.github.token`；写全限定名（`${secret:slimbot.mcp.github.token}`）
+则不再拼接。
 
 ### 写入 keychain
 
@@ -435,6 +494,7 @@ provider 的 `api_key` 和 `triggers.secrets` 里的值都走同一条解析链�
 # macOS（service = 键，account 恒为 slimbot）
 security add-generic-password -s slimbot.default -a slimbot -w 'sk-...'
 security add-generic-password -s slimbot.trigger.github -a slimbot -w 'ghp_...'
+security add-generic-password -s slimbot.mcp.github.token -a slimbot -w 'ghp_...'
 
 # 删除
 security delete-generic-password -s slimbot.default -a slimbot

@@ -200,6 +200,10 @@ pub struct AgentLoop {
     owner_alerts: Arc<crate::owner_alert::OwnerAlertDedup>,
     /// Shared pending approvals (never persisted; a restart fails closed).
     approvals: Arc<crate::approval::ApprovalStore>,
+    /// Gateway-level MCP connector pool, built from `config.mcp` and started
+    /// with this loop. `None` when no server is configured, so a script's
+    /// connector surface is empty rather than broken (ticket 26).
+    connectors: Option<Arc<crate::mcp::McpService>>,
 }
 
 /// Returned by `AgentLoop::run()` so the caller can publish input and
@@ -444,6 +448,25 @@ impl AgentLoop {
             config.tools.approval.clone(),
         ));
 
+        // One connector pool per process, brought up here so both CLI and
+        // gateway mode reach the same `mcp.servers[]` (ticket 26). `start()`
+        // only spawns supervisors: no connection is awaited, so a dead server
+        // cannot delay or wedge the loop that is starting.
+        let connectors: Option<Arc<crate::mcp::McpService>> = {
+            let pool = crate::mcp::McpService::new(&config.mcp);
+            if pool.has_servers() {
+                let pool = Arc::new(pool);
+                pool.start();
+                info!(
+                    "[AgentLoop] connector pool started for {} MCP server(s)",
+                    pool.servers().len()
+                );
+                Some(pool)
+            } else {
+                None
+            }
+        };
+
         // Subagent runtime: per-run tool managers are assembled from the
         // catalog, so the main loop's tool table and prompt cache never change.
         let catalog = Arc::new(catalog);
@@ -479,12 +502,14 @@ impl AgentLoop {
             tracer.clone(),
         )
         .with_pressure(pressure.clone())
-        .with_approvals(approvals.clone());
+        .with_approvals(approvals.clone())
+        .with_connectors(connectors.clone());
 
         Ok(Self {
             owner_primary: Arc::new(crate::delivery::OwnerPrimaryStore::load(paths.data_dir())),
             owner_alerts: Arc::new(crate::owner_alert::OwnerAlertDedup::new()),
             approvals,
+            connectors,
             config,
             workspace_dir: paths.workspace_dir().to_path_buf(),
             provider,
@@ -518,6 +543,13 @@ impl AgentLoop {
     /// The process-wide pending-approval store (ADR 0011).
     pub fn approvals(&self) -> Arc<crate::approval::ApprovalStore> {
         self.approvals.clone()
+    }
+
+    /// The gateway connector pool, when any MCP server is configured (ticket
+    /// 26). Exposed for wiring-time inspection: the pool itself is the observable
+    /// surface for server status and the cached tool set.
+    pub fn connectors(&self) -> Option<Arc<crate::mcp::McpService>> {
+        self.connectors.clone()
     }
 
     /// The provider used for agent turns. Card generation reuses this same
@@ -650,6 +682,7 @@ impl AgentLoop {
         let owner_primary = self.owner_primary.clone();
         let owner_alerts = self.owner_alerts.clone();
         let approvals = self.approvals.clone();
+        let connectors = self.connectors.clone();
 
         let max_tokens = full_config
             .providers
@@ -764,27 +797,35 @@ impl AgentLoop {
                             guard.session_cancel_token(&request.session_id)
                         };
 
-                        let task = SessionTaskBuilder::new(
-                            request.session_id.clone(),
-                            request.content,
-                            request.hook.with_owner_id(&owner_id),
-                        )
-                        .session_manager(session_manager.clone())
-                        .tool_manager(tool_manager.clone())
-                        .provider(provider.clone())
-                        .config(config.clone())
-                        .workspace_dir(workspace_dir.clone())
-                        .memory_service(memory_service.clone())
-                        .outbound_tx(outbound_tx.clone())
-                        .channel_inject(request.channel_inject)
-                        .consolidator(Some(consolidator.clone()))
-                        .cancel_token(cancel_token)
-                        .max_tokens(max_tokens)
-                        .tracer(tracer.clone())
-                        .approvals(approvals.clone())
-                        .owner_primary(owner_primary.clone())
-                        .owner_alerts(owner_alerts.clone())
-                        .build();
+                        let task = {
+                            let mut builder = SessionTaskBuilder::new(
+                                request.session_id.clone(),
+                                request.content,
+                                request.hook.with_owner_id(&owner_id),
+                            )
+                            .session_manager(session_manager.clone())
+                            .tool_manager(tool_manager.clone())
+                            .provider(provider.clone())
+                            .config(config.clone())
+                            .workspace_dir(workspace_dir.clone())
+                            .memory_service(memory_service.clone())
+                            .outbound_tx(outbound_tx.clone())
+                            .channel_inject(request.channel_inject)
+                            .consolidator(Some(consolidator.clone()))
+                            .cancel_token(cancel_token)
+                            .max_tokens(max_tokens)
+                            .tracer(tracer.clone())
+                            .approvals(approvals.clone())
+                            .owner_primary(owner_primary.clone())
+                            .owner_alerts(owner_alerts.clone());
+                            // The pool is shared by every run in the process, so
+                            // a connector call from this conversation reuses the
+                            // connection the loop already holds.
+                            if let Some(pool) = connectors.clone() {
+                                builder = builder.connectors(pool);
+                            }
+                            builder.build()
+                        };
 
                         let mut guard = session_manager.lock().await;
                         let _ = guard.submit_task(task).await;
@@ -906,6 +947,11 @@ impl AgentLoop {
     pub async fn graceful_shutdown(&self, channel_manager: &Arc<crate::channel::ChannelManager>) {
         // Signal inbound loop to stop
         let _ = self.shutdown_tx.send(());
+        // Close connector connections before anything that could still call
+        // them is gone: the supervisors stop, then live clients are closed.
+        if let Some(pool) = &self.connectors {
+            pool.shutdown().await;
+        }
         graceful_shutdown(
             channel_manager,
             &self.session_manager,
@@ -918,6 +964,9 @@ impl AgentLoop {
     /// Shutdown for CLI mode (no ChannelManager). Shuts down consolidator,
     /// session manager, and memory store.
     pub async fn shutdown_for_cli(&self) {
+        if let Some(pool) = &self.connectors {
+            pool.shutdown().await;
+        }
         shutdown_session_memory(
             &self.session_manager,
             &self.consolidator,
@@ -942,6 +991,7 @@ mod tests {
         let config_path = data_dir.join("config.json");
         let config = crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1159,6 +1209,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1227,6 +1278,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1314,6 +1366,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1381,6 +1434,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1448,6 +1502,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1551,6 +1606,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1623,6 +1679,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1723,6 +1780,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1798,6 +1856,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "nonexistent".to_string(), // Provider doesn't exist
                 max_iterations: 10,
@@ -1910,6 +1969,7 @@ mod tests {
         let (message_bus, receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -2254,6 +2314,7 @@ mod tests {
         let (message_bus, receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,

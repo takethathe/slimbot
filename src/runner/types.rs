@@ -89,6 +89,10 @@ pub struct RunSpec {
     /// The in-memory pending-approval store shared by every run of this
     /// process (ADR 0011). Never persisted: a restart fails closed.
     pub approvals: Arc<crate::approval::ApprovalStore>,
+    /// The gateway's MCP connector pool (ticket 26), when any server is
+    /// configured. Scripts reach its tools through the codemode agent entry;
+    /// they are never part of the model's tool schema.
+    pub connectors: Option<Arc<crate::mcp::McpService>>,
 }
 
 impl RunSpec {
@@ -225,6 +229,7 @@ mod tests {
             chat_id: "c1".into(),
             runtime_ctx: "ctx".into(),
             approvals: Default::default(),
+            connectors: None,
         }
     }
 }

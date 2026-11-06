@@ -16,7 +16,7 @@ slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支�
 - `main`（Entry）、`cli`（参数解析）、`config`（配置读写）、`bootstrap`（workspace 模板）、`setup`（setup 命令）、`agent_loop`（顶层协调）、`runner`（ReAct 循环核心）
 - `session`（会话管理 + JSONL 持久化）、`context`（system prompt 构建）、`message_bus`（消息总线）、`tool`（Tool trait + ToolManager）、`tools/`（内置工具实现）、`channel/`（CLI + WebUI 通道）
 - `gateway`（Gateway 模式入口）、`cron/`（定时任务）、`heartbeat/`（心跳服务）、`provider/`（LLM API 封装）
-- `trigger/`（触发器层：source 采集 → subscription 判定 → dispatch 投递）、`agent/`（子代理定义 + ToolCatalog + SubagentRuntime）、`codemode/`（JS 脚本沙箱：rquickjs + 双层超时 + 宿主白名单）
+- `trigger/`（触发器层：source 采集 → subscription 判定 → dispatch 投递）、`agent/`（子代理定义 + ToolCatalog + SubagentRuntime）、`codemode/`（JS 脚本沙箱：rquickjs + 双层超时 + 宿主白名单）、`mcp/`（MCP 连接器：自研最小客户端 + 两种 transport + gateway 级连接池与退避重连）
 - `consolidate`（会话摘要压缩）、`memory`（记忆存储）、`snip`（上下文截断）、`dream`（记忆合并）
 
 `docs/` 为文档目录。
@@ -44,6 +44,7 @@ slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支�
 - 循环结束：超出 `max_iterations` 或模型返回无 tool_calls
 - 一个能力一个入口：同一能力不同时做 agent 和 skill（agent 是“可被启动的执行体”，skill 是“可被加载的知识”），否则模型会走不用读文档的那条路
 - 子代理与触发器行动：`subagent` 工具与触发器 `agent` action 共用同一个 `SubagentRuntime`（全局并发闸）；子代理会话仅内存、跑完即删，外部内容只以证据形式进入上下文（ADR 0009）
+- 连接器（MCP）：连接池由 `AgentLoop` 从 `config.mcp` 建并启动（CLI 与 gateway 同源），工具**只进 codemode 脚本面**（`searchTools()` / `tools.mcp__*`），**永不进模型 tool schema**（ADR 0016）；server 的 description 与输出全按不可信数据处理，结果包 `<codemode_output>`；风险级 fail-closed（连接器工具一律 `ExternalSend`，server 的 annotation 不参与定级；免审批只能逐工具 override）。子代理暂不继承连接器池（`docs/TODO.md`）
 
 ## 开发规范
 

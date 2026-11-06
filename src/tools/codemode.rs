@@ -159,6 +159,7 @@ mod tests {
             task_hook: TaskHook::new("cli:c1"),
             tool_manager: Arc::new(manager),
             approvals: Arc::new(ApprovalStore::new(ApprovalConfig::default())),
+            connectors: None,
             tracer: None,
             cancel_token: None,
         }));

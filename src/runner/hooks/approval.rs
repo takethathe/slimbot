@@ -66,6 +66,7 @@ pub(crate) fn gate_context(spec: &RunSpec) -> GateContext {
         approvals: spec.approvals.clone(),
         tracer: spec.tracer.clone(),
         cancel_token: spec.cancel_token.clone(),
+        connectors: spec.connectors.clone(),
     }
 }
 
@@ -274,6 +275,7 @@ mod tests {
                 chat_id: "c1".into(),
                 runtime_ctx: "ctx".into(),
                 approvals: store.clone(),
+                connectors: None,
             };
             let state = RunState::new(Arc::new(TurnContext::new("cli".into(), "c1".into())));
             Self {

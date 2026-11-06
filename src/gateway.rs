@@ -154,6 +154,20 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         .await?,
     );
 
+    // Connector pool came up with the loop (ticket 26): naming the configured
+    // servers here is the startup record of what the gateway will try to reach.
+    // Statuses are still `connecting` — each transition logs itself later, so
+    // an unreachable server shows up as a warning, never as a stalled start.
+    if let Some(pool) = agent_loop.connectors() {
+        let names = pool
+            .servers()
+            .iter()
+            .map(|(name, _, tools)| format!("{name} ({} tool(s) cached)", tools))
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!("[gateway] MCP connectors: {}", names);
+    }
+
     // ChannelManager: init channels from config
     let (event_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(256);
     let mut channel_manager = ChannelManager::new(
@@ -560,6 +574,7 @@ mod tests {
         let config_path = data_dir.join("config.json");
         let config = crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -802,6 +817,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -875,6 +891,7 @@ mod tests {
         let trace_paths = crate::agent_loop::resolve_trace_file_paths(
             &Config {
                 pressure: Default::default(),
+                mcp: Default::default(),
                 tracing: serde_json::from_value(serde_json::json!({
                     "enabled": true,
                     "backends": [
@@ -926,6 +943,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1005,6 +1023,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1223,6 +1242,7 @@ mod tests {
         let (message_bus, _receivers) = MessageBus::new();
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1652,6 +1672,7 @@ mod tests {
     async fn test_gateway_config_with_all_fields() {
         let config = crate::config::Config {
             pressure: Default::default(),
+            mcp: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 50,

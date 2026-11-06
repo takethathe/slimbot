@@ -6,6 +6,9 @@
 //!   `providers`).
 //! - `slimbot.trigger.<secret-name>` — trigger secret (one per entry of
 //!   `triggers.secrets`).
+//! - `slimbot.mcp.<server>.<name>` — credential for one MCP connector, reached
+//!   from a `${secret:<name>}` placeholder inside `mcp.servers[]` env/header
+//!   values (ticket 26).
 //!
 //! Each key maps onto exactly one place per source:
 //!
@@ -30,7 +33,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use crate::config::{ProviderConfig, TriggersConfig};
+use crate::config::{McpServerConfig, ProviderConfig, TriggersConfig};
 
 /// Keyring *account* every slimbot credential is stored under; the secret key
 /// is the keyring *service*.
@@ -44,6 +47,11 @@ pub fn provider_key(provider: &str) -> String {
 /// Config key of a trigger secret: `slimbot.trigger.<secret-name>`.
 pub fn trigger_key(secret: &str) -> String {
     format!("{}.trigger.{}", KEYRING_ACCOUNT, secret)
+}
+
+/// Config key of one MCP connector credential: `slimbot.mcp.<server>.<name>`.
+pub fn mcp_key(server: &str, name: &str) -> String {
+    format!("{}.mcp.{}.{}", KEYRING_ACCOUNT, server, name)
 }
 
 /// Environment variable carrying the secret for `key`: upper-cased, with every
@@ -326,6 +334,73 @@ fn report(resolved: &Resolved) {
     }
 }
 
+/// The marker every connector credential placeholder starts with. A key that
+/// does not already carry it is expanded under the owning server.
+const PLACEHOLDER_PREFIX: &str = "${secret:";
+
+/// Replace every `${secret:<key>}` in `value` with the chain's answer for that
+/// key (keychain → env). Keys written without the `slimbot.` prefix are
+/// resolved as [`mcp_key`] for the owning server, so an entry can say
+/// `${secret:token}` instead of repeating its own address.
+///
+/// A key the chain does not have leaves the placeholder verbatim: the connector
+/// then fails its handshake with that text visible to the owner, which is a
+/// better diagnosis than silently starting with an empty credential. Only the
+/// key is ever logged.
+fn substitute(value: &str, server: &str, store: &SecretStore) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    loop {
+        let Some(start) = rest.find(PLACEHOLDER_PREFIX) else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + PLACEHOLDER_PREFIX.len()..];
+        let Some(end) = after.find('}') else {
+            // Unterminated: keep the text as written, a typo is not our job to
+            // repair by guessing where it was meant to close.
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let written = &after[..end];
+        let key = if written.starts_with("slimbot.") {
+            written.to_string()
+        } else {
+            mcp_key(server, written)
+        };
+        match store.resolve(&key) {
+            Some(resolved) => {
+                out.push_str(resolved.expose());
+                report(&resolved);
+            }
+            None => {
+                crate::debug!("[secrets] no source for connector key {key} (server {server})");
+                out.push_str(&rest[start..=start + PLACEHOLDER_PREFIX.len() + end]);
+            }
+        }
+        rest = &after[end + 1..];
+    }
+}
+
+/// Fill every `${secret:...}` placeholder in the connector env/header values
+/// from the chain. Values without placeholders pass through untouched, so a
+/// credential written straight into the `0600` config file keeps working.
+pub fn resolve_mcp_secrets(servers: &mut [McpServerConfig], store: &SecretStore) {
+    for server in servers.iter_mut() {
+        for value in server.env.values_mut() {
+            if value.contains(PLACEHOLDER_PREFIX) {
+                *value = substitute(value, &server.name, store);
+            }
+        }
+        for value in server.headers.values_mut() {
+            if value.contains(PLACEHOLDER_PREFIX) {
+                *value = substitute(value, &server.name, store);
+            }
+        }
+    }
+}
+
 /// Restrict `path` to owner read/write (`0600`). Returns whether the mode had
 /// to be changed. A no-op off Unix.
 #[cfg(unix)]
@@ -354,6 +429,7 @@ mod tests {
     fn test_provider_and_trigger_keys_use_documented_names() {
         assert_eq!(provider_key("openai"), "slimbot.openai");
         assert_eq!(trigger_key("github_token"), "slimbot.trigger.github_token");
+        assert_eq!(mcp_key("github", "token"), "slimbot.mcp.github.token");
     }
 
     #[test]
@@ -451,6 +527,101 @@ mod tests {
         let resolved = store.resolve("slimbot.test-only-key").unwrap();
         assert_eq!(resolved.expose(), "from-env");
         assert_eq!(resolved.source(), SourceKind::Env);
+    }
+
+    // ── Connector placeholders ──
+
+    fn mcp_server(name: &str, env: &[(&str, &str)], headers: &[(&str, &str)]) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_mcp_secrets_expands_short_key_under_the_server() {
+        let store = store(&[("slimbot.mcp.github.token", "ghp-from-keychain")], &[]);
+        let mut servers = vec![mcp_server(
+            "github",
+            &[("GITHUB_PERSONAL_ACCESS_TOKEN", "${secret:token}")],
+            &[],
+        )];
+
+        resolve_mcp_secrets(&mut servers, &store);
+
+        assert_eq!(
+            servers[0].env["GITHUB_PERSONAL_ACCESS_TOKEN"],
+            "ghp-from-keychain"
+        );
+    }
+
+    #[test]
+    fn test_resolve_mcp_secrets_expands_absolute_key_inside_a_larger_value() {
+        // A header needs the scheme around the credential, so substitution is
+        // embedded rather than whole-value.
+        let store = store(&[("slimbot.trigger.github_token", "ghp-abc")], &[]);
+        let mut servers = vec![mcp_server(
+            "api",
+            &[],
+            &[(
+                "Authorization",
+                "Bearer ${secret:slimbot.trigger.github_token}",
+            )],
+        )];
+
+        resolve_mcp_secrets(&mut servers, &store);
+
+        assert_eq!(
+            servers[0].headers["Authorization"], "Bearer ghp-abc",
+            "an absolute key is used as written, and env beats the short form"
+        );
+    }
+
+    #[test]
+    fn test_resolve_mcp_secrets_env_source_fills_a_placeholder() {
+        // SAFETY: unique variable name, observed only by this test.
+        unsafe { std::env::set_var("SLIMBOT_MCP_HTTP_TEST_TOKEN", "from-env") };
+        let mut servers = vec![mcp_server(
+            "http-test",
+            &[("TOKEN", "${secret:token}")],
+            &[],
+        )];
+
+        resolve_mcp_secrets(
+            &mut servers,
+            &SecretStore::new(vec![(SourceKind::Env, Box::new(EnvSource))]),
+        );
+
+        assert_eq!(servers[0].env["TOKEN"], "from-env");
+    }
+
+    #[test]
+    fn test_resolve_mcp_secrets_keeps_literal_values_and_unresolved_placeholders() {
+        let mut servers = vec![mcp_server(
+            "github",
+            &[
+                ("PLAIN", "ghp-written-into-config"),
+                ("MISSING", "${secret:nope}"),
+                ("UNTERMINATED", "${secret:oops"),
+            ],
+            &[],
+        )];
+
+        resolve_mcp_secrets(&mut servers, &store(&[], &[]));
+
+        assert_eq!(servers[0].env["PLAIN"], "ghp-written-into-config");
+        // Left verbatim so the owner sees which key is missing instead of a
+        // server that fails on an empty credential.
+        assert_eq!(servers[0].env["MISSING"], "${secret:nope}");
+        assert_eq!(servers[0].env["UNTERMINATED"], "${secret:oops");
     }
 
     #[cfg(unix)]

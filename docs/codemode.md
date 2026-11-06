@@ -42,8 +42,9 @@
 
 实现在 `src/codemode/agent.rs`（`AgentHost`）+ `src/tools/codemode.rs`（模型可见的 `codemode` 工具，默认工具集的第 10 个）。模型/子代理提交一段 `async function main(ctx)`，脚本的**唯一**额外能力是运行装配的工具面：
 
-- `await ctx.tools.<name>(args)`：调本次运行 `ToolManager` 装配的工具；目录里没有的名字在命名空间里**结构性缺失**（`typeof ctx.tools.nope === "undefined"`），能力清单仍是唯一安全闸；
-- `await ctx.searchTools(query, limit?)`：对本运行工具目录（name+description）做 BM25-lite 排序检索（复用票 15 `KeywordIndex` 的分词与打分核心：拉丁词 + CJK bigram、名字命中 ×2 权重），返回 JSON 字符串 `[{name, description}]`；未命中的词不产生结果，空查询无结果；
+- `await ctx.tools.<name>(args)`：调本次运行可调用目录里的工具；目录里没有的名字在命名空间里**结构性缺失**（`typeof ctx.tools.nope === "undefined"`），能力清单仍是唯一安全闸；
+- `await ctx.searchTools(query, limit?)`：对同一份可调用目录（name+description）做 BM25-lite 排序检索（复用票 15 `KeywordIndex` 的分词与打分核心：拉丁词 + CJK bigram、名字命中 ×2 权重），返回 JSON 字符串 `[{name, description}]`；未命中的词不产生结果，空查询无结果；
+- 两份目录不同（票 26）：发给模型的只有 `ToolManager`；脚本可搜可调的是 `ToolManager` + **在线** MCP 连接器的工具（`RunToolExec::callable_definitions()`）。连接器工具因此只能被脚本发现与调用，永远不出现在模型的 `tools` 里（[ADR 0016](adr/0016-mcp-through-codemode-only.md)）；server 掉线时它的工具从两份面上同时消失，回来时又出现——同一个 `ctx` 在两次执行里可能长得不一样。连接器工具的 description 是 server 自述的不可信文本，进入时带 `[connector <server>]` 前缀；它们的输出统一包在 `<codemode_output>` 里。详见 [mcp.md](mcp.md)。
 - 其余只有时间三件与 `log`。**没有** fs / http / secret / store：要碰外部世界只能走 `tools.*`，由各工具自己的风险等级把关。
 
 每次 `tools.*` 调用走与顶层 tool_call 相同的审批闸（ADR 0011）：决策核心从 `ApprovalHook` 抽出到 `src/runner/gate.rs`（`GateContext` + `decide()`），钩子与嵌套调用共用同一 `decide`，`Allow/Deny/Ask`、redemption、veto、审计 span 逐字一致。运行期通路：runner 把 `RunToolExec`（内含 `GateContext`）挂进 task-local 的 `TurnContext`，`codemode` 工具在 `execute()` 里取到它、`AgentHost` 把每个工具装成异步宿主函数。唯一的形态差别：脚本里**没有中途弹窗**——`Deny` 的拒绝文本、`Ask` 的 NOT EXECUTED 指引文本作为调用的** resolved 值**返回给脚本（顶层对应的是把 tool 结果写成同样的文本再结束轮次）；attended 轮里嵌套 `Ask` 照常写入 pending 记录，脚本跑完后 `codemode` 工具把 owner 可见的 pending 清单附在工具结果尾部，下一轮模型重放同一脚本、同一 args 哈希按 redemption 放行。无人值守轮（subagent/cron/trigger）里嵌套 `Ask` 与顶层一样 fail closed 直接拒绝，不写 pending。

@@ -33,6 +33,9 @@ pub(crate) struct GateContext {
     pub approvals: Arc<crate::approval::ApprovalStore>,
     pub tracer: Option<Arc<Tracer>>,
     pub cancel_token: Option<CancellationToken>,
+    /// The gateway's connector pool (ticket 26). `None` when no MCP server is
+    /// configured, which reads exactly like a pool with no tools in it.
+    pub connectors: Option<Arc<crate::mcp::McpService>>,
 }
 
 impl GateContext {
@@ -40,6 +43,34 @@ impl GateContext {
         self.cancel_token
             .as_ref()
             .is_some_and(|ct| ct.is_cancelled())
+    }
+
+    /// The risk class of one call, looked up in both tool sources: the run's
+    /// registered tools first, then the connectors. Registered tools win, so a
+    /// connector can never shadow or reinterpret a tool the run owns.
+    fn risk_of(&self, name: &str) -> Option<RiskLevel> {
+        match self.tool_manager.risk_level(name) {
+            Some(risk) => Some(risk),
+            None => self
+                .connectors
+                .as_ref()
+                .and_then(|pool| pool.risk_for(name)),
+        }
+    }
+
+    /// Execute one call against whichever source owns the name.
+    async fn dispatch(&self, name: &str, args: Value) -> anyhow::Result<String> {
+        // A name the registered tools do not know is the connector's to answer;
+        // no pool configured means it simply does not exist.
+        if self.tool_manager.risk_level(name).is_none()
+            && let Some(pool) = &self.connectors
+        {
+            return pool
+                .call(name, args)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()));
+        }
+        self.tool_manager.execute(name, args).await
     }
 }
 
@@ -130,7 +161,7 @@ fn new_approval_id(control: ControlLevel) -> String {
 /// The single decision point: allow, refuse, or defer to the owner.
 pub(crate) async fn decide(ctx: &GateContext, tool_call: &ToolCall) -> GateDecision {
     // An unregistered tool cannot execute, so there is nothing to authorize.
-    let Some(risk) = ctx.tool_manager.risk_level(&tool_call.name) else {
+    let Some(risk) = ctx.risk_of(&tool_call.name) else {
         return GateDecision::Execute;
     };
     let control = ctx.approvals.control_for(&tool_call.name, risk);
@@ -258,9 +289,22 @@ impl RunToolExec {
         }
     }
 
-    /// The assembled tool catalog this run exposes (names + descriptions).
+    /// The tool catalog this run exposes to the model. Connector tools are
+    /// deliberately absent: a script discovers them through `searchTools` and
+    /// reaches them as `tools.mcp__<server>__<tool>`, so their (untrusted,
+    /// server-authored) schemas never widen the model's action space.
     pub(crate) fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.context.tool_manager.to_openai_functions()
+    }
+
+    /// What a script may search and call: the run's tools plus every online
+    /// connector's tools, in that order.
+    pub(crate) fn callable_definitions(&self) -> Vec<ToolDefinition> {
+        let mut defs = self.tool_definitions();
+        if let Some(pool) = &self.context.connectors {
+            defs.extend(pool.definitions());
+        }
+        defs
     }
 
     pub(crate) fn took_pending(&self) -> bool {
@@ -284,8 +328,7 @@ impl RunToolExec {
             args,
         };
         match decide(&self.context, &call).await {
-            GateDecision::Execute => match self.context.tool_manager.execute(name, call.args).await
-            {
+            GateDecision::Execute => match self.context.dispatch(name, call.args).await {
                 Ok(text) => text,
                 Err(e) => format_tool_error(&e.to_string()),
             },

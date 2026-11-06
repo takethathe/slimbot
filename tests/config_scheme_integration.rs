@@ -13,6 +13,7 @@ fn test_default_config_structure() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -49,6 +50,7 @@ fn test_normalize_fills_empty_agent_provider() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -73,6 +75,7 @@ fn test_normalize_derives_url_from_base_url() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -105,6 +108,7 @@ fn test_normalize_preserves_existing_api_url() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -136,6 +140,7 @@ fn test_normalize_falls_back_to_default_url_when_no_base() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -167,6 +172,7 @@ fn test_normalize_trailing_slash_stripped_from_base_url() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -198,6 +204,7 @@ fn test_normalize_removes_empty_tools_and_channels() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -241,6 +248,7 @@ fn test_normalize_does_not_touch_api_key() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -267,6 +275,7 @@ fn test_normalize_max_iterations_and_timeout_via_clamp() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -299,6 +308,7 @@ fn test_write_default_config_creates_file() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -326,6 +336,7 @@ fn test_written_config_is_valid_json() {
     providers.insert("default".to_string(), ProviderConfig::default());
     let config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig::default(),
         providers,
         tools: Default::default(),
@@ -376,6 +387,7 @@ fn test_normalize_multiple_providers() {
     );
     let mut config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig {
             provider: "siliconflow".to_string(),
             max_iterations: 40,

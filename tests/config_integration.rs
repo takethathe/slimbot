@@ -203,6 +203,7 @@ fn test_save_and_reload_round_trip() {
 
     let config = Config {
         pressure: Default::default(),
+        mcp: Default::default(),
         agent: AgentConfig {
             provider: "my-provider".to_string(),
             max_iterations: 10,

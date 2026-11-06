@@ -179,6 +179,110 @@ async fn test_runner_wires_turn_context_to_tools() {
     );
 }
 
+/// What each `chat` call carried: the tool schema names and the system prompt.
+type SeenCalls = Arc<std::sync::Mutex<Vec<(Vec<String>, String)>>>;
+
+/// Provider that records what each call actually carried: the tool schema names
+/// and the system prompt text.
+#[derive(Default)]
+struct RecordingProvider {
+    seen: SeenCalls,
+}
+
+#[async_trait]
+impl Provider for RecordingProvider {
+    async fn chat(
+        &self,
+        messages: &[&Message],
+        tools: Option<&[ToolDefinition]>,
+        _recorder: Option<&dyn SpanRecorder>,
+    ) -> Result<LLMResponse> {
+        let names = match tools {
+            Some(defs) => defs.iter().map(|d| d.name.clone()).collect(),
+            None => Vec::new(),
+        };
+        let system = messages
+            .iter()
+            .filter_map(|m| match *m {
+                Message::System { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.seen.lock().unwrap().push((names, system));
+        Ok(LLMResponse {
+            content: Some("done".to_string()),
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_connector_tools_never_reach_the_model_schema() {
+    // The ticket's central inversion: a connector widens what a script can call,
+    // and says nothing more to the model than "these connectors are wired up".
+    use crate::mcp::service::test_support as mcp_test;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path();
+    let session_dir = path.join("sessions");
+    let workspace_dir = path.join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let sm: SharedSessionManager = Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap()));
+    let mut tm = ToolManager::new(workspace_dir.clone());
+    tm.register(Box::new(MockEchoTool::new("capture", "captured")));
+    let tm = Arc::new(tm);
+    sm.lock().await.get_or_create("cli:c1").await.unwrap();
+    let ms = Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace_dir)));
+    ms.lock().await.init().unwrap();
+
+    let (pool, _peer) = mcp_test::online_service(
+        "github",
+        vec![serde_json::json!({
+            "name": "get_pull",
+            "description": "fetch a pull request",
+            "annotations": {"readOnlyHint": true},
+        })],
+    );
+    mcp_test::wait_for(|| pool.any_online(), "the fake server online").await;
+
+    let provider = Arc::new(RecordingProvider::default());
+    let runner = make_runner(sm.clone(), tm, provider.clone(), workspace_dir, ms)
+        .with_connectors(Some(pool));
+    let result = runner
+        .run(
+            "hi".to_string(),
+            TaskHook::new("cli:c1"),
+            "cli:c1",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(result.success, "{:?}", result.content);
+
+    let seen = provider.seen.lock().unwrap();
+    let (names, system) = &seen[0];
+    assert!(names.iter().any(|n| n == "capture"), "{names:?}");
+    assert!(
+        names.iter().all(|n| !n.starts_with("mcp__")),
+        "connector tools must not be offered to the model: {names:?}"
+    );
+    assert!(system.contains("# Connectors"), "{system}");
+    assert!(
+        system.contains("**github** — online (1 tool(s))"),
+        "{system}"
+    );
+    assert!(
+        !system.contains("fetch a pull request"),
+        "server-authored description stays out of the prompt: {system}"
+    );
+}
+
 /// Tool that marks the turn as having delivered output to its origin
 /// (mirrors MessageTool's origin-marking behavior).
 struct MarkingTool;

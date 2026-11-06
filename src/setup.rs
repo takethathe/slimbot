@@ -23,6 +23,7 @@ fn default_config() -> Config {
         subagent: Default::default(),
         triggers: Default::default(),
         pressure: Default::default(),
+        mcp: Default::default(),
     }
 }
 

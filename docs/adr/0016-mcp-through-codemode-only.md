@@ -11,7 +11,7 @@ v1 的 MCP 集成把外部 server 的工具藏在 `codemode` 模型工具后面�
 **Consequences**
 
 - 前置基建：`codemode` 必须先从 trigger-internal 扩展为 model-facing tool（`src/tools/codemode.rs` + 新 `ENTRY_AGENT`），ADR 0008 的执行模型不变但 scope 扩大。
-- `searchTools()` 只搜 MCP 工具、复用现有 `KeywordIndex` 的 BM25 核心；内置工具已在 schema 里可见不需要 searchTools。
+- `searchTools()` 只搜 MCP 工具、复用现有 `KeywordIndex` 的 BM25 核心；内置工具已在 schema 里可见不需要 searchTools。**落地修正（票 25/26）**：票 25 把检索面定为本运行的工具目录（子代理/受限 agent 的装配集是内置工具的子集，脚本同样需要发现它们），票 26 再并入在线连接器的工具，所以它同时也搜内置工具。本条决策不变的是「连接器工具只能经 searchTools 发现、不进模型 schema」；多搜一遍内置工具的代价只是排序噪声。
 - 断连处理：指数退避 + 从 searchTools 可搜面摘除离线 server 的工具 + 恢复后回添。
 - MCP tool description 作为不可信文本：codemode 路径里「脚本是过滤器」，模型只看到脚本输出（加 `<codemode_output>` wrapper）；不受 ADR 0009 的 evidence-only 约束（那条限 trigger 路径）。
 - 重开条件：若将来高频 MCP 工具需要被模型直接 tool_call（延迟敏感 / 简单调用），按 server/tool 粒度引入 `exposure: direct` 即可——接缝是 `McpService` 向 `ToolCatalog` 注册 factory，不改 codemode 路径。

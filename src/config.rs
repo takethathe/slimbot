@@ -12,9 +12,9 @@ use crate::secrets::SecretStore;
 
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
-    AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig, MemoryConfig,
-    OwnerConfig, PressureConfig, ProviderConfig, SecretEntry, SubagentConfig, TraceBackendEntry,
-    TraceConfig, TriggersConfig, WebFetchConfig,
+    AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig, McpConfig,
+    McpServerConfig, MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig, SecretEntry,
+    SubagentConfig, TraceBackendEntry, TraceConfig, TransportKind, TriggersConfig, WebFetchConfig,
 };
 
 // ── Root Config ──
@@ -50,6 +50,10 @@ pub struct Config {
     /// provider window (see `docs/config.md` and ADR 0013).
     #[serde(default)]
     pub pressure: PressureConfig,
+    /// MCP connectors. Gateway-level: the pool is owned by `McpService`, and
+    /// its tools reach the model only through codemode (ADR 0016).
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -246,6 +250,10 @@ impl Config {
         self.triggers.clamp();
         self.pressure.clamp();
         self.tools.approval.clamp();
+        self.mcp.clamp();
+        for server in self.mcp.servers.iter_mut() {
+            server.clamp();
+        }
         if let Some(wf) = &mut self.web_fetch {
             wf.clamp();
         }
@@ -256,6 +264,54 @@ impl Config {
         // Remove entries with empty name/type
         self.tools.entries.retain(|t| !t.name.is_empty());
         self.channels.retain(|name, _| !name.is_empty());
+        // A connector without a name has no callable prefix and no loggable
+        // identity, so it is dropped rather than validated into an error.
+        self.mcp.servers.retain(|s| !s.name.trim().is_empty());
+    }
+
+    /// Connector-specific wiring checks. A malformed server entry is a
+    /// configuration error, not a runtime one: better to refuse the gateway
+    /// than to bring up a pool that can never answer a call.
+    fn validate_mcp(&self) -> Result<()> {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for server in &self.mcp.servers {
+            // A disabled entry is never connected to, so its transport shape
+            // cannot strand a call: don't refuse the whole gateway over a
+            // toggle-off server that hasn't been filled in. The name-collision
+            // check below still runs — the name matters if it's ever re-enabled.
+            if server.enabled {
+                match server.transport_kind() {
+                    TransportKind::Stdio => {
+                        if server.command.trim().is_empty() {
+                            anyhow::bail!(
+                                "mcp.servers.{}: transport \"stdio\" needs a command",
+                                server.name
+                            );
+                        }
+                    }
+                    TransportKind::Http => {
+                        if !server.url.starts_with("http://") && !server.url.starts_with("https://")
+                        {
+                            anyhow::bail!(
+                                "mcp.servers.{}: transport \"http\" needs a url starting with http:// or https://",
+                                server.name
+                            );
+                        }
+                    }
+                }
+            }
+            // Two names that sanitize to the same callable prefix would be
+            // indistinguishable to a script (`gh-mcp` vs `gh_mcp`).
+            let prefix = crate::mcp::server_prefix(&server.name);
+            if let Some(clash) = seen.insert(prefix.clone(), server.name.clone()) {
+                anyhow::bail!(
+                    "mcp.servers: names `{}` and `{}` both address tools as `{prefix}`",
+                    clash,
+                    server.name
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -281,6 +337,7 @@ impl Config {
         if provider.model.is_empty() {
             anyhow::bail!("provider '{}'.model must not be empty", self.agent.provider);
         }
+        self.validate_mcp()?;
         Ok(())
     }
 
@@ -338,10 +395,11 @@ impl Config {
     }
 
     /// True when a secret-typed field (provider `api_key`, `triggers.secrets`
-    /// value) carries a value. Drives the `0600` file mode.
+    /// value, connector env/header) carries a value. Drives the `0600` file mode.
     pub fn contains_secrets(&self) -> bool {
         self.providers.values().any(|p| !p.api_key.is_empty())
             || self.triggers.secrets.iter().any(|s| !s.value.is_empty())
+            || self.mcp.servers.iter().any(|s| s.holds_secret())
     }
 
     /// Replace secret-typed fields with the result of the resolution chain.
@@ -352,6 +410,7 @@ impl Config {
     pub fn resolve_secrets(&mut self, store: &SecretStore) {
         crate::secrets::resolve_provider_secrets(&mut self.providers, store);
         crate::secrets::resolve_trigger_secrets(&mut self.triggers, store);
+        crate::secrets::resolve_mcp_secrets(&mut self.mcp.servers, store);
     }
 
     /// Parse a config document, applying the legacy-key migrations first.
@@ -701,6 +760,7 @@ mod tests {
             subagent: Default::default(),
             triggers: Default::default(),
             pressure: Default::default(),
+            mcp: Default::default(),
         }
     }
 
@@ -709,6 +769,39 @@ mod tests {
         let mut cfg = make_test_config();
         cfg.agent.provider = String::new();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_mcp_enabled_http_without_url_is_rejected() {
+        let config: Config = serde_json::from_str(
+            r#"{
+            "agent": {"provider": "default"},
+            "providers": {"default": {"type": "openai", "api_key": "k", "model": "m"}},
+            "mcp": {"servers": [{"name": "gh", "transport": "http", "url": ""}]}
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            config.validate().is_err(),
+            "an enabled http connector with no url must be refused"
+        );
+    }
+
+    #[test]
+    fn test_mcp_disabled_server_with_bad_shape_is_allowed() {
+        // A toggle-off entry the pool never touches must not block startup.
+        let config: Config = serde_json::from_str(
+            r#"{
+            "agent": {"provider": "default"},
+            "providers": {"default": {"type": "openai", "api_key": "k", "model": "m"}},
+            "mcp": {"servers": [{"name": "gh", "transport": "http", "enabled": false, "url": ""}]}
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            config.validate().is_ok(),
+            "a disabled, half-filled connector must not refuse the gateway"
+        );
     }
 
     #[test]

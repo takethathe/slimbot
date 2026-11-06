@@ -209,15 +209,18 @@ _Avoid_: microcompact（代码符号名）, drop（不带可找回线索的整�
 _Avoid_: plugin, extension
 
 **McpService**:
-Gateway 级服务，管理所有已配置 MCP server 的连接池、工具列表缓存、健康检查与退避重连。codemode 的 tool bridge 通过它路由调用。
+Gateway 级服务，管理所有已配置 MCP server 的连接池、工具列表缓存、健康检查与退避重连。codemode 的 tool bridge 通过它路由调用。它由 `AgentLoop` 从 `config.mcp` 建池并启动（CLI 与 gateway 同源），每一台 server 一个 supervisor。状态视图（名字 / 状态 / 缓存工具数）是对外可观测的全部事实，恒不含凭证。
 _Avoid_: MCP client（泛指协议实现）, MCP manager
+
+**Connector tool (callable)**:
+一个连接器工具在脚本里的地址：`mcp__<server>__<tool>`（下发时非 `[A-Za-z0-9_]` 字符被替换为 `_`，同前缀撞名时后缀 `_2`、`_3`）。`mcp__` 前缀同时是路由标记：以它开头的名字永不去 `ToolManager` 里找。它是脚本面的名字，不是模型面的名字。
 
 **Codemode (agent entry)**:
 模型在 ReAct 循环中可调用的一个工具：模型写 JS 源码，宿主在 QuickJS VM 里执行，脚本通过 `tools.*()` / `searchTools()` 调用工具，结果返回模型。区别于 trigger 路径的 `collect` / `judge` 入口。
 _Avoid_: code interpreter, script runner, sandbox（后者指执行环境而非模型可调用的工具本身）
 
 **searchTools**:
-codemode 脚本内的全局函数，用 BM25 排序发现已连接 MCP server 的工具（返回 `{ name, description }[]`）。它不搜内置工具（那些已在 schema 可见）。
+codemode 脚本内的全局函数，用 BM25 排序检索本次运行的**可调用目录**（本次运行装配的内置工具 + 在线连接器的工具，返回 `[{name, description}]`）。内置工具在模型 schema 里已可见，因此它存在的理由是连接器工具：那一批只经脚本发现、永不进入模型 `tools` 的东西。离线 server 的工具不在可调用目录里。
 _Avoid_: tool_search（那是 pi 的模型级工具，本决策不用它）, memory_search（那是记忆检索）
 
 ### Connector

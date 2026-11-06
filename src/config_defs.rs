@@ -149,6 +149,91 @@ define_config! {
     }
 }
 
+// ── MCP connectors (ticket 26, ADR 0016) ──
+//
+// One entry per external MCP server. Connector tools never enter the model's
+// tool schema: they are discovered inside codemode through `searchTools()` and
+// called as `tools.mcp__<server>__<tool>()`, so this section describes the
+// connection pool only, not a tool allow-list.
+
+/// The transport family named by `mcp.servers[].transport`. The config keeps a
+/// plain string (so the editor and `clamp()` treat it like any other select),
+/// and the service matches on the derived kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// Spawn the server as a child process and speak newline-delimited JSON-RPC.
+    Stdio,
+    /// POST JSON-RPC to a streamable-HTTP endpoint.
+    Http,
+}
+
+/// Empty string map, spelled out so `define_config!` can embed it as a default.
+fn empty_map() -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
+
+define_config! {
+    "mcp" => McpConfig {
+        servers: Vec<McpServerConfig> = Vec::<McpServerConfig>::new(), none, desc: "MCP connectors to reach from codemode (stdio child process or streamable-HTTP endpoint)",
+        call_timeout_seconds: u64 = 20, range(1, 300), desc: "Budget for one connector tool call",
+        connect_timeout_seconds: u64 = 15, range(1, 300), desc: "Budget for one connection attempt plus handshake",
+        probe_interval_seconds: u64 = 30, range(1, 3600), desc: "How often an online server is probed to notice an idle death",
+        backoff_initial_ms: u64 = 500, range(50, 60_000), desc: "First wait before retrying an offline server",
+        backoff_max_seconds: u64 = 300, range(1, 3600), desc: "Upper bound of the retry backoff (bounded retries, never a wedge)",
+    }
+}
+
+define_config! {
+    "mcp.servers" => McpServerConfig {
+        name: String = "".to_string(), str_max(64), desc: "Connector id; becomes the mcp__<name>__ callable prefix",
+        transport: String = "stdio".to_string(), allowed(["stdio", "http"]), desc: "Transport: stdio (spawn a child process) or http (streamable-HTTP endpoint)",
+        enabled: bool = true, none, desc: "Disable to keep the server configured but never attempted",
+        command: String = "".to_string(), str_max(512), desc: "stdio: executable to spawn (e.g. an npx launcher)",
+        args: Vec<String> = Vec::<String>::new(), none, desc: "stdio: arguments passed to the command",
+        env: BTreeMap<String, String> = empty_map(), secret, desc: "stdio: environment for the child (the only environment it gets); values may hold ${secret:<key>}",
+        url: String = "".to_string(), str_max(512), desc: "http: endpoint URL",
+        headers: BTreeMap<String, String> = empty_map(), secret, desc: "http: static request headers, typically an Authorization value built from ${secret:<key>}",
+    }
+}
+
+impl McpServerConfig {
+    /// The transport kind this entry names. `clamp()` already restricts the
+    /// string to the whitelist, so anything unrecognized falls back to stdio
+    /// rather than failing a load that predates the check.
+    pub fn transport_kind(&self) -> TransportKind {
+        if self.transport == "http" {
+            TransportKind::Http
+        } else {
+            TransportKind::Stdio
+        }
+    }
+
+    /// Environment to hand the child process, unnamed entries dropped. Values
+    /// are already resolved (see [`crate::secrets::resolve_mcp_secrets`]).
+    pub fn resolved_env(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .filter(|(k, _)| !k.trim().is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Static request headers, unnamed entries dropped.
+    pub fn resolved_headers(&self) -> Vec<(String, String)> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| !k.trim().is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// True when any env/header value carries a value. Drives the `0600` file
+    /// mode; a resolved placeholder is a value on disk only before resolution.
+    pub fn holds_secret(&self) -> bool {
+        self.env.values().any(|v| !v.is_empty()) || self.headers.values().any(|v| !v.is_empty())
+    }
+}
+
 // ── `tools.approval` field metadata (hand-written) ──
 //
 // The approval policy lives in `src/approval/mod.rs` (it carries behavior:

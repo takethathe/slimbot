@@ -130,6 +130,8 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 
 在此之上是两种 codemode 消费者，互为操作镜像：**采集器**（触发器源 `collect.js`，读侧、周期采集，已落地）与**执行器**（`act.js`，写侧、按需动作；v1 决策见 [ADR 0019](adr/0019-executor-as-codemode-operation-primitive.md)，完整实现走连接器子 effort）。执行器动作带副作用、纳入审批（[ADR 0011](adr/0011-approval-by-turn-end-redemption.md)）、无人值守 Deny。
 
+连接器的 v1 实例已落地（票 26）：`src/mcp/` 的 `McpService` 在 gateway/CLI 两侧由 `AgentLoop` 建池并启动，每 server 一个 supervisor（连接、工具缓存、退避重连）；它的工具**只存在于 codemode 脚本面**（`searchTools()` / `tools.mcp__<server>__<tool>()`），从不进入模型的 tool schema。细节见 [mcp.md](mcp.md)，决策见 [ADR 0016](adr/0016-mcp-through-codemode-only.md) 与 [ADR 0020](adr/0020-hand-rolled-minimal-mcp-client.md)。
+
 ## 数据流
 
 ### Inbound（用户输入）
@@ -187,6 +189,8 @@ AgentRunner 状态变更 → TaskHook.notify_status()
 | 触发器行动 | 在 tick 之外的单消费者队列执行 | 模型调用不能挤进 tick 的硬超时；队满丢弃而不顺延，迟到十分钟的提醒比不提醒更糟 |
 | 子代理会话 | `mark_ephemeral` + 跑完 `drop_session` | 不留 JSONL、不进 consolidator，一次性任务不该污染长期上下文 |
 | 外部内容 | 只以证据形式进入上下文，快照不落盘 | 见 [ADR 0009](adr/0009-no-raw-external-content.md) |
+| 连接器工具 | 不进模型 tool schema，只在 codemode 脚本里发现与调用 | 一个外部 server 就带来 30+ 工具，会把模型注意力从内置能力上拉走；脚本还能一次编排多调用（ADR 0016） |
+| 连接器离线 | 清空该 server 的工具缓存，调用立即回一条干净错误 | 发现面不给必然失败的调用；退避有上限且每 server 独立，一台连不上不会 wedge gateway |
 
 ## 目录结构与模块关系
 
@@ -208,7 +212,8 @@ main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   │     │     ├── session.rs ── Session + SessionManager + SessionRunner
   │     │     ├── consolidate.rs ── Consolidator（token 预算触发摘要）
   │     │     ├── context.rs ── 上下文构建
-  │     │     └── runner.rs ── ReAct 循环
+  │     │     ├── runner.rs ── ReAct 循环
+  │     │     └── mcp/ ── MCP 连接器池（两种 transport、工具缓存、退避重连；只经 codemode 脚本可见）
   │     │
   │     ├── message_bus.rs ── 纯异步通道端点
   │     ├── memory/ ── category 化长期记忆、backend、历史记录

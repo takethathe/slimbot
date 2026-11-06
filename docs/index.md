@@ -27,6 +27,7 @@
 | [触发器层](trigger.md) | `trigger/` | 固定 tick、数据源采集与快照、边沿判定、执行投递与 fire 账本 |
 | [子代理运行时](agent.md) | `agent/` | agent 定义与工具增量、一次性 run、并发闸、结果投递 |
 | [脚本沙箱](codemode.md) | `codemode/` | rquickjs 专职线程、双层超时、宿主函数白名单、凭证抹除 |
+| [MCP 连接器](mcp.md) | `mcp/` | 自研最小客户端（stdio + streamable-HTTP）、gateway 级连接池与退避重连；工具只进 codemode 的 `searchTools()` / `tools.mcp__*`，**不进模型 schema**（ADR 0016、0020） |
 
 ## 基础设施模块
 

@@ -68,6 +68,7 @@ mod tests {
             chat_id: "c1".into(),
             runtime_ctx: "ctx".into(),
             approvals: Default::default(),
+            connectors: None,
             tracer: None,
         }
     }
