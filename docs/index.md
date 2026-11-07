@@ -48,5 +48,5 @@
 
 ## 快速链接
 
-- [CLAUDE.md](../CLAUDE.md) — 开发规范、项目结构、编码标准
+- [CLAUDE.md](../CLAUDE.md) — 开发规范与检索入口（构建/门禁、代码地图、硬约束）
 - [README](../README.md) — 项目概览、构建与运行说明

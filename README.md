@@ -1,21 +1,24 @@
 # SlimBot
 
-A lightweight AI chatbot assistant built in Rust, powered by the ReAct (Reason + Act) pattern and OpenAI-compatible LLM APIs. Supports tool calling and multi-channel I/O (CLI, WebUI, and more).
+A personal AI assistant written in Rust: a ReAct loop over OpenAI-compatible LLM APIs, with tool calling, long-term memory, scheduled automation and multi-channel I/O (CLI, WebUI, Feishu).
 
 ## Features
 
-- **ReAct Loop** — Agent reasons and acts in cycles: builds context, calls the LLM, executes tool calls, and repeats until a final answer is reached.
-- **Tool Calling** — Extensible tool system via the `Tool` trait with OpenAI function calling format conversion.
-- **Multi-Channel** — Pluggable channel architecture via the `Channel` / `ChannelFactory` traits. Ships with a CLI channel.
-- **Session Persistence** — JSONL-based session storage with automatic load/save.
-- **Workspace-Driven Context** — System prompt assembled from workspace files (`agent.md`, `user.md`, `soul.md`, `tools.md`) and optional skill files (`skills/*.md`).
-- **Configurable** — LLM provider, agent behavior, channels, and tools all driven by a single `config.json`.
+- **ReAct Loop** — builds context, calls the model, executes tool calls, repeats until the model answers without one.
+- **Tools** — 10 built-in tools (shell, file read/write/edit, list/make dir, grep, find_files, web_fetch) plus a `codemode` JavaScript sandbox; connector (MCP) tools are reachable only from inside codemode scripts.
+- **Approval** — every tool declares a risk level; a config policy maps risk to allow / ask / deny, and `ask` is redeemed on the next turn.
+- **Memory** — one writable `MEMORY.md` behind a protected-document funnel, with a derived index, BM25-lite recall, and a Dream pass that consolidates history.
+- **Automation** — cron jobs, a heartbeat check, and data-source triggers (collect → judge → dispatch).
+- **Subagents** — one-shot delegated runs sharing a global concurrency gate with trigger actions.
+- **Multi-Channel** — CLI and WebUI (SSE) plus a Feishu IM channel with streaming cards.
+- **Session Persistence** — append-only JSONL, rewritten in full only after consolidation.
+- **Configurable** — one `config.json`; secrets resolve from OS keychain → environment → file (`0600`).
 
 ## Quick Start
 
 ### Prerequisites
 
-- Rust 2024 edition toolchain (`rustc`, `cargo`)
+- Rust with the 2024 edition (`rustc`, `cargo`)
 
 ### Build
 
@@ -26,132 +29,126 @@ cargo build
 ### Run
 
 ```bash
-# With explicit config path
-cargo run -- /path/to/config.json
-
-# Uses default ~/.slimbot/config.json if no argument given
-cargo run
+cargo run -- setup                     # create ~/.slimbot/config.json and the workspace
+cargo run -- agent                     # interactive CLI session
+cargo run -- agent "summarize today"   # one turn, then exit
+cargo run -- gateway                   # cron + heartbeat + triggers + enabled channels (WebUI, Feishu)
 ```
+
+There is no default subcommand: `cargo run` on its own prints help. Paths come from `-c/--config`, `-d/--data-dir` (default `~/.slimbot`) and `-w/--workspace-dir` (default `{data_dir}/workspace`).
 
 ### Configuration
 
-Create `~/.slimbot/config.json`:
+`setup` writes a config file with every field at its default. The two things you must fill in are a provider key and at least one channel:
 
 ```json
 {
-  "data_dir": "/home/user/.slimbot",
-  "provider": {
-    "api_url": "https://api.openai.com/v1/chat/completions",
-    "api_key": "sk-...",
-    "model": "gpt-4o",
-    "temperature": 0.7,
-    "max_tokens": 4096
+  "agent": { "provider": "default" },
+  "providers": {
+    "default": { "api_key": "sk-...", "model": "gpt-4o" }
   },
-  "agent": {
-    "max_iterations": 40,
-    "timeout_seconds": 120
-  },
-  "tools": [
-    { "name": "shell", "enabled": true }
-  ],
-  "channels": [
-    {
-      "type": "cli",
-      "enabled": true,
-      "config": { "prompt": "> " }
-    }
-  ]
+  "channels": {
+    "webui": { "enabled": true }
+  }
 }
 ```
 
+`api_key` may stay empty when it is available as `SLIMBOT_DEFAULT` or as the OS-keychain entry `slimbot.default`. See [docs/config.md](docs/config.md) for the full schema (per-provider context window, pressure ratios, MCP servers, …).
+
 ### Workspace
 
-The workspace directory (`~/.slimbot/workspace/`) contains files that shape the agent's behavior:
+`~/.slimbot/workspace/` holds everything that shapes the agent:
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `agent.md` | Agent behavior definition |
-| `user.md` | User profile |
-| `soul.md` | Agent personality |
-| `tools.md` | Tool usage guide |
-| `skills/*.md` | Optional skill files |
+| `AGENTS.md` | Agent operating instructions |
+| `USER.md` | User profile |
+| `SOUL.md` | Agent personality |
+| `TOOLS.md` | Tool usage notes |
+| `memory/MEMORY.md` | Long-term memory (the only memory document written directly) |
+| `agents/` | Subagent definitions (`trigger.md` ships by default) |
+| `skills/` | Loadable skill documents |
+| `triggers/` | Trigger sources and rules, plus fire history |
+| `sessions/` | `{session_id}.jsonl` conversation logs |
+| `cron/jobs.json` | Scheduled jobs |
 
-Session data is stored in `~/.slimbot/workspace/sessions/{session_id}.jsonl`.
+Bootstrap files still holding their template text are not injected into the system prompt.
 
 ## Architecture
 
 ```
-AgentLoop ── initializes Provider, ToolManager, SessionManager
-   │
-   ▼
-AgentRunner ── ReAct Loop
-   ├── ContextBuilder.build() → system prompt + history + tool definitions
-   ├── Provider.chat()        → LLM API call
-   ├── ToolManager.execute()  → tool execution
-   └── SessionManager.persist() → JSONL persistence
-   │
-   ▼
-MessageBus ── BusRequest → SessionTask → enqueue/dequeue → AgentRunner
-   │
-   ▼
-ChannelManager ── create channels from config → poll input → interact with MessageBus
+Channel → MessageBus → AgentLoop → SessionRunner → AgentRunner (ReAct)
+                                                     ├── ContextBuilder   system prompt + history + tool schemas
+                                                     ├── Provider.chat()  LLM call
+                                                     ├── ToolManager      tool execution, gated by approval
+                                                     └── SessionManager   JSONL persistence
+                                     outbound → ChannelManager → Channel
 ```
+
+Gateway mode runs the same `AgentLoop` and adds `CronService`, `HeartbeatService`, and `TriggerService` + `Dispatcher` (a tick only collects, judges and enqueues; actions run outside it). WebUI broadcasts `AgentEvent` over SSE.
 
 ### Key Design Decisions
 
-- **Shared access**: `SharedSessionManager = Arc<Mutex<SessionManager>>`, all modules access through a shared mutex.
-- **Status events**: `SessionTask` carries a `TaskHook`, which sends state changes via `tokio::sync::mpsc` to the channel.
-- **Persistence**: Full JSONL write at the end of each AgentRunner cycle (append, not overwrite).
-- **Session ID format**: `{channel_id}:{chat_id}`
-- **Loop termination**: exits when `max_iterations` is exceeded or the model responds without tool calls.
+- **Shared session state** — `SharedSessionManager = Arc<Mutex<SessionManager>>`.
+- **Session id** — `{channel_id}:{chat_id}`.
+- **Persistence** — append-only JSONL; a full rewrite happens only after consolidation.
+- **Loop termination** — `max_iterations` exceeded, or a response without tool calls.
+- **One entry per capability** — an agent is an executable body, a skill is loadable knowledge; never both for the same capability.
+- **External content stays evidence** — subagent and trigger input never enters the context as raw text, and never enters memory.
+- **Connector tools never enter the model schema** — they are discovered inside codemode via `searchTools()`.
 
-## CLI Arguments
+The reasoning behind each is recorded in [docs/adr/](docs/adr/).
+
+## CLI
 
 ```bash
-slimbot [CONFIG]              # Positional config path (backward compatible)
-slimbot -c, --config <PATH>   # Config file path
-slimbot -d, --data-dir <PATH> # Data directory
-slimbot -w, --workspace-dir <PATH>  # Workspace directory
-slimbot --log <LEVEL>         # Log level: 0=debug, 1=info (default), 2=warning, 3=error, 4=fatal
-slimbot --log-file <PATH>     # Also write logs to file (tilde expansion supported)
+slimbot [OPTIONS] [CONFIG] [COMMAND]
+
+Commands:
+  setup              Create or normalize the config and initialize directories
+  agent [QUERY]      CLI session; with QUERY, run one turn and exit
+  gateway            Cron + heartbeat + triggers + enabled channels
 ```
 
-Subcommands:
-- `setup` — Run setup wizard (create/normalize config, initialize directories)
-- `agent [-s SESSION_ID]` — Start CLI interactive agent session
+| Option | Default | Meaning |
+|---|---|---|
+| `-c, --config <PATH>` | `{data_dir}/config.json` | Config file (top-level option, before the subcommand) |
+| `-d, --data-dir <PATH>` | `~/.slimbot` | Data directory |
+| `-w, --workspace-dir <PATH>` | `{data_dir}/workspace` | Workspace directory (must sit under the data directory) |
+| `--log <LEVEL>` | `1` | `0`=debug `1`=info `2`=warning `3`=error `4`=fatal |
+| `--log-file <PATH>` | — | Also write logs to a file |
 
-See [docs/logging.md](docs/logging.md) for detailed logging configuration.
+A positional `CONFIG` still works, but only together with a subcommand (`slimbot /path/config.json agent`). See [docs/logging.md](docs/logging.md) for log configuration.
 
 ## Project Structure
 
 ```
 slimbot/
-├── Cargo.toml
-├── .gitignore
-└── src/
-    ├── main.rs         # Entry point: config → AgentLoop → MessageBus → ChannelManager
-    ├── config.rs       # Config struct: JSON loading, ProviderConfig, AgentConfig, ChannelEntry
-    ├── tool.rs         # Tool trait + ToolManager: registration & OpenAI function calling conversion
-    ├── provider/       # LLM provider abstraction
-    │   ├── mod.rs      # Provider trait, ChatResponse, FinishReason
-    │   └── openai.rs   # OpenAIProvider implementation
-    ├── session.rs      # Session + SessionManager: FIFO queue, message management, JSONL persistence
-    ├── context.rs      # ContextBuilder: system prompt assembly from workspace files + skills + history
-    ├── runner.rs       # AgentRunner: ReAct loop core
-    ├── agent_loop.rs   # AgentLoop: top-level orchestration
-    ├── message_bus.rs  # MessageBus: request routing and result delivery
-    └── channel/        # I/O channel abstraction
-        ├── mod.rs      # Channel/ChannelFactory traits, ChannelManager
-        └── cli.rs      # CliChannel & CliChannelFactory
+├── src/
+│   ├── main.rs, cli.rs, setup.rs, gateway.rs   entry, arguments, setup, gateway
+│   ├── agent_loop.rs, runner/                  orchestration, ReAct loop, approval hooks
+│   ├── context.rs, session.rs, message_bus.rs  prompt assembly, sessions, request routing
+│   ├── consolidate.rs, snip.rs, pressure.rs    context budget: summary, trimming, limits
+│   ├── provider/, channel/, tools/, tool.rs    LLM providers, I/O channels, tools
+│   ├── trigger/, cron/, heartbeat/, agent/     automation, subagent runtime
+│   ├── codemode/, mcp/                         script sandbox, connector pool
+│   ├── memory/, card/, approval/, trace/       memory, cards, approval, tracing
+│   └── config*.rs, log.rs, path.rs, secrets.rs, utils/
+├── docs/          module docs — index at docs/index.md
+├── tests/         integration tests
+├── GLOSSARY.md    domain vocabulary
+└── AGENTS.md      development conventions (symlink to CLAUDE.md)
 ```
 
 ## Development
 
 ```bash
-cargo check    # Quick compile check
-cargo build    # Full build
-cargo test     # Run tests
+cargo fmt -- --check
+cargo clippy
+cargo test
 ```
+
+Conventions live in [AGENTS.md](AGENTS.md); per-module documentation is indexed in [docs/index.md](docs/index.md).
 
 ## License
 

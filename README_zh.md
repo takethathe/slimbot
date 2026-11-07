@@ -1,15 +1,18 @@
 # SlimBot
 
-一个使用 Rust 开发的轻量级 AI 聊天机器人，基于 ReAct（推理 + 行动）模式，兼容 OpenAI 的 LLM API。支持工具调用和多通道 I/O（CLI、WebUI 等）。
+一个用 Rust 编写的个人 AI 助手：基于 ReAct 循环，兼容 OpenAI 的 LLM API，支持工具调用、长期记忆、定时自动化与多通道 I/O（CLI、WebUI、飞书）。
 
 ## 特性
 
-- **ReAct 循环** — Agent 按周期运行：构建上下文 → 调用 LLM → 执行工具 → 重复直到得出最终答案。
-- **工具调用** — 6 个内置工具（shell、file_reader、file_writer、file_editor、list_dir、make_dir），可扩展的 `Tool` trait 系统，支持 OpenAI function calling 格式转换。
-- **多通道** — 通过 `Channel` / `ChannelFactory` trait 实现可插拔通道架构，内置 CLI 通道。
-- **会话持久化** — 基于 JSONL 的会话存储，自动加载和保存。
-- **工作区驱动的上下文** — System prompt 由工作区文件（`agent.md`、`user.md`、`soul.md`、`tools.md`）和可选的技能文件（`skills/*.md`）组装而成。
-- **完全可配置** — LLM 提供商、Agent 行为、通道和工具均通过单一 `config.json` 驱动。详见 [docs/tools.md](docs/tools.md) 了解内置工具。
+- **ReAct 循环** — 构建上下文 → 调用模型 → 执行工具 → 重复，直到模型给出不带工具调用的回答。
+- **工具** — 10 个内置工具（shell、文件读写编辑、目录列表/创建、grep、find_files、web_fetch）加一个 `codemode` JavaScript 沙箱；连接器（MCP）工具只能在 codemode 脚本里访问。
+- **审批** — 每个工具自述风险级，配置把风险级映射到 allow / ask / deny；`ask` 在下一轮兑现。
+- **记忆** — 由受保护文档漏斗守住唯一可写文件 `MEMORY.md`，配派生索引、BM25-lite 召回，以及 Dream 定期整理历史。
+- **自动化** — 定时任务（cron）、心跳检查，以及数据源触发器（采集 → 判定 → 投递）。
+- **子代理** — 一次性委派运行，与触发器行动共用全局并发闸。
+- **多通道** — CLI 与 WebUI（SSE），加一个带流式卡片的飞书 IM 通道。
+- **会话持久化** — append-only JSONL，只有压缩后才会全量重写。
+- **可配置** — 单一 `config.json`；密钥按 OS keychain → 环境变量 → 文件（`0600`）顺序解析。
 
 ## 快速开始
 
@@ -26,123 +29,126 @@ cargo build
 ### 运行
 
 ```bash
-# 指定配置文件路径
-cargo run -- /path/to/config.json
-
-# 不传参数则使用默认路径 ~/.slimbot/config.json
-cargo run
+cargo run -- setup                     # 创建 ~/.slimbot/config.json 与工作区
+cargo run -- agent                     # CLI 交互会话
+cargo run -- agent "总结一下今天"        # 单轮跑完即退出
+cargo run -- gateway                   # cron + heartbeat + 触发器 + 已启用通道（WebUI、飞书）
 ```
 
-### 配置文件
+没有默认子命令：只跑 `cargo run` 会打印 help。路径由 `-c/--config`、`-d/--data-dir`（默认 `~/.slimbot`）和 `-w/--workspace-dir`（默认 `{data_dir}/workspace`）决定。
 
-创建 `~/.slimbot/config.json`：
+### 配置
+
+`setup` 写出所有字段都取默认值的配置文件。需要你填的只有 provider 的 key 和一个通道：
 
 ```json
 {
-  "data_dir": "/home/user/.slimbot",
-  "provider": {
-    "api_url": "https://api.openai.com/v1/chat/completions",
-    "api_key": "sk-...",
-    "model": "gpt-4o",
-    "temperature": 0.7,
-    "max_tokens": 4096
+  "agent": { "provider": "default" },
+  "providers": {
+    "default": { "api_key": "sk-...", "model": "gpt-4o" }
   },
-  "agent": {
-    "max_iterations": 40,
-    "timeout_seconds": 120
-  },
-  "tools": [
-    { "name": "shell", "enabled": true }
-  ],
-  "channels": [
-    {
-      "type": "cli",
-      "enabled": true,
-      "config": { "prompt": "> " }
-    }
-  ]
+  "channels": {
+    "webui": { "enabled": true }
+  }
 }
 ```
 
+`api_key` 留空时，只要能作为环境变量 `SLIMBOT_DEFAULT` 或 OS keychain 条目 `slimbot.default` 取到即可。完整字段（每个 provider 的 context window、上下文压力占比、MCP server 等）见 [docs/config.md](docs/config.md)。
+
 ### 工作区
 
-工作区目录（`~/.slimbot/workspace/`）中的文件用于塑造 Agent 的行为：
+`~/.slimbot/workspace/` 存放决定 agent 行为的东西：
 
-| 文件 | 用途 |
+| 路径 | 用途 |
 |---|---|
-| `agent.md` | Agent 行为定义 |
-| `user.md` | 用户画像 |
-| `soul.md` | Agent 人格 |
-| `tools.md` | 工具使用指南 |
-| `skills/*.md` | 可选技能文件 |
+| `AGENTS.md` | Agent 运行指令 |
+| `USER.md` | 用户画像 |
+| `SOUL.md` | Agent 人格 |
+| `TOOLS.md` | 工具使用说明 |
+| `memory/MEMORY.md` | 长期记忆（唯一被直接写入的记忆文档） |
+| `agents/` | 子代理定义（默认铺出 `trigger.md`） |
+| `skills/` | 可加载的技能文档 |
+| `triggers/` | 触发器源与规则，以及触发历史 |
+| `sessions/` | `{session_id}.jsonl` 会话日志 |
+| `cron/jobs.json` | 定时任务 |
 
-会话数据存储在 `~/.slimbot/workspace/sessions/{session_id}.jsonl`。
+仍在模板原文状态的 bootstrap 文件不会注入 system prompt。
 
 ## 架构
 
 ```
-AgentLoop ── 初始化 Provider、ToolManager、SessionManager
-   │
-   ▼
-AgentRunner ── ReAct 循环
-   ├── ContextBuilder.build() → system prompt + 历史消息 + 工具定义
-   ├── Provider.chat()        → LLM API 调用
-   ├── ToolManager.execute()  → 工具执行
-   └── SessionManager.persist() → JSONL 持久化
-   │
-   ▼
-MessageBus ── 接收 BusRequest → 封装 SessionTask → 入队/出队 → 调用 AgentRunner
-   │
-   ▼
-ChannelManager ── 从 config.json 按 type 创建通道 → 轮询输入 → 与 MessageBus 交互
+Channel → MessageBus → AgentLoop → SessionRunner → AgentRunner (ReAct)
+                                                     ├── ContextBuilder   system prompt + 历史 + 工具 schema
+                                                     ├── Provider.chat()  调用 LLM
+                                                     ├── ToolManager      执行工具（经审批闸）
+                                                     └── SessionManager   写入 JSONL
+                                     outbound → ChannelManager → Channel
 ```
+
+Gateway 模式复用同一套 `AgentLoop`，额外起 `CronService`、`HeartbeatService` 和 `TriggerService` + `Dispatcher`（tick 只采集/判定/入队，行动在队列外执行）。WebUI 通过 SSE 广播 `AgentEvent`。
 
 ### 关键设计决策
 
-- **共享访问**：`SharedSessionManager = Arc<Mutex<SessionManager>>`，所有模块通过共享 Mutex 访问。
-- **状态事件**：`SessionTask` 携带 `TaskHook`，通过 `tokio::sync::mpsc` 向通道发送状态变更。
-- **持久化**：每轮 AgentRunner 循环结束后全量写入 JSONL（追加模式，非覆盖）。
-- **Session ID 格式**：`{channel_id}:{chat_id}`
-- **循环终止条件**：超出 `max_iterations` 或模型返回无 tool_calls 时结束。
+- **共享会话状态** — `SharedSessionManager = Arc<Mutex<SessionManager>>`。
+- **Session ID** — `{channel_id}:{chat_id}`。
+- **持久化** — append-only JSONL；只有压缩后才全量重写。
+- **循环终止** — 超出 `max_iterations`，或模型返回无 tool_calls。
+- **一个能力一个入口** — agent 是可被启动的执行体，skill 是可被加载的知识；同一能力只做其中一个。
+- **外部内容只作证据** — 子代理与触发器的输入不会以原文进上下文，也不会进记忆。
+- **连接器工具不进模型 schema** — 只在 codemode 里通过 `searchTools()` 发现。
+
+每条背后的推理记录在 [docs/adr/](docs/adr/)。
+
+## 命令行
+
+```bash
+slimbot [OPTIONS] [CONFIG] [COMMAND]
+
+Commands:
+  setup              创建或规范化配置，初始化目录
+  agent [QUERY]      CLI 会话；带 QUERY 则跑一轮后退出
+  gateway            cron + heartbeat + 触发器 + 已启用通道
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `-c, --config <PATH>` | `{data_dir}/config.json` | 配置文件（顶层选项，放在子命令之前） |
+| `-d, --data-dir <PATH>` | `~/.slimbot` | 数据目录 |
+| `-w, --workspace-dir <PATH>` | `{data_dir}/workspace` | 工作区目录（必须在数据目录之下） |
+| `--log <LEVEL>` | `1` | `0`=debug `1`=info `2`=warning `3`=error `4`=fatal |
+| `--log-file <PATH>` | — | 同时把日志写进文件 |
+
+位置参数 `CONFIG` 仍可用，但必须配合子命令（`slimbot /path/config.json agent`）。日志配置见 [docs/logging.md](docs/logging.md)。
 
 ## 项目结构
 
 ```
 slimbot/
-├── Cargo.toml
-├── .gitignore
-└── src/
-    ├── main.rs         # 入口：加载配置 → 初始化 AgentLoop → MessageBus → ChannelManager
-    ├── config.rs       # 配置结构体：JSON 加载、ProviderConfig、AgentConfig、ChannelEntry
-    ├── tool.rs         # Tool trait + ToolManager：工具注册与 OpenAI function calling 转换
-    ├── tools/          # 内置工具模块
-    │   ├── mod.rs      # 工厂函数 + resolve_data_path() 路径校验
-    │   ├── shell.rs    # Shell 命令执行工具
-    │   ├── file_reader.rs  # 文件读取工具
-    │   ├── file_writer.rs  # 文件写入工具
-    │   ├── file_editor.rs  # 文件编辑工具
-    │   ├── list_dir.rs     # 目录列表工具
-    │   └── make_dir.rs     # 目录创建工具
-    ├── provider/       # LLM 提供商抽象
-    │   ├── mod.rs      # Provider trait、ChatResponse、FinishReason
-    │   └── openai.rs   # OpenAIProvider 实现
-    ├── session.rs      # Session + SessionManager：FIFO 队列、消息管理、JSONL 持久化
-    ├── context.rs      # ContextBuilder：从工作区文件 + 技能 + 历史组装 system prompt
-    ├── runner.rs       # AgentRunner：ReAct 循环核心
-    ├── agent_loop.rs   # AgentLoop：顶层编排
-    ├── message_bus.rs  # MessageBus：请求路由与结果传递
-    └── channel/        # I/O 通道抽象
-        ├── mod.rs      # Channel/ChannelFactory trait、ChannelManager
-        └── cli.rs      # CliChannel & CliChannelFactory
+├── src/
+│   ├── main.rs, cli.rs, setup.rs, gateway.rs   入口、参数、setup、gateway
+│   ├── agent_loop.rs, runner/                  顶层编排、ReAct 循环、审批 hook
+│   ├── context.rs, session.rs, message_bus.rs  提示词组装、会话、请求路由
+│   ├── consolidate.rs, snip.rs, pressure.rs    上下文预算：摘要、裁剪、长度限制
+│   ├── provider/, channel/, tools/, tool.rs    LLM provider、I/O 通道、工具
+│   ├── trigger/, cron/, heartbeat/, agent/     自动化、子代理运行时
+│   ├── codemode/, mcp/                         脚本沙箱、连接器池
+│   ├── memory/, card/, approval/, trace/       记忆、卡片、审批、trace
+│   └── config*.rs, log.rs, path.rs, secrets.rs, utils/
+├── docs/          模块文档 —— 索引见 docs/index.md
+├── tests/         集成测试
+├── GLOSSARY.md    领域术语表
+└── AGENTS.md      开发规范（指向 CLAUDE.md 的符号链接）
 ```
 
 ## 开发
 
 ```bash
-cargo check    # 快速检查编译
-cargo build    # 完整构建
-cargo test     # 运行测试
+cargo fmt -- --check
+cargo clippy
+cargo test
 ```
+
+开发规范见 [AGENTS.md](AGENTS.md)，模块文档索引见 [docs/index.md](docs/index.md)。
 
 ## License
 

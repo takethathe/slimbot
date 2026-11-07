@@ -16,7 +16,7 @@ Gateway 模式:
 
 ### CLI 模式
 
-CLI 通道**不需要配置**。运行 `cargo run --` 时自动启用，使用 stdin/stdout 进行交互。CLI 通道不在 `config.channels` 中出现。
+CLI 通道**不需要配置**。运行 `cargo run -- agent` 时自动启用，使用 stdin/stdout 进行交互。CLI 通道不在 `config.channels` 中出现。
 
 ### Gateway 模式
 

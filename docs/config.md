@@ -22,7 +22,7 @@ cargo run -- -c /path/to/custom.json setup  # 自定义配置文件路径
 | `--data-dir PATH` | `-d` | `~/.slimbot` | 应用数据目录 |
 | `--workspace-dir PATH` | `-w` | `{data-dir}/workspace` | 工作区目录 |
 
-**向后兼容：** 第一个位置参数仍可作为配置文件路径（`cargo run -- config.json`）。
+**向后兼容：** 第一个位置参数仍可作为配置文件路径，但必须配合子命令（`cargo run -- config.json agent`）；没有子命令时程序只打印 help。
 
 ### 路径推断逻辑
 
@@ -35,16 +35,16 @@ cargo run -- -c /path/to/custom.json setup  # 自定义配置文件路径
 
 ```bash
 # 使用默认路径
-cargo run --
+cargo run -- agent
 
 # 指定配置文件（向后兼容的位置参数）
-cargo run -- /path/to/config.json
+cargo run -- /path/to/config.json agent
 
 # 指定数据目录，工作区自动推断为 /data/myapp/workspace
-cargo run -- -d /data/myapp
+cargo run -- -d /data/myapp agent
 
 # 完全自定义所有路径
-cargo run -- -c /etc/slimbot/config.json -d /opt/slimbot -w /opt/slimbot/ws
+cargo run -- -c /etc/slimbot/config.json -d /opt/slimbot -w /opt/slimbot/ws gateway
 
 # Setup 命令使用自定义路径
 cargo run -- -d /data/myapp setup
@@ -90,7 +90,7 @@ cargo run -- -d /data/myapp setup
 |------|------|------|--------|------|
 | `agent` | object | **是** | — | 单个 Agent 配置 |
 | `providers` | object | **是** | — | 命名 Provider 定义（键值映射） |
-| `tools` | array | 否 | `[]` | 注册的工具定义列表 |
+| `tools` | object | 否 | `{ "entries": [], "approval": {...} }` | 工具表（`entries` 为空 = 全部 10 个内置工具）与审批策略；旧裸数组仍可加载 |
 | `channels` | object | 否 | `{}` | 通信通道定义（键值映射） |
 | `gateway` | object | 否 | 见下文 | Gateway 模式配置 |
 | `json_render` | object | 否 | 见下文 | WebUI 卡片生成配置 |

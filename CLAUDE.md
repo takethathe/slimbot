@@ -1,97 +1,77 @@
-# CLAUDE.md
+# SlimBot
 
-slimbot 是基于 ReAct 循环的 AI 机器人助手，使用 Rust 开发，支持工具调用和多通道（CLI、WebUI）。
+基于 ReAct 循环的 AI 机器人助手，Rust 开发，多通道（CLI / WebUI / 飞书）。
 
-## 构建和运行
+## 构建与运行
 
-- **运行：** `cargo run -- setup` （初始化配置、目录和 bootstrap 文件），然后 `cargo run -- <config.json路径>` （默认 `~/.slimbot/config.json`）
-- **Gateway 模式：** `cargo run -- gateway` （启动 cron、heartbeat、trigger 60s tick 和 enabled channels，包括 WebUI）
-- **快速检查：** `cargo check --message-format=json 2>/dev/null | jq -c 'select(.reason == "compiler-message") | {level: .message.level, location: (.message.spans[0] | "\(.file_name):\(.line_start)"), message: .message.message}'` （JSON 输出 + jq 压缩，仅保留诊断信息，减少 token 消耗）
-- **提交前检查：** `cargo fmt -- --check`、`cargo clippy`（无新 warning）、`cargo test` 全部通过
+```bash
+cargo run -- setup            # 初始化配置、目录与 bootstrap 文件
+cargo run -- agent            # CLI 交互会话
+cargo run -- agent "<问题>"    # 单轮跑完即退出，调试首选
+cargo run -- gateway          # cron + heartbeat + trigger + 已启用通道（含 WebUI）
+```
 
-## 目录结构
+调试时用 `-d <临时目录>` 换数据目录，别污染 `~/.slimbot`。
 
-`src/` 模块及职责：
+**编译检查（省 token）：** `cargo check --message-format=json 2>/dev/null | jq -c 'select(.reason == "compiler-message") | {level: .message.level, location: (.message.spans[0] | "\(.file_name):\(.line_start)"), message: .message.message}'`
 
-- `main`（Entry）、`cli`（参数解析）、`config`（配置读写）、`bootstrap`（workspace 模板）、`setup`（setup 命令）、`agent_loop`（顶层协调）、`runner`（ReAct 循环核心）
-- `session`（会话管理 + JSONL 持久化）、`context`（system prompt 构建）、`message_bus`（消息总线）、`tool`（Tool trait + ToolManager）、`tools/`（内置工具实现）、`channel/`（CLI + WebUI + 飞书通道，飞书见 `docs/feishu.md`）
-- `gateway`（Gateway 模式入口）、`cron/`（定时任务）、`heartbeat/`（心跳服务）、`provider/`（LLM API 封装）
-- `trigger/`（触发器层：source 采集 → subscription 判定 → dispatch 投递）、`agent/`（子代理定义 + ToolCatalog + SubagentRuntime）、`codemode/`（JS 脚本沙箱：rquickjs + 双层超时 + 宿主白名单）、`mcp/`（MCP 连接器：自研最小客户端 + 两种 transport + gateway 级连接池与退避重连）
-- `consolidate`（会话摘要压缩）、`memory`（记忆存储）、`snip`（上下文截断）、`dream`（记忆合并）
+**提交前门禁：** `cargo fmt -- --check`、`cargo clippy`、`cargo test` 三项全绿。
 
-`docs/` 为文档目录。
+## 代码地图
 
-## 架构
+- **模块 → 文档** — `docs/index.md`；少数模块只有合并在别的 doc 里的小节。
+- **术语** — 根目录 `GLOSSARY.md`。命名、测试名、issue 标题都用它的词。
+- **决策** — `docs/adr/`。动手前读相关的；要推翻就明说，不默默覆盖。
+- **待办** — `docs/TODO.md`。
 
-**CLI 模式：** `ChannelManager` 轮询输入 → `MessageBus` 封装任务 → `AgentRunner` 执行 ReAct 循环 → 结果回传通道。
+## 核心回路
 
-**Gateway 模式：** 额外启动 `CronService`（定时任务）、`HeartbeatService`（心跳检测）和 `TriggerService` + `Dispatcher`（触发器：tick 只采集/判定/入队，行动在队列外执行），触发 `AgentLoop.run_task()`。WebUI 通过 SSE 广播 `AgentEvent`。
+`Channel` → `MessageBus`（inbound）→ `AgentLoop` → `SessionRunner`（同 session 顺序执行）→ `AgentRunner`（ReAct）→ `ContextBuilder` → `Provider.chat()` → `ToolManager.execute()` → `SessionManager.persist()`（追加 JSONL）→ outbound → 通道。
 
-**核心数据流：** `ContextBuilder` 构建消息 → `Provider.chat()` 调用 LLM → `ToolManager.execute()` 执行工具 → `SessionManager.persist()` 持久化 JSONL。
+gateway 复用同一套 `AgentLoop`，额外起 `CronService`、`HeartbeatService`、`TriggerService` + `Dispatcher`（tick 只采集/判定/入队，行动在队列外执行）；WebUI 用 SSE 广播 `AgentEvent`。图见 `docs/architecture.md`。
 
 ## 数据目录
 
-`~/.slimbot/workspace/` 包含：`AGENTS.md`、`USER.md`、`SOUL.md`、`TOOLS.md`（setup 生成）、`HEARTBEAT.md`、`agents/`（agent 定义，setup 铺出 `trigger.md`）、`skills/`、`triggers/`（源与规则定义 + history.jsonl）、`cron/jobs.json`、`sessions/{id}.jsonl`。
+`data_dir`（默认 `~/.slimbot`）与 `workspace_dir`（默认 `{data_dir}/workspace`）独立配置，显式 workspace 必须在 data_dir 之下；文件工具的路径一律经 `resolve_workspace_path` 收进 workspace。
 
-`data_dir` 和 `workspace_dir` 独立配置，后者默认 `{data_dir}/workspace`。未修改的 bootstrap 文件会被 `context.rs` 跳过。
+- 目录清单 — `docs/path.md`。
+- `setup` 铺出的 bootstrap 文件 — `docs/bootstrap.md`；未改动的模板不注入 system prompt。
+- workspace 的 `AGENTS.md` 是 agent 的运行指令，与本文件无关。
 
-## 关键设计决策
+## 硬约束
 
-- 消息持久化：默认 append-only JSONL，`consolidated_lines > 0` 时全量重写
-- Session 双列表：`history: Arc<[Message]>`（已持久化）+ `current_turn: Vec<Message>`（本轮缓冲）
-- Provider 接口：`Provider::chat(&[&Message])` 引用传递，避免 clone
-- Session ID 格式：`{channel_id}:{chat_id}`
-- 循环结束：超出 `max_iterations` 或模型返回无 tool_calls
-- 一个能力一个入口：同一能力不同时做 agent 和 skill（agent 是“可被启动的执行体”，skill 是“可被加载的知识”），否则模型会走不用读文档的那条路
-- 子代理与触发器行动：`subagent` 工具与触发器 `agent` action 共用同一个 `SubagentRuntime`（全局并发闸）；子代理会话仅内存、跑完即删，外部内容只以证据形式进入上下文（ADR 0009）
-- 连接器（MCP）：连接池由 `AgentLoop` 从 `config.mcp` 建并启动（CLI 与 gateway 同源），工具**只进 codemode 脚本面**（`searchTools()` / `tools.mcp__*`），**永不进模型 tool schema**（ADR 0016）；server 的 description 与输出全按不可信数据处理，结果包 `<codemode_output>`；风险级 fail-closed（连接器工具一律 `ExternalSend`，server 的 annotation 不参与定级；免审批只能逐工具 override）。子代理暂不继承连接器池（`docs/TODO.md`）
+- **一个能力一个入口** — 同一能力不同时做 agent 和 skill（agent 是可被启动的执行体，skill 是可被加载的知识），否则模型会走不用读文档的那条路。
+- **工具风险级是事实、不可配** — 审批语义是「Ask 结束回合 → 下一轮按 `(tool, args_hash)` 兑现」（ADR 0011）。
+- **外部内容只作证据** — 子代理与触发器拿到的外部原文只以证据形式进上下文，不进记忆（ADR 0009）；子代理会话只在内存、跑完即删，与 `agent` action 共用一个 `SubagentRuntime` 闸。
+- **连接器工具不进模型 schema** — 只经 codemode 的 `searchTools()` / `tools.mcp__*` 可达；server 的自述与输出按不可信数据处理，风险级一律 `ExternalSend`、fail-closed（ADR 0016、0020）。
+- **上下文长度只有一个锚** — `src/pressure.rs` 从 provider 的 context window 派生全部限制，别处不硬编码（ADR 0013）。
+- **受保护文档写不进去** — `file_writer` / `file_editor` 返回 `REFUSED:`，判定在路径解析之后（ADR 0012）。
+- **Session 两个列表** — `history`（已持久化）+ `current_turn`（本轮缓冲），id 为 `{channel_id}:{chat_id}`；持久化默认 append-only，`consolidated_lines > 0` 才全量重写。
 
-## 开发规范
+## 开发流程
 
-### 工作流程
+1. **问清楚** — 需求有歧义先问，不猜着写。
+2. **规划** — 目标 + 可测试的行为点清单，确认后再动代码。
+3. **先写测试** — 每个行为点一条，此刻必须是红的；命名 `test_<feature>_<scenario>_<expected>`，模块内 `#[cfg(test)] mod tests`，跨模块放 `tests/`；每个公共函数至少一条，复杂逻辑补边界。
+4. **实现** — 最小代码转绿，同时改文档：README 只在根，其余进 `docs/<topic>.md` 并在 `docs/index.md` 登记。
+5. **验证** — 门禁全绿；`docs/TODO.md` 有一行（新计划、代码里留的 TODO 都在那儿），相关 doc 与 ADR 已同步。
 
-所有开发任务遵循 **规划 → 测试 → 实现 → 验证** 四步流程：
+## 代码质量
 
-1. **确认需求**：收到用户需求后，先确认理解是否正确，再开始后续工作
-2. **规划（Plan）**：明确目标，分解为可测试的行为点，确认后再开始编码
-3. **测试先行（Test First）**：为每个行为点编写测试用例，描述输入/输出/边界条件，此时测试应失败
-4. **实现（Implement）**：编写最小代码使测试通过，同步更新文档
-5. **验证（Verify）**：运行「构建和运行」中的提交前检查确保所有测试通过，更新文档和 TODO
+- Lint 零警告，不是「无新 warning」。
+- 宏（如 `async_trait`）的警告就地 `#[allow(...)]` + 一行注释说明是宏产物，不上升为 crate 级。
+- 代码注释一律英文。
 
-### TDD 实践
+## Git 提交
 
-- **测试命名**：`test_<功能>_<场景>_<预期结果>`，如 `test_parse_config_missing_field_returns_default`
-- **测试粒度**：每个公共函数/方法至少一个单元测试，复杂逻辑覆盖边界条件
-- **测试位置**：`#[cfg(test)] mod tests` 在对应模块内，集成测试放 `tests/` 目录
-- **运行测试**：`cargo test <模块名>` 运行特定模块，`cargo test` 运行全部
-
-### 文档管理
-
-- **README 文档**：放在项目根目录
-- **其它所有文档**（设计文档、API 文档、模块说明等）：统一放在 `docs/` 目录下
-- **TODO 管理**：新增功能计划或代码中的 TODO 必须以简洁的语言记录到 `docs/TODO.md` 中。工作流程的"验证"步骤需包含：添加/完成 TODO 记录，以及编写相关技术文档
-
-### Git 提交
-
-- **提交前必须进行 code review**，确认代码质量和变更合理性
-- **commit message 必须使用英文**
-- **commit message 遵循 Conventional Commits 规范**：title 格式为 `<type>: <subject>`，常用类型：`feat`（新功能）、`fix`（修复）、`refactor`（重构）、`style`（格式化）、`test`（测试）、`chore`（杂项/配置）、`docs`（文档）；复杂改动在 body 中用 `- ` 列表说明细节
-- **绝对禁止在 commit message 中添加 `Co-Authored-By: Claude` 或任何将 Claude / AI 列为贡献者的内容。这是硬性规则，无例外。**
-
-### 代码注释
-
-- **所有代码注释必须使用英文**
+- 提交前 review 自己的 diff，确认没有调试残留和无关改动。
+- Message 用英文，Conventional Commits 且必须带 module 作用域：`<type>(<module>): <subject>`，如 `feat(mcp): add the streamable-HTTP transport`。
+- `type` 取 `feat` / `fix` / `refactor` / `style` / `test` / `chore` / `docs`；`module` 取 `src/<module>` 那一段（`runner`、`session`、`mcp`、`trigger`、`config`…），跨模块取改动最大的一处，仓库级杂项用 `repo`。
+- 复杂改动在 body 用 `- ` 列表写细节。
+- Message 只署真人贡献者，`Co-Authored-By:` 不写 AI。硬性规则，无例外。
 
 ## Agent skills
 
-### Issue tracker
-
-Issues and specs live as markdown files under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Five canonical roles map to `Status:` line values in issue files. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context layout — one `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+- **Issue tracker** — issue 与 spec 是 `.scratch/<feature-slug>/` 下的 markdown，规则见 `docs/agents/issue-tracker.md`。
+- **Triage labels** — issue 文件的 `Status:` 行用哪五个标签，见 `docs/agents/triage-labels.md`。
+- **Domain docs** — skill 怎么消费术语表与 ADR，细则见 `docs/agents/domain.md`。
