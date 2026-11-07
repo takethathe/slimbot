@@ -389,6 +389,8 @@ pub enum TurnKind {
     Heartbeat,
     Trigger,
     Subagent,
+    /// A built-in system run with no conversation behind it (Dream).
+    System,
 }
 
 impl TurnKind {
@@ -404,6 +406,7 @@ impl TurnKind {
             TurnKind::Heartbeat => "heartbeat",
             TurnKind::Trigger => "trigger",
             TurnKind::Subagent => "subagent",
+            TurnKind::System => "system",
         }
     }
 }

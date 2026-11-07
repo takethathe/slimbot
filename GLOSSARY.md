@@ -25,7 +25,7 @@ owner 的稳定标识（v1 固定为单例值），把会话、任务、审计�
 _Avoid_: user id, account id
 
 **TurnKind**:
-一次 Run 的发起来源（User / Cron / Heartbeat / Trigger / Subagent），用于区分「谁在驱动这次运行」，不改变 Run 本身的定义。
+一次 Run 的发起来源（User / Cron / Heartbeat / Trigger / Subagent / System），用于区分「谁在驱动这次运行」，不改变 Run 本身的定义。
 _Avoid_: task type, run type
 
 **Session**:

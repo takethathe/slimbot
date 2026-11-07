@@ -9,7 +9,7 @@ use crate::memory::SharedMemory;
 use crate::memory::audit::MemoryWriteAudit;
 use crate::pressure::{MemoryDocBudget, PressureAnchor};
 use crate::provider::Provider;
-use crate::session::SharedSessionManager;
+use crate::session::{SharedSessionManager, TaskHook, TurnKind};
 use crate::tool::ToolManager;
 use crate::tools::memory_tools::{MemoryEditTool, MemoryReadTool, MemoryWriteTool};
 use crate::trace::{SpanRecorder, SpanStatus, Tracer};
@@ -34,6 +34,16 @@ pub struct DreamService {
     /// the runner's context/truncation limits and the tool-result TTL sweep.
     /// Separate from `doc_budget`, which stays on the primary window.
     pressure: PressureAnchor,
+}
+
+/// Dream's own session id: the pass runs with no owner in the conversation.
+pub(crate) const DREAM_SESSION_ID: &str = "system:dream";
+
+/// The hook Dream's run carries. Its turn kind is the whole point: Dream is an
+/// unattended system run, so an `Ask` control inside it is a refusal, never a
+/// pending approval nobody would ever redeem (ADR 0011 fail-closed).
+fn dream_hook() -> TaskHook {
+    TaskHook::new(DREAM_SESSION_ID).with_turn_kind(TurnKind::System)
 }
 
 pub struct DreamResult {
@@ -250,12 +260,12 @@ impl DreamService {
         // document budget (ticket 06 #5, ADR 0013 — two anchors kept apart).
         .with_pressure(self.pressure.clone());
 
-        let hook = crate::session::TaskHook::new("system:dream");
+        let hook = dream_hook();
         let result = runner
             .run(
                 prompt,
                 hook,
-                "system:dream",
+                DREAM_SESSION_ID,
                 None,
                 Some(tokio_util::sync::CancellationToken::new()),
                 None,
@@ -749,5 +759,16 @@ mod tests {
 
         assert_eq!(service.sweep_expired_tool_results(), 0);
         assert!(eight_days_old.exists(), "8 days is inside a 30-day TTL");
+    }
+
+    #[test]
+    fn test_dream_hook_is_an_unattended_system_turn() {
+        let hook = dream_hook();
+        assert_eq!(hook.session_id(), DREAM_SESSION_ID);
+        assert_eq!(hook.turn_kind(), TurnKind::System);
+        assert!(
+            !hook.turn_kind().is_attended(),
+            "Dream must not be classified as an attended run"
+        );
     }
 }

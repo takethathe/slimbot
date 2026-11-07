@@ -103,10 +103,10 @@ pub struct TaskHook {
     turn_kind: TurnKind,                                      // 这次 run 是怎么被发起的
 }
 
-pub enum TurnKind { User, Cron, Heartbeat, Trigger, Subagent }
+pub enum TurnKind { User, Cron, Heartbeat, Trigger, Subagent, System }
 ```
 
-`TurnKind` 由装配处在调 `run()` 前设置（用户消息 = `User`，其余为无人值守），审批据此决定 `ask` 是否降级为 `deny`（`TurnKind::is_attended()`）。
+`TurnKind` 由装配处在调 `run()` 前设置（用户消息 = `User`，其余为无人值守；Dream 这类没有对话来源的系统运行 = `System`），审批据此决定 `ask` 是否降级为 `deny`（`TurnKind::is_attended()`）。
 ```
 
 `TaskHook` 通过构建器模式组合：

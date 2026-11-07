@@ -162,7 +162,7 @@ LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨�
 - **滚动**：回合结束时清理的是"回合开始时已存在"的记录；**本回合内新产生的 `Ask` 滚动到下一轮**，否则确认轮里冒出的新动作永远等不到兑现。
 - **TTL**：默认 1800 秒（可配，上限 24 小时）。过期的记录在下一回合**开始时**作废，且不再出现在上下文里。
 - **重启**：pending 集合只在内存里（`ApprovalStore`），gateway 重启即清空，天然 fail-closed。
-- **无人值守**：`TurnKind` 为 `Cron` / `Heartbeat` / `Trigger` / `Subagent` 时，`Ask` 一律按 `Deny` 处理且**不写记录**——没有"下一轮"可以兑现它。
+- **无人值守**：`TurnKind` 为 `Cron` / `Heartbeat` / `Trigger` / `Subagent` / `System`（Dream）时，`Ask` 一律按 `Deny` 处理且**不写记录**——没有"下一轮"可以兑现它。
 
 ### 会话历史的构建时变换
 

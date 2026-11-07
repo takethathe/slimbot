@@ -411,6 +411,7 @@ mod tests {
             TurnKind::Heartbeat,
             TurnKind::Trigger,
             TurnKind::Subagent,
+            TurnKind::System,
         ] {
             let mut h = Harness::new(ApprovalConfig::default(), kind);
             let call = h.call("tc-1", "shell", json!({"command": "touch /tmp/x"}));
@@ -432,6 +433,35 @@ mod tests {
             assert!(!h.state.should_exit, "{kind:?} keeps the run going");
             assert_eq!(h.audit_decisions(), vec!["denied_by_policy"]);
         }
+    }
+
+    #[tokio::test]
+    async fn test_approval_hook_system_turn_names_itself_in_the_refusal() {
+        // A Dream pass is a `System` run. The refusal must say so, because the
+        // old classification (default `User`) made it write a pending record in
+        // the `system:dream` session that no owner would ever see or redeem.
+        let mut h = Harness::new(ApprovalConfig::default(), TurnKind::System);
+        let call = h.call("tc-1", "shell", json!({"command": "memory sweep"}));
+        match h.decide(&call).await {
+            ToolHookAction::Skip { result } => {
+                assert!(result.starts_with("DENIED"), "got: {result}");
+                assert!(
+                    result.contains("unattended (system)"),
+                    "the refusal names the run kind: {result}"
+                );
+                assert!(
+                    !result.contains("NOT EXECUTED"),
+                    "no pending guidance for an unattended run: {result}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+        assert!(
+            h.store.pending_for("s1").is_empty(),
+            "a system run must never queue an approval"
+        );
+        assert!(!h.store.has_pending("s1"));
+        assert_eq!(h.audit_decisions(), vec!["denied_by_policy"]);
     }
 
     // ── redemption ──
