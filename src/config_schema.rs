@@ -357,7 +357,10 @@ fn providers_section(config: &Config) -> SchemaSection {
 }
 
 /// Built-in tool identifiers (mirrors `tools::create_tool`).
-const BUILTIN_TOOLS: &[&str] = &[
+///
+/// `pub(crate)` only so the coverage test can compare the list against the
+/// factory; the schema itself reads it in `tools_section`.
+pub(crate) const BUILTIN_TOOLS: &[&str] = &[
     "shell",
     "file_reader",
     "file_writer",
@@ -367,6 +370,7 @@ const BUILTIN_TOOLS: &[&str] = &[
     "grep",
     "find_files",
     "web_fetch",
+    "codemode",
 ];
 
 fn tools_section(config: &Config) -> SchemaSection {
@@ -2386,5 +2390,27 @@ mod tests {
         assert_eq!(field(dream, "model_override").value, json!("cheap"));
         let tools = section(&tree, "tools");
         assert_eq!(tools.items.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_builtin_tools_list_covers_the_tool_factory() {
+        // Two directions, both needed: a listed name the factory cannot build
+        // would hand the WebUI a toggle that silently registers nothing, and a
+        // built-in missing from this list is a tool nobody can configure.
+        let tmp = tempfile::tempdir().unwrap();
+        for name in BUILTIN_TOOLS {
+            assert!(
+                crate::tools::create_tool(name, tmp.path()).is_some(),
+                "BUILTIN_TOOLS lists `{name}`, which tools::create_tool cannot build"
+            );
+        }
+        // The catalog's default set is every built-in a run gets when the
+        // config lists nothing, so it enumerates the factory's domain.
+        for name in crate::agent::catalog::effective_builtin_names(&[]) {
+            assert!(
+                BUILTIN_TOOLS.contains(&name.as_str()),
+                "`{name}` is a built-in tool but is missing from BUILTIN_TOOLS"
+            );
+        }
     }
 }

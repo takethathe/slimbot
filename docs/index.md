@@ -5,7 +5,7 @@
 | 文档 | 说明 |
 |------|------|
 | [配置指南](config.md) | `config.json` 结构、验证规则、多 Provider 配置 |
-| [内置工具](tools.md) | 9 个内置工具（shell、文件读写编辑、目录、grep/find_files、web_fetch），加 `memory_search`、`subagent` 与 Dream 专用记忆工具；触发器工具（`trigger` / `trigger_source`）只对声明它们的 agent 可见 |
+| [内置工具](tools.md) | 10 个内置工具（shell、文件读写编辑、目录、grep/find_files、web_fetch、codemode），加 `memory_search`、`subagent` 与 Dream 专用记忆工具；触发器工具（`trigger` / `trigger_source`）只对声明它们的 agent 可见 |
 | [日志系统](logging.md) | 日志级别、CLI 参数、输出格式 |
 
 ## 核心模块
