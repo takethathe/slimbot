@@ -96,6 +96,15 @@ pub(crate) fn now_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Human-readable byte count for the trace startup line.
+fn human_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
 /// Build a tracer from the `tracing` config section, or `None` when tracing
 /// is disabled or no backend is enabled. This is the wiring-layer mapping from
 /// config to backends; the trace module itself stays free of config.
@@ -105,9 +114,20 @@ fn build_tracer(config: &Config, workspace_dir: &std::path::Path) -> Option<Arc<
     }
     let mut backends: Vec<Arc<dyn TraceBackend>> = Vec::new();
     // File backends are constructed from the shared path resolution so the
-    // viewer reads exactly the files the tracer writes.
-    for path in resolve_trace_file_paths(config, workspace_dir) {
-        match FileBackend::new(&path) {
+    // viewer reads exactly the files the tracer writes. One startup line per
+    // path makes growth visible: the CLI appends forever, the gateway resets
+    // on start (both are documented semantics, not choices made here).
+    let file_paths = resolve_trace_file_paths(config, workspace_dir);
+    for path in &file_paths {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        info!(
+            "[Trace] File backend: {} ({}, CLI appends, gateway truncates on start)",
+            path,
+            human_size(size)
+        );
+    }
+    for path in &file_paths {
+        match FileBackend::new(path) {
             Ok(fb) => backends.push(Arc::new(fb) as Arc<dyn TraceBackend>),
             Err(e) => {
                 warn_log!("[Trace] File backend '{}' failed to open: {}", path, e);
@@ -378,24 +398,26 @@ impl AgentLoop {
         }
         let providers = Arc::new(providers_map);
 
+        // Built before the consolidator and Dream so both are observable through
+        // the same tracer the main loop uses (ticket 06 #4, ADR 0022).
+        let tracer = build_tracer(&config, paths.workspace_dir());
+
         // The window anchor lives on the provider section (ADR 0013): the
         // consolidator, the trimming hooks and Dream all read the same value.
         let pressure = crate::pressure::PressureAnchor::from_config(&config);
-        let consolidator = Arc::new(
-            Consolidator::new(
-                provider.clone(),
-                session_manager_arc.clone(),
-                memory_service.clone(),
-                pressure.window_tokens,
-            )
-            .with_anchor(pressure.clone()),
-        );
+        let mut consolidator = Consolidator::new(
+            provider.clone(),
+            session_manager_arc.clone(),
+            memory_service.clone(),
+            pressure.window_tokens,
+        )
+        .with_anchor(pressure.clone());
+        if let Some(tracer) = tracer.clone() {
+            consolidator = consolidator.with_tracer(tracer);
+        }
+        let consolidator = Arc::new(consolidator);
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
-
-        // Built before Dream so a Dream pass is observable through the same
-        // tracer the main loop uses (ticket 06 #4).
-        let tracer = build_tracer(&config, paths.workspace_dir());
 
         // The memory-document budget is anchored on the **primary** agent
         // provider window (ADR 0013): Dream may run on a `model_override` with

@@ -48,12 +48,31 @@ impl OtelBackend {
     /// Build a backend exporting over OTLP HTTP to `endpoint`, advertising
     /// `service_name` on every exported resource.
     pub fn new(endpoint: &str, service_name: &str) -> anyhow::Result<Self> {
+        let endpoint = Self::normalize_endpoint(endpoint);
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&endpoint)
             .with_timeout(Duration::from_secs(10))
             .build()?;
         Ok(Self::with_exporter(exporter, service_name))
+    }
+
+    /// The OTLP/HTTP exporter treats an explicitly provided endpoint verbatim
+    /// (unlike env-var endpoints, it does not append the signal path). A bare
+    /// `http://host:4318` would therefore POST to `/` and be rejected by every
+    /// standard collector, so the traces path is filled in here when the
+    /// endpoint carries no path of its own.
+    pub(super) fn normalize_endpoint(endpoint: &str) -> String {
+        let trimmed = endpoint.trim_end_matches('/');
+        let after_scheme = trimmed
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(trimmed);
+        if after_scheme.contains('/') {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/v1/traces")
+        }
     }
 
     /// Build a backend over an arbitrary exporter (used by tests with an

@@ -133,6 +133,13 @@ impl ChatSpan {
                     "gen_ai.response.finish_reasons",
                     serde_json::json!([r.finish_reason.to_string()]),
                 );
+                // The full reply is what makes a bad card diagnosable from the
+                // trace alone; same no-truncation stance as the main loop's
+                // `chat` span (ADR 0022).
+                if let Some(content) = &r.content {
+                    self.guard
+                        .set_attribute("gen_ai.response.content", serde_json::json!(content));
+                }
             }
             Err(e) => {
                 self.guard
@@ -1724,6 +1731,11 @@ mod tests {
         assert_eq!(
             chat.attributes.get("gen_ai.usage.cache_read.input_tokens"),
             Some(&json!(5))
+        );
+        assert_eq!(
+            chat.attributes.get("gen_ai.response.content"),
+            Some(&json!(VALID_SPEC_JSONL)),
+            "the generated spec is the reply a bad card must be diagnosed from"
         );
         assert_eq!(
             chat.parent_span_id.as_deref(),

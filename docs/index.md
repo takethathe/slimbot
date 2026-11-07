@@ -45,7 +45,7 @@
 | [配置编辑 schema](config.md#webui-配置编辑器) | `config_schema.rs` | schema 序列化 + path-patch 引擎（WebUI 配置编辑器后端） |
 | [Bootstrap 模板](bootstrap.md) | `bootstrap.rs`, `embed.rs` | 嵌入文件、模板加载、技能文件 |
 | [工具函数](utils.md) | `utils/mod.rs` | 文本截断、原子写入、持久化引用 |
-| [Trace](trace.md) | `trace/` | span 埋点、多 backend 导出（file / OpenTelemetry） |
+| [Trace](trace.md) | `trace/` | span 埋点、多 backend 导出（file / OpenTelemetry）；新建配置默认开启，覆盖所有模型调用（含 consolidation 与卡片回复），本地用 `/traces` 看（ADR 0022） |
 
 ## 快速链接
 

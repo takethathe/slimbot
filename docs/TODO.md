@@ -1,5 +1,15 @@
 # TODO
 
+## trace 本地可观测（2026-11-08 收官）
+
+目的地 = 本地开箱看到所有模型请求和回复，已落地：spec `.scratch/trace-observability/spec.md`，5 张票全部完成（01 setup 默认开 + ADR-0022 / 02 consolidation 进 trace / 03 卡片回复进 trace / 04 OTLP 端到端验证 / 05 文档收口）。关键结果：`setup` 产物 `tracing.enabled=true` + file backend + 默认关闭的 otel backend，`TraceConfig` 默认值仍为关（老配置不被改写）；consolidation 产出 `consolidation → chat ×N`，卡片 `chat` span 记全量回复；`OtelBackend` 对无路径 endpoint 补 `/v1/traces`（导出器不会自动补，原始配置会 POST 到 `/` 被标准 collector 拒绝）；端到端测试用进程内假 collector 钉住 `POST /v1/traces` 与正文通达。仍出 scope：metrics/`/health`、采样、轮转与保留期、正文脱敏、OpenInference 映射、`/traces` 的 Chat 面板、常驻 collector。
+
+- [x] 01 setup 默认开启 tracing + 增长可见 + ADR-0022
+- [x] 02 consolidation 的模型调用进 trace
+- [x] 03 卡片生成的回复正文进 trace
+- [x] 04 OTLP 导出端到端验证
+- [x] 05 文档收口
+
 ## personal agent v1（wayfinder 建图中，2026-10-31）
 
 - [x] **能力调研** — 行业一手资料 + 代码核对的缺口分析：`.scratch/personal-agent-capabilities/research.md`

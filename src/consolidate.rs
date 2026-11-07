@@ -14,6 +14,7 @@ use crate::memory::SharedMemory;
 use crate::pressure::{DEFAULT_CHAR_PER_TOKEN_RATIO, PressureAnchor};
 use crate::provider::{FinishReason, Provider};
 use crate::session::{Message, SharedSessionManager, message_content_chars, message_content_str};
+use crate::trace::{SpanGuard, SpanRecorder, SpanStatus, Tracer};
 
 /// Hard cap on messages per consolidation chunk.
 ///
@@ -31,6 +32,9 @@ pub struct Consolidator {
     /// length are all percentages of it.
     anchor: PressureAnchor,
     cancel_token: CancellationToken,
+    /// Optional tracer for the `consolidation` span and its `chat` children
+    /// (ADR 0022). `None` keeps consolidation as unobserved as before.
+    tracer: Option<Arc<Tracer>>,
 }
 
 impl Consolidator {
@@ -46,7 +50,14 @@ impl Consolidator {
             memory_service,
             anchor: PressureAnchor::from_window(context_window_tokens),
             cancel_token: CancellationToken::new(),
+            tracer: None,
         }
+    }
+
+    /// Attach a tracer so one compression round is visible in the trace.
+    pub fn with_tracer(mut self, tracer: Arc<Tracer>) -> Self {
+        self.tracer = Some(tracer);
+        self
     }
 
     /// Replace the window anchor (window tokens + `pressure.*` ratio table).
@@ -178,6 +189,89 @@ impl Consolidator {
         messages: &[Message],
         summary_max_chars: usize,
     ) -> Result<Option<String>> {
+        // One compression round = one `consolidation` parent span; every model
+        // call hangs off it as a `chat` child. Status is settled here so an
+        // early `?` inside cannot leave a half-described span behind.
+        let span = self
+            .tracer
+            .as_ref()
+            .map(|t| t.start_span("consolidation", None));
+        let outcome = self
+            .archive_traced(messages, summary_max_chars, span.as_ref())
+            .await;
+        if let Some(span) = &span {
+            if let Ok(Some(summary)) = &outcome {
+                span.set_attribute(
+                    "consolidation.summary_chars",
+                    serde_json::json!(summary.chars().count()),
+                );
+            }
+            match &outcome {
+                Ok(_) => span.set_status(SpanStatus::Ok),
+                Err(e) => span.set_status(SpanStatus::Error(e.to_string())),
+            }
+        }
+        outcome
+    }
+
+    /// Start a `chat` child span for one model call, or `None` without a tracer.
+    fn start_chat_span(&self, parent: Option<&SpanGuard>) -> Option<SpanGuard> {
+        let tracer = self.tracer.as_ref()?;
+        let parent_ctx = parent.map(|p| p.context());
+        let span = tracer.start_span("chat", parent_ctx.as_ref());
+        span.set_attribute("gen_ai.operation.name", serde_json::json!("chat"));
+        Some(span)
+    }
+
+    /// One summarization call: the provider writes the full request body through
+    /// the recorder; usage, finish reason and reply land on the same span, and a
+    /// provider failure settles it as an error.
+    async fn chat(
+        &self,
+        messages: &[&Message],
+        parent: Option<&SpanGuard>,
+    ) -> Result<crate::provider::LLMResponse> {
+        let span = self.start_chat_span(parent);
+        let recorder: Option<&dyn SpanRecorder> = span.as_ref().map(|s| s as &dyn SpanRecorder);
+        let result = self.provider.chat(messages, None, recorder).await;
+        if let Some(span) = &span {
+            match &result {
+                Ok(r) => {
+                    span.set_attribute(
+                        "gen_ai.usage.input_tokens",
+                        serde_json::json!(r.usage.prompt_tokens),
+                    );
+                    span.set_attribute(
+                        "gen_ai.usage.output_tokens",
+                        serde_json::json!(r.usage.completion_tokens),
+                    );
+                    span.set_attribute(
+                        "gen_ai.usage.cache_read.input_tokens",
+                        serde_json::json!(r.usage.prompt_cache_hit_tokens),
+                    );
+                    span.set_attribute(
+                        "gen_ai.response.finish_reasons",
+                        serde_json::json!([r.finish_reason.to_string()]),
+                    );
+                    if let Some(content) = &r.content {
+                        span.set_attribute("gen_ai.response.content", serde_json::json!(content));
+                    }
+                }
+                Err(e) => {
+                    span.set_attribute("error.type", serde_json::json!("provider_error"));
+                    span.set_status(SpanStatus::Error(e.to_string()));
+                }
+            }
+        }
+        result
+    }
+
+    async fn archive_traced(
+        &self,
+        messages: &[Message],
+        summary_max_chars: usize,
+        parent: Option<&SpanGuard>,
+    ) -> Result<Option<String>> {
         if messages.is_empty() {
             return Ok(None);
         }
@@ -185,18 +279,19 @@ impl Consolidator {
         let formatted = Self::format_messages(messages);
 
         // Layer 1: initial summarization (prompt already specifies the size limit).
-        let mut summary = match self
-            .provider
+        let first = self
             .chat(
                 &[
                     &Message::system(self.system_prompt(summary_max_chars)),
                     &Message::user(formatted),
                 ],
-                None,
-                None,
+                parent,
             )
-            .await?
-        {
+            .await?;
+        if let Some(parent) = parent {
+            parent.set_attribute("consolidation.attempts", serde_json::json!(1));
+        }
+        let mut summary = match first {
             r if r.finish_reason == FinishReason::Error => {
                 anyhow::bail!(
                     "LLM returned error: {}",
@@ -222,16 +317,20 @@ impl Consolidator {
             );
 
             let response = self
-                .provider
                 .chat(
                     &[
                         &Message::system(Self::compress_prompt(summary_max_chars)),
                         &Message::user(summary.clone()),
                     ],
-                    None,
-                    None,
+                    parent,
                 )
                 .await?;
+            if let Some(parent) = parent {
+                parent.set_attribute(
+                    "consolidation.attempts",
+                    serde_json::json!(attempt as u64 + 2),
+                );
+            }
 
             if response.finish_reason == FinishReason::Error {
                 info!(
@@ -742,8 +841,16 @@ mod tests {
             &self,
             _messages: &[&Message],
             _tools: Option<&[crate::tool::ToolDefinition]>,
-            _recorder: Option<&dyn crate::trace::SpanRecorder>,
+            recorder: Option<&dyn crate::trace::SpanRecorder>,
         ) -> anyhow::Result<LLMResponse> {
+            // Stand-in for the provider's request-body capture: the assertions
+            // only care that the recorder reached the provider.
+            if let Some(rec) = recorder {
+                rec.set_attribute(
+                    "http.request.body",
+                    serde_json::json!(r#"{"messages":[{"role":"system"}]}"#),
+                );
+            }
             let mut responses = self.responses.lock().unwrap();
             let (content, finish_reason) = if responses.len() > 1 {
                 responses.remove(0)
@@ -1107,5 +1214,187 @@ mod tests {
     #[test]
     fn test_max_compress_retries_constant() {
         assert_eq!(MAX_COMPRESS_RETRIES, 2);
+    }
+
+    // ── Trace coverage (ADR 0022) ──
+
+    struct TraceRecorder {
+        /// span_id → (name, parent_span_id)
+        starts: Mutex<std::collections::HashMap<String, (String, Option<String>)>>,
+        ends: Mutex<Vec<RecordedSpan>>,
+    }
+
+    struct RecordedSpan {
+        span_id: String,
+        name: String,
+        parent_span_id: Option<String>,
+        status: crate::trace::SpanStatus,
+        attributes: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    impl TraceRecorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                starts: Mutex::new(std::collections::HashMap::new()),
+                ends: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn spans_named(&self, name: &str) -> Vec<RecordedSpan> {
+            self.ends
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.name == name)
+                .map(|s| RecordedSpan {
+                    span_id: s.span_id.clone(),
+                    name: s.name.clone(),
+                    parent_span_id: s.parent_span_id.clone(),
+                    status: s.status.clone(),
+                    attributes: s.attributes.clone(),
+                })
+                .collect()
+        }
+
+        fn nth(&self, name: &str, index: usize) -> RecordedSpan {
+            self.spans_named(name)
+                .into_iter()
+                .nth(index)
+                .unwrap_or_else(|| panic!("missing {name} span #{index}"))
+        }
+    }
+
+    impl crate::trace::TraceBackend for TraceRecorder {
+        fn on_span_start(
+            &self,
+            ctx: &crate::trace::SpanContext,
+            name: &str,
+            _start: std::time::SystemTime,
+        ) {
+            self.starts.lock().unwrap().insert(
+                ctx.span_id.clone(),
+                (name.to_string(), ctx.parent_span_id.clone()),
+            );
+        }
+
+        fn on_span_end(
+            &self,
+            ctx: &crate::trace::SpanContext,
+            _end: std::time::SystemTime,
+            status: &crate::trace::SpanStatus,
+            attributes: &std::collections::BTreeMap<String, serde_json::Value>,
+        ) {
+            let starts = self.starts.lock().unwrap();
+            let (name, parent_span_id) = starts
+                .get(&ctx.span_id)
+                .cloned()
+                .unwrap_or_else(|| ("<unknown>".to_string(), None));
+            self.ends.lock().unwrap().push(RecordedSpan {
+                span_id: ctx.span_id.clone(),
+                name,
+                parent_span_id,
+                status: status.clone(),
+                attributes: attributes.clone(),
+            });
+        }
+    }
+
+    async fn setup_traced_consolidator(
+        provider: Arc<dyn Provider>,
+    ) -> (Consolidator, Arc<TraceRecorder>, TempDir, String) {
+        let recorder = TraceRecorder::new();
+        let tracer = Arc::new(crate::trace::Tracer::new(vec![recorder.clone()]));
+        let (consolidator, tmp, session_id) = setup_consolidator(provider).await;
+        (consolidator.with_tracer(tracer), recorder, tmp, session_id)
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_traces_parent_and_chat_span_with_request_body() {
+        let provider = Arc::new(SequenceMockProvider::new(vec![(
+            "- User prefers dark mode".to_string(),
+            FinishReason::Stop,
+        )]));
+        let (consolidator, recorder, _tmp, session_id) = setup_traced_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let parent = recorder.nth("consolidation", 0);
+        let chat = recorder.nth("chat", 0);
+        assert_eq!(parent.status, crate::trace::SpanStatus::Ok);
+        assert_eq!(
+            parent.attributes.get("consolidation.attempts"),
+            Some(&serde_json::json!(1))
+        );
+        assert!(
+            parent
+                .attributes
+                .contains_key("consolidation.summary_chars")
+        );
+        assert_eq!(
+            chat.parent_span_id.as_deref(),
+            Some(parent.span_id.as_str()),
+            "the model call hangs off the compression round"
+        );
+        assert_eq!(
+            chat.attributes.get("gen_ai.operation.name"),
+            Some(&serde_json::json!("chat"))
+        );
+        assert!(
+            chat.attributes.contains_key("http.request.body"),
+            "the provider must receive the recorder"
+        );
+        assert_eq!(
+            chat.attributes.get("gen_ai.response.content"),
+            Some(&serde_json::json!("- User prefers dark mode"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_retry_adds_a_second_chat_span() {
+        let large = "x".repeat(summary_budget() + 100);
+        let compressed = "- User chose SQLite".to_string();
+        let provider = Arc::new(SequenceMockProvider::new(vec![
+            (large, FinishReason::Stop),
+            (compressed, FinishReason::Stop),
+        ]));
+        let (consolidator, recorder, _tmp, session_id) = setup_traced_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        assert_eq!(recorder.spans_named("chat").len(), 2);
+        assert_eq!(
+            recorder
+                .nth("consolidation", 0)
+                .attributes
+                .get("consolidation.attempts"),
+            Some(&serde_json::json!(2)),
+            "a compressed retry is a second model call"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_provider_error_marks_the_parent_span_error() {
+        let provider = Arc::new(SequenceMockProvider::new(vec![(
+            "upstream refused".to_string(),
+            FinishReason::Error,
+        )]));
+        let (consolidator, recorder, _tmp, session_id) = setup_traced_consolidator(provider).await;
+
+        consolidator
+            .maybe_consolidate(&session_id, 30000)
+            .await
+            .unwrap();
+
+        let parent = recorder.nth("consolidation", 0);
+        assert!(
+            matches!(parent.status, crate::trace::SpanStatus::Error(_)),
+            "a failed summarization must not look healthy"
+        );
     }
 }

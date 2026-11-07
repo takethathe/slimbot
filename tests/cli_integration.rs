@@ -259,3 +259,62 @@ fn test_log_file_global_on_setup() {
     assert!(output.status.success());
     assert!(log_path.exists());
 }
+
+// ── Trace startup visibility ──
+
+#[test]
+fn test_cli_startup_logs_the_trace_file_path_and_mode() {
+    // ADR 0022: the CLI appends to the trace file forever, so the startup line
+    // must say where it is, how big it already is, and that it is not truncated.
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let config_path = data_dir.join("config.json");
+    let config = serde_json::json!({
+        "agent": { "provider": "default" },
+        "providers": {
+            "default": {
+                "api_key": "sk-test-key-not-real",
+                "model": "gpt-4o",
+                "base_url": "http://127.0.0.1:9",
+                "timeout_seconds": 1
+            }
+        },
+        "tracing": {
+            "enabled": true,
+            "backends": [{ "type": "file", "enabled": true, "path": "" }]
+        }
+    });
+    fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+    let log_path = tmp.path().join("cli.log");
+    // The provider call fails fast (port 9 is closed); the trace wiring and its
+    // startup line have already run by then.
+    let _ = slimbot_bin()
+        .arg("--log=1")
+        .arg(format!("--log-file={}", log_path.display()))
+        .arg(format!("--data-dir={}", data_dir.display()))
+        .arg("agent")
+        .arg("hi")
+        .output()
+        .unwrap();
+
+    let log = fs::read_to_string(&log_path).expect("log file");
+    let trace_path = data_dir.join("workspace").join("traces.jsonl");
+    assert!(
+        log.contains("[Trace] File backend:"),
+        "the startup line must name the trace backend: {log}"
+    );
+    assert!(
+        log.contains(trace_path.to_str().unwrap()),
+        "the startup line must carry the resolved path: {log}"
+    );
+    assert!(
+        log.contains("CLI appends"),
+        "the startup line must state the append semantics: {log}"
+    );
+    assert!(
+        trace_path.exists(),
+        "the file backend is opened at startup, before any span ends"
+    );
+}

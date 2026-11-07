@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::bootstrap::{bootstrap_files, skill_files};
 use crate::config::Config;
-use crate::config_defs::{AgentConfig, ProviderConfig};
+use crate::config_defs::{AgentConfig, ProviderConfig, TraceBackendEntry, TraceConfig};
 use crate::debug;
 use crate::path::PathManager;
 
@@ -17,7 +17,28 @@ fn default_config() -> Config {
         channels: std::collections::HashMap::new(),
         gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
+        // Trace recording is on by default for a fresh install so the local
+        // `/traces` viewer is useful without reading docs first; the OTel
+        // backend ships configured but disabled, one flag away from a
+        // collector (ADR 0022).
+        tracing: TraceConfig {
+            enabled: true,
+            reset_on_start: true,
+            backends: vec![
+                TraceBackendEntry {
+                    r#type: "file".to_string(),
+                    enabled: true,
+                    path: String::new(),
+                    ..Default::default()
+                },
+                TraceBackendEntry {
+                    r#type: "otel".to_string(),
+                    enabled: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
         memory: Default::default(),
         json_render: Default::default(),
         subagent: Default::default(),
@@ -159,6 +180,67 @@ fn create_directories_and_bootstrap(paths: &PathManager) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_config_enables_file_tracing_and_offers_otel() {
+        let config = default_config();
+        assert!(config.tracing.enabled, "a fresh setup records traces");
+        assert!(config.tracing.reset_on_start);
+
+        let file = config
+            .tracing
+            .backends
+            .iter()
+            .find(|b| b.r#type == "file")
+            .expect("a file backend ships by default");
+        assert!(file.enabled);
+        assert!(
+            file.path.is_empty(),
+            "empty path resolves to {{workspace}}/traces.jsonl"
+        );
+
+        let otel = config
+            .tracing
+            .backends
+            .iter()
+            .find(|b| b.r#type == "otel")
+            .expect("the otel backend is pre-wired");
+        assert!(!otel.enabled, "no collector by default");
+        assert_eq!(otel.endpoint, "http://localhost:4318");
+        assert_eq!(otel.service_name, "slimbot");
+    }
+
+    #[test]
+    fn test_setup_leaves_tracing_disabled_on_a_config_without_the_section() {
+        // An upgrade must never start writing prompts to disk behind the user's
+        // back: only a fresh setup gets tracing on (ADR 0022).
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "agent": { "provider": "default" },
+                "providers": { "default": { "api_key": "k", "model": "m" } }
+            }"#,
+        )
+        .unwrap();
+
+        run_setup(
+            Some(config_path.to_str().unwrap()),
+            tmp.path().join("data").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(rewritten["tracing"]["enabled"], serde_json::json!(false));
+        assert_eq!(
+            rewritten["tracing"]["backends"],
+            serde_json::json!([]),
+            "no backend is invented for an existing config"
+        );
+    }
 
     #[test]
     fn test_mask_api_key_empty() {
