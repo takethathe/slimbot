@@ -17,6 +17,32 @@ use crate::tools::cron::CronTool;
 use crate::tools::message::MessageTool;
 use crate::warn_log;
 
+/// Register one tool in both places a run can reach it, from a single builder:
+/// one instance goes to the main loop's shared `ToolManager`, and the same
+/// builder becomes the subagent catalog's factory (one instance per run, since
+/// every run assembles its own tool set).
+///
+/// The catalog has to mirror the main loop's tool set and both copies must
+/// reach the transports identically; keeping one builder per tool is what makes
+/// that a property of the code instead of a copy-paste discipline problem.
+fn register_in_loop_and_catalog<T, F>(
+    tool_manager: &mut ToolManager,
+    catalog: &mut crate::agent::ToolCatalog,
+    name: &str,
+    builder: &F,
+) where
+    T: Tool + 'static,
+    F: Fn() -> T,
+    F: Clone + Send + Sync + 'static,
+{
+    tool_manager.register(Box::new(builder()));
+    let build = builder.clone();
+    catalog.register(
+        name,
+        Arc::new(move || Some(Box::new(build()) as Box<dyn Tool>)),
+    );
+}
+
 pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     WorkerPool::init_global(64);
 
@@ -57,29 +83,14 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     let mut catalog = crate::agent::ToolCatalog::new();
     catalog.register_builtin_set(&config.tools.entries, paths.workspace_dir());
 
-    // Create message tool with send callback
-    let mut message_tool = MessageTool::new();
+    // Each delivery tool is wired once, in its own builder, and that single
+    // builder feeds both registrations (the main loop's shared tool set and the
+    // subagent catalog). Two copies of one tool's send path is how they drift.
     let outbound_tx = message_bus.outbound_tx();
-    let send_outbound = outbound_tx.clone();
-    message_tool.set_send_callback(Arc::new(move |channel, chat_id, content| {
-        let tx = send_outbound.clone();
-        Box::pin(async move {
-            tx.send(BusResult {
-                session_id: format!("{}:{}", channel, chat_id),
-                run_id: uuid::Uuid::new_v4().to_string(),
-                content,
-            })
-            .await
-            .map_err(|e| e.to_string())
-        })
-    }));
-    tool_manager.register(Box::new(message_tool));
-
-    // Catalog factory for `message`: one instance per run, same send path.
-    catalog.register(
-        "message",
-        Arc::new(move || {
-            let tx = outbound_tx.clone();
+    let build_message = {
+        let tx = outbound_tx.clone();
+        move || {
+            let tx = tx.clone();
             let mut tool = MessageTool::new();
             tool.set_send_callback(Arc::new(move |channel, chat_id, content| {
                 let tx = tx.clone();
@@ -93,45 +104,41 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
                     .map_err(|e| e.to_string())
                 })
             }));
-            Some(Box::new(tool) as Box<dyn Tool>)
-        }),
-    );
+            tool
+        }
+    };
+    register_in_loop_and_catalog(&mut tool_manager, &mut catalog, "message", &build_message);
 
     // send_file delivers an agent-produced image/file on the dedicated media
     // path (ticket 28), beside the text `message` path.
     let media_tx = message_bus.media_tx();
-    {
+    let build_send_file = {
         let tx = media_tx.clone();
-        let mut send_file_tool = crate::tools::send_file::SendFileTool::new();
-        send_file_tool.set_send_callback(Arc::new(move |delivery| {
+        move || {
             let tx = tx.clone();
-            Box::pin(async move { tx.send(delivery).await.map_err(|e| e.to_string()) })
-        }));
-        tool_manager.register(Box::new(send_file_tool));
-    }
-    catalog.register(
-        "send_file",
-        Arc::new(move || {
-            let tx = media_tx.clone();
             let mut tool = crate::tools::send_file::SendFileTool::new();
             tool.set_send_callback(Arc::new(move |delivery| {
                 let tx = tx.clone();
                 Box::pin(async move { tx.send(delivery).await.map_err(|e| e.to_string()) })
             }));
-            Some(Box::new(tool) as Box<dyn Tool>)
-        }),
+            tool
+        }
+    };
+    register_in_loop_and_catalog(
+        &mut tool_manager,
+        &mut catalog,
+        "send_file",
+        &build_send_file,
     );
 
-    // Create cron service and cron tool
-    let cron_service = CronService::new(paths.workspace_dir());
-    let cron_service_arc = Arc::new(cron_service);
-    let cron_tool = CronTool::new(cron_service_arc.clone());
-    tool_manager.register(Box::new(cron_tool));
-    let cron_for_catalog = cron_service_arc.clone();
-    catalog.register(
-        "cron",
-        Arc::new(move || Some(Box::new(CronTool::new(cron_for_catalog.clone())) as Box<dyn Tool>)),
-    );
+    // Cron: the tool and the scheduler share one service instance, so a job the
+    // agent creates is visible to the very next tick.
+    let cron_service_arc = Arc::new(CronService::new(paths.workspace_dir()));
+    let build_cron = {
+        let service = cron_service_arc.clone();
+        move || CronTool::new(service.clone())
+    };
+    register_in_loop_and_catalog(&mut tool_manager, &mut catalog, "cron", &build_cron);
 
     // Trigger data sources live outside the main loop's tool list: the
     // `trigger_source` and `trigger` tools are visible only to agents that
