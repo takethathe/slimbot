@@ -725,11 +725,17 @@ impl AgentLoop {
                             continue;
                         }
 
-                        // The first conversation the owner talks on becomes the
-                        // owner's primary channel: the last-resort delivery
-                        // target for sources with no origin (ticket 17).
-                        if let Some(target) =
-                            crate::delivery::DeliveryTarget::from_session_id(&request.session_id)
+                        // The first conversation the owner *talks on* becomes
+                        // the owner's primary channel: the last-resort delivery
+                        // target for sources with no origin (ticket 17). An
+                        // unattended turn that happens to carry the owner's
+                        // authorship (a trigger notice injected into its own
+                        // destination) is not the owner talking, and first-wins
+                        // would pin a machine destination for good.
+                        if request.hook.turn_kind().is_attended()
+                            && let Some(target) = crate::delivery::DeliveryTarget::from_session_id(
+                                &request.session_id,
+                            )
                         {
                             owner_primary.record_first(&target);
                         }
@@ -2195,6 +2201,55 @@ mod tests {
         assert!(
             !response.contains("Messages: 0"),
             "an owner message must produce a run: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_inbound_does_not_pin_owner_primary_but_owner_turn_does() {
+        // Ticket 17 defines the owner primary channel as *the conversation the
+        // owner is talking on*. A trigger notice enters through the same inbound
+        // seam as owner messages, so recording unconditionally would let an early
+        // fire pin the destination of a machine notice as the owner's permanent
+        // last-resort delivery target (first-wins, survives restart).
+        let tmp = tempfile::tempdir().unwrap();
+        let (agent_loop, _sm, bus, mut outbound) = identity_test_loop(&tmp).await;
+
+        bus.inbound_tx()
+            .send(crate::message_bus::BusRequest::owner(
+                "feishu:oc_fired",
+                "notice: one of your rules matched",
+                TaskHook::new("feishu:oc_fired").with_turn_kind(crate::session::TurnKind::Trigger),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), outbound.recv())
+            .await
+            .expect("a trigger notice must be answered")
+            .expect("outbound result");
+        assert_eq!(
+            agent_loop.owner_primary().current(),
+            None,
+            "an unattended trigger turn must not establish the owner's channel"
+        );
+
+        // The owner's own conversation is what gets recorded, and it still can
+        // after the fire was skipped (nothing was pinned ahead of it).
+        bus.inbound_tx()
+            .send(crate::message_bus::BusRequest::owner(
+                "webui:main",
+                "hello",
+                TaskHook::new("webui:main"),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), outbound.recv())
+            .await
+            .expect("an owner message must run")
+            .expect("outbound result");
+        assert_eq!(
+            agent_loop.owner_primary().current(),
+            crate::delivery::DeliveryTarget::new("webui", "main"),
+            "the conversation the owner talks on becomes the primary channel"
         );
     }
 
