@@ -87,9 +87,6 @@ impl std::fmt::Display for LLMResponse {
     }
 }
 
-// `double_must_use` is an `async_trait` desugaring artifact on methods
-// returning `Result`, not a real attribute on this code.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Call the LLM.

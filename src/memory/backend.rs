@@ -44,9 +44,6 @@ pub enum EditOutcome {
 /// SlimBot's actual consumption pattern: whole-file context injection and
 /// surgical edits from the Dream process. Entry-level APIs (store/recall per
 /// entry, semantic search) are deliberately out of scope for now.
-// `double_must_use` is an `async_trait` desugaring artifact on methods
-// returning `Result`, not a real attribute on this code.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait MemoryBackend: Send + Sync {
     /// Backend name, e.g. "markdown".

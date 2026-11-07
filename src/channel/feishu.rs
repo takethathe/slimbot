@@ -336,9 +336,6 @@ fn save_media_file(
 /// The outbound half of the seam: post a finished answer (text or media) back
 /// to a chat. The real implementation talks to Feishu; tests record what was
 /// asked.
-// `double_must_use` is an `async_trait` desugaring artifact on methods returning
-// `Result`, not a real attribute on this code.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub(crate) trait FeishuSender: Send + Sync {
     async fn send_text_to_chat(&self, chat_id: &str, text: &str) -> Result<()>;
@@ -372,7 +369,6 @@ pub(crate) trait FeishuTransport: Send + Sync {
 /// URL parameter by construction, so a caller cannot turn an inbound message
 /// into an SSRF probe (ADR 0017). The real implementation calls the `im`
 /// resource API; tests record which handles were requested.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub(crate) trait MediaDownloader: Send + Sync {
     async fn download(

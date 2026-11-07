@@ -21,7 +21,7 @@ clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
 dirs = "5"
-async-trait = "0.1"
+async-trait = "0.1.92"
 futures = "0.3"
 chrono = "0.4"
 tokio-util = "0.7.18"

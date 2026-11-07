@@ -116,9 +116,6 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
-// `double_must_use` is an `async_trait` desugaring artifact on methods
-// returning `Result`, not a real attribute on this code.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;

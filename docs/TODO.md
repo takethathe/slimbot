@@ -451,7 +451,7 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 ### clippy 清零（2026-11-07）
 
 - [x] **修复全部 clippy 警告** — 31 条 `double_must_use` 全部来自 `async_trait` 0.1.89：它在 trait 内的 async fn 上打了一条无消息的 `#[must_use]`，而返回的 `Pin<Box<dyn Future>>` 本就因 `Future: #[must_use]` 而须使用。14 处 trait 定义就地加 `#[allow(clippy::double_must_use)]` + 说明（沿用 `src/channel/feishu.rs` 的既有先例），`cargo clippy --all-targets -- -D warnings` 现在全绿
-- [ ] **待上游修复后回收 allow** — `async-trait` 不再给 async fn 打裸 `#[must_use]`（或项目脱离 `async_trait`）时，删掉那 14 处 `#[allow(clippy::double_must_use)]`
+- [x] **回收 allow（已完成）** — `async-trait` 0.1.92（2026-08-08，dtolnay/async-trait#303）不再给 async fn 打裸 `#[must_use]`，锁文件升到 0.1.92 后 16 处 `#[allow(clippy::double_must_use)]` 与配套注释全部删除（原记 14 处有误，实为 10 文件 16 处），`cargo clippy --all-targets -- -D warnings` 无告警
 
 ## personal agent 触发器（已实现，2026-10-31）
 

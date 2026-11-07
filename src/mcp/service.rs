@@ -108,9 +108,6 @@ pub struct CachedTool {
 
 /// Opens one connection for a server spec. Injectable so tests can hand the
 /// service an in-memory peer instead of a process or a socket.
-// `double_must_use` is an `async_trait` desugaring artifact on methods
-// returning `Result`, not a real attribute on this code.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Connector: Send + Sync {
     async fn connect(&self, spec: &McpServerConfig) -> Result<Arc<dyn McpTransport>, McpError>;
