@@ -486,7 +486,6 @@ mod tests {
     /// as a single-purpose server, so the transport is exercised without an
     /// external dependency. Outside that re-invocation the test does nothing.
     #[test]
-    #[allow(non_snake_case)]
     fn mcp_stdio_child_server() {
         // The parent re-runs the test binary with this exact name and this env
         // var set; a normal `cargo test` run returns immediately.
