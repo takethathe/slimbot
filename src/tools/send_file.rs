@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::message_bus::MediaDelivery;
 use crate::tool::Tool;
+use crate::utils::looks_like_url;
 
 /// Delivery callback: hand a fully-built media delivery to the transport.
 /// `Ok(())` means it was queued for the owning channel; `Err` is surfaced to
@@ -45,33 +46,6 @@ impl SendFileTool {
 
     pub fn set_send_callback(&mut self, cb: MediaCallback) {
         self.send_callback = Some(cb);
-    }
-
-    /// True when the supplied path looks like a remote URL rather than a local
-    /// file. We refuse these so the channel is never coaxed into fetching an
-    /// arbitrary address (the outbound mirror of the file-key-only inbound rule).
-    fn looks_like_url(path: &str) -> bool {
-        let lower = path.trim().to_ascii_lowercase();
-        // A scheme followed by `://` (http, https, ftp, gs, s3, file, …). We
-        // also reject a bare `file://`, which would let a caller read outside
-        // the workspace through a URL-shaped argument.
-        match lower.find("://") {
-            Some(idx) => {
-                // The scheme must start at the beginning and be scheme-shaped
-                // (letters/digits/+/-/.), so a Windows drive or a colon in a
-                // caption does not false-positive.
-                let scheme = &lower[..idx];
-                !scheme.is_empty()
-                    && scheme
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic())
-                    && scheme
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-            }
-            None => false,
-        }
     }
 }
 
@@ -111,7 +85,7 @@ impl Tool for SendFileTool {
         if path.trim().is_empty() {
             return Ok("Error: send_file requires a non-empty path".to_string());
         }
-        if Self::looks_like_url(path) {
+        if looks_like_url(path) {
             return Ok("Error: send_file refuses URLs; pass a local file path only".to_string());
         }
 
@@ -248,17 +222,6 @@ mod tests {
             assert!(result.contains("refuses URLs"), "got: {result} for {url}");
         }
         assert!(rx.try_recv().is_err(), "no delivery is queued for a URL");
-    }
-
-    #[test]
-    fn test_looks_like_url_discriminators() {
-        assert!(SendFileTool::looks_like_url("https://a/b"));
-        assert!(SendFileTool::looks_like_url("HTTP://a/b"));
-        assert!(SendFileTool::looks_like_url("file:///etc/passwd"));
-        // Local paths, including a colon in a name, are not URLs.
-        assert!(!SendFileTool::looks_like_url("out/report.pdf"));
-        assert!(!SendFileTool::looks_like_url("./a/b"));
-        assert!(!SendFileTool::looks_like_url("/abs/path"));
     }
 
     #[tokio::test]

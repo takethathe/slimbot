@@ -203,7 +203,7 @@ impl InboundRouter {
         for res in &msg.resources {
             // Accept only an opaque file-key handle. A remote address shaped
             // like `scheme://…` is refused before any request is attempted.
-            if looks_like_url(&res.file_key) {
+            if crate::utils::looks_like_url(&res.file_key) {
                 note(
                     LogLevel::Debug,
                     "[feishu] refused an attachment handle shaped like a URL".to_string(),
@@ -381,28 +381,6 @@ pub(crate) trait MediaDownloader: Send + Sync {
         file_key: &str,
         resource_type: &str,
     ) -> Result<Vec<u8>>;
-}
-
-/// True when a handle looks like a remote URL rather than an opaque file-key.
-/// Feishu keys are scheme-less (`img_v2_…`, `file_v2_…`); anything shaped
-/// `scheme://…` is refused before a fetch is attempted. The outbound `send_file`
-/// tool mirrors this exact rule, so the two directions share one discipline.
-fn looks_like_url(handle: &str) -> bool {
-    let lower = handle.trim().to_ascii_lowercase();
-    match lower.find("://") {
-        Some(idx) => {
-            let scheme = &lower[..idx];
-            !scheme.is_empty()
-                && scheme
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-        }
-        None => false,
-    }
 }
 
 /// A best-effort image MIME type from a file name/extension. Feishu image
@@ -676,7 +654,7 @@ impl Channel for FeishuChannel {
     async fn write_media(&mut self, delivery: &crate::message_bus::MediaDelivery) -> Result<()> {
         // Defense-in-depth against the outbound mirror of the inbound rule: a
         // media path shaped like a URL is refused, never fetched.
-        if looks_like_url(delivery.media.path()) {
+        if crate::utils::looks_like_url(delivery.media.path()) {
             anyhow::bail!("feishu refuses a media path shaped like a URL");
         }
         let chat_id = Self::chat_id_from(&delivery.session_id).to_string();
@@ -933,7 +911,7 @@ impl MediaDownloader for SdkDownloader {
     ) -> Result<Vec<u8>> {
         // Mirror the router's rule at the seam boundary: a handle shaped like a
         // URL is refused, never dereferenced.
-        if looks_like_url(file_key) {
+        if crate::utils::looks_like_url(file_key) {
             anyhow::bail!("refused an attachment handle shaped like a URL");
         }
         let resp = self
@@ -1504,18 +1482,6 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_looks_like_url_rejects_remote_and_keeps_local_handles() {
-        assert!(looks_like_url("https://a/b"));
-        assert!(looks_like_url("HTTP://a/b"));
-        assert!(looks_like_url("file:///etc/passwd"));
-        // Feishu file-key handles and local paths are not URLs.
-        assert!(!looks_like_url("img_v2_abc"));
-        assert!(!looks_like_url("file_v2_x"));
-        assert!(!looks_like_url("./a/b"));
-        assert!(!looks_like_url("/abs/path"));
     }
 
     // ── write_output: the answer goes back on the same chat ──

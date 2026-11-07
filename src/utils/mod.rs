@@ -73,6 +73,37 @@ pub fn build_persisted_reference(file_path: &Path, content: &str, preview_max: u
     result
 }
 
+/// True when a string is shaped like a remote URL (`scheme://…`) rather than a
+/// local path or an opaque provider handle.
+///
+/// One rule, two directions: the Feishu channel refuses an inbound attachment
+/// handle that looks like a URL (never dereference a caller-supplied address),
+/// and the `send_file` tool refuses an outbound path that looks like one. Keeping
+/// it here is what makes "media moves by handle, never by URL" (ADR 0017) a
+/// property of the code instead of two predicates that can drift.
+///
+/// The scheme must start at the beginning and be scheme-shaped (letters, digits,
+/// `+`, `-`, `.`), so a Windows drive letter or a colon inside a file name does
+/// not false-positive. `file://` is refused too: it would let a URL-shaped
+/// argument read outside the workspace.
+pub fn looks_like_url(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    match lower.find("://") {
+        Some(idx) => {
+            let scheme = &lower[..idx];
+            !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        }
+        None => false,
+    }
+}
+
 /// Default directory name for persisted tool results.
 pub const TOOL_RESULTS_DIR: &str = "tool-results";
 
@@ -144,6 +175,32 @@ pub fn sweep_tool_results(workspace_dir: &Path, ttl: std::time::Duration) -> usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_looks_like_url_accepts_schemes_and_refuses_local_shapes() {
+        // Remote schemes and file:// are all URL-shaped.
+        for url in [
+            "https://a/b",
+            "HTTP://a/b",
+            "file:///etc/passwd",
+            "s3://bucket/key",
+            "ftp://h/p",
+        ] {
+            assert!(looks_like_url(url), "{url} is URL-shaped");
+        }
+        // Local paths and opaque provider handles are not.
+        for handle in [
+            "./a/b",
+            "/abs/path",
+            "out/report.pdf",
+            "C:\\Users\\me\\a.png",
+            "img_v2_abc",
+            "file_v2_x",
+            "name:with-colon",
+        ] {
+            assert!(!looks_like_url(handle), "{handle} is not URL-shaped");
+        }
+    }
 
     #[test]
     fn test_truncate_short_text() {
