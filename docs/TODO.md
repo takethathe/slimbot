@@ -448,6 +448,11 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 - [ ] **补充测试覆盖** — FileReader 缺少成功读取/截断测试、路径安全缺少 symlink 越界测试、Cron 缺少并发 tick 测试、Session 缺少并发提交竞态测试
 - [ ] **优化 Message 序列化避免中间 Value 分配** — `serde_json::json!()` 每次 LLM 调用为每条消息分配中间 JSON Value。实现自定义 `Serialize` 直接写 OpenAI 格式（`provider/openai.rs:118-203`）
 
+### clippy 清零（2026-11-07）
+
+- [x] **修复全部 clippy 警告** — 31 条 `double_must_use` 全部来自 `async_trait` 0.1.89：它在 trait 内的 async fn 上打了一条无消息的 `#[must_use]`，而返回的 `Pin<Box<dyn Future>>` 本就因 `Future: #[must_use]` 而须使用。14 处 trait 定义就地加 `#[allow(clippy::double_must_use)]` + 说明（沿用 `src/channel/feishu.rs` 的既有先例），`cargo clippy --all-targets -- -D warnings` 现在全绿
+- [ ] **待上游修复后回收 allow** — `async-trait` 不再给 async fn 打裸 `#[must_use]`（或项目脱离 `async_trait`）时，删掉那 14 处 `#[allow(clippy::double_must_use)]`
+
 ## personal agent 触发器（已实现，2026-10-31）
 
 - [x] **Wayfinder map** — 触发器体系（数据源采集与快照、订阅判定、subagent 承载、codemode 运行时、与 cron 的接缝）的决策地图：`.scratch/personal-agent-triggers/map.md`；票文在同目录 `issues/`，终点产物是 spec（票 08）

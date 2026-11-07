@@ -89,6 +89,9 @@ pub struct ScoredEntry {
 }
 
 /// Replaceable index implementation. Slice 1 ships only [`KeywordIndex`].
+// `double_must_use` is an `async_trait` desugaring artifact on methods
+// returning `Result`, not a real attribute on this code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait MemoryIndex: Send + Sync {
     /// Derive entries from a document set, replacing any previous state.

@@ -122,6 +122,9 @@ impl McpTool {
 
 /// The framing layer a client speaks through. Implementations own correlation
 /// and liveness; the client only ever asks for one method's answer.
+// `double_must_use` is an `async_trait` desugaring artifact on methods
+// returning `Result`, not a real attribute on this code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     /// Send one request and await its result value (the `result` field of a
