@@ -123,6 +123,18 @@ define_config! {
     }
 }
 
+// ── Executors (ticket 19, spec M) ──
+//
+// The executor store grows only when the model asks for a new one, so the cap
+// is a soft one: a loose default that a deployment can tighten or switch off
+// (`0`), never a mechanism that scans, dedupes or merges anything.
+
+define_config! {
+    "executors" => ExecutorsConfig {
+        max_count: usize = 20, range(0, 10_000), desc: "Soft cap on stored executors: at the cap `create` is refused and points at `list` + `delete` first. 0 disables the cap (the default 20 is deliberately loose)",
+    }
+}
+
 define_config! {
     "triggers" => TriggersConfig {
         enabled: bool = true, none, desc: "Master switch for the trigger tick (sources are not collected when off)",

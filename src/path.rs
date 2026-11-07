@@ -123,6 +123,13 @@ impl PathManager {
         self.workspace_dir.join("triggers")
     }
 
+    /// Directory holding executor definitions
+    /// (`executors/<exec-xxxx>/{meta.json, act.js}`). Root level, not under
+    /// `triggers/`: an executor is a peer primitive, not a trigger accessory.
+    pub fn executors_dir(&self) -> PathBuf {
+        self.workspace_dir.join("executors")
+    }
+
     pub fn tool_results_dir(&self) -> PathBuf {
         self.workspace_dir.join(".tool_results")
     }

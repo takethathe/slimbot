@@ -323,14 +323,15 @@ SlimBot 的工具分四组：
 
 ## 目录限定工具（catalog-only）
 
-`trigger_source` 与 `trigger` 只在 `ToolCatalog` 注册，主循环工具表里没有它们；只有 agent 定义显式声明的工具（如 bootstrap 的 `trigger` agent）会把它们装配进子代理的 `ToolManager`。两个工具都是 `action` 驱动的 CRUD：
+`trigger_source`、`trigger` 与 `executor` 只在 `ToolCatalog` 注册，主循环工具表里没有它们；只有 agent 定义显式声明的工具（bootstrap 的 `trigger` agent 声明前两个，`executor` agent 声明 `executor`）会把它们装配进子代理的 `ToolManager`。三个工具都是 `action` 驱动的 CRUD：
 
 | 工具 | actions | 对象 |
 |------|---------|------|
 | `trigger_source` | `list` / `create` / `update` / `delete` | 数据源：采集脚本，把一个通道（文件/接口/邮箱）归一为 `{items: [...]}`；`list` 只报字段名和类型，不报采样值 |
 | `trigger` | `list` / `create` / `update` / `delete` / `test` | 订阅规则：监控数据源 + 判定脚本 + 命中后的 action；`test` 用当前快照试跑一次 |
+| `executor` | `list` / `create` / `update` / `delete` / `run` | 执行器：存放的 `act.js` 动作脚本，按需跑一次；`run` 的 args 按 meta 的 `args_schema` 先校验，结果 in-band 回 `{ok, summary, evidence?, failure?}` |
 
-完整参数、脚本约定与投递机制见 [trigger.md](trigger.md)。
+完整参数、脚本约定与投递机制见 [trigger.md](trigger.md) 与 [executor.md](executor.md)。
 
 ---
 

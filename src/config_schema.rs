@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::approval::ControlLevel;
 use crate::config::{
-    AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig,
-    MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig, SecretEntry, SubagentConfig,
-    ToolEntry, TraceBackendEntry, TraceConfig, TriggersConfig, WebFetchConfig,
+    AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, ExecutorsConfig, HeartbeatConfig,
+    JsonRenderConfig, MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig, SecretEntry,
+    SubagentConfig, ToolEntry, TraceBackendEntry, TraceConfig, TriggersConfig, WebFetchConfig,
 };
 use crate::config_macro::FieldMeta;
 
@@ -182,6 +182,12 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
             "Subagent",
             SubagentConfig::fields(),
             &to_value_map(&config.subagent),
+        ),
+        scalar_section(
+            "executors",
+            "Executors",
+            ExecutorsConfig::fields(),
+            &to_value_map(&config.executors),
         ),
         scalar_section(
             "triggers",
@@ -648,6 +654,7 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
         }
         ["tracing", "backends", idx, field] => set_backend_field(config, idx, field, value),
         ["subagent", field] => set_subagent(config, field, value),
+        ["executors", field] => set_executors(config, field, value),
         ["triggers", field] => set_triggers(config, field, value),
         ["triggers", "secrets", idx, field] => set_secret_field(config, idx, field, value),
         ["pressure", field] => set_pressure(config, field, value),
@@ -661,6 +668,20 @@ fn set_subagent(config: &mut Config, field: &str, value: &serde_json::Value) -> 
             config.subagent.max_concurrent = value_u32(value, "subagent.max_concurrent")? as usize
         }
         _ => return Err(format!("Unknown subagent field: {}", field)),
+    }
+    Ok(())
+}
+
+fn set_executors(
+    config: &mut Config,
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match field {
+        "max_count" => {
+            config.executors.max_count = value_u64(value, "executors.max_count")? as usize
+        }
+        _ => return Err(format!("Unknown executors field: {}", field)),
     }
     Ok(())
 }
@@ -1325,6 +1346,7 @@ mod tests {
             triggers: Default::default(),
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
         }
     }
 
@@ -1361,6 +1383,7 @@ mod tests {
                 "tracing",
                 "memory",
                 "subagent",
+                "executors",
                 "triggers",
                 "pressure",
                 "providers",
@@ -1442,6 +1465,24 @@ mod tests {
         assert!(!config.triggers.enabled);
         assert_eq!(config.triggers.tick_interval_s, 120);
         assert_eq!(config.triggers.max_queue, 30);
+    }
+
+    #[test]
+    fn test_patch_executors_max_count_applies_and_clamps() {
+        let mut config = make_config();
+        let ops = vec![op(PatchOpKind::Set, "executors.max_count", json!(50))];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.executors.max_count, 50);
+
+        // Out of range is clamped rather than rejected, like every other knob.
+        let ops = vec![op(
+            PatchOpKind::Set,
+            "executors.max_count",
+            json!(1_000_000),
+        )];
+        apply_config_patch(&mut config, &ops).unwrap();
+        assert_eq!(config.executors.max_count, 10_000);
     }
 
     #[test]

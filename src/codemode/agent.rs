@@ -6,28 +6,23 @@
 //! else — no filesystem, no network, no secrets. The host function list is the
 //! only safety boundary (ADR 0008), and every `tools.<name>()` call runs the
 //! shared approval gate (ADR 0011) the runner's own tool calls run, so `Ask`
-//! and `Deny` levels behave identically inside a script.
+//! and `Deny` levels behave identically inside a script. The `tools` /
+//! `searchTools` installation itself is shared with the other entries in
+//! [`super::connector`]; only the catalog subset differs.
 //!
 //! The one deliberate difference from the top level: a refusal is not an
 //! interrupted turn. The gate's answer text (DENIED / pending guidance) comes
 //! back as the call's *resolved value*, so a script never dies mid-flight and
 //! there are no per-call popups inside one codemode run.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use rquickjs::function::{Async, Opt};
-use rquickjs::{Ctx, Function, Object, Value as JsValue};
-use serde_json::{Value, json};
-
-use super::host::{HostBindings, HostEnv, LogSink, host_object, install_log, install_time};
-use crate::memory::index::tokenize;
+use super::connector::{call_in_turn, install_tool_bridge};
+use super::host::{HostBindings, HostEnv, LogSink, install_log, install_time};
 use crate::runner::gate::RunToolExec;
-use crate::tool::{ToolDefinition, TurnContext, with_turn_context};
-
-/// The number of hits `searchTools` returns when no limit is given.
-const DEFAULT_SEARCH_LIMIT: usize = 8;
+use crate::tool::TurnContext;
+use rquickjs::Ctx;
 
 /// Bindings for one agent-entry execution.
 pub(crate) struct AgentHost {
@@ -68,190 +63,22 @@ impl HostBindings for AgentHost {
             })
         };
         install_log(ctx, env, logs)?;
-        install_search_tools(ctx, self.exec.clone())?;
-        install_tools_namespace(ctx, self.exec.clone(), self.turn.clone())?;
+
+        // The catalog is the run's own tools plus every online connector's; the
+        // invoke path is the approval gate, so `Ask` / `Deny` behave inside a
+        // script exactly as they do at the top level (ADR 0011).
+        install_tool_bridge(
+            ctx,
+            (self.exec.clone(), self.turn.clone()),
+            |(exec, _)| exec.callable_definitions(),
+            |(exec, turn), name, args| {
+                call_in_turn(turn, move || {
+                    Box::pin(async move { exec.call(&name, args).await })
+                })
+            },
+        )?;
         Ok(())
     }
-}
-
-/// Convert a JS argument to `serde_json` text on the spot: tool arguments are
-/// JSON everywhere, and nothing borrowed may cross the await boundary.
-fn js_to_json(v: &JsValue<'_>) -> rquickjs::Result<Value> {
-    let ctx = v.ctx().clone();
-    let Some(string) = ctx.json_stringify(v.clone())? else {
-        return Err(rquickjs::Error::new_from_js("value", "json"));
-    };
-    let text = string.to_string()?;
-    serde_json::from_str(&text).map_err(|_| rquickjs::Error::new_from_js("value", "json"))
-}
-
-/// Install `ctx.tools.<name>(args)` for every tool this run may execute.
-/// Tools the run does not have are structurally absent from the namespace, so
-/// a script can never call what the catalog did not assemble. That catalog is
-/// the run's own tools plus the online connectors' tools (ticket 26) — a wider
-/// set than the model sees, and still gated per call. The arguments object is
-/// optional (`Opt`): calling a tool with no arguments is legal.
-fn install_tools_namespace<'js>(
-    ctx: &Ctx<'js>,
-    exec: Arc<RunToolExec>,
-    turn: Option<Arc<TurnContext>>,
-) -> rquickjs::Result<()> {
-    let host = host_object(ctx)?;
-    let tools = Object::new(ctx.clone())?;
-    for def in exec.callable_definitions() {
-        let exec = exec.clone();
-        let turn = turn.clone();
-        let name = def.name.clone();
-        let func = Function::new(
-            ctx.clone(),
-            Async(move |args: Opt<JsValue<'js>>| {
-                let exec = exec.clone();
-                let name = name.clone();
-                let turn = turn.clone();
-                // Convert on the JS thread: nothing borrowed may cross the await.
-                let json = match args.0 {
-                    Some(ref v) => js_to_json(v).map_err(|e| e.to_string()),
-                    None => Ok(Value::Object(serde_json::Map::new())),
-                };
-                async move {
-                    // An unconvertible argument object must not become "no
-                    // arguments": the tool would run with the wrong payload.
-                    let text = match json {
-                        Err(msg) => format!(
-                            "Error: `tools.{name}` arguments must be a JSON-serializable \
-                             object ({msg})"
-                        ),
-                        Ok(json) => match turn {
-                            Some(turn) => with_turn_context(turn, exec.call(&name, json)).await,
-                            None => exec.call(&name, json).await,
-                        },
-                    };
-                    Ok::<String, rquickjs::Error>(text)
-                }
-            }),
-        )?;
-        tools.set(def.name.as_str(), func)?;
-    }
-    host.set("tools", tools)?;
-    Ok(())
-}
-
-/// Install `ctx.searchTools(query, limit?)`, returning a JSON array string of
-/// `{name, description}` ranked by the same BM25-lite scoring the memory
-/// keyword index uses (ticket 15 core: latin tokens + CJK bigrams, name hits
-/// weighted like headings). Connector tools are searchable; their descriptions
-/// are server text and stay data for the script (ADR 0009).
-fn install_search_tools<'js>(ctx: &Ctx<'js>, exec: Arc<RunToolExec>) -> rquickjs::Result<()> {
-    let host = host_object(ctx)?;
-    let func = Function::new(
-        ctx.clone(),
-        Async(move |query: String, limit: Opt<i32>| {
-            let defs = exec.callable_definitions();
-            let mut limit = limit.0.unwrap_or(DEFAULT_SEARCH_LIMIT as i32);
-            if limit <= 0 {
-                limit = DEFAULT_SEARCH_LIMIT as i32;
-            }
-            if limit > 32 {
-                limit = 32;
-            }
-            let hits = search_tools(&defs, &query, limit as usize);
-            async move {
-                Ok::<String, rquickjs::Error>(
-                    serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()),
-                )
-            }
-        }),
-    )?;
-    host.set("searchTools", func)?;
-    Ok(())
-}
-
-fn term_counts(tokens: Vec<String>) -> HashMap<String, u32> {
-    let mut counts = HashMap::new();
-    for token in tokens {
-        *counts.entry(token).or_insert(0) += 1;
-    }
-    counts
-}
-
-/// Rank tool definitions against `query`. Deterministic: terms are visited in
-/// sorted order and score ties break on the tool name, so repeated searches
-/// over the same catalog return the same order (float addition is not
-/// associative).
-pub(crate) fn search_tools(defs: &[ToolDefinition], query: &str, limit: usize) -> Vec<Value> {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
-
-    let mut terms = tokenize(query);
-    if terms.is_empty() || defs.is_empty() {
-        return Vec::new();
-    }
-    terms.sort();
-    terms.dedup();
-
-    struct Doc {
-        name: String,
-        description: String,
-        counts: HashMap<String, u32>,
-        len: usize,
-    }
-    let docs: Vec<Doc> = defs
-        .iter()
-        .map(|def| {
-            let name = term_counts(tokenize(&def.name));
-            let description = term_counts(tokenize(&def.description));
-            let mut counts: HashMap<String, u32> = HashMap::new();
-            for (token, c) in name {
-                *counts.entry(token).or_insert(0) += 2 * c;
-            }
-            for (token, c) in description {
-                *counts.entry(token).or_insert(0) += c;
-            }
-            let len = counts.values().sum::<u32>() as usize;
-            Doc {
-                name: def.name.clone(),
-                description: def.description.clone(),
-                counts,
-                len: len.max(1),
-            }
-        })
-        .collect();
-
-    let n = docs.len() as f64;
-    let avg_len = (docs.iter().map(|d| d.len).sum::<usize>() as f64 / n).max(1.0);
-    let mut scores = vec![0.0f64; docs.len()];
-
-    for token in &terms {
-        let df = docs.iter().filter(|d| d.counts.contains_key(token)).count() as f64;
-        if df == 0.0 {
-            continue;
-        }
-        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-        for (idx, doc) in docs.iter().enumerate() {
-            let Some(&tf) = doc.counts.get(token) else {
-                continue;
-            };
-            let tf = tf as f64;
-            let denom = tf + K1 * (1.0 - B + B * doc.len as f64 / avg_len);
-            scores[idx] += idf * (tf * (K1 + 1.0)) / denom;
-        }
-    }
-
-    let mut hits: Vec<(f64, &Doc)> = scores
-        .iter()
-        .enumerate()
-        .filter(|(_, score)| **score > 0.0)
-        .map(|(idx, score)| (*score, &docs[idx]))
-        .collect();
-    hits.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.name.cmp(&b.1.name))
-    });
-    hits.truncate(limit);
-    hits.into_iter()
-        .map(|(_, doc)| json!({"name": doc.name, "description": doc.description}))
-        .collect()
 }
 
 #[cfg(test)]
@@ -260,6 +87,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::approval::{ApprovalConfig, ApprovalStore, ControlLevel, RiskLevel};
@@ -643,6 +471,7 @@ mod tests {
             PathBuf::from("/tmp/slimbot-codemode-agent-test"),
             &[],
             Arc::new(BTreeMap::new()),
+            None,
         ));
         let request = RunRequest::new(
             r#"async function collect(ctx) {

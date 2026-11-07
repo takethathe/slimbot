@@ -220,17 +220,17 @@ _Avoid_: MCP client（泛指协议实现）, MCP manager
 _Avoid_: code interpreter, script runner, sandbox（后者指执行环境而非模型可调用的工具本身）
 
 **searchTools**:
-codemode 脚本内的全局函数，用 BM25 排序检索本次运行的**可调用目录**（本次运行装配的内置工具 + 在线连接器的工具，返回 `[{name, description}]`）。内置工具在模型 schema 里已可见，因此它存在的理由是连接器工具：那一批只经脚本发现、永不进入模型 `tools` 的东西。离线 server 的工具不在可调用目录里。
+codemode 脚本内的全局函数，用 BM25 排序检索本次运行的**可调用目录**（agent 入口是本次运行装配的内置工具 + 全部在线连接器的工具；采集入口只有 server 声称只读的连接器工具），返回 `[{name, description}]`。内置工具在模型 schema 里已可见，因此它存在的理由是连接器工具：那一批只经脚本发现、永不进入模型 `tools` 的东西。离线 server 的工具不在可调用目录里。
 _Avoid_: tool_search（那是 pi 的模型级工具，本决策不用它）, memory_search（那是记忆检索）
 
 ### Connector
 
 **Connector**:
 一段 **codemode 可直接调用的、非基础原语、非内置工具**的外部能力封装；同一个连接器既能“获取信息”也能“执行动作”。定义特征是从 codemode 内可被调用，不是“凡与外部相连”——MCP server 是连接器的一个特例（v1 的实例）。
-_Avoid_: Channel/通道（与连接器正交，是会话/传输面）, 基础原语（时间/网络这类 codemode 内置原语，不算连接器）, 内置工具（`file_editor`/`shell`/`message`/`web_fetch` 等，不算连接器）, 执行器（那是消费连接器写侧的动作脚本）, json-render 卡片（属 Channel 侧展示，不是连接器）
+_Avoid_: Channel/通道（与连接器正交，是会话/传输面）, 基础原语（时间/网络这类 codemode 内置原语，不算连接器）, 内置工具（`file_editor`/`shell`/`message`/`web_fetch` 等，不算连接器）, 执行器（那是以连接器写侧为主的动作脚本）, json-render 卡片（属 Channel 侧展示，不是连接器）
 
 **Executor (执行器)**:
-与采集器（触发器源 `collect.js`）**操作镜像**的 codemode 动作脚本：消费连接器的写侧，对外部资源执行一次真实动作。由 subagent 创建与调用、**按需执行**（无常驻 tick；周期性的“动”由触发器 fire 驱动）。其动作带副作用，纳入审批（见 Risk level / Pending approval）；无人值守一律按 Deny。
+与采集器（触发器源 `collect.js`）**操作镜像**的 codemode 动作脚本：以连接器的写侧为主（读面不受 `allow_connectors` 限制，但仍过审批闸），对外部资源执行一次真实动作。由 subagent 创建与调用、**按需执行**（无常驻 tick；周期性的“动”由触发器 fire 驱动）。其动作带副作用，纳入审批（见 Risk level / Pending approval）；无人值守一律按 Deny。
 _Avoid_: Connector（连接器是它调用的能力后端，不是脚本本身）, 采集器（那是只读侧）, tool
 
 ### IM Channel

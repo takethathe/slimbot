@@ -66,9 +66,11 @@ There is no default subcommand: `cargo run` on its own prints help. Paths come f
 | `SOUL.md` | Agent personality |
 | `TOOLS.md` | Tool usage notes |
 | `memory/MEMORY.md` | Long-term memory (the only memory document written directly) |
-| `agents/` | Subagent definitions (`trigger.md` ships by default) |
+| `agents/` | Subagent definitions (`trigger.md` and `executor.md` ship by default) |
 | `skills/` | Loadable skill documents |
+| `references/` | Documents shared by both subagents (the connector contract); never skills |
 | `triggers/` | Trigger sources and rules, plus fire history |
+| `executors/` | Executor definitions, `exec-xxxx/{meta.json, act.js}` — stored actions run on demand |
 | `sessions/` | `{session_id}.jsonl` conversation logs |
 | `cron/jobs.json` | Scheduled jobs |
 
@@ -131,7 +133,7 @@ slimbot/
 │   ├── consolidate.rs, snip.rs, pressure.rs    context budget: summary, trimming, limits
 │   ├── provider/, channel/, tools/, tool.rs    LLM providers, I/O channels, tools
 │   ├── trigger/, cron/, heartbeat/, agent/     automation, subagent runtime
-│   ├── codemode/, mcp/                         script sandbox, connector pool
+│   ├── codemode/, mcp/, executor/              script sandbox, connector pool, executors
 │   ├── memory/, card/, approval/, trace/       memory, cards, approval, tracing
 │   └── config*.rs, log.rs, path.rs, secrets.rs, utils/
 ├── docs/          module docs — index at docs/index.md

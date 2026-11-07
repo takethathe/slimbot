@@ -91,6 +91,13 @@ pub fn host_error<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
     rquickjs::Exception::throw_message(ctx, message)
 }
 
+/// Turn a host-side failure message into the `Error` a script catches. Same
+/// shape as [`host_error`], for host functions that have no `Ctx` at hand
+/// (the JSON primitives below the shims).
+pub fn host_failure(message: String) -> rquickjs::Error {
+    rquickjs::Error::new_from_js_message("host", "string", message)
+}
+
 /// Install the three time functions every script gets: `now()`, `boot_at()`
 /// and `uptime_s()`. All local time, no timezone configuration.
 pub fn install_time<'js>(ctx: &Ctx<'js>, _env: &HostEnv) -> rquickjs::Result<()> {
@@ -142,6 +149,30 @@ pub fn install_log<'js>(ctx: &Ctx<'js>, env: &HostEnv, sink: LogSink) -> rquickj
         sink(&env.redact(&message));
     })?;
     host.set("log", log)?;
+    Ok(())
+}
+
+/// Install `secret(name)`: the value of one entry of `triggers.secrets`, or a
+/// thrown error naming the config key when there is no such secret. Every
+/// entry that reads secrets (collect, act) shares this one implementation.
+pub fn install_secret<'js>(
+    ctx: &Ctx<'js>,
+    secrets: Arc<std::collections::BTreeMap<String, String>>,
+) -> rquickjs::Result<()> {
+    let host = host_object(ctx)?;
+    let secret = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'_>, name: String| -> rquickjs::Result<String> {
+            match secrets.get(&name) {
+                Some(value) => Ok(value.clone()),
+                None => Err(host_error(
+                    &ctx,
+                    &format!("no secret named '{name}'; add it to triggers.secrets in config"),
+                )),
+            }
+        },
+    )?;
+    host.set("secret", secret)?;
     Ok(())
 }
 

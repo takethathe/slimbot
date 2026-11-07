@@ -27,6 +27,12 @@ pub enum ScriptErrorKind {
     Output,
     /// The script did not define the entry function.
     MissingEntry,
+    /// A host function stopped the run (spent call budget, refused call). The
+    /// reason travels in the message; the caller has the [`AbortHandle`] and
+    /// therefore knows which kind it was.
+    ///
+    /// [`AbortHandle`]: super::sandbox::AbortHandle
+    Aborted,
     /// The sandbox itself failed (thread panic, engine start-up, size limits).
     Internal,
 }
@@ -40,6 +46,7 @@ impl ScriptErrorKind {
             ScriptErrorKind::Memory => "memory",
             ScriptErrorKind::Output => "output",
             ScriptErrorKind::MissingEntry => "missing_entry",
+            ScriptErrorKind::Aborted => "aborted",
             ScriptErrorKind::Internal => "internal",
         }
     }
@@ -78,6 +85,11 @@ impl ScriptError {
             ScriptErrorKind::MissingEntry,
             format!("script does not define a `{entry}` function"),
         )
+    }
+
+    /// The run was stopped by a host function through its abort handle.
+    pub fn aborted(reason: impl Into<String>) -> Self {
+        Self::new(ScriptErrorKind::Aborted, reason)
     }
 
     pub fn internal(message: impl Into<String>) -> Self {

@@ -100,7 +100,7 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 
 ### SubagentRuntime（与主 loop 共用）
 
-子代理是一份 `agents/<name>.md` 定义的一次性执行（详见 [agent.md](agent.md)）：自己的会话只在内存、按定义从 `ToolCatalog` 装配 `ToolManager`、全局并发闸。主 loop 的 `subagent` 工具与触发器的 `agent` action 共用同一个 runtime 实例，因此共用同一个闸与同一条回会话的路。脚本执行（采集 / 判定）走 `codemode` 沙箱：rquickjs + 专职线程 + 双层超时 + 宿主函数白名单（详见 [codemode.md](codemode.md)）。
+子代理是一份 `agents/<name>.md` 定义的一次性执行（详见 [agent.md](agent.md)）：自己的会话只在内存、按定义从 `ToolCatalog` 装配 `ToolManager`、全局并发闸。主 loop 的 `subagent` 工具与触发器的 `agent` action 共用同一个 runtime 实例，因此共用同一个闸与同一条回会话的路；`trigger` 与 `executor` 两个内置子代理走的都是这条路（执行器没有第二条执行路径，见 [ADR 0021](adr/0021-executor-parasitic-unattended-subagent.md)）。脚本执行（采集 / 判定 / 动作）走 `codemode` 沙箱：rquickjs + 专职线程 + 双层超时 + 宿主函数白名单（详见 [codemode.md](codemode.md)）。
 
 ### 单用户信任边界（身份层）
 
@@ -128,7 +128,9 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 
 连接器 = codemode 可直接调用的、非基础原语、非内置工具的外部能力封装（同一连接器既读又动）；MCP server 是 v1 唯一实例（见 `GLOSSARY.md` `### Connector`）。它把「agent 对外部系统的能力」抽象成一个可寻址的服务单元，与 Channel（会话/传输面）正交，区别于宿主内置工具（file/shell/message）与 codemode 基础原语（时间、`ctx.http`）。
 
-在此之上是两种 codemode 消费者，互为操作镜像：**采集器**（触发器源 `collect.js`，读侧、周期采集，已落地）与**执行器**（`act.js`，写侧、按需动作；v1 决策见 [ADR 0019](adr/0019-executor-as-codemode-operation-primitive.md)，完整实现走连接器子 effort）。执行器动作带副作用、纳入审批（[ADR 0011](adr/0011-approval-by-turn-end-redemption.md)）、无人值守 Deny。
+在此之上是两种 codemode 消费者，互为操作镜像：**采集器**（触发器源 `collect.js`，读侧、周期采集）与**执行器**（`act.js`，写侧、按需动作）。定位见 [ADR 0019](adr/0019-executor-as-codemode-operation-primitive.md)，形状与姿态见 [ADR 0021](adr/0021-executor-parasitic-unattended-subagent.md)：执行器**完全寄生一个 ephemeral 子代理**（`agents/executor.md`），`executor` 工具只注册进 `ToolCatalog`，因此主循环唯一能看到的是 `# Available Agents` 里的一行描述。act 入口与 agent 入口共用同一座连接器桥（`src/codemode/connector.rs`），差别只在传入哪份目录——采集器只见 server 声称只读的连接器工具，agent 见全量，act 见**全部可搜、写按 `allow_connectors` 才可调**（四张过滤表见 [codemode.md](codemode.md#连接器面一座桥四张过滤表)）。两个子代理共享的知识只有一份非-skill 文档 `references/connector.md`（`agents/*.md` 里一行硬指针按需读取，从不进主循环，见 [bootstrap.md](bootstrap.md#reference-文档不进-available-skills)）。
+
+执行器动作带副作用、纳入审批（[ADR 0011](adr/0011-approval-by-turn-end-redemption.md)），并且因为跑在无人值守的临时会话里而**事实上 Allow-only**：命中需确认（`Ask`）的连接器写调用当场按拒绝处理、终止整段脚本、不写 Pending——「回合末兑现」要求「下一轮」，而这个会话跑完即删。需要 owner 交互确认的动作不是执行器场景，走主循环的工具路径（那里有真下一轮）。细节见 [executor.md](executor.md)，决策见 ADR 0021。
 
 连接器的 v1 实例已落地（票 26）：`src/mcp/` 的 `McpService` 在 gateway/CLI 两侧由 `AgentLoop` 建池并启动，每 server 一个 supervisor（连接、工具缓存、退避重连）；它的工具**只存在于 codemode 脚本面**（`searchTools()` / `tools.mcp__<server>__<tool>()`），从不进入模型的 tool schema。细节见 [mcp.md](mcp.md)，决策见 [ADR 0016](adr/0016-mcp-through-codemode-only.md) 与 [ADR 0020](adr/0020-hand-rolled-minimal-mcp-client.md)。
 
@@ -191,6 +193,8 @@ AgentRunner 状态变更 → TaskHook.notify_status()
 | 外部内容 | 只以证据形式进入上下文，快照不落盘 | 见 [ADR 0009](adr/0009-no-raw-external-content.md) |
 | 连接器工具 | 不进模型 tool schema，只在 codemode 脚本里发现与调用 | 一个外部 server 就带来 30+ 工具，会把模型注意力从内置能力上拉走；脚本还能一次编排多调用（ADR 0016） |
 | 连接器离线 | 清空该 server 的工具缓存，调用立即回一条干净错误 | 发现面不给必然失败的调用；退避有上限且每 server 独立，一台连不上不会 wedge gateway |
+| 执行器形状 | `executor` 工具只注册进 `ToolCatalog`，调用面是一个寄生子代理 | 主循环的 schema 与 prompt cache 不因对外动作而膨胀，执行路径只有一条（ADR 0021） |
+| 执行器审批 | 无人值守 ⇒ `Ask` 即 Deny、不写 Pending | 「回合末兑现」要求下一轮，ephemeral 子代理没有下一轮（ADR 0011、0021） |
 
 ## 目录结构与模块关系
 
@@ -213,7 +217,8 @@ main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   │     │     ├── consolidate.rs ── Consolidator（token 预算触发摘要）
   │     │     ├── context.rs ── 上下文构建
   │     │     ├── runner.rs ── ReAct 循环
-  │     │     └── mcp/ ── MCP 连接器池（两种 transport、工具缓存、退避重连；只经 codemode 脚本可见）
+  │     │     ├── mcp/ ── MCP 连接器池（两种 transport、工具缓存、退避重连；只经 codemode 脚本可见）
+  │     │     └── executor/ ── 执行器定义 + `executor` 工具（只进 catalog，由执行器子代理装配）
   │     │
   │     ├── message_bus.rs ── 纯异步通道端点
   │     ├── memory/ ── category 化长期记忆、backend、历史记录

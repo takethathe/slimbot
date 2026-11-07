@@ -66,9 +66,11 @@ cargo run -- gateway                   # cron + heartbeat + 触发器 + 已启�
 | `SOUL.md` | Agent 人格 |
 | `TOOLS.md` | 工具使用说明 |
 | `memory/MEMORY.md` | 长期记忆（唯一被直接写入的记忆文档） |
-| `agents/` | 子代理定义（默认铺出 `trigger.md`） |
+| `agents/` | 子代理定义（默认铺出 `trigger.md` 与 `executor.md`） |
 | `skills/` | 可加载的技能文档 |
+| `references/` | 两个子代理共享的文档（连接器契约）；不做成 skill |
 | `triggers/` | 触发器源与规则，以及触发历史 |
+| `executors/` | 执行器定义 `exec-xxxx/{meta.json, act.js}`——存好的动作，按需跑一次 |
 | `sessions/` | `{session_id}.jsonl` 会话日志 |
 | `cron/jobs.json` | 定时任务 |
 
@@ -131,7 +133,7 @@ slimbot/
 │   ├── consolidate.rs, snip.rs, pressure.rs    上下文预算：摘要、裁剪、长度限制
 │   ├── provider/, channel/, tools/, tool.rs    LLM provider、I/O 通道、工具
 │   ├── trigger/, cron/, heartbeat/, agent/     自动化、子代理运行时
-│   ├── codemode/, mcp/                         脚本沙箱、连接器池
+│   ├── codemode/, mcp/, executor/              脚本沙箱、连接器池、执行器
 │   ├── memory/, card/, approval/, trace/       记忆、卡片、审批、trace
 │   └── config*.rs, log.rs, path.rs, secrets.rs, utils/
 ├── docs/          模块文档 —— 索引见 docs/index.md

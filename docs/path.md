@@ -60,6 +60,7 @@ pub fn resolve(
 | `session_dir()` | `PathBuf` | `{workspace}/sessions` |
 | `skills_dir()` | `PathBuf` | `{workspace}/skills` |
 | `memory_dir()` | `PathBuf` | `{workspace}/memory` |
+| `executors_dir()` | `PathBuf` | `{workspace}/executors`（执行器定义，根级） |
 | `tool_results_dir()` | `PathBuf` | `{workspace}/.tool_results` |
 | `bootstrap_file(name)` | `PathBuf` | `{workspace}/{name}` |
 

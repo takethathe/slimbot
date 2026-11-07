@@ -63,8 +63,14 @@ ids the rule will read (or say why it needs none).
 - `script`: the body of `async function collect(ctx)` that returns
   `{items: [...]}`. Every item must be an object.
 
-What a collector can use — nothing else exists, and there is no shell, no
-`sleep`, and no writing:
+**Before writing the script**, call `file_reader` on
+`references/connector.md` when the watched system is one the owner has a
+connector for, or when you are unsure whether a plain read is enough. That file
+is the single home of the connector discovery and call rules; this one only says
+what the source must do.
+
+What a collector can use besides connectors — no shell, no `sleep`, and no
+writing:
 
 ```js
 async function collect(ctx) {

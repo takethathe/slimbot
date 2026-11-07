@@ -467,6 +467,32 @@ impl AgentLoop {
             }
         };
 
+        // `executor` is catalog-only like the trigger tools: the main loop's
+        // tool list (and its prompt cache) never mentions executors, and only an
+        // agent definition that declares `tools: executor` gets it. It lives
+        // here rather than in `gateway.rs` because `from_parts` is the one place
+        // both entries reach: registering it in the gateway would leave `cargo
+        // run -- agent` starting an executor run with a silently missing tool.
+        // No layer is built -- an executor has no tick, every call scans
+        // `workspace/executors` on demand -- and `run` reads the same
+        // `triggers.secrets` map the collect entry uses, so `ctx.secret(name)`
+        // has one source.
+        let executors_root = paths.executors_dir();
+        let executor_secrets = Arc::new(crate::trigger::secret_map(&config.triggers));
+        // The sprawl cap is read once at assembly: the catalog closure runs per
+        // run, and the cap is a config value, not per-run state.
+        let executor_max_count = config.executors.max_count;
+        catalog.register(
+            "executor",
+            Arc::new(move || {
+                Some(Box::new(crate::executor::tool::ExecutorTool::new(
+                    executors_root.clone(),
+                    executor_secrets.clone(),
+                    executor_max_count,
+                )) as Box<dyn Tool>)
+            }),
+        );
+
         // Subagent runtime: per-run tool managers are assembled from the
         // catalog, so the main loop's tool table and prompt cache never change.
         let catalog = Arc::new(catalog);
@@ -483,6 +509,10 @@ impl AgentLoop {
             tracer.clone(),
             message_bus.clone(),
             approvals.clone(),
+            // The same pool the main loop gets: an executor subagent reaches
+            // its connectors through it (ticket 15), and a `codemode` script in
+            // any subagent sees `tools.mcp__*` from it (ticket 26 follow-up).
+            connectors.clone(),
         ));
         // Only the main loop gets `subagent`; agent runs can never declare it.
         tool_manager.register(Box::new(SubagentTool::new(subagent_runtime.clone())));
@@ -1001,6 +1031,7 @@ mod tests {
         let config = crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1219,6 +1250,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1278,6 +1310,20 @@ mod tests {
             registered_tool_names(&agent_loop).contains(&"memory_search".to_string()),
             "CLI mode must expose memory_search"
         );
+        // Catalog-only tools (spec E): the model's schema is exactly the main
+        // loop's `ToolManager` (`RunToolExec::tool_definitions`), so a tool that
+        // is absent here is invisible to the main loop; the CLI entry must still
+        // hand it to subagent runs, or `agents/executor.md` builds a run with a
+        // silently missing tool.
+        let schema = registered_tool_names(&agent_loop);
+        assert!(
+            !schema.contains(&"executor".to_string()),
+            "the main loop's tool schema must not mention executors: {schema:?}"
+        );
+        assert!(
+            agent_loop.subagent_runtime.catalog().contains("executor"),
+            "CLI mode must let the executor agent build its tool"
+        );
     }
 
     #[tokio::test]
@@ -1288,6 +1334,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1356,6 +1403,67 @@ mod tests {
             registered_tool_names(&agent_loop).contains(&"memory_search".to_string()),
             "gateway mode must expose memory_search"
         );
+        // Same invariant as the CLI test: both entries share `from_parts`, so
+        // the catalog-only contract must hold in both.
+        let schema = registered_tool_names(&agent_loop);
+        assert!(
+            !schema.contains(&"executor".to_string()),
+            "the main loop's tool schema must not mention executors: {schema:?}"
+        );
+        assert!(
+            agent_loop.subagent_runtime.catalog().contains("executor"),
+            "gateway mode must let the executor agent build its tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_executor_catalog_tool_carries_the_configured_max_count() {
+        // The cap is read once at assembly (ticket 19). A deployment that sets
+        // `executors.max_count = 1` has to get the second `create` refused: a
+        // catalog tool built with the config value is the only way that number
+        // travels from the file to the executor store.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let (message_bus, _receivers) = MessageBus::new();
+        let mut config = Config::default();
+        config.agent.provider = "default".to_string();
+        config.providers.insert(
+            "default".to_string(),
+            crate::config::ProviderConfig {
+                api_key: "test-key".to_string(),
+                ..Default::default()
+            },
+        );
+        config.gateway.cron.enabled = false;
+        config.gateway.heartbeat.enabled = false;
+        config.executors.max_count = 1;
+
+        let agent_loop =
+            AgentLoop::from_config(&paths, message_bus, _receivers.inbound, Arc::new(config))
+                .await
+                .expect("CLI AgentLoop must build");
+        let executor = agent_loop
+            .subagent_runtime
+            .catalog()
+            .build_tool_manager(&["executor".to_string()], paths.workspace_dir());
+
+        let first = executor
+            .execute(
+                "executor",
+                serde_json::json!({"action": "create", "name": "one"}),
+            )
+            .await
+            .unwrap();
+        assert!(first.contains("\"created\":true"), "{first}");
+
+        let second = executor
+            .execute(
+                "executor",
+                serde_json::json!({"action": "create", "name": "two"}),
+            )
+            .await
+            .unwrap();
+        assert!(second.contains("\"max_count\":1"), "{second}");
     }
 
     /// Names of every tool registered on an `AgentLoop`.
@@ -1376,6 +1484,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1444,6 +1553,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1512,6 +1622,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1616,6 +1727,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1689,6 +1801,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1790,6 +1903,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1866,6 +1980,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "nonexistent".to_string(), // Provider doesn't exist
                 max_iterations: 10,
@@ -1979,6 +2094,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -2373,6 +2489,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,

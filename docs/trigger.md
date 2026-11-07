@@ -21,6 +21,7 @@
 ```
 workspace/
 ├── agents/trigger.md              # 内置 trigger agent 定义（setup 铺出）
+├── agents/executor.md             # 内置 executor agent 定义，fire 一个执行器就是起它
 └── triggers/
     ├── sources/<src-xxxx>/        # meta.json + collect.js
     ├── triggers/<trg-xxxx>/       # meta.json + condition.js + state.json
@@ -40,7 +41,9 @@ workspace/
 - **失败是局部的**：单源超时、抛错、磁盘上脚本坏了，只记在这个源身上，其它源照常提交；连续 3 次失败降到每 5 个 tick 采一次，成功即恢复；脚本改坏时保留上一版可用产物。
 - **凭证**：只来自 `triggers.secrets`，脚本用 `ctx.secret(name)` 取；`Redactor` 会把值从返回值、日志与错误信息里抹掉。
 
-宿主函数白名单（详见 [codemode.md](codemode.md)）：`ctx.http.get` / `post`、`ctx.fs.stat` / `read` / `list`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()` / `boot_at()` / `uptime_s()`。**没有** shell，也没有 sleep——文件变更用轮询脚本表达。`ctx.http.get/post` 复用 `web_fetch` 的 SSRF 校验（`is_private_ip` / `resolve_and_pin`），fs 调用默认锁在 workspace 内，绝对路径要求源在 `allow_paths` 里声明过。
+宿主函数白名单（详见 [codemode.md](codemode.md)）：`ctx.http.get` / `post`、`ctx.fs.stat` / `read` / `list`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()` / `boot_at()` / `uptime_s()`。**没有** shell，也没有 sleep——文件变更用轮询脚本表达。
+
+进程里有连接器池时，采集器还多一条**连接器读**：`ctx.tools.mcp__<server>__<tool>(args?)` 与 `ctx.searchTools(query, limit?)`，目录只含 server 声称只读（`readOnlyHint` 且非 `destructiveHint`）的工具——同一 server 的写工具既不装也搜不到，采集面因此是 act 写半的**读半镜像**。这是**加法**：基础原语一个不少，写面不存在，采集器**不接审批闸**（采集本来就无人值守、无审批，连接器读被限制在 owner 在 `mcp.servers[]` 里配过的 server 上，严格窄于既有 `ctx.http` 权限）。过滤口径、残余风险与理由见 [codemode.md](codemode.md#采集面的只读性票-17) 与 [mcp.md](mcp.md#风险映射fail-closed)。`ctx.http.get/post` 复用 `web_fetch` 的 SSRF 校验（`is_private_ip` / `resolve_and_pin`），fs 调用默认锁在 workspace 内，绝对路径要求源在 `allow_paths` 里声明过。
 
 ## 订阅规则（subscription）
 
@@ -80,18 +83,49 @@ workspace/
 
 模板占位符：`{{evidence}}`（每行 `- [src @ RFC3339] text`，无证据给 `(no evidence)`）、`{{detail}}`、`{{now}}`，渲染结果 8KB 封顶。
 
+### fire 一个执行器 = 一条普通 `agent` 规则
+
+「周期性地动」不需要新机件：它就是一条 `kind=agent` 的规则，`agent` 取 `executor`（[执行器](executor.md#周期性地动绑在触发器上)）。
+
+```json
+{"on_fire": {"kind": "agent", "agent": "executor",
+             "task_template": "对 exec-1a2b 执行：{{evidence}}"}}
+```
+
+`action_from_args` 与 `ActionKind` 里**没有**第四种 kind：加一个 `executor{id,args}` 会让 dispatch 引擎绕过模型直跑 `act.js`，等于把「执行器执行 = 起子代理、由模型驱动」这条单一执行路径分岔。回归锁：`test_the_action_kinds_stay_the_three_the_engine_executes`。
+
+路径与普通 `agent` 规则完全同一：`run_agent` → `SubagentRuntime::start(WaitForSlot)` → `agents/executor.md` 起的 ephemeral 子代理 → 子模型按 task 调 `executor run{id,args}` → 结果以 `[Subagent result]` 回 origin。因此**没有执行器专用的投递逻辑**：origin 携带、不可达时 book-only、`deliver` 三级求值全部继承。
+
+**args 从 evidence 取值不建注入机件**：子模型读渲染后的 `{{evidence}}` 文本，自己组 `executor run` 的 `id` 与 `args`。占位符只渲文本，撑不起结构化模板，这正是 spec I 不采 `executor` kind 的理由。
+
+**外部 evidence 注入 args = 提示注入的动作版，靠四道限界兜**（实现在别处，本层不重复实现）：
+
+| 限界 | 挡什么 | 落在哪 |
+|------|--------|--------|
+| `allow_connectors` | 只能写到列表里的 server，之外的调用**终止整段脚本** | [executor.md](executor.md#allow_connectors写的天花板不是审批的替代) · `codemode/act/connectors.rs` |
+| Allow-only | 无人值守子代理里 `Ask`/`Deny` 都立即拒绝，注入最多诱导一个本就允许的动作 | [executor.md](executor.md#失败一律-in-band按根因分类) · `runner/gate.rs` |
+| `args_schema` | 不合 schema 的 args 在脚本启动前就被拒 | [executor.md](executor.md#meta-形状) · `executor/args.rs` |
+| evidence 裁剪 + provenance | 每条 ≤200 字、合计 4KB，进 task 后再 8KB 封顶，且带 `src @ 时间` | 上文的 `clamp_verdict` / `render_template` |
+
+**失败反馈是 in-band 的，不是 dispatch alert**：绑定错误的执行器、外部 4xx、审批被拒，全部由子模型写进 `[Subagent result]` 的正文回 origin。`run_agent` 失败只做两件事——`book(ok=false)` 写一行 history 与一行 `warn` 日志；**不存在「action 执行失败告警」这条路径**，也不许新增（alert 只由判定失败产生，语义是「同一规则连续失败退网」）。回归锁：`test_an_executor_fire_whose_write_needs_approval_reports_in_band_and_raises_no_alert`。
+
+**接受噪声**：绑了 Ask 级执行器的规则每次 fire 都会给 origin 发一条「需审批、已拒、未执行」。这是正确反馈（无人值守永远兑现不了它），v1 **不做抑制/去重/静默**。
+
 ## history.jsonl
 
 append-only，每行只有六个字段：`{trigger_id, fired_at, action_kind, ok, merged, detail}`——**没有证据正文**。滚动到 `history_lines`（默认 5000）只留一代；写失败只记日志，不阻断触发。
 
 ## 工具与入口
 
-两个多 action 工具**不注册进主 loop 的默认工具集**，只有声明它们的 agent 能看见：
+多 action 工具**不注册进主 loop 的默认工具集**，只有声明它们的 agent 能看见：
 
 | 工具 | actions | 说明 |
 |------|---------|------|
 | `trigger_source` | `list` / `create` / `update` / `delete` | `list` 只回 `shape`（字段名、类型、条数、观测时间），**不回显真实值且绝不触发采集** |
 | `trigger` | `list` / `create` / `update` / `delete` / `test` | `create` 要求 `schedule` 与 `script` 至少有一个；`test` 用当前冻结快照立即跑一次，不 fire、不投递、不写状态 |
+| `executor` | `list` / `create` / `update` / `delete` / `run` | 只在 `executor` 子代理内可见，同属 catalog-only；`run` 与四道闸见 [executor.md](executor.md#executor-工具) |
+
+`trigger create` / `update` 会校验 `on_fire.agent` 指向的定义已落盘，所以写「fire 一个执行器」的规则前 `agents/executor.md` 必须已经存在（`setup` 铺出；老部署要重跑 `setup`）。
 
 用户侧入口是内置 agent `agents/trigger.md`（system prompt 里以 `# Available Agents` 一行出现）。**一个能力一个入口**：触发器只以 agent 存在，不注册 skill——两者并存时模型会走不用读文档的那条路。
 

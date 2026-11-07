@@ -187,6 +187,11 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         .await?,
     );
 
+    // The collector reads connectors too, but only the half their server claims
+    // read-only (ticket 17). The pool came up with the loop, so the source layer
+    // (built earlier) is handed it here.
+    source_layer.attach_connectors(agent_loop.connectors());
+
     // Connector pool came up with the loop (ticket 26): naming the configured
     // servers here is the startup record of what the gateway will try to reach.
     // Statuses are still `connecting` — each transition logs itself later, so
@@ -628,6 +633,7 @@ mod tests {
         let config = crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -871,6 +877,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -945,6 +952,7 @@ mod tests {
             &Config {
                 pressure: Default::default(),
                 mcp: Default::default(),
+                executors: Default::default(),
                 tracing: serde_json::from_value(serde_json::json!({
                     "enabled": true,
                     "backends": [
@@ -997,6 +1005,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1077,6 +1086,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1296,6 +1306,7 @@ mod tests {
         let config = Arc::new(crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 10,
@@ -1726,6 +1737,7 @@ mod tests {
         let config = crate::config::Config {
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
             agent: crate::config::AgentConfig {
                 provider: "default".to_string(),
                 max_iterations: 50,

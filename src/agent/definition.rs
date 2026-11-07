@@ -402,6 +402,76 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_names_accept_the_executor_increment() {
+        // `executor` is catalog-only, but it still has to validate as a
+        // declared tool: an unknown name rejects the whole definition, and the
+        // only symptom is an agent that silently never appears.
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        write_agent(
+            &agents,
+            "executor.md",
+            "---\nname: executor\ndescription: Act on the outside world.\ntools: executor\ndeliver: true\ntimeout_secs: 180\n---\nbody\n",
+        );
+        let reg = load_registry(&agents, &known());
+        assert!(
+            reg.rejected().is_empty(),
+            "the executor definition must not be rejected: {:?}",
+            reg.rejected()
+        );
+        let def = reg.get("executor").expect("executor agent must load");
+        assert!(def.deliver);
+        assert_eq!(def.timeout_secs, 180);
+        let names = def.tool_names(&default_tool_set(&[]));
+        assert!(names.contains(&"executor".to_string()));
+        assert_eq!(names.len(), 13, "one increment over the twelve defaults");
+    }
+
+    #[test]
+    fn test_the_bootstrapped_agent_templates_load_and_are_listed() {
+        // The shipped templates, not a synthetic fixture: frontmatter parsing is
+        // line-based and silently ignores unknown keys, so only the real files
+        // prove that `agents/executor.md` is loadable, listable and reachable by
+        // `subagent {agent: "executor"}`.
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        for template in ["trigger.md", "executor.md"] {
+            let dest = format!("agents/{template}");
+            let content = crate::bootstrap::bootstrap_files()
+                .find(|(bootstrapped, _)| *bootstrapped == dest)
+                .map(|(_, content)| content)
+                .expect("template must be embedded");
+            std::fs::write(agents.join(template), content).unwrap();
+        }
+
+        let reg = load_registry(&agents, &known());
+        assert!(
+            reg.rejected().is_empty(),
+            "shipped templates must load: {:?}",
+            reg.rejected()
+        );
+
+        let executor = reg.get("executor").expect("executor agent must load");
+        assert_eq!(executor.tools, vec!["executor".to_string()]);
+        assert!(executor.deliver);
+        assert_eq!(executor.timeout_secs, 180);
+        assert!(
+            executor.system_prompt.contains("references/connector.md"),
+            "the body must point at the shared connector reference"
+        );
+
+        // `# Available Agents` is generated from the registry, so a loaded
+        // definition is all it takes to be reachable.
+        let section = reg.prompt_section().unwrap();
+        assert!(
+            section.contains("- **executor** — "),
+            "executor must occupy its line: {section}"
+        );
+        assert!(section.contains("- **trigger** — "));
+    }
+
+    #[test]
     fn test_tool_names_appends_increments() {
         let dir = tempfile::tempdir().unwrap();
         let agents = dir.path().join("agents");

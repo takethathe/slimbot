@@ -79,6 +79,7 @@ cargo run -- -d /data/myapp setup
   "channels": { ... },
   "gateway": { ... },
   "json_render": { ... },
+  "executors": { "max_count": 20 },
   "pressure": { ... },
   "mcp": { "servers": [ ... ] }
 }
@@ -94,6 +95,7 @@ cargo run -- -d /data/myapp setup
 | `channels` | object | 否 | `{}` | 通信通道定义（键值映射） |
 | `gateway` | object | 否 | 见下文 | Gateway 模式配置 |
 | `json_render` | object | 否 | 见下文 | WebUI 卡片生成配置 |
+| `executors` | object | 否 | `{"max_count": 20}` | 执行器数量软上限（`0` = 不设上限） |
 | `pressure` | object | 否 | 见下文 | 上下文压力占比（长度限制全部由 provider 窗口派生） |
 | `mcp` | object | 否 | 空池 | MCP 连接器（`mcp.servers[]`）与连接预算 |
 
@@ -418,6 +420,20 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 - **按风险级配置而非逐个工具**：新出现的工具（例如 MCP 连接器带来的工具）自动继承所在风险级的策略，不会因为"忘了配"而静默放开。
 - **无人值守按 `deny`**：cron / heartbeat / trigger / subagent 的 run 遇到 `ask` 一律拒绝，且不写待确认记录。
 - 审批只约束 agent 主动发起的动作；Agent 写配置文件不走审批（见 ADR 0002、票 02）。
+
+### `executors` — 执行器数量软上限
+
+执行器（`executors/exec-xxxx/`）的膨胀治理只需要一个旋钮：存放数量软上限。到达上限时 `executor` 工具的 `create` 被拒，并把已有条目（id / name / description / status）随拒绝一起返回，要求先清理；`update` / `list` / `delete` / `run` 不受限。机制与「先看再建」纪律见 [executor.md](executor.md#膨胀治理v1-轻)。
+
+```json
+{ "executors": { "max_count": 20 } }
+```
+
+| 字段 | 类型 | 约束 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `max_count` | usize | range(0, 10000) | `20` | 存放的执行器数量上限；`0` = 不设上限。默认 20 是**故意宽松**的：v1 量小，硬拒绝容易误伤正常创建，部署侧真要收紧再改 |
+
+这一节是顶层配置而不是 `triggers` 的子字段：`executors/` 是 workspace 根级目录，执行器不是触发器的附属（见 [executor.md](executor.md#目录布局)）。
 
 ### `mcp` — MCP 连接器
 

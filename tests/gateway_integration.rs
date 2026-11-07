@@ -64,6 +64,7 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
         triggers: Default::default(),
         pressure: Default::default(),
         mcp: Default::default(),
+        executors: Default::default(),
     }
 }
 

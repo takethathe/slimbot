@@ -29,7 +29,7 @@ pub trait Tool: Send + Sync {
 | 风险级 | 含义 | 内置工具 |
 |--------|------|----------|
 | `ReadOnly` | 只读，不改动任何状态 | `file_reader`、`list_dir`、`grep`、`find_files`、`memory_search`、`memory_read` |
-| `WorkspaceWrite` | 只写工作区内文件 | `file_writer`、`file_editor`、`make_dir`、`cron`、`memory_write`、`memory_edit`、`subagent`、`trigger_source`、`trigger` |
+| `WorkspaceWrite` | 只写工作区内文件 | `file_writer`、`file_editor`、`make_dir`、`cron`、`memory_write`、`memory_edit`、`subagent`、`trigger_source`、`trigger`、`executor` |
 | `Exec` | 执行任意命令 | `shell` |
 | `NetworkEgress` | 内容离开本机到网络 | `web_fetch` |
 | `ExternalSend` | 向外部的人/通道发送 | `message` |
@@ -95,14 +95,15 @@ pub struct ToolManager {
 | `subagent` | `AgentLoop::from_parts`（仅主循环） | 启动子代理；保留工具，agent 定义不可声明 |
 | `message` / `cron` | gateway 启动时 | 需要 channel 回调与 cron 运行时 |
 | `trigger_source` / `trigger` | gateway 启动时，**只注册进 `ToolCatalog`** | 主循环不可见，仅当 agent 定义显式声明时才装配到子代理 |
+| `executor` | `AgentLoop::from_parts`，**只注册进 `ToolCatalog`** | 主循环不可见；CLI 与 gateway 同源（否则 CLI 下 `agents/executor.md` 会缺工具），见 [executor.md](executor.md) |
 | `memory_read` / `memory_write` / `memory_edit` | `DreamService::build_tools` | 只在 Dream 沙箱内注册，沙箱无文件工具 |
 
 ## ToolCatalog 与可见性
 
 `ToolCatalog` 是工具工厂的进程级注册表（`src/agent/catalog.rs`）：子代理运行时按定义从 catalog 装配自己的 `ToolManager`，主循环的共享工具表与 prompt cache 因此不受影响。
 
-- gateway 与 CLI 模式都在启动时 `register_builtin_set()` 镜像内置工具，`from_parts` 再补 `memory_search`；gateway 另补 `message` / `cron` / `trigger_source` / `trigger`
-- `STATIC_TOOL_NAMES`（13 个）用于在 catalog 尚未组装时（如构建 system prompt）校验工具名
+- gateway 与 CLI 模式都在启动时 `register_builtin_set()` 镜像内置工具，`from_parts` 再补 `memory_search` / `executor`（后者只进 catalog）；gateway 另补 `message` / `cron` / `trigger_source` / `trigger`
+- `STATIC_TOOL_NAMES`（16 个）用于在 catalog 尚未组装时（如构建 system prompt）校验工具名；`executor` 在这里而在主循环工具表之外，两处缺一都会让子代理缺工具
 - 保留工具：`FORBIDDEN_AGENT_TOOLS = ["cron", "subagent"]`，agent 声明它们会被整份拒绝（防止绕过触发器层与并发闸）
 - `ToolCatalog::install_global()` 后，`agent::known_tool_names()` 与触发器工具可查询当前可见工具集
 
@@ -177,7 +178,7 @@ fn context_exempt(&self) -> bool { false }  // 默认不豁免
 
 | 保护集 | 来源 | 理由 |
 |--------|------|------|
-| `AGENTS.md`、`USER.md`、`SOUL.md`、`TOOLS.md`、`agents/trigger.md` | `bootstrap::protected_documents()`（从 bootstrap 列表派生后再去掉 `MEMORY.md`，不维护第二份硬编码清单） | 身份与工作指令，只有 owner 能改 |
+| `AGENTS.md`、`USER.md`、`SOUL.md`、`TOOLS.md`、`agents/trigger.md`、`agents/executor.md`、`references/connector.md` | `bootstrap::protected_documents()`（从 bootstrap 列表派生后再去掉 `MEMORY.md`，不维护第二份硬编码清单） | 身份、工作指令与宿主知识，只有 owner 能改 |
 | `skills/*/SKILL.md`、`memory/*.md`（`MEMORY.md` 除外） | 路径规则 | Dream 的产出区，由 Dream 写 |
 
 命中即返回**工具结果文本**（不是 `Err`，不退回合、不 panic）：

@@ -132,6 +132,16 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_the_connector_reference_is_owner_only() {
+        // A reference is host-authored knowledge, the same class as an agent
+        // definition: one run must not rewrite the rules the next run reads.
+        assert_eq!(
+            classify("references/connector.md"),
+            Some(ProtectedKind::Bootstrap)
+        );
+    }
+
+    #[test]
     fn test_classify_runtime_and_ordinary_files_stay_writable() {
         for doc in [
             "memory/history.jsonl",

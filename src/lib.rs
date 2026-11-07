@@ -19,6 +19,7 @@ pub(crate) mod cron;
 pub mod delivery;
 pub(crate) mod dream;
 pub(crate) mod embed;
+pub(crate) mod executor;
 pub(crate) mod gateway;
 pub(crate) mod heartbeat;
 pub mod identity;

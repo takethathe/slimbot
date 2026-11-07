@@ -72,6 +72,13 @@ impl TurnContext {
     pub fn sent_in_turn(&self) -> bool {
         self.sent_in_turn.load(Ordering::Acquire)
     }
+
+    /// The run's nested tool-call authority, when this turn was built by a
+    /// runner. Read through here when the caller already holds the turn: the
+    /// task-local is then read once instead of twice.
+    pub(crate) fn tool_exec(&self) -> Option<Arc<crate::runner::gate::RunToolExec>> {
+        self.tool_exec.clone()
+    }
 }
 
 task_local! {
@@ -106,7 +113,7 @@ pub fn current_turn_target() -> (String, String) {
 /// outside a runner-built turn. The codemode tool needs this to execute
 /// `tools.*` host calls under the run's own approval gate.
 pub(crate) fn current_tool_exec() -> Option<Arc<crate::runner::gate::RunToolExec>> {
-    current_turn().and_then(|t| t.tool_exec.clone())
+    current_turn().and_then(|turn| turn.tool_exec())
 }
 
 #[derive(Debug, Clone)]

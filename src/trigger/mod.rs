@@ -282,7 +282,7 @@ pub fn build_layers(
     (sources, rules, Arc::new(secrets))
 }
 
-fn secret_map(config: &TriggersConfig) -> BTreeMap<String, String> {
+pub(crate) fn secret_map(config: &TriggersConfig) -> BTreeMap<String, String> {
     config
         .secrets
         .iter()

@@ -1,8 +1,8 @@
 //! The script execution layer.
 //!
-//! Three very different scripts — a data-source collector, a trigger condition,
-//! and a model-authored agent program — share one evaluator. Each execution
-//! gets:
+//! Four very different scripts — a data-source collector, a trigger
+//! condition, a model-authored agent program, and an executor's action
+//! script — share one evaluator. Each execution gets:
 //!
 //! * a dedicated OS thread per execution, which exits with the script: the
 //!   result travels back over a channel, so no thread ever outlives its run,
@@ -16,10 +16,13 @@
 //! * two independent deadlines: a watchdog thread flips the VM's interrupt
 //!   flag so a spinning script is cut off mid-instruction, and an outer
 //!   `tokio::time::timeout` catches a host call that never settles;
+//! * an optional [`AbortHandle`] a host function can flip when it must stop the
+//!   script outright (a spent call budget, a refused action); the interrupt path
+//!   is the only uncatchable stop, so a script cannot `try` its way past it;
 //! * a hard memory ceiling and a hard output ceiling.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rquickjs::function::Async;
@@ -32,10 +35,13 @@ use super::redact::Redactor;
 
 /// Name of the function the caller expects the script to define. `collect`
 /// returns `{items: [...]}`, `judge` returns `{fire, evidence?, detail?}`,
-/// `main` (the agent entry, ticket 25) returns arbitrary JSON.
+/// `main` (the agent entry, ticket 25) returns arbitrary JSON, and `act` (the
+/// executor entry, ticket 12) returns `{ok, summary, evidence?}` (validated by
+/// the caller, not by the sandbox).
 pub const ENTRY_COLLECT: &str = "collect";
 pub const ENTRY_JUDGE: &str = "judge";
 pub const ENTRY_AGENT: &str = "main";
+pub const ENTRY_ACT: &str = "act";
 
 /// Budgets for one execution.
 #[derive(Debug, Clone, Copy)]
@@ -77,21 +83,111 @@ impl Limits {
         }
     }
 
+    /// Act-entry scripts perform one action: same wall clock as the agent
+    /// entry (a single action may read, decide and then act), but a small
+    /// result. The ceiling is 16KB — the same order as the evidence budget
+    /// (`EVIDENCE_MAX_ITEMS` 5 × `PAYLOAD_MAX_BYTES` 4KB = 20KB) and a quarter
+    /// of the 64KB collect ceiling, because the result is intermediary product
+    /// for a subagent, not a data set.
+    pub fn act() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            memory_bytes: 64 * 1024 * 1024,
+            max_output_bytes: 16 * 1024,
+        }
+    }
+
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 }
 
+/// Why a run was stopped from inside the sandbox.
+///
+/// The kind is a fact about *who* stopped the run, not a message prefix: an
+/// approval refusal and a spent host budget abort the VM the same way, but the
+/// caller has to report them as different failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortKind {
+    /// A host gate stopped the run: a spent per-run call budget, a result over
+    /// the output ceiling, a write outside the caller's ceiling.
+    Stopped,
+    /// A policy gate refused the call (approval Ask/Deny). The act entry's
+    /// connector write path raises it.
+    Refused,
+}
+
+/// A run's abort switch, shared between the caller, the host functions and the
+/// VM.
+///
+/// A host function cannot throw an uncatchable error, so "stop this script
+/// now" can only mean: set this flag and let the interrupt handler cut the next
+/// instruction. The first reason wins, so a later budget stop never rewrites
+/// the refusal that caused it.
+#[derive(Debug, Default)]
+pub struct AbortHandle {
+    kind: Mutex<Option<AbortKind>>,
+    reason: Mutex<Option<String>>,
+}
+
+impl AbortHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop the run because a host limit was reached.
+    pub fn stop(&self, reason: impl Into<String>) {
+        self.set(AbortKind::Stopped, reason);
+    }
+
+    /// Stop the run because a policy gate refused a call.
+    pub fn refuse(&self, reason: impl Into<String>) {
+        self.set(AbortKind::Refused, reason);
+    }
+
+    fn set(&self, kind: AbortKind, reason: impl Into<String>) {
+        let mut slot = self.kind.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(kind);
+        let mut reason_slot = self.reason.lock().unwrap_or_else(|p| p.into_inner());
+        *reason_slot = Some(reason.into());
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        self.kind
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    pub fn kind(&self) -> Option<AbortKind> {
+        *self.kind.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
 /// One script to evaluate.
 pub struct RunRequest {
-    /// Script source. Defines `collect(ctx)` or `judge(ctx)`.
+    /// Script source. Defines `collect(ctx)`, `judge(ctx)`, `main(ctx)` or
+    /// `act(ctx)`.
     pub script: String,
-    /// Entry function name, see [`ENTRY_COLLECT`] / [`ENTRY_JUDGE`].
+    /// Entry function name, see [`ENTRY_COLLECT`] / [`ENTRY_JUDGE`] /
+    /// [`ENTRY_AGENT`] / [`ENTRY_ACT`].
     pub entry: String,
     /// Plain data merged into `ctx` (source views, previous store values...).
     pub ctx: Value,
     pub limits: Limits,
+    /// Set when a host function may have to stop the run early.
+    pub abort: Option<Arc<AbortHandle>>,
 }
 
 impl RunRequest {
@@ -101,6 +197,7 @@ impl RunRequest {
             entry: entry.to_string(),
             ctx: Value::Null,
             limits: Limits::judge(),
+            abort: None,
         }
     }
 
@@ -113,6 +210,13 @@ impl RunRequest {
         self.limits = limits;
         self
     }
+
+    /// Hand the run an abort switch a host function can flip. The same handle
+    /// stays with the caller, so it can tell a refusal from a spent budget.
+    pub fn with_abort(mut self, abort: Arc<AbortHandle>) -> Self {
+        self.abort = Some(abort);
+        self
+    }
 }
 
 /// Run a script to completion on the calling thread.
@@ -121,8 +225,9 @@ impl RunRequest {
 /// panics and never takes the host process down: a panic inside the script
 /// thread is reported as an `internal` error.
 ///
-/// Production callers are async and use [`execute_async`]; this is the sync half,
-/// kept for callers that have no runtime to hand and exercised by the tests.
+/// The blocking half of [`execute_async`], kept for the tests: they drive a
+/// script to a result without standing up an async runtime. Production callers
+/// all reach the sandbox through `execute_async`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn execute(
     request: RunRequest,
@@ -191,16 +296,21 @@ async fn run_in_runtime(
     let budget_ms = budget.as_millis();
     let redactor = env.redactor().clone();
     let timed_out = Arc::new(AtomicBool::new(false));
+    let abort = request.abort.clone();
 
     let js = AsyncRuntime::new()
         .map_err(|e| ScriptError::internal(format!("could not start the script engine: {e}")))?;
 
     // The interrupt flag: a script that never yields is cut off inside the VM,
-    // which is the only way to stop `while (true) {}`.
+    // which is the only way to stop `while (true) {}`. A host function that set
+    // the abort flag rides the same path.
     {
         let flag = timed_out.clone();
-        js.set_interrupt_handler(Some(Box::new(move || flag.load(Ordering::SeqCst))))
-            .await;
+        let abort = abort.clone();
+        js.set_interrupt_handler(Some(Box::new(move || {
+            flag.load(Ordering::SeqCst) || abort.as_ref().is_some_and(|handle| handle.is_aborted())
+        })))
+        .await;
     }
     if request.limits.memory_bytes > 0 {
         js.set_memory_limit(request.limits.memory_bytes).await;
@@ -252,7 +362,20 @@ async fn run_script<'js>(
     budget_ms: u128,
     redactor: Redactor,
 ) -> Result<Value, ScriptError> {
+    // Checked before `classify`, which reports a `timed_out` interrupt as a
+    // timeout: an aborted run must stay an abort, or the caller cannot tell an
+    // approval refusal from a spent budget.
+    let aborted = |abort: &Option<Arc<AbortHandle>>| -> Option<ScriptError> {
+        abort
+            .as_ref()
+            .filter(|handle| handle.is_aborted())
+            .map(|handle| ScriptError::aborted(handle.reason().unwrap_or_default()))
+    };
+
     let fail = |error: CaughtError<'js>, ctx: &Ctx<'js>| -> ScriptError {
+        if let Some(aborted) = aborted(&request.abort) {
+            return aborted;
+        }
         classify(
             &describe_exception(&error, ctx),
             timed_out.load(Ordering::SeqCst),
@@ -301,7 +424,14 @@ async fn run_script<'js>(
     };
 
     let text = match promise.into_future::<String>().await {
-        Ok(text) => text,
+        // A script can return before the VM ever consults the interrupt handler
+        // (one host call, then straight to `return`), so the settled result is
+        // checked too. Both branches, and before the size check: an aborted run
+        // is an abort, whatever else is also true of its result.
+        Ok(text) => match aborted(&request.abort) {
+            Some(aborted) => return Err(aborted),
+            None => text,
+        },
         Err(error) => return Err(fail(CaughtError::from_error(&ctx, error), &ctx)),
     };
 
@@ -718,7 +848,7 @@ mod tests {
 
     #[test]
     fn test_repeated_runs_do_not_accumulate_threads() {
-        let before = thread_count();
+        let before = settled_thread_count();
         for _ in 0..100 {
             let value = run(
                 "async function judge(ctx) { return { ok: 1 }; }",
@@ -728,7 +858,7 @@ mod tests {
             .expect("run must succeed");
             assert_eq!(value["ok"], 1);
         }
-        let after = thread_count();
+        let after = settled_thread_count();
         if let (Some(before), Some(after)) = (before, after) {
             assert!(
                 after <= before + 2,
@@ -784,6 +914,32 @@ mod tests {
         assert_eq!(value, Value::Null);
     }
 
+    /// The quietest thread count over a settling window.
+    ///
+    /// "Did a run leave a thread behind?" is a question about this module's
+    /// threads, but the only cross-platform way to count them is the whole
+    /// process — and `cargo test` runs these tests beside others that start and
+    /// reap their own threads (tokio workers, MCP supervisors, act runs). A
+    /// single sample can catch one of those mid-flight, which reads as growth
+    /// that has nothing to do with a leaked run. A real leak never settles back,
+    /// so the minimum over a window is the honest number on both sides of the
+    /// loop: a leaked thread is still there on every sample, while another
+    /// test's transient thread is gone before the window closes.
+    fn settled_thread_count() -> Option<usize> {
+        const SAMPLES: u32 = 12;
+        const WINDOW: Duration = Duration::from_millis(720);
+        let mut lowest: Option<usize> = None;
+        for sample in 0..SAMPLES {
+            if sample > 0 {
+                std::thread::sleep(WINDOW / SAMPLES);
+            }
+            if let Some(count) = thread_count() {
+                lowest = Some(lowest.map_or(count, |low| low.min(count)));
+            }
+        }
+        lowest
+    }
+
     /// Best-effort thread count: `/proc` on Linux, `ps -M` on macOS. Returns
     /// `None` when neither is available, which skips the assertion.
     fn thread_count() -> Option<usize> {
@@ -802,6 +958,60 @@ mod tests {
         Some(text.lines().count().saturating_sub(1))
     }
 
+    /// Host functions a test script can reach: one switch that flips an
+    /// [`AbortHandle`], the way a spent budget or a refused call would.
+    struct AbortHost {
+        abort: Arc<AbortHandle>,
+    }
+
+    impl HostBindings for AbortHost {
+        fn install(&self, ctx: &Ctx<'_>, _env: &HostEnv) -> rquickjs::Result<()> {
+            let host: Object = host_object(ctx)?;
+            let abort = self.abort.clone();
+            host.set(
+                "abort_now",
+                Function::new(ctx.clone(), move || {
+                    abort.stop("the test host stopped the run");
+                })?,
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_abort_handle_stops_the_script_even_when_caught() {
+        // The interrupt path is the only stop a script cannot catch, which is
+        // what "terminate the whole script" has to mean.
+        let abort = Arc::new(AbortHandle::new());
+        let err = execute(
+            RunRequest::new(
+                "async function judge(ctx) { \
+                     try { ctx.abort_now(); } catch (e) {} \
+                     return { ok: true }; }",
+                ENTRY_JUDGE,
+            )
+            .with_limits(budget(3_000))
+            .with_abort(abort.clone()),
+            Arc::new(AbortHost {
+                abort: abort.clone(),
+            }),
+            env(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "aborted", "{err}");
+        assert!(err.message.contains("test host stopped"), "{err}");
+    }
+
+    #[test]
+    fn test_abort_handle_keeps_the_first_reason() {
+        let abort = AbortHandle::new();
+        assert!(!abort.is_aborted());
+        abort.stop("budget spent");
+        abort.refuse("needs approval");
+        assert_eq!(abort.kind(), Some(AbortKind::Stopped));
+        assert_eq!(abort.reason().as_deref(), Some("budget spent"));
+    }
+
     #[test]
     fn test_limits_have_expected_defaults() {
         assert_eq!(Limits::collect().timeout, Duration::from_secs(10));
@@ -811,5 +1021,28 @@ mod tests {
         // The agent entry orchestrates real tool calls, so it gets real time.
         assert_eq!(Limits::agent().timeout, Duration::from_secs(30));
         assert_eq!(Limits::agent().memory_bytes, 64 * 1024 * 1024);
+        // The act entry does real work once, so it gets the same wall clock as
+        // the agent entry but a much smaller result (evidence scale).
+        assert_eq!(Limits::act().timeout, Duration::from_secs(30));
+        assert_eq!(Limits::act().memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(Limits::act().max_output_bytes, 16 * 1024);
+    }
+
+    #[test]
+    fn test_act_entry_runs_the_act_function() {
+        let value = run(
+            "async function act(ctx) { return { ok: true, summary: 'did it' }; }",
+            ENTRY_ACT,
+            Limits::act(),
+        )
+        .expect("script must succeed");
+        assert_eq!(value["summary"], "did it");
+    }
+
+    #[test]
+    fn test_missing_act_entry_names_the_act_function() {
+        let err = run("const x = 1;", ENTRY_ACT, Limits::act()).unwrap_err();
+        assert_eq!(err.code(), "missing_entry");
+        assert!(err.message.contains("act"), "{}", err.message);
     }
 }

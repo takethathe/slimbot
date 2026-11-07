@@ -633,6 +633,7 @@ mod tests {
             triggers: Default::default(),
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
         }
     }
 

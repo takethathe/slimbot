@@ -32,6 +32,7 @@ use crate::codemode::{
     ENTRY_COLLECT, HostEnv, Limits, Redactor, RunRequest, ScriptError, execute_async,
 };
 use crate::debug;
+use crate::mcp::McpService;
 use crate::warn_log;
 
 use host::CollectHost;
@@ -169,6 +170,10 @@ pub struct SourceLayer {
     interval: Duration,
     inner: Mutex<BTreeMap<String, Runtime>>,
     tick_index: AtomicU64,
+    /// The process-wide connector pool, attached by the wiring layer once the
+    /// loop has brought it up (the layers are built first, the pool second). A
+    /// layer without a pool collects exactly as it did before ticket 17.
+    connectors: Mutex<Option<Arc<McpService>>>,
 }
 
 impl SourceLayer {
@@ -187,6 +192,7 @@ impl SourceLayer {
             interval,
             inner: Mutex::new(BTreeMap::new()),
             tick_index: AtomicU64::new(0),
+            connectors: Mutex::new(None),
         };
         layer.reload();
         layer
@@ -194,6 +200,25 @@ impl SourceLayer {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Hand the collector the process-wide connector pool (ticket 17).
+    ///
+    /// A setter rather than a constructor parameter because the pool comes up
+    /// with the agent loop, after these layers are built; `None` (or never
+    /// calling this) leaves the collector's surface untouched.
+    pub fn attach_connectors(&self, connectors: Option<Arc<McpService>>) {
+        *self
+            .connectors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = connectors;
+    }
+
+    fn connectors(&self) -> Option<Arc<McpService>> {
+        self.connectors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Re-read the sources directory. New sources appear, deleted ones vanish,
@@ -295,17 +320,19 @@ impl SourceLayer {
         }
 
         let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
+        let connectors = self.connectors();
         let mut tasks = Vec::with_capacity(due.len());
         for source in due {
             let permits = permits.clone();
             let workspace = self.workspace.clone();
             let secrets = self.secrets.clone();
+            let connectors = connectors.clone();
             tasks.push(tokio::spawn(async move {
                 let _permit = match permits.acquire().await {
                     Ok(permit) => permit,
                     Err(_) => return (source.id.clone(), Err("collector cancelled".to_string())),
                 };
-                let outcome = collect_one(workspace, secrets, &source).await;
+                let outcome = collect_one(workspace, secrets, connectors, &source).await;
                 (source.id, outcome)
             }));
         }
@@ -473,6 +500,7 @@ impl SourceLayer {
 async fn collect_one(
     workspace: PathBuf,
     secrets: Arc<BTreeMap<String, String>>,
+    connectors: Option<Arc<McpService>>,
     source: &DueSource,
 ) -> Result<normalize::Normalized, String> {
     if let Some(problem) = &source.problem {
@@ -488,6 +516,7 @@ async fn collect_one(
         workspace,
         &source.meta.allow_paths,
         secrets.clone(),
+        connectors,
     ));
     let limits = Limits::collect().with_timeout(Duration::from_secs(source.meta.timeout_s));
     let request = RunRequest::new(script, ENTRY_COLLECT).with_limits(limits);
@@ -563,6 +592,50 @@ mod tests {
         let view = layer.view("src-0001").expect("view after collect");
         assert_eq!(view.count, 2);
         assert!(view.observed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_collector_reads_through_the_attached_connector_pool() {
+        // The pool is handed to the layer after it is built (it comes up with
+        // the loop), so this pins the hand-off: a collector reaches a read-only
+        // connector through `ctx.tools`, and its item lands in the snapshot.
+        use crate::mcp::service::test_support as mcp_test;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = SourceMeta::new("src-0001", "src-0001");
+        source.timeout_s = 5;
+        let root = tmp.path().join("triggers").join("sources");
+        save_meta(&root, &source).unwrap();
+        save_script(
+            &root,
+            "src-0001",
+            r#"async function collect(ctx) {
+                const read = await ctx.tools.mcp__github__get_pull({number: 7});
+                return { items: [{title: read}] };
+            }"#,
+        )
+        .unwrap();
+
+        let (pool, _peer) = mcp_test::online_service(
+            "github",
+            vec![json!({
+                "name": "get_pull",
+                "description": "Fetch one pull request",
+                "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            })],
+        );
+        mcp_test::wait_for(|| pool.any_online(), "the fake server online").await;
+
+        let layer = layer(tmp.path(), DEFAULT_TTL);
+        layer.attach_connectors(Some(pool));
+        let report = layer.tick(2).await;
+        assert_eq!(report.succeeded, vec!["src-0001".to_string()]);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+
+        let view = layer.view("src-0001").expect("view after collect");
+        let title = view.items[0]["title"].as_str().unwrap_or_default();
+        assert!(title.contains("pong"), "{title}");
+        assert!(title.contains("<codemode_output"), "{title}");
     }
 
     #[tokio::test]

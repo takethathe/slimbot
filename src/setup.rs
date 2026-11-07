@@ -21,6 +21,7 @@ fn default_config() -> Config {
         memory: Default::default(),
         json_render: Default::default(),
         subagent: Default::default(),
+        executors: Default::default(),
         triggers: Default::default(),
         pressure: Default::default(),
         mcp: Default::default(),
@@ -122,6 +123,7 @@ fn create_directories_and_bootstrap(paths: &PathManager) -> Result<()> {
     std::fs::create_dir_all(paths.memory_dir())?;
     std::fs::create_dir_all(paths.agents_dir())?;
     std::fs::create_dir_all(paths.triggers_dir())?;
+    std::fs::create_dir_all(paths.executors_dir())?;
 
     // Write bootstrap files (skip if already exists)
     for (dest, template) in bootstrap_files() {
@@ -258,6 +260,7 @@ mod tests {
         assert!(paths.memory_dir().exists());
         assert!(paths.agents_dir().exists());
         assert!(paths.triggers_dir().exists());
+        assert!(paths.executors_dir().exists());
 
         // Bootstrap files should exist
         let workspace = paths.workspace_dir();
@@ -267,9 +270,60 @@ mod tests {
         assert!(workspace.join("TOOLS.md").exists());
         assert!(workspace.join("memory").join("MEMORY.md").exists());
         assert!(workspace.join("agents").join("trigger.md").exists());
+        assert!(workspace.join("agents").join("executor.md").exists());
+        assert!(workspace.join("references").join("connector.md").exists());
         // identity/dream stay embedded-only — never written to the workspace.
         assert!(!workspace.join("identity.md").exists());
         assert!(!workspace.join("dream.md").exists());
+    }
+
+    /// Ticket 18: the shared connector reference lands under `references/` and
+    /// never under `skills/`, so `# Available Skills` (built from the skills
+    /// dir and injected into every prompt, main loop included) stays free of it.
+    #[tokio::test]
+    async fn test_setup_connector_reference_stays_out_of_available_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let paths = PathManager::resolve(None, Some(data_dir.to_str().unwrap()), None).unwrap();
+        create_directories_and_bootstrap(&paths).unwrap();
+
+        let workspace = paths.workspace_dir();
+        let reference = workspace.join("references").join("connector.md");
+        assert!(
+            reference.exists(),
+            "references/connector.md must be written"
+        );
+
+        // One non-always skill so `# Available Skills` is a populated section
+        // rather than an absent one: the exclusion below is then a real filter.
+        let optional = workspace.join("skills").join("optional");
+        std::fs::create_dir_all(&optional).unwrap();
+        std::fs::write(
+            optional.join("SKILL.md"),
+            "---\nname: optional\ndescription: An optional skill.\nalways: false\n---\n\nBody",
+        )
+        .unwrap();
+
+        let ms = std::sync::Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryService::new(
+            workspace,
+        )));
+        ms.lock().await.init().unwrap();
+        let cb = crate::context::ContextBuilder::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
+            )),
+            std::sync::Arc::new(crate::tool::ToolManager::new(workspace.to_path_buf())),
+            workspace.to_path_buf(),
+            ms.clone(),
+        );
+
+        let prompt = cb.build_system_prompt("cli", None).await;
+        assert!(prompt.contains("# Available Skills"), "{prompt}");
+        assert!(prompt.contains("skills/optional/SKILL.md"), "{prompt}");
+        assert!(
+            !prompt.contains("connector.md"),
+            "the connector reference must never be advertised as a skill: {prompt}"
+        );
     }
 
     #[test]

@@ -18,7 +18,9 @@ pub type ToolFactory = Arc<dyn Fn() -> Option<Box<dyn Tool>> + Send + Sync>;
 /// Names every SlimBot build can construct, used to validate agent
 /// definitions even before the catalog is assembled (e.g. while building a
 /// system prompt). `message` / `memory_search` / trigger tools are registered
-/// by the wiring layer rather than by `config.tools`.
+/// by the wiring layer rather than by `config.tools`. `executor` is here for
+/// the same reason as the trigger tools: no `config.tools` entry can reach it,
+/// but an agent definition has to be able to declare it.
 const STATIC_TOOL_NAMES: &[&str] = &[
     "shell",
     "file_reader",
@@ -35,6 +37,7 @@ const STATIC_TOOL_NAMES: &[&str] = &[
     "memory_search",
     "trigger",
     "trigger_source",
+    "executor",
 ];
 
 pub struct ToolCatalog {
@@ -170,6 +173,7 @@ mod tests {
             "memory_search",
             "trigger",
             "trigger_source",
+            "executor",
             "web_fetch",
         ] {
             assert!(
@@ -197,6 +201,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_executor_tool_is_catalog_only_and_absent_from_the_default_tool_set() {
+        // The main loop must be blind to executors: `executor` is a known name
+        // (an agent definition declares it) but never part of the default set,
+        // so no run gets it without asking. `catalog-only` used to rest on that
+        // structure alone; this is the lock.
+        let defaults = crate::agent::definition::default_tool_set(&[]);
+        assert!(!defaults.contains(&"executor".to_string()));
+        assert!(known_tool_names().contains(&"executor".to_string()));
     }
 
     #[test]

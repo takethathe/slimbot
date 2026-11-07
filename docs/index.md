@@ -5,7 +5,7 @@
 | 文档 | 说明 |
 |------|------|
 | [配置指南](config.md) | `config.json` 结构、验证规则、多 Provider 配置 |
-| [内置工具](tools.md) | 10 个内置工具（shell、文件读写编辑、目录、grep/find_files、web_fetch、codemode），加 `memory_search`、`subagent` 与 Dream 专用记忆工具；触发器工具（`trigger` / `trigger_source`）只对声明它们的 agent 可见 |
+| [内置工具](tools.md) | 10 个内置工具（shell、文件读写编辑、目录、grep/find_files、web_fetch、codemode），加 `memory_search`、`subagent` 与 Dream 专用记忆工具；触发器工具（`trigger` / `trigger_source`）与 `executor` 只对声明它们的 agent 可见 |
 | [日志系统](logging.md) | 日志级别、CLI 参数、输出格式 |
 
 ## 核心模块
@@ -26,6 +26,7 @@
 | [通道](channel.md) | `channel/` | 通道抽象、工厂模式、并发 I/O 循环 |
 | [飞书通道](feishu.md) | `channel/feishu.rs` | 首个 IM 通道：单条 WS 长连（gateway 独占）、`owner_open_id` 绑 owner、p2p 文本往返 + 流式卡片原位更新、图片/文件收发（入站只按 file-key 拉、防 SSRF）、隐私护栏（ADR 0017） |
 | [触发器层](trigger.md) | `trigger/` | 固定 tick、数据源采集与快照、边沿判定、执行投递与 fire 账本 |
+| [执行器](executor.md) | `executor/` | 存放的 `act.js` 动作脚本：目录形状与 meta、入参校验、`scan-on-call` 读盘（无常驻层）、`executor` 工具的增删改查与 `run`（数值闸 + 结果契约 + 失败分类）；调用面是寄生的 `executor` 子代理（`agents/executor.md`），主循环零污染，act 侧 v1 Allow-only（ADR 0021） |
 | [子代理运行时](agent.md) | `agent/` | agent 定义与工具增量、一次性 run、并发闸、结果投递 |
 | [脚本沙箱](codemode.md) | `codemode/` | rquickjs 专职线程、双层超时、宿主函数白名单、凭证抹除 |
 | [MCP 连接器](mcp.md) | `mcp/` | 自研最小客户端（stdio + streamable-HTTP）、gateway 级连接池与退避重连；工具只进 codemode 的 `searchTools()` / `tools.mcp__*`，**不进模型 schema**（ADR 0016、0020） |

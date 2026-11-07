@@ -15,6 +15,6 @@ personal agent 光会“读与提醒”（触发器）不够，得能“对外�
 - MCP 归为“连接器的特例”（同 server 既读又动），不另立第二套外部集成机制；v1 的“一个真实集成”= 一个 GitHub 式 MCP 连接器 + 相应执行器。
 - 执行器动作带副作用，默认风险档 `external_send`，走票 03 的“回合末兑现 / 文本清单无按钮”审批，**不在 codemode 执行中途逐调用弹窗**；无人值守（trigger 自动 fire）里的执行器动作一律 Deny（继承票 03/票 12）。审批粒度（整脚本 vs 逐动作）留给后续实现接缝，本决策不定。
 - 执行器/采集器经连接器取回的外部内容若进入触发器采集路径，仍受 ADR 0009 的 evidence-only 约束，不因“走了连接器”绕过证据上限；连接器作为触发器源信息来源是单向的（collect 可用连接器读侧，连接器不反向依赖触发器）。
-- 完整“镜像触发器”的执行器实现设计（`executors/<id>/{meta.json, act.js}`、actuation HostBindings、subagent 创建流程、codemode 调用面）另立一张触发器式子 effort；票 13 与本 ADR 只锁定位与接缝。
+- 完整“镜像触发器”的执行器实现设计（`executors/<id>/{meta.json, act.js}`、actuation HostBindings、subagent 创建流程、codemode 调用面）另立一张触发器式子 effort；票 13 与本 ADR 只锁定位与接缝。**实现定案见 [ADR 0021](0021-executor-parasitic-unattended-subagent.md)**：执行器完全寄生一个 ephemeral 无人值守子代理（不进主循环、v1 Allow-only）；本 ADR 仍是「执行器是什么」，0021 是「它以什么形状存在、以什么姿态运行」。
 - 连接器泛化（“凡 codemode 可调用的外部能力封装”）作为领域概念进 GLOSSARY/`docs/architecture.md`，不单开 ADR：它把 MCP 归入连接器，但不改变各连接器实例的既有机制。
 - 由此边界推掉一批差异化项：卡片 actions 回传**出 v1**（审批已不需按钮，见票 03 #79）；技能供应链（安装/版本/签名）、数据导出/备份工具**出 v1**（数据即明文文件，复制 workspace 即备份）。

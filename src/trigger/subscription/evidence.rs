@@ -172,7 +172,10 @@ pub fn render_template(
     Ok(rendered)
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
+/// Keep at most `max` characters, marking the cut with an ellipsis. Shared with
+/// the act result contract, which applies the same text bound to `summary` and
+/// to evidence text.
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     let count = text.chars().count();
     if count <= max {
         return text.to_string();

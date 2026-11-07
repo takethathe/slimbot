@@ -97,6 +97,34 @@ pub(crate) fn offline_reason(e: &McpError) -> String {
     out
 }
 
+/// A tool is inside the read-only view only when both hints say so: read-only
+/// claimed and not destructive. Either hint missing fails the test, because a
+/// missing `readOnlyHint` means `false` and a missing `destructiveHint` means
+/// `true` (fail-closed, see [`McpTool`]).
+fn is_read_only_claim(tool: &McpTool) -> bool {
+    tool.read_only_hint && !tool.destructive_hint
+}
+
+fn as_definition(cached: &CachedTool) -> ToolDefinition {
+    // The server's own text is marked as its text, not ours, and so is its
+    // claim about side effects: the claim travels as data and never decides the
+    // approval level (see [`McpService::risk_for`]).
+    ToolDefinition {
+        name: cached.callable.clone(),
+        description: format!(
+            "[connector {}] {}{}",
+            cached.server,
+            cached.tool.one_line_description(),
+            if is_read_only_claim(&cached.tool) {
+                " (server claims read-only)"
+            } else {
+                ""
+            }
+        ),
+        parameters: cached.tool.input_schema.clone(),
+    }
+}
+
 /// One cached tool, addressed by the name a script calls.
 #[derive(Debug, Clone)]
 pub struct CachedTool {
@@ -318,26 +346,46 @@ impl McpService {
             .read()
             .values()
             .flat_map(|state| state.tools.iter())
-            .map(|cached| ToolDefinition {
-                name: cached.callable.clone(),
-                // The server's own text is marked as its text, not ours, and so
-                // is its claim about side effects: the claim travels as data and
-                // never decides the approval level (see [`Self::risk_for`]).
-                description: format!(
-                    "[connector {}] {}{}",
-                    cached.server,
-                    cached.tool.one_line_description(),
-                    if cached.tool.read_only_hint && !cached.tool.destructive_hint {
-                        " (server claims read-only)"
-                    } else {
-                        ""
-                    }
-                ),
-                parameters: cached.tool.input_schema.clone(),
-            })
+            .map(as_definition)
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// The read-only half of [`Self::definitions`]: only tools whose server
+    /// claims `readOnlyHint` and does not claim `destructiveHint`.
+    ///
+    /// This is a **capability** filter, not a policy one: it decides what the
+    /// collect entry may see and call at all (ticket 17), while [`Self::risk_for`]
+    /// keeps answering `ExternalSend` for every connector call. A claim selects
+    /// an entry's surface; it never lowers the approval class. The direction is
+    /// fail-closed, so an unannotated tool is not read-only (see [`McpTool`]).
+    pub fn readonly_definitions(&self) -> Vec<ToolDefinition> {
+        let mut out: Vec<ToolDefinition> = self
+            .states
+            .read()
+            .values()
+            .flat_map(|state| state.tools.iter())
+            .filter(|cached| is_read_only_claim(&cached.tool))
+            .map(as_definition)
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Whether one callable is inside the read-only view.
+    ///
+    /// Fail-closed twice over: a tool the cache does not know (offline server,
+    /// vanished tool, typo) is not read-only, and neither is one whose server
+    /// does not make both claims. Consumed by the collect bridge's per-call
+    /// guard and by the act entry's write-side ceiling, which takes the
+    /// complement at install time (ADR 0021).
+    pub fn is_read_only_claimed(&self, callable: &str) -> bool {
+        self.states
+            .read()
+            .values()
+            .flat_map(|state| state.tools.iter())
+            .any(|cached| cached.callable == callable && is_read_only_claim(&cached.tool))
     }
 
     /// The gate's risk class for a connector tool.
@@ -355,6 +403,23 @@ impl McpService {
             .flat_map(|state| state.tools.iter())
             .find(|t| t.callable == callable)
             .map(|_| RiskLevel::ExternalSend)
+    }
+
+    /// The configured server that owns a callable, resolved by longest prefix.
+    ///
+    /// Resolution reads `specs`, not the tool cache, because it answers a
+    /// question about the ceiling ("is this a write on an allowed server?") and
+    /// must not change when a server is briefly offline. Longest prefix wins:
+    /// one server's name can be the prefix of another's (`github` inside
+    /// `github__enterprise`), and the first match would answer for the wrong
+    /// server. `None` means the name belongs to no configured server.
+    pub fn server_of(&self, callable: &str) -> Option<String> {
+        self.specs
+            .iter()
+            .map(|spec| (server_prefix(&spec.name), spec.name.clone()))
+            .filter(|(prefix, _)| callable.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, name)| name)
     }
 
     /// The input schema of one callable, for error text.
@@ -376,19 +441,8 @@ impl McpService {
     pub async fn call(&self, callable: &str, args: Value) -> Result<String, McpError> {
         let (server, status, tool, client) = {
             let states = self.states.read();
-            let mut server: Option<String> = None;
-            let mut matched = 0usize;
-            for spec in &self.specs {
-                let prefix = server_prefix(&spec.name);
-                // Longest prefix wins: one server's name can be the prefix of
-                // another's (`github` inside `github__enterprise`), and the first
-                // spec that happened to match would answer for the wrong server.
-                if callable.starts_with(prefix.as_str()) && prefix.len() > matched {
-                    server = Some(spec.name.clone());
-                    matched = prefix.len();
-                }
-            }
-            let server = server
+            let server = self
+                .server_of(callable)
                 .filter(|name| states.contains_key(name))
                 .ok_or_else(|| {
                     McpError::Protocol(format!("no connector tool named `{callable}`"))
@@ -636,6 +690,10 @@ pub(crate) mod test_support {
     pub struct FakePeer {
         online: std::sync::atomic::AtomicBool,
         attempts: std::sync::atomic::AtomicUsize,
+        /// How many `tools/call` frames the peer answered. Distinct from
+        /// `attempts` (connections): "the connector was never asked to do the
+        /// thing" is a different claim from "nothing connected".
+        calls: std::sync::atomic::AtomicUsize,
         tools: RwLock<Vec<Value>>,
         /// The text one `tools/call` answers with.
         answer: RwLock<String>,
@@ -646,6 +704,7 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 online: std::sync::atomic::AtomicBool::new(true),
                 attempts: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
                 tools: RwLock::new(tools),
                 answer: RwLock::new("pong".to_string()),
             })
@@ -656,6 +715,15 @@ pub(crate) mod test_support {
         }
         pub fn attempts(&self) -> usize {
             self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// How many tool calls this peer was asked to perform.
+        pub fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// Replace the text one tool call answers with, so a test can hand back
+        /// the receipt an action would build on.
+        pub fn set_answer(&self, answer: impl Into<String>) {
+            *self.answer.write() = answer.into();
         }
     }
 
@@ -672,9 +740,14 @@ pub(crate) mod test_support {
             match method {
                 "initialize" => Ok(json!({"protocolVersion": "2025-03-26"})),
                 "tools/list" => Ok(json!({"tools": &*self.peer.tools.read()})),
-                "tools/call" => Ok(json!({
-                    "content": [{"type": "text", "text": &*self.peer.answer.read()}],
-                })),
+                "tools/call" => {
+                    self.peer
+                        .calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!({
+                        "content": [{"type": "text", "text": &*self.peer.answer.read()}],
+                    }))
+                }
                 other => Err(McpError::Protocol(format!("unexpected {other}"))),
             }
         }
@@ -900,6 +973,92 @@ mod tests {
             service.risk_for("mcp__github__merge_pull"),
             Some(RiskLevel::ExternalSend),
             "no hint means no trust"
+        );
+        service.shutdown().await;
+    }
+
+    #[test]
+    fn test_server_of_resolves_the_longest_configured_prefix() {
+        // `allow_connectors` is a server-level ceiling, so the answer has to be
+        // the exact configured server — not a shorter name that happens to be a
+        // prefix of it (`github` inside `github__enterprise`), and not a guess
+        // when the callable belongs to no server at all.
+        let service = service(&["github", "github__enterprise"], vec![]);
+        assert_eq!(
+            service.server_of("mcp__github__create_issue").as_deref(),
+            Some("github")
+        );
+        assert_eq!(
+            service
+                .server_of("mcp__github__enterprise__create_issue")
+                .as_deref(),
+            Some("github__enterprise")
+        );
+        assert_eq!(service.server_of("file_writer"), None);
+        assert_eq!(service.server_of("mcp__gitlab__create_issue"), None);
+    }
+
+    #[tokio::test]
+    async fn test_readonly_definitions_keep_only_the_read_only_claims() {
+        // The read-only view is what the collect entry sees (ticket 17), so the
+        // filter's direction is fail-closed: a tool is read-only only when the
+        // server claims read-only *and* not destructive. A missing hint is not
+        // a claim (`destructiveHint` defaults to true, `readOnlyHint` to false).
+        let peer = FakePeer::new(vec![
+            json!({
+                "name": "get_pull",
+                "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            }),
+            json!({
+                "name": "merge_pull",
+                "annotations": {"readOnlyHint": true, "destructiveHint": true},
+            }),
+            json!({
+                "name": "delete_branch",
+                "annotations": {"destructiveHint": false},
+            }),
+            json!({"name": "publish_release"}),
+        ]);
+        let service = service(&["github"], vec![("github".into(), peer)]);
+        service.start();
+        wait_until(
+            || (service.definitions().len() == 4).then_some(()),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("server online");
+
+        let names: Vec<String> = service
+            .readonly_definitions()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert_eq!(names, vec!["mcp__github__get_pull".to_string()]);
+
+        // Same answer for the per-callable question, and unknown names are not
+        // read-only either.
+        assert!(service.is_read_only_claimed("mcp__github__get_pull"));
+        for name in [
+            "mcp__github__merge_pull",
+            "mcp__github__delete_branch",
+            "mcp__github__publish_release",
+            "mcp__github__no_such_tool",
+        ] {
+            assert!(!service.is_read_only_claimed(name), "{name}");
+        }
+
+        // The read-only view carries the claim in its text, exactly like the
+        // full catalog: it is still the server's claim, not a risk class.
+        let defs = service.readonly_definitions();
+        assert!(
+            defs[0].description.contains("server claims read-only"),
+            "{}",
+            defs[0].description
+        );
+        // And `risk_for` stays untouched by the filter.
+        assert_eq!(
+            service.risk_for("mcp__github__get_pull"),
+            Some(RiskLevel::ExternalSend)
         );
         service.shutdown().await;
     }

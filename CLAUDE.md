@@ -35,6 +35,7 @@ gateway 复用同一套 `AgentLoop`，额外起 `CronService`、`HeartbeatServic
 `data_dir`（默认 `~/.slimbot`）与 `workspace_dir`（默认 `{data_dir}/workspace`）独立配置，显式 workspace 必须在 data_dir 之下；文件工具的路径一律经 `resolve_workspace_path` 收进 workspace。
 
 - 目录清单 — `docs/path.md`。
+- workspace 根级的两个专用目录：`executors/`（执行器定义 `exec-xxxx/{meta.json, act.js}`）与 `references/`（跨子代理共享的 reference，非 skill、不进 `# Available Skills`，见 `docs/bootstrap.md`）。
 - `setup` 铺出的 bootstrap 文件 — `docs/bootstrap.md`；未改动的模板不注入 system prompt。
 - workspace 的 `AGENTS.md` 是 agent 的运行指令，与本文件无关。
 
@@ -46,6 +47,7 @@ gateway 复用同一套 `AgentLoop`，额外起 `CronService`、`HeartbeatServic
 - **连接器工具不进模型 schema** — 只经 codemode 的 `searchTools()` / `tools.mcp__*` 可达；server 的自述与输出按不可信数据处理，风险级一律 `ExternalSend`、fail-closed（ADR 0016、0020）。
 - **上下文长度只有一个锚** — `src/pressure.rs` 从 provider 的 context window 派生全部限制，别处不硬编码（ADR 0013）。
 - **受保护文档写不进去** — `file_writer` / `file_editor` 返回 `REFUSED:`，判定在路径解析之后（ADR 0012）。
+- **执行器只寄生子代理** — `executor` 只注册进 `ToolCatalog`，主循环的 schema 与 prompt 里没有它；act 侧 `Ask` 即 Deny、不写 Pending（ADR 0021）。
 - **Session 两个列表** — `history`（已持久化）+ `current_turn`（本轮缓冲），id 为 `{channel_id}:{chat_id}`；持久化默认 append-only，`consolidated_lines > 0` 才全量重写。
 
 ## 开发流程

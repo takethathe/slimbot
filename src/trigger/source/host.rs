@@ -2,8 +2,20 @@
 //!
 //! A collector runs unattended, on model-written code, so its capability list
 //! is deliberately short: HTTP reads, filesystem reads inside the workspace,
-//! secrets, logging, and the clock. There is no shell, no write, and no
-//! `sleep` (a script that sleeps burns the timeout budget while looking busy).
+//! secrets, logging, the clock, and — when a connector pool is wired — the
+//! **read-only** half of the connectors (ticket 17). There is no shell, no write,
+//! and no `sleep` (a script that sleeps burns the timeout budget while looking
+//! busy).
+//!
+//! The connector view is additive: RSS feeds, plain endpoints and local files
+//! keep going through `ctx.http` / `ctx.fs`, and a connector read sits beside
+//! them for systems the owner actually configured an MCP server for. Its filter
+//! is a capability list, not an approval class: a tool is installed only when
+//! its server claims `readOnlyHint` and not `destructiveHint`, so the write half
+//! is neither installed nor searchable. `McpService::risk_for` still answers
+//! `ExternalSend` for every connector call — a claim selects this entry's
+//! surface, it never buys a lower approval level (see `docs/codemode.md`; the
+//! rule is recorded in ADR 0021).
 //!
 //! The JavaScript surface is a thin shim over JSON-returning primitives, so
 //! this module never has to hand JS objects to an async host function.
@@ -11,24 +23,21 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use rquickjs::function::Async;
 use rquickjs::{Ctx, Function};
 
+use crate::codemode::connector::install_tool_bridge;
 use crate::codemode::host::{
-    HostBindings, HostEnv, LogSink, host_error, host_object, install_log, install_time,
+    HostBindings, HostEnv, LogSink, host_failure, host_object, install_log, install_secret,
+    install_time,
 };
+use crate::codemode::http::install_http;
+use crate::mcp::McpService;
 
 /// Largest file a collector may read in one call.
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 /// Largest directory listing a collector may request.
 const MAX_LIST_ENTRIES: usize = 500;
-/// Largest HTTP body kept; the rest is dropped and flagged.
-const MAX_HTTP_BYTES: usize = 2 * 1024 * 1024;
-/// Hard ceiling for one HTTP call. The sandbox's own deadline is usually
-/// tighter; this exists so a stalled socket cannot outlive its script.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Everything a collector may touch, fixed for the whole execution.
 #[derive(Clone)]
@@ -36,6 +45,9 @@ pub struct CollectHost {
     workspace: PathBuf,
     allow: Vec<PathBuf>,
     secrets: Arc<BTreeMap<String, String>>,
+    /// The process-wide connector pool, when the process has one. `None` leaves
+    /// the collector's surface exactly as it was before connectors existed.
+    connectors: Option<Arc<McpService>>,
     logs: Arc<Mutex<Vec<String>>>,
 }
 
@@ -44,6 +56,7 @@ impl CollectHost {
         workspace: PathBuf,
         allow_paths: &[String],
         secrets: Arc<BTreeMap<String, String>>,
+        connectors: Option<Arc<McpService>>,
     ) -> Self {
         let workspace = canonical_or_self(&workspace);
         let allow = allow_paths
@@ -55,8 +68,27 @@ impl CollectHost {
             workspace,
             allow,
             secrets,
+            connectors,
             logs: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Install the read-only connector view: `ctx.tools.mcp__*` and
+    /// `ctx.searchTools` over the tools whose server claims them read-only.
+    ///
+    /// No pool means no surface at all — not an empty one — so a process without
+    /// `mcp.servers[]` keeps exactly the collector capability list it had before
+    /// ticket 17.
+    fn install_connectors(&self, ctx: &Ctx<'_>) -> rquickjs::Result<()> {
+        let Some(pool) = self.connectors.clone() else {
+            return Ok(());
+        };
+        install_tool_bridge(
+            ctx,
+            pool,
+            |pool: &Arc<McpService>| pool.readonly_definitions(),
+            |pool, name, args| Box::pin(async move { call_read_only(&pool, &name, args).await }),
+        )
     }
 
     /// Resolve a script-supplied path: workspace-relative by default, absolute
@@ -132,125 +164,15 @@ impl CollectHost {
         }
         Ok(serde_json::Value::Array(rows).to_string())
     }
-
-    async fn http_get(
-        &self,
-        url: String,
-        headers_json: String,
-    ) -> std::result::Result<String, String> {
-        self.http_request(reqwest::Method::GET, url, headers_json, String::new())
-            .await
-    }
-
-    async fn http_post(
-        &self,
-        url: String,
-        headers_json: String,
-        body: String,
-    ) -> std::result::Result<String, String> {
-        self.http_request(reqwest::Method::POST, url, headers_json, body)
-            .await
-    }
-
-    async fn http_request(
-        &self,
-        method: reqwest::Method,
-        url: String,
-        headers_json: String,
-        body: String,
-    ) -> std::result::Result<String, String> {
-        let parsed = crate::tools::web_fetch::validate_url(&url)?;
-        // Pin the host before connecting so a DNS answer cannot change between
-        // validation and the request.
-        let port = parsed.port_or_known_default().unwrap_or(80);
-        crate::tools::web_fetch::resolve_and_pin(&parsed, port).await?;
-
-        let method_label = method.to_string();
-        let mut request = http_client().request(method, parsed.clone());
-        if !headers_json.trim().is_empty()
-            && let Ok(serde_json::Value::Object(map)) =
-                serde_json::from_str::<serde_json::Value>(&headers_json)
-        {
-            for (key, value) in map {
-                if let Some(text) = value.as_str() {
-                    request = request.header(key, text);
-                }
-            }
-        }
-
-        if !body.is_empty() {
-            request = request.body(body);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("{method_label} to '{url}' failed: {e}"))?;
-        let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| format!("cannot read the response body: {e}"))?;
-        let truncated = bytes.len() > MAX_HTTP_BYTES;
-        let slice = if truncated {
-            &bytes[..MAX_HTTP_BYTES]
-        } else {
-            &bytes[..]
-        };
-        let text = String::from_utf8_lossy(slice).to_string();
-        Ok(serde_json::json!({
-            "status": status,
-            "text": text,
-            "truncated": truncated,
-        })
-        .to_string())
-    }
 }
 
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let url = attempt.url();
-            if url.scheme() != "http" && url.scheme() != "https" {
-                return attempt.stop();
-            }
-            if let Some(url::Host::Ipv4(addr)) = url.host()
-                && crate::tools::web_fetch::is_private_ip(std::net::IpAddr::V4(addr))
-            {
-                return attempt.stop();
-            }
-            if attempt.previous().len() > 5 {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .unwrap_or_default()
-}
-
-/// JavaScript shim: `ctx.fs.*` / `ctx.http.get|post` over JSON primitives.
+/// JavaScript shim: `ctx.fs.*` over the JSON primitives. The HTTP shim lives
+/// in `codemode::http`, shared with the act entry.
 const SHIM: &str = r#"
 __host.fs = {
     stat: (path) => JSON.parse(__host.fs_stat(String(path))),
     read: (path) => __host.fs_read(String(path)),
     list: (path) => JSON.parse(__host.fs_list(String(path))),
-};
-__host.http = {
-    get: async (url, opts) => JSON.parse(
-        await __host.http_get(
-            String(url),
-            opts && opts.headers ? JSON.stringify(opts.headers) : ""
-        )
-    ),
-    post: async (url, opts) => JSON.parse(
-        await __host.http_post(
-            String(url),
-            opts && opts.headers ? JSON.stringify(opts.headers) : "",
-            opts && opts.body !== undefined ? String(opts.body) : ""
-        )
-    ),
 };
 "#;
 
@@ -267,6 +189,8 @@ impl HostBindings for CollectHost {
             })
         };
         install_log(ctx, env, logs)?;
+        install_http(ctx)?;
+        install_secret(ctx, self.secrets.clone())?;
 
         let host = host_object(ctx)?;
 
@@ -278,7 +202,7 @@ impl HostBindings for CollectHost {
                 Function::new(
                     ctx.clone(),
                     move |path: String| -> rquickjs::Result<String> {
-                        stat.stat(&path).map_err(base_error)
+                        stat.stat(&path).map_err(host_failure)
                     },
                 )?,
             )?;
@@ -288,7 +212,7 @@ impl HostBindings for CollectHost {
                 Function::new(
                     ctx.clone(),
                     move |path: String| -> rquickjs::Result<String> {
-                        read.read(&path).map_err(base_error)
+                        read.read(&path).map_err(host_failure)
                     },
                 )?,
             )?;
@@ -298,69 +222,36 @@ impl HostBindings for CollectHost {
                 Function::new(
                     ctx.clone(),
                     move |path: String| -> rquickjs::Result<String> {
-                        list.list(&path).map_err(base_error)
+                        list.list(&path).map_err(host_failure)
                     },
                 )?,
             )?;
         }
 
-        // -- http (async: the VM keeps running while the request is in flight) --
-        {
-            let handle = self.clone();
-            let host_fn = Function::new(
-                ctx.clone(),
-                Async(move |url: String, headers: String| {
-                    let handle = handle.clone();
-                    async move { handle.http_get(url, headers).await.map_err(base_error) }
-                }),
-            )?;
-            host.set("http_get", host_fn)?;
-            let handle = self.clone();
-            let host_fn = Function::new(
-                ctx.clone(),
-                Async(move |url: String, headers: String, body: String| {
-                    let handle = handle.clone();
-                    async move {
-                        handle
-                            .http_post(url, headers, body)
-                            .await
-                            .map_err(base_error)
-                    }
-                }),
-            )?;
-            host.set("http_post", host_fn)?;
-        }
-
-        // -- secrets --
-        {
-            let secrets = self.secrets.clone();
-            host.set(
-                "secret",
-                Function::new(
-                    ctx.clone(),
-                    move |ctx: Ctx<'_>, name: String| -> rquickjs::Result<String> {
-                        match secrets.get(&name) {
-                            Some(value) => Ok(value.clone()),
-                            None => Err(host_error(
-                                &ctx,
-                                &format!(
-                                    "no secret named '{name}'; add it to triggers.secrets in config"
-                                ),
-                            )),
-                        }
-                    },
-                )?,
-            )?;
-        }
+        self.install_connectors(ctx)?;
 
         ctx.eval::<(), _>(SHIM)?;
         Ok(())
     }
 }
 
-/// Host-side failures surface as a thrown `Error` the script can catch.
-fn base_error(message: String) -> rquickjs::Error {
-    rquickjs::Error::new_from_js_message("host", "string", message)
+/// One connector read on behalf of a collector.
+///
+/// The claim is re-checked here, not only at install time: a server that
+/// re-lists its tools mid-run (or goes offline) must not leave a write-side tool
+/// callable through a function installed a moment earlier. Fail-closed both
+/// ways: an unknown callable is not read-only.
+async fn call_read_only(pool: &McpService, name: &str, args: serde_json::Value) -> String {
+    if !pool.is_read_only_claimed(name) {
+        return format!(
+            "Error: `{name}` is not a read-only connector tool (the server is offline or \
+             does not claim it read-only); a collector may not call it"
+        );
+    }
+    match pool.call(name, args).await {
+        Ok(text) => text,
+        Err(e) => format!("Error: {e}"),
+    }
 }
 
 fn expand(path: &str) -> PathBuf {
@@ -409,6 +300,7 @@ fn canonical_existing_ancestor(path: &Path) -> std::result::Result<PathBuf, Stri
 mod tests {
     use super::*;
     use crate::codemode::{HostEnv, NoHost, Redactor};
+    use serde_json::json;
     use std::sync::Arc;
 
     fn host(workspace: &Path, allow: &[&str]) -> CollectHost {
@@ -417,7 +309,36 @@ mod tests {
             workspace.to_path_buf(),
             &allow,
             Arc::new(BTreeMap::from([("token".to_string(), "s3cr3t".into())])),
+            None,
         )
+    }
+
+    /// One fake connector server brought online on a runtime of its own: the
+    /// script runs on a dedicated thread and blocks the test thread while it
+    /// waits, so the supervisor loop needs a scheduler that keeps turning.
+    fn online_pool(
+        server: &str,
+        tools: Vec<serde_json::Value>,
+    ) -> (Arc<crate::mcp::McpService>, tokio::runtime::Runtime) {
+        use crate::mcp::service::test_support as mcp_test;
+        let rt = tokio::runtime::Runtime::new().expect("connector runtime");
+        let (service, _peer) = {
+            let _guard = rt.enter();
+            mcp_test::online_service(server, tools)
+        };
+        rt.block_on(mcp_test::wait_for(
+            || service.any_online(),
+            "the fake server online",
+        ));
+        (service, rt)
+    }
+
+    fn run_collect(script: &str, host: Arc<CollectHost>) -> serde_json::Value {
+        let request = crate::codemode::RunRequest::new(script, crate::codemode::ENTRY_COLLECT)
+            .with_limits(
+                crate::codemode::Limits::collect().with_timeout(std::time::Duration::from_secs(5)),
+            );
+        crate::codemode::execute(request, host, HostEnv::default()).expect("probe must run")
     }
 
     #[test]
@@ -490,26 +411,37 @@ mod tests {
         assert!(err.contains("read limit"), "{err}");
     }
 
-    #[tokio::test]
-    async fn test_private_http_target_is_blocked() {
+    #[test]
+    fn test_collect_entry_still_gets_the_shared_http_surface() {
+        // `ctx.http` moved to `codemode::http` (shared with the act entry);
+        // the collector still gets both verbs, and both still refuse a private
+        // target before opening a socket.
         let tmp = tempfile::tempdir().unwrap();
-        let h = host(tmp.path(), &[]);
-        let err = h
-            .http_get("http://127.0.0.1:8080/x".to_string(), String::new())
-            .await
-            .unwrap_err();
-        assert!(err.contains("private"), "{err}");
-        // POST answers to the same boundary as GET — the check lives in the
-        // shared request path, so neither method can reach a private host.
-        let err = h
-            .http_post(
-                "http://127.0.0.1:8080/x".to_string(),
-                String::new(),
-                "{}".to_string(),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.contains("private"), "{err}");
+        let request = crate::codemode::RunRequest::new(
+            r#"async function collect(ctx) {
+                const refused = [];
+                for (const call of [
+                    () => ctx.http.get("http://127.0.0.1:8080/x"),
+                    () => ctx.http.post("http://127.0.0.1:8080/x", {body: "{}"}),
+                ]) {
+                    try { await call(); refused.push("reached"); }
+                    catch (e) { refused.push(String(e && e.message || e)); }
+                }
+                return { items: [], http: Object.keys(ctx.http).sort(), refused };
+            }"#,
+            crate::codemode::ENTRY_COLLECT,
+        )
+        .with_limits(
+            crate::codemode::Limits::collect().with_timeout(std::time::Duration::from_secs(5)),
+        );
+        let value =
+            crate::codemode::execute(request, Arc::new(host(tmp.path(), &[])), HostEnv::default())
+                .expect("probe must run");
+
+        assert_eq!(value["http"], serde_json::json!(["get", "post"]));
+        for outcome in value["refused"].as_array().unwrap() {
+            assert!(outcome.as_str().unwrap().contains("private"), "{outcome}");
+        }
     }
 
     #[test]
@@ -527,6 +459,157 @@ mod tests {
         let resolved = h.resolve("sub/missing.txt").unwrap();
         assert!(resolved.starts_with(h.workspace.clone()));
         assert!(resolved.to_string_lossy().ends_with("sub/missing.txt"));
+    }
+
+    #[test]
+    fn test_collect_entry_reaches_only_the_read_only_connector_tools() {
+        // One server, one tool it claims read-only and one it does not: the
+        // collector's connector surface is a *capability* subset (ticket 17), so
+        // the write-side tool is neither installed nor searchable, while the
+        // read-side call runs end to end. The same pool hands the agent entry
+        // both tools; only this entry's filter differs.
+        let (pool, _rt) = online_pool(
+            "github",
+            vec![
+                json!({
+                    "name": "get_pull",
+                    "description": "Fetch one pull request",
+                    "annotations": {"readOnlyHint": true, "destructiveHint": false},
+                }),
+                json!({"name": "merge_pull", "description": "Merge one pull request"}),
+            ],
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Arc::new(CollectHost::new(
+            tmp.path().to_path_buf(),
+            &[],
+            Arc::new(BTreeMap::new()),
+            Some(pool),
+        ));
+        let value = run_collect(
+            r#"async function collect(ctx) {
+                const hits = JSON.parse(await ctx.searchTools("pull request")).map((h) => h.name);
+                const writeVisible = typeof ctx.tools.mcp__github__merge_pull;
+                let merge;
+                try { merge = await ctx.tools.mcp__github__merge_pull({}); }
+                catch (e) { merge = "threw"; }
+                const read = await ctx.tools.mcp__github__get_pull({number: 12});
+                return { items: [{title: read}], hits, writeVisible, merge };
+            }"#,
+            host,
+        );
+
+        assert_eq!(value["hits"], json!(["mcp__github__get_pull"]), "{value}");
+        assert_eq!(value["writeVisible"], "undefined", "{value}");
+        assert_eq!(value["merge"], "threw", "{value}");
+        let title = value["items"][0]["title"].as_str().unwrap();
+        assert!(title.contains("<codemode_output"), "{title}");
+        assert!(title.contains("pong"), "{title}");
+    }
+
+    #[test]
+    fn test_collect_entry_keeps_its_whole_primitive_surface_with_a_connector_pool() {
+        // The connector view is additive, never a replacement (ticket 17): RSS
+        // feeds, plain endpoints and local files still go through the base
+        // primitives while a pool is attached.
+        let (pool, _rt) = online_pool(
+            "github",
+            vec![json!({
+                "name": "get_pull",
+                "description": "Fetch one pull request",
+                "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            })],
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("feed.xml"), "<rss/>").unwrap();
+        let host = Arc::new(CollectHost::new(
+            tmp.path().to_path_buf(),
+            &[],
+            Arc::new(BTreeMap::from([("token".to_string(), "s3cr3t".into())])),
+            Some(pool),
+        ));
+        let value = run_collect(
+            r#"async function collect(ctx) {
+                ctx.log("collect ran");
+                let httpOutcome;
+                try { await ctx.http.get("http://127.0.0.1:8080/x"); httpOutcome = "reached"; }
+                catch (e) { httpOutcome = String(e && e.message || e); }
+                return {
+                    items: [{title: "ok"}],
+                    keys: Object.keys(ctx).sort(),
+                    http: Object.keys(ctx.http).sort(),
+                    httpOutcome,
+                    read: ctx.fs.read("feed.xml"),
+                    stat: ctx.fs.stat("feed.xml").exists,
+                    secret: ctx.secret("token") === "s3cr3t",
+                    connector: typeof ctx.tools.mcp__github__get_pull,
+                };
+            }"#,
+            host,
+        );
+
+        // The exact surface: every base primitive still installed, the read-only
+        // connector view added beside them.
+        assert_eq!(
+            value["keys"],
+            json!([
+                "boot_at",
+                "fs",
+                "fs_list",
+                "fs_read",
+                "fs_stat",
+                "http",
+                "http_get",
+                "http_post",
+                "log",
+                "now",
+                "searchTools",
+                "secret",
+                "tools",
+                "uptime_s"
+            ]),
+            "{value}"
+        );
+        assert_eq!(value["http"], json!(["get", "post"]));
+        assert!(
+            value["httpOutcome"].as_str().unwrap().contains("private"),
+            "{value}"
+        );
+        assert_eq!(value["read"], "<rss/>");
+        assert_eq!(value["stat"], true);
+        assert_eq!(value["secret"], true);
+        assert_eq!(value["connector"], "function");
+    }
+
+    #[test]
+    fn test_collect_entry_has_no_connector_surface_without_a_pool() {
+        // No pool, no addition: the collector's surface is exactly today's, and
+        // `tools` / `searchTools` stay structurally absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let value = run_collect(
+            r#"async function collect(ctx) {
+                return { items: [], keys: Object.keys(ctx).sort() };
+            }"#,
+            Arc::new(host(tmp.path(), &[])),
+        );
+        assert_eq!(
+            value["keys"],
+            json!([
+                "boot_at",
+                "fs",
+                "fs_list",
+                "fs_read",
+                "fs_stat",
+                "http",
+                "http_get",
+                "http_post",
+                "log",
+                "now",
+                "secret",
+                "uptime_s"
+            ]),
+            "{value}"
+        );
     }
 
     #[test]

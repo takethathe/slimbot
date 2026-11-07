@@ -177,13 +177,17 @@ fn fingerprint_of(item: &Value) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn serialized_len(value: &Value) -> usize {
+pub(crate) fn serialized_len(value: &Value) -> usize {
     serde_json::to_string(value).map(|s| s.len()).unwrap_or(0)
 }
 
 /// Shrink the longest strings until the item fits. Shape and keys survive;
 /// only text is cut, which is what "truncate" can honestly mean for JSON.
-fn trim_to_budget(item: &mut Value, budget: usize) -> bool {
+///
+/// Shared with `executor::result`, which applies the same 4KB item budget to an
+/// action's `evidence`: the executor transmits external content too, and the
+/// evidence boundary does not stop applying because the caller is an action.
+pub(crate) fn trim_to_budget(item: &mut Value, budget: usize) -> bool {
     for _ in 0..TRIM_PASSES {
         if serialized_len(item) <= budget {
             return true;

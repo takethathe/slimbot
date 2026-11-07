@@ -443,3 +443,60 @@ pub fn schedule_from_args(args: &Value) -> std::result::Result<Option<CronSchedu
     validate_schedule(&schedule)?;
     Ok(Some(schedule))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_the_action_kinds_stay_the_three_the_engine_executes() {
+        // An executor fire is an `agent` fire (spec I: reuse the kind, do not
+        // add one). A fourth kind would fork the single execution path — the
+        // engine would need a second runner, a second delivery rule and a second
+        // history meaning — so the set is closed here on purpose.
+        let mut known: Vec<&str> = [ActionKind::Agent, ActionKind::Notify, ActionKind::Record]
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect();
+        known.sort();
+        assert_eq!(known, vec!["agent", "notify", "record"]);
+
+        for refused in ["executor", "act", "script", "subagent", "exec"] {
+            assert!(
+                ActionKind::parse(refused).is_none(),
+                "'{refused}' must not become an action kind: executors are agents"
+            );
+        }
+
+        // The tool boundary says the same thing, so a rule author who tries it
+        // is told which three exist.
+        let err = action_from_args(&json!({
+            "on_fire": {"kind": "executor", "agent": "executor", "task_template": "{{evidence}}"}
+        }))
+        .expect_err("a fourth kind is refused when the rule is created");
+        assert!(err.contains("expected agent, notify or record"), "{err}");
+    }
+
+    #[test]
+    fn test_an_executor_rule_is_an_ordinary_agent_action() {
+        // The rule spec I asks for: `kind=agent`, `agent="executor"`, a rendered
+        // task. Nothing about it is executor-specific, which is the point.
+        let action = action_from_args(&json!({
+            "on_fire": {
+                "kind": "agent",
+                "agent": "executor",
+                "task_template": "对 exec-00000001 执行：{{evidence}}",
+            }
+        }))
+        .expect("an executor rule parses as an ordinary agent action");
+        assert_eq!(action.kind, ActionKind::Agent);
+        assert_eq!(action.agent.as_deref(), Some("executor"));
+        assert_eq!(
+            action.task_template.as_deref(),
+            Some("对 exec-00000001 执行：{{evidence}}")
+        );
+        assert!(action.deliver.is_none(), "the definition's deliver applies");
+        assert!(action.validate().is_ok());
+    }
+}

@@ -7,7 +7,10 @@
 //! rules, same refusal text. The only difference is what happens after the
 //! decision — the runner hook can end the turn, while a nested call hands the
 //! refusal or pending-guidance text back to the script as the call's resolved
-//! value (no mid-script popups).
+//! value (no mid-script popups). The act entry is the exception (ticket 15): it
+//! stops the whole script on any verdict other than "it ran", because an
+//! unattended ephemeral subagent has no next turn in which to redeem a pending
+//! approval — see [`NestedCall`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -318,10 +321,20 @@ impl RunToolExec {
             .pending_list_text(&self.context.session_id)
     }
 
-    /// Gate and execute one nested call. Never fails the caller: every outcome
-    /// (result, refusal, pending guidance) comes back as text, mirroring how
-    /// the runner answers tool messages for the model.
-    pub(crate) async fn call(&self, name: &str, args: Value) -> String {
+    /// The run's connector pool, so an entry can install a connector surface
+    /// over the same pool this gate dispatches to (ticket 15).
+    pub(crate) fn connectors(&self) -> Option<Arc<crate::mcp::McpService>> {
+        self.context.connectors.clone()
+    }
+
+    /// Gate and execute one nested call, keeping *how* it ended.
+    ///
+    /// Entries that must react to a refusal rather than read it as a value need
+    /// the verdict as a fact; the text prefixes (`DENIED:`, `NOT EXECUTED:`) are
+    /// prose and may be reworded, so they are never the control flow. The act
+    /// entry stops its script on any non-`Ran` answer (ticket 15); the agent
+    /// entry answers the text and keeps going.
+    pub(crate) async fn call_gated(&self, name: &str, args: Value) -> NestedCall {
         let call = ToolCall {
             id: format!("codemode-{}", uuid::Uuid::new_v4().simple()),
             name: name.to_string(),
@@ -329,15 +342,43 @@ impl RunToolExec {
         };
         match decide(&self.context, &call).await {
             GateDecision::Execute => match self.context.dispatch(name, call.args).await {
-                Ok(text) => text,
-                Err(e) => format_tool_error(&e.to_string()),
+                Ok(text) => NestedCall::Ran(text),
+                Err(e) => NestedCall::Ran(format_tool_error(&e.to_string())),
             },
-            GateDecision::Refuse { result } => result,
-            GateDecision::Pending { result, .. } => {
-                self.pending_seen.store(true, Ordering::Release);
-                result
-            }
-            GateDecision::Cancelled { reason } => format_tool_error(&reason),
+            GateDecision::Refuse { result } => NestedCall::Refused(result),
+            GateDecision::Pending { result, .. } => NestedCall::Pending(result),
+            GateDecision::Cancelled { reason } => NestedCall::Cancelled(format_tool_error(&reason)),
         }
     }
+
+    /// Gate and execute one nested call. Never fails the caller: every outcome
+    /// (result, refusal, pending guidance) comes back as text, mirroring how
+    /// the runner answers tool messages for the model.
+    pub(crate) async fn call(&self, name: &str, args: Value) -> String {
+        match self.call_gated(name, args).await {
+            NestedCall::Ran(text) | NestedCall::Refused(text) => text,
+            NestedCall::Pending(text) => {
+                // The codemode tool appends the owner-facing pending list from
+                // this flag, so the attended hand-off stays observable.
+                self.pending_seen.store(true, Ordering::Release);
+                text
+            }
+            NestedCall::Cancelled(reason) => reason,
+        }
+    }
+}
+
+/// How one nested `tools.<name>()` call ended.
+///
+/// The gate's verdict, not the answer text: `Refused` and `Pending` both mean
+/// "nothing executed", and the difference is whether an approval was recorded.
+pub(crate) enum NestedCall {
+    /// The tool ran, or answered a clean tool error of its own.
+    Ran(String),
+    /// The policy refused the call; nothing executed.
+    Refused(String),
+    /// An attended `Ask` recorded a pending approval; nothing executed.
+    Pending(String),
+    /// A redeemed replay found the run cancelled by `/stop`.
+    Cancelled(String),
 }

@@ -36,6 +36,8 @@
 - `tool_definitions()` — 发给模型的那一份，**只有** `ToolManager` 里注册的工具；
 - `callable_definitions()` — 脚本能搜能调的那一份，`ToolManager` + 每个**在线** server 的工具，注册的工具排在前面并按名字优先（连接器工具不可能遮蔽内置工具）。
 
+池自己还提供一个**只读子集**：`readonly_definitions()`（以及逐名的 `is_read_only_claimed()`）只收 server 声称 `readOnlyHint` 且未声称 `destructiveHint` 的工具。它是**能力面**过滤器，只给采集器用——同一个池对 agent / act 入口仍是全量目录，而两个入口里每一次连接器调用照旧按 `ExternalSend` 过审批。缺省方向仍是 fail-closed（`readOnlyHint` 缺省 `false`、`destructiveHint` 缺省 `true`），所以未声明的工具不算只读。这条「按声称筛能力面、不改风险级」的口径是对 spec 字面要求的刻意偏离，理由与残余风险见 [ADR 0021](adr/0021-executor-parasitic-unattended-subagent.md) 与 [codemode.md](codemode.md#采集面的只读性票-17)。
+
 `call()` 定位 server 靠 callable 前缀而不是查缓存：离线的 server 缓存已经空了，而"那个连接器现在不在线"比"没有这个工具"对脚本更有用。
 
 ## 生命周期
@@ -71,6 +73,8 @@ server 写的每一个字节都按数据对待，绝不按指令对待：
 
 连接器工具走票 03/21 的同一个审批闸，风险级由 `McpService::risk_for` 决定，规则只有一条：**server 的自述不参与定级**。
 
+这条规则在三个入口上一致：agent 脚本、act 脚本、以及被 `subagent` 起的子代理。执行器的 `allow_connectors` 是**能力**上限（哪些 server 的写允许被这个执行器碰），不是定级输入——把 server 加进列表不会把它的写变成 `Allow`，把 callable 设成 `Allow` 也不会让它越过天花板。
+
 | 来源 | 结果 | 默认档 |
 |------|------|--------|
 | 任何连接器工具（无论 annotation 写什么） | `ExternalSend` | ask |
@@ -92,15 +96,17 @@ server 写的每一个字节都按数据对待，绝不按指令对待：
 
 ## 装配位置
 
-池由 `AgentLoop` 拥有并从 `config.mcp` 构造，`mcp.servers` 里没有 enabled 条目时**根本不建池**（`connectors()` 返回 `None`，脚本里 `mcp__*` 命名空间结构性缺失）。三条入口因此同源：
+池由 `AgentLoop` 拥有并从 `config.mcp` 构造，`mcp.servers` 里没有 enabled 条目时**根本不建池**（`connectors()` 返回 `None`，脚本里 `mcp__*` 命名空间结构性缺失）。所有入口同源：
 
 | 入口 | 有连接器 | 说明 |
 |------|----------|------|
 | `slimbot`（CLI agent session） | 是 | `AgentLoop::from_config` 一条路径 |
 | `slimbot gateway` | 是 | 启动后额外记一行 `[gateway] MCP connectors: …` 作为"这台机器打算去够哪些东西"的开机账 |
+| 执行器 act 脚本（`executor run`） | **写半边，按 `allow_connectors`** | 复用同一座 `codemode/connector.rs` 桥；目录是全量工具，调用前按 `server_of()` 判天花板，列表外的写即终止整段脚本。每次调用过同一个审批闸（一律 `ExternalSend`），见 [codemode.md](codemode.md#act-的连接器面allow-only--两闸正交票-15) |
 | 触发器 fire 的会话 | 是 | dispatch 投进 inbound，与 CLI 走同一个 `SessionTaskBuilder` |
-| `subagent` 工具起的子代理 | **否** | `SubagentRuntime` 自建 runner，未挂 `connectors`（v1 有意不做，见 `docs/TODO.md`） |
+| `subagent` 工具起的子代理 | 是 | `SubagentRuntime` 把同一个 `Arc<McpService>` 交给它自建的 runner（票 15 打通：执行器子代理的 act 脚本要靠它写外部对象）。没有池时行为与从前一致：`mcp__*` 结构性缺失 |
+| 触发器采集器（`collect.js`） | **只读半边** | tick 与 `AgentLoop` 同进程，池经 `SourceLayer::attach_connectors()` 交到采集器；采集面只装 `readonly_definitions()`，见 [codemode.md](codemode.md#采集面的只读性票-17) |
 
 ## 测试
 
-`cargo test --lib mcp::`（协议、两种 transport、池与退避、命名与路由、风险映射、离线理由收敛），`cargo test --test mcp_integration`（GitHub 式读链路端到端 + secret 链 + 无敏感日志 + 拒绝式 server），`cargo test --test gateway_integration`（配置里有/没有 server 时池的有无）。
+`cargo test --lib mcp::`（协议、两种 transport、池与退避、命名与路由、风险映射、离线理由收敛、`server_of()` 取最长前缀），`cargo test --lib codemode::act`（act 侧：读写判据、`allow_connectors` 双向、Ask/Deny 中止且不留 Pending、共用调用预算），`cargo test --lib executor::tool`（写成功带 receipt、无人值守拒因、evidence 逐条 4KB），`cargo test --lib agent::runtime`（子代理继承池、拒因回到 origin），`cargo test --test mcp_integration`（GitHub 式读链路端到端 + secret 链 + 无敏感日志 + 拒绝式 server），`cargo test --test gateway_integration`（配置里有/没有 server 时池的有无）。

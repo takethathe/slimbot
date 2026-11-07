@@ -111,6 +111,11 @@ pub struct SubagentRuntime {
     /// Shared pending-approval store; subagent runs are unattended, so every
     /// `Ask` inside them is refused instead of proposed (ADR 0011).
     approvals: Arc<crate::approval::ApprovalStore>,
+    /// The process-wide connector pool, when there is one. Shared rather than
+    /// copied: a subagent's `codemode` scripts and its top-level gate must see
+    /// the same servers, and an executor run reaches its connectors through
+    /// them (ticket 15).
+    connectors: Option<Arc<crate::mcp::McpService>>,
     slots: Arc<Semaphore>,
     max_concurrent: usize,
     running: Arc<AtomicUsize>,
@@ -128,6 +133,14 @@ struct RunPlan {
 }
 
 impl SubagentRuntime {
+    /// The catalog every run assembles its tool set from. Test-only: production
+    /// code reaches the catalog through `start`, and the wiring tests need to
+    /// see what a declared tool can actually be built from.
+    #[cfg(test)]
+    pub(crate) fn catalog(&self) -> &ToolCatalog {
+        self.catalog.as_ref()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog: Arc<ToolCatalog>,
@@ -142,6 +155,7 @@ impl SubagentRuntime {
         tracer: Option<Arc<Tracer>>,
         bus: Arc<MessageBus>,
         approvals: Arc<crate::approval::ApprovalStore>,
+        connectors: Option<Arc<crate::mcp::McpService>>,
     ) -> Self {
         let max_concurrent = max_concurrent.max(1);
         Self {
@@ -156,6 +170,7 @@ impl SubagentRuntime {
             tracer,
             bus,
             approvals,
+            connectors,
             slots: Arc::new(Semaphore::new(max_concurrent)),
             max_concurrent,
             running: Arc::new(AtomicUsize::new(0)),
@@ -288,19 +303,27 @@ impl SubagentRuntime {
             self.catalog
                 .build_tool_manager(&plan.tool_names, &self.workspace_dir),
         );
-        let runner = AgentRunner::builder()
-            .session_manager(self.session_manager.clone())
-            .tool_manager(tool_manager)
-            .provider(self.provider.clone())
-            .config(self.agent_config.clone())
-            .workspace_dir(self.workspace_dir.clone())
-            .memory_service(self.memory_service.clone())
-            .consolidator(None)
-            .tracer(self.tracer.clone())
-            .max_tokens(self.max_tokens)
-            .approvals(self.approvals.clone())
-            .with_defaults()
-            .build();
+        let runner = {
+            let builder = AgentRunner::builder()
+                .session_manager(self.session_manager.clone())
+                .tool_manager(tool_manager)
+                .provider(self.provider.clone())
+                .config(self.agent_config.clone())
+                .workspace_dir(self.workspace_dir.clone())
+                .memory_service(self.memory_service.clone())
+                .consolidator(None)
+                .tracer(self.tracer.clone())
+                .max_tokens(self.max_tokens)
+                .approvals(self.approvals.clone());
+            // Same pool the main loop reaches: a subagent script's
+            // `tools.mcp__*` and an executor's connector writes both come from
+            // here. Without a pool the run simply has no connector surface.
+            let builder = match self.connectors.clone() {
+                Some(pool) => builder.connectors(pool),
+                None => builder,
+            };
+            builder.with_defaults().build()
+        };
 
         let span = self
             .tracer
@@ -482,6 +505,34 @@ mod tests {
     }
 
     fn fixture(provider: Arc<dyn Provider>, max_concurrent: usize) -> Fixture {
+        fixture_with(provider, max_concurrent, |_catalog, _workspace| {})
+    }
+
+    /// Same fixture, with a hook to register extra tool factories before the
+    /// runtime is built (a run can only reach what the catalog can build).
+    fn fixture_with(
+        provider: Arc<dyn Provider>,
+        max_concurrent: usize,
+        extend: impl FnOnce(&mut ToolCatalog, &std::path::Path),
+    ) -> Fixture {
+        fixture_full(
+            provider,
+            max_concurrent,
+            None,
+            Arc::new(crate::approval::ApprovalStore::new(Default::default())),
+            extend,
+        )
+    }
+
+    /// The fixture with the process-wide dependencies a connector test needs:
+    /// the pool a subagent reaches, and the approval policy its calls meet.
+    fn fixture_full(
+        provider: Arc<dyn Provider>,
+        max_concurrent: usize,
+        connectors: Option<Arc<crate::mcp::McpService>>,
+        approvals: Arc<crate::approval::ApprovalStore>,
+        extend: impl FnOnce(&mut ToolCatalog, &std::path::Path),
+    ) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
         let sessions = tmp.path().join("sessions");
@@ -489,6 +540,7 @@ mod tests {
 
         let mut catalog = ToolCatalog::new();
         catalog.register_builtin("file_reader", &workspace);
+        extend(&mut catalog, &workspace);
 
         let bus = MessageBus::new();
         let (message_bus, receivers) = bus;
@@ -511,7 +563,8 @@ mod tests {
             max_concurrent,
             None,
             message_bus,
-            Default::default(),
+            approvals,
+            connectors,
         ));
 
         Fixture {
@@ -790,6 +843,237 @@ mod tests {
         assert!(got.is_err(), "deliver=false must not inject anything");
     }
 
+    /// One scripted answer for [`ScriptedProvider`].
+    enum Step {
+        Reply(LLMResponse),
+        /// The host assigns the executor id, so the `run` call is built from the
+        /// conversation: the `create` result the model just read carries it.
+        RunTheStoredExecutor,
+        /// Report the most recent tool result verbatim — what the shipped
+        /// template tells the agent to do with a failed run ("report what was
+        /// asked and why it stopped here"), without scripting its wording.
+        EchoLastToolResult,
+    }
+
+    /// Answers with a fixed script of responses, recording the tool names the
+    /// run offered the model. (`crate::provider::MockProvider` is a single
+    /// canned reply and cannot drive a tool-calling run.)
+    struct ScriptedProvider {
+        steps: std::sync::Mutex<Vec<Step>>,
+        calls: AtomicUsize,
+        offered_tools: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: std::sync::Mutex::new(steps),
+                calls: AtomicUsize::new(0),
+                offered_tools: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, args: serde_json::Value) -> crate::tool::ToolCall {
+        crate::tool::ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    /// The `exec-…` id from the most recent tool result that reports one.
+    fn executor_id_from(messages: &[&Message]) -> String {
+        messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::Tool { content, .. } => serde_json::from_str::<serde_json::Value>(content)
+                    .ok()?
+                    .get("id")?
+                    .as_str()
+                    .filter(|id| id.starts_with("exec-"))
+                    .map(str::to_string),
+                _ => None,
+            })
+            .expect("the create result carries the executor id")
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn chat(
+            &self,
+            messages: &[&Message],
+            tools: Option<&[ToolDefinition]>,
+            _recorder: Option<&dyn SpanRecorder>,
+        ) -> anyhow::Result<LLMResponse> {
+            if let Some(tools) = tools {
+                self.offered_tools
+                    .lock()
+                    .unwrap()
+                    .extend(tools.iter().map(|t| t.name.clone()));
+            }
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            let steps = self.steps.lock().unwrap();
+            match steps.get(index) {
+                Some(Step::Reply(reply)) => Ok(reply.clone()),
+                Some(Step::RunTheStoredExecutor) => {
+                    let id = executor_id_from(messages);
+                    Ok(LLMResponse {
+                        content: Some("running it".to_string()),
+                        tool_calls: Some(vec![tool_call(
+                            "tc-run",
+                            "executor",
+                            // The brief the model read in step 1, handed to the
+                            // action as `ctx.args`.
+                            serde_json::json!({
+                                "action": "run",
+                                "id": id,
+                                "args": { "text": "one two three four five" }
+                            }),
+                        )]),
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: Usage::default(),
+                    })
+                }
+                Some(Step::EchoLastToolResult) => {
+                    let last = messages
+                        .iter()
+                        .rev()
+                        .find_map(|message| match message {
+                            Message::Tool { content, .. } => Some(content.clone()),
+                            _ => None,
+                        })
+                        .expect("a tool result to report");
+                    Ok(LLMResponse {
+                        content: Some(last),
+                        tool_calls: None,
+                        finish_reason: FinishReason::Stop,
+                        usage: Usage::default(),
+                    })
+                }
+                None => panic!("ScriptedProvider: no more responses for call {index}"),
+            }
+        }
+    }
+
+    fn reply(content: &str) -> Step {
+        Step::Reply(LLMResponse {
+            content: Some(content.to_string()),
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        })
+    }
+
+    fn call(name: &str, args: serde_json::Value) -> Step {
+        Step::Reply(LLMResponse {
+            content: None,
+            tool_calls: Some(vec![tool_call("tc", name, args)]),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_the_executor_agent_creates_and_runs_an_action_script() {
+        // The whole point of the entry: the definition, its `tools: executor`
+        // increment and the tool itself line up, so one delegated task can read
+        // a workspace file, record an executor and run it. The result travels
+        // back as the ordinary `[Subagent result]` line.
+        let script = "async function act(ctx) { \
+             const words = String(ctx.args.text || '').trim().split(/\\s+/).filter(Boolean); \
+             return { ok: true, summary: 'summarized ' + words.length + ' words' }; \
+         }";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            call("file_reader", serde_json::json!({ "path": "brief.md" })),
+            call(
+                "executor",
+                serde_json::json!({
+                    "action": "create",
+                    "name": "summarize-brief",
+                    "description": "Summarizes the brief in one line",
+                    "script": script,
+                }),
+            ),
+            Step::RunTheStoredExecutor,
+            reply("Recorded and run: summarized 5 words."),
+        ]));
+
+        let f = fixture_with(provider.clone(), 3, |catalog, workspace| {
+            let root = workspace.join("executors");
+            let secrets = Arc::new(std::collections::BTreeMap::new());
+            catalog.register(
+                "executor",
+                Arc::new(move || {
+                    Some(Box::new(crate::executor::tool::ExecutorTool::new(
+                        root.clone(),
+                        secrets.clone(),
+                        0,
+                    )) as Box<dyn crate::tool::Tool>)
+                }),
+            );
+        });
+        let workspace = f._tmp.path().join("workspace");
+        // The shipped template, not a fixture: `tools: executor` in it is what
+        // makes the tool reachable at all.
+        std::fs::create_dir_all(workspace.join("agents")).unwrap();
+        std::fs::write(
+            workspace.join("agents/executor.md"),
+            include_str!("../../resources/templates/agents/executor.md"),
+        )
+        .unwrap();
+        std::fs::write(workspace.join("brief.md"), "one two three four five").unwrap();
+
+        let run = f
+            .runtime
+            .start(
+                StartRequest {
+                    agent: "executor".into(),
+                    task: "Summarize brief.md with an executor.".into(),
+                    origin: Some(Origin::new("cli", "c1")),
+                    deliver: None,
+                },
+                AcquireMode::RejectWhenFull,
+            )
+            .await
+            .expect("the executor agent must start");
+
+        let mut rx = f.receivers.inbound;
+        let req = next_inbound(&mut rx).await.expect("inbound result");
+        assert_eq!(req.session_id, "cli:c1");
+        assert!(
+            req.content.starts_with(&format!(
+                "[Subagent result] agent=executor run_id={}",
+                run.run_id
+            )),
+            "{}",
+            req.content
+        );
+        assert!(req.content.contains("ok=true"));
+        assert!(
+            req.content.contains("summarized 5 words"),
+            "the run's report must reach origin: {}",
+            req.content
+        );
+
+        // The subagent model, unlike the main loop's, is offered the tool.
+        let offered = provider.offered_tools.lock().unwrap().clone();
+        assert!(offered.contains(&"executor".to_string()), "{offered:?}");
+
+        // `create` went through the tool, not around it: one ready executor is
+        // on disk with the name the model sent.
+        let executors: Vec<_> = std::fs::read_dir(workspace.join("executors"))
+            .expect("executors dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect();
+        assert_eq!(executors.len(), 1, "exactly one executor was created");
+        let meta = std::fs::read_to_string(executors[0].path().join("meta.json")).unwrap();
+        assert!(meta.contains("summarize-brief"), "{meta}");
+        assert!(executors[0].path().join("act.js").exists());
+    }
+
     #[test]
     fn test_origin_session_id() {
         assert_eq!(Origin::new("webui", "main").session_id(), "webui:main");
@@ -817,6 +1101,201 @@ mod tests {
         assert!(msg.contains("ok=false"));
         assert!(
             msg.ends_with("Explain to the user what failed and give them a concrete next step.")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subagent_reaches_the_connector_pool() {
+        // The pool the process built is the subagent's too. Before ticket 15 the
+        // subagent runner had none, so `tools.mcp__*` was structurally absent
+        // there — the exact gap that made an executor's connector writes
+        // unreachable.
+        let (pool, peer) = crate::mcp::service::test_support::online_service(
+            "github",
+            vec![serde_json::json!({
+                "name": "get_pull",
+                "annotations": {"readOnlyHint": true, "destructiveHint": false},
+            })],
+        );
+        crate::mcp::service::test_support::wait_for(|| pool.any_online(), "the fake server online")
+            .await;
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            call(
+                "codemode",
+                serde_json::json!({
+                    "script": "async function main(ctx) { \
+                         const out = await ctx.tools.mcp__github__get_pull({number: 1}); \
+                         return { seen: out.includes('pong') }; }"
+                }),
+            ),
+            reply("read the pull request"),
+        ]));
+        let mut approvals = crate::approval::ApprovalConfig::default();
+        approvals.tools.insert(
+            "mcp__github__get_pull".to_string(),
+            crate::approval::ControlLevel::Allow,
+        );
+        let f = fixture_full(
+            provider,
+            3,
+            Some(pool),
+            Arc::new(crate::approval::ApprovalStore::new(approvals)),
+            |catalog, _workspace| {
+                catalog.register(
+                    "codemode",
+                    Arc::new(|| {
+                        Some(Box::new(crate::tools::codemode::CodemodeTool)
+                            as Box<dyn crate::tool::Tool>)
+                    }),
+                );
+            },
+        );
+        // The agent has to declare the tool: `tools:` is the per-run increment.
+        let workspace = f._tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("agents")).unwrap();
+        std::fs::write(
+            workspace.join("agents/reader.md"),
+            "---\nname: reader\ndescription: reads a connector\ndeliver: true\ntimeout_secs: 30\ntools: codemode\n---\n\nYou are a test agent.\n",
+        )
+        .unwrap();
+
+        let run = f
+            .runtime
+            .start(
+                StartRequest {
+                    agent: "reader".into(),
+                    task: "read the pull request".into(),
+                    origin: Some(Origin::new("cli", "c1")),
+                    deliver: None,
+                },
+                AcquireMode::RejectWhenFull,
+            )
+            .await
+            .expect("run must start");
+
+        let mut rx = f.receivers.inbound;
+        let req = next_inbound(&mut rx).await.expect("inbound result");
+        assert!(
+            req.content.starts_with(&format!(
+                "[Subagent result] agent=reader run_id={}",
+                run.run_id
+            )),
+            "{}",
+            req.content
+        );
+        assert_eq!(
+            peer.calls(),
+            1,
+            "the subagent's script must reach the connector: {}",
+            req.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_executor_agent_reports_an_approval_refusal_to_origin() {
+        // Demo (b) end to end: the action's write is `ExternalSend` and the
+        // policy is the default, so an unattended run refuses it — and origin
+        // reads why, instead of a cheerful summary of something never sent.
+        let (pool, peer) = crate::mcp::service::test_support::online_service(
+            "github",
+            vec![serde_json::json!({"name": "create_issue"})],
+        );
+        crate::mcp::service::test_support::wait_for(|| pool.any_online(), "the fake server online")
+            .await;
+
+        let script = "async function act(ctx) { \
+             const out = await ctx.tools.mcp__github__create_issue({ title: 'the bug' }); \
+             return { ok: true, summary: 'filed: ' + out }; \
+         }";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            call(
+                "executor",
+                serde_json::json!({
+                    "action": "create",
+                    "name": "file-the-bug",
+                    "description": "Files one bug through the github connector",
+                    "script": script,
+                    "allow_connectors": ["github"],
+                }),
+            ),
+            Step::RunTheStoredExecutor,
+            Step::EchoLastToolResult,
+        ]));
+        // Default policy: every connector call is `ExternalSend`, and
+        // `ExternalSend` defaults to `Ask`.
+        let approvals = Arc::new(crate::approval::ApprovalStore::new(Default::default()));
+        let f = fixture_full(
+            provider,
+            3,
+            Some(pool),
+            approvals.clone(),
+            |catalog, workspace| {
+                let root = workspace.join("executors");
+                let secrets = Arc::new(std::collections::BTreeMap::new());
+                catalog.register(
+                    "executor",
+                    Arc::new(move || {
+                        Some(Box::new(crate::executor::tool::ExecutorTool::new(
+                            root.clone(),
+                            secrets.clone(),
+                            0,
+                        )) as Box<dyn crate::tool::Tool>)
+                    }),
+                );
+            },
+        );
+        let workspace = f._tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("agents")).unwrap();
+        std::fs::write(
+            workspace.join("agents/executor.md"),
+            include_str!("../../resources/templates/agents/executor.md"),
+        )
+        .unwrap();
+
+        let run = f
+            .runtime
+            .start(
+                StartRequest {
+                    agent: "executor".into(),
+                    task: "File the bug through github.".into(),
+                    origin: Some(Origin::new("cli", "c1")),
+                    deliver: None,
+                },
+                AcquireMode::RejectWhenFull,
+            )
+            .await
+            .expect("the executor agent must start");
+
+        let mut rx = f.receivers.inbound;
+        let req = next_inbound(&mut rx).await.expect("inbound result");
+        assert!(
+            req.content.starts_with(&format!(
+                "[Subagent result] agent=executor run_id={}",
+                run.run_id
+            )),
+            "{}",
+            req.content
+        );
+        assert!(
+            req.content.contains("needs owner authorization"),
+            "origin must read the refusal reason: {}",
+            req.content
+        );
+        assert!(
+            req.content.contains("nothing was executed"),
+            "and that nothing was sent: {}",
+            req.content
+        );
+        assert!(
+            req.content.contains("approval_refused"),
+            "the failure label travels with it: {}",
+            req.content
+        );
+        assert_eq!(peer.calls(), 0, "nothing reached the connector");
+        assert!(
+            !approvals.has_pending("cli:c1"),
+            "an unattended run must not leave a pending approval behind"
         );
     }
 }

@@ -22,7 +22,7 @@ frontmatter 只声明**增量**，正文原样作为 system prompt：
 
 ## ToolCatalog
 
-进程级的 `name → 工厂` 注册表，把「有哪些工具」与「某次 run 用哪些工具」分开：主 loop 装配一次，子代理按定义每次装配自己的 `ToolManager`。`known_tool_names()` 供定义校验。`trigger_source` / `trigger` **只注册在 catalog 里**，不进主 loop 的默认集——只有声明它们的 agent 看得见，这就是「触发器机制不在主 loop 出现」这条需求的实现方式；`subagent` 反过来，由主 loop 的 `ToolManager` 直接注册，agent 定义永远拿不到它。
+进程级的 `name → 工厂` 注册表，把「有哪些工具」与「某次 run 用哪些工具」分开：主 loop 装配一次，子代理按定义每次装配自己的 `ToolManager`。`known_tool_names()` 供定义校验。`trigger_source` / `trigger` / `executor` **只注册在 catalog 里**，不进主 loop 的默认集——只有声明它们的 agent 看得见，这就是「触发器与执行器机制不在主 loop 出现」这条需求的实现方式。`executor` 的工厂在 `AgentLoop::from_parts`，CLI 与 gateway 同源；`trigger_source` / `trigger` 只在 gateway 注册，所以 CLI 模式下 trigger 子代理会缺工具（既有缺口，接线新工具时别照抄）。反方向是 `subagent`：由主 loop 的 `ToolManager` 直接注册，agent 定义永远拿不到它。
 
 ## 运行：SubagentRuntime
 
@@ -62,3 +62,7 @@ frontmatter 只声明**增量**，正文原样作为 system prompt：
 ## 提示词注入
 
 `ContextBuilder` 在 system prompt 里渲染 `# Available Agents`（一行一个名字与描述）。与 `# Available Skills` 的分工是一条硬约定：**一个能力一个入口**——agent 是「可被启动的执行体」，skill 是「可被加载的知识」，同一能力同时占两个位置时模型会走不用读文档的那条路（直接调 agent），文档就形同虚设。
+
+两个子代理共享的知识既不是 agent 也不是 skill，而是 **reference 文档**（`references/<topic>.md`，`bootstrap_files()` 落盘、不注册为 skill，当前只有 `references/connector.md`）。它靠 `agents/*.md` 正文里的一行硬指针被按需 `file_reader` 读到：agent.md 正文原样作该次运行的 system prompt，所以指针只活在子代理的上下文里，**从不进主循环**；进主循环的只有 `# Available Agents` 那一行 `description`。选 reference 而不选 skill 的理由正是后者的 available 列表会注入每轮 system prompt（含主循环），见 [bootstrap.md](bootstrap.md#reference-文档不进-available-skills)。
+
+硬约束：同一份知识只写一处。reference 放跨 agent 共享的机制契约，agent.md 放角色专属的步骤与 **Done when**；agent.md 里发现本该属于 reference 的机制描述时，把它移走而不是复制。

@@ -12,9 +12,10 @@ use crate::secrets::SecretStore;
 
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
-    AgentConfig, CronConfig, DreamConfig, HeartbeatConfig, JsonRenderConfig, McpConfig,
-    McpServerConfig, MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig, SecretEntry,
-    SubagentConfig, TraceBackendEntry, TraceConfig, TransportKind, TriggersConfig, WebFetchConfig,
+    AgentConfig, CronConfig, DreamConfig, ExecutorsConfig, HeartbeatConfig, JsonRenderConfig,
+    McpConfig, McpServerConfig, MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig,
+    SecretEntry, SubagentConfig, TraceBackendEntry, TraceConfig, TransportKind, TriggersConfig,
+    WebFetchConfig,
 };
 
 // ── Root Config ──
@@ -43,6 +44,10 @@ pub struct Config {
     /// by the main loop and the trigger dispatcher.
     #[serde(default)]
     pub subagent: SubagentConfig,
+    /// Sprawl guardrails for the executor store. Top level because `executors/`
+    /// sits at the workspace root, not under `triggers/` (spec A).
+    #[serde(default)]
+    pub executors: ExecutorsConfig,
     /// Trigger layer configuration (tick cadence, queue limits, secrets).
     #[serde(default)]
     pub triggers: TriggersConfig,
@@ -247,6 +252,7 @@ impl Config {
         self.json_render.clamp();
         self.memory.clamp();
         self.subagent.clamp();
+        self.executors.clamp();
         self.triggers.clamp();
         self.pressure.clamp();
         self.tools.approval.clamp();
@@ -787,6 +793,7 @@ mod tests {
             triggers: Default::default(),
             pressure: Default::default(),
             mcp: Default::default(),
+            executors: Default::default(),
         }
     }
 
@@ -1179,6 +1186,33 @@ mod tests {
         cfg.clamp();
         assert_eq!(cfg.agent.max_iterations, 1); // clamped to minimum
         assert_eq!(cfg.agent.timeout_seconds, 1); // clamped to minimum (range(1, 600))
+    }
+
+    #[test]
+    fn test_executors_max_count_default_is_a_loose_twenty() {
+        // Spec M: v1 ships the soft cap disabled in spirit -- a loose default
+        // that a deployment opts into tightening. Pinned so nobody quietly turns
+        // the knob into a hard gate on ordinary creation.
+        assert_eq!(ExecutorsConfig::default().max_count, 20);
+        assert_eq!(Config::default().executors.max_count, 20);
+    }
+
+    #[test]
+    fn test_executors_max_count_zero_stays_disabled_through_clamp() {
+        // `0` is the documented "no cap" value, so clamp must not raise it to a
+        // minimum the way the other max_* knobs do.
+        let mut cfg = make_test_config();
+        cfg.executors.max_count = 0;
+        cfg.clamp();
+        assert_eq!(cfg.executors.max_count, 0);
+    }
+
+    #[test]
+    fn test_executors_max_count_clamps_into_range() {
+        let mut cfg = make_test_config();
+        cfg.executors.max_count = 1_000_000;
+        cfg.clamp();
+        assert_eq!(cfg.executors.max_count, 10_000); // range(0, 10_000)
     }
 
     #[test]
