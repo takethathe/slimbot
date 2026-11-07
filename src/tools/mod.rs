@@ -11,6 +11,7 @@ pub mod memory_search;
 pub mod memory_tools;
 pub mod message;
 pub mod protected;
+pub mod send_file;
 pub mod shell;
 pub mod web_fetch;
 

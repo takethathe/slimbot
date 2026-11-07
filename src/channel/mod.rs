@@ -58,6 +58,37 @@ async fn dispatch_card(
     }
 }
 
+/// Route one media delivery to the channel named by its session-id prefix, then
+/// hand it to `write_media`. A system-originated session (cron, heartbeat) has
+/// no user-facing channel and is skipped, mirroring the outbound router. An
+/// otherwise-unknown channel logs an error rather than panicking.
+async fn dispatch_media(
+    channels: &Mutex<HashMap<String, Box<dyn Channel>>>,
+    delivery: &crate::message_bus::MediaDelivery,
+) {
+    let channel_id = extract_channel_id(&delivery.session_id);
+    if is_system_channel(channel_id) {
+        return;
+    }
+    let mut ch_guard = channels.lock().await;
+    match ch_guard.get_mut(channel_id) {
+        Some(channel) => {
+            if let Err(e) = channel.write_media(delivery).await {
+                error!(
+                    "[ChannelManager] Failed to write media to {}: {}",
+                    channel_id, e
+                );
+            }
+        }
+        None => {
+            error!(
+                "[ChannelManager] No channel for media session: {}",
+                delivery.session_id
+            );
+        }
+    }
+}
+
 /// Channel trait, abstracts all I/O channels
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -105,6 +136,13 @@ pub trait Channel: Send + Sync {
     async fn write_card(&mut self, _event: &crate::card::CardEvent) -> Result<()> {
         Ok(())
     }
+    /// Deliver an agent-produced file (image or attachment) to the conversation.
+    /// Default: no-op — media-capable channels (Feishu) override this to upload
+    /// and send; text-only channels (CLI, WebUI in v1) drop the delivery. Kept
+    /// off `write_output` so the plain-text result contract stays unchanged.
+    async fn write_media(&mut self, _delivery: &crate::message_bus::MediaDelivery) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Channel factory trait, creates channels by type from config
@@ -126,6 +164,9 @@ pub struct ChannelManager {
     /// Owned card-event receiver, consumed once by `run_with_shutdown`. Set via
     /// `attach_card_rx`; absent (None) means card delivery is not wired (CLI).
     card_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::card::CardEvent>>>,
+    /// Owned media-delivery receiver, consumed once by `run_with_shutdown`. Set
+    /// via `attach_media_rx`; absent (None) means the media path is not wired.
+    media_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::message_bus::MediaDelivery>>>,
     config: Arc<Config>,
     io_handles: Arc<Mutex<HashMap<String, IoHandle>>>,
     io_scheduler: IoScheduler,
@@ -146,6 +187,7 @@ impl ChannelManager {
             message_bus,
             outbound_rx: std::sync::Mutex::new(Some(outbound_rx)),
             card_rx: std::sync::Mutex::new(None),
+            media_rx: std::sync::Mutex::new(None),
             config,
             io_handles: Arc::new(Mutex::new(HashMap::new())),
             io_scheduler,
@@ -161,8 +203,18 @@ impl ChannelManager {
         *self.card_rx.lock().unwrap() = Some(rx);
     }
 
+    /// Attach the media-delivery receiver this manager should route. Call before
+    /// `run_with_shutdown`; the receiver is taken once when the loop starts.
+    pub fn attach_media_rx(&self, rx: mpsc::Receiver<crate::message_bus::MediaDelivery>) {
+        *self.media_rx.lock().unwrap() = Some(rx);
+    }
+
     fn take_card_rx(&self) -> Option<mpsc::Receiver<crate::card::CardEvent>> {
         self.card_rx.lock().unwrap().take()
+    }
+
+    fn take_media_rx(&self) -> Option<mpsc::Receiver<crate::message_bus::MediaDelivery>> {
+        self.media_rx.lock().unwrap().take()
     }
 
     /// Return the event broadcast sender for channels to subscribe to agent events.
@@ -412,6 +464,18 @@ impl ChannelManager {
             tokio::spawn(async move {
                 while let Some(event) = card_rx.recv().await {
                     dispatch_card(&channels, &event).await;
+                }
+            });
+        }
+
+        // Media router: a dedicated mpsc, beside the card path, for agent-
+        // produced files. Route by session prefix to the owning channel and
+        // call `write_media`; text-only channels inherit the no-op and drop it.
+        if let Some(mut media_rx) = self.take_media_rx() {
+            let channels = self.channels.clone();
+            tokio::spawn(async move {
+                while let Some(delivery) = media_rx.recv().await {
+                    dispatch_media(&channels, &delivery).await;
                 }
             });
         }

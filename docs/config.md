@@ -148,6 +148,7 @@ WebUI 为补偿「无认证」在 HTTP 层强制四条护栏（全局中间件�
 | `base_url` | string | 否 | 飞书开放平台 | API 根地址（Lark 国际版等部署可覆盖） |
 | `verification_token` | string | 否 | `""` | 事件校验 token（webhook 场景；长连接模式下可不填） |
 | `encrypt_key` | string | 否 | `""` | 事件加密 key（同上） |
+| `streaming` | bool | 否 | `true` | 流式卡片开关；`false`（或字符串 `"false"`）关闭，回退为纯文本往返（票 28） |
 
 ```json
 {

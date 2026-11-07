@@ -45,9 +45,9 @@
 
 - [x] **配置与注册** — `channels.feishu` 段（`app_id`、`app_secret`(secret 标记 + env override)、`owner_open_id`、`domain`、`streaming`）；`FeishuChannelFactory`（`channel_type = "feishu"`）注册进 `ChannelManager`；gateway 装配时确保唯一连接持有者（票 27 落地：必填校验 + `enabled` 门控 + `resolve_channel_secrets` 命名空间 `slimbot.channel.<channel>.<field>`；v1 实字段为 `base_url`/`verification_token`/`encrypt_key`，`streaming` 随票 28）
 - [x] **入站链路** — WS 长连 + crate `channel` 归一化 → `NormalizedMessage` → `publish_inbound`；owner 校验（非 `owner_open_id` 私聊静默忽略、群组丢弃）；session_id `feishu:{oc_…}`（票 27 落地：`classify_inbound` + `InboundRouter` → `BusRequest::owner`；网络隔离在 `FeishuTransport`/`FeishuSender` 接缝后，见 `docs/feishu.md`）
-- [ ] **出站流式卡片** — `AgentEvent` delta → CardKit 流式卡片原位刷新 → 收尾定稿；agent markdown → 飞书卡片 markdown 子集映射
-- [ ] **媒体** — 入站图片/文件按飞书 file-key 经 im API 下载进 workspace（**不拉任意 URL，防 SSRF**）；出站发图/发文件
-- [x] **隐私护栏落地（适配器侧）** — 适配器不记正文/open_id/tenant_key/app_secret/token，错误只落变体+失败类别；marker 守护测试 `test_round_trip_logs_never_carry_pii`（票 27 落地）
+- [x] **出站流式卡片** — `AgentEvent` 状态机（`TaskStarted` 建档 → `AssistantMessage` 经 `edit_card` 原位刷新 → `TaskCompleted`/`TaskFailed` 定稿）；`write_output` 按 `run_id` 去重避免双发；建卡/更新失败回退纯文本（票 28 落地：`streaming` 默认开、`FeishuSender::create_card`/`update_card` 接缝后离线可测，见 `docs/feishu.md`）。markdown → 飞书卡片 markdown 子集映射当前直透 `Element::Markdown`
+- [x] **媒体** — 入站图片/文件按飞书 file-key 经 `MediaDownloader` 接缝下载（图片进多模态 `Content::Image` base64、非图片落 `{workspace}/media/feishu/` 以路径引用；**不拉任意 URL，URL 形状句柄拒绝防 SSRF**）；出站 `send_file` 工具 → media 队列 → `write_media` 交 SDK 上传发送（票 28 落地）
+- [x] **隐私护栏落地（适配器侧）** — 适配器不记正文/open_id/tenant_key/app_secret/token/媒体句柄·文件名·本地路径，错误只落变体+失败类别；marker 守护测试 `test_round_trip_logs_never_carry_pii`（票 27）与 `test_media_logs_never_carry_handles_names_or_paths`（票 28），经 `CAPTURE_GUARD` 串行
 - [ ] **crate tracing 逐 call-site 核验** — 确认 `larksuite-oapi-sdk-rs` 的 `tracing` 未泄 PII（否则加 filtering layer）；升级前重 diff 其 tracing/error 面
 - [ ] **cargo audit** — 纳入提交前检查；升级前重 diff 其 tracing/error 面
 - [ ] **验收** — owner 私聊流式全链路 + 图片/文件收发 + 重启续会话 + 非 owner 忽略 + 日志/session 无明文密钥与正文

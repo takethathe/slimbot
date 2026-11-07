@@ -16,17 +16,20 @@
 //! `tenant_key`, the app secret, or a token. Logs carry only fixed words, chat
 //! *counts*, and non-identifying state.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::sync::{broadcast, mpsc};
 
 use super::{Channel, ChannelFactory};
 use crate::io_scheduler::{IoHandle, IoScheduler};
 use crate::log::LogLevel;
 use crate::message_bus::{BusRequest, BusResult};
-use crate::session::{TaskHook, TaskState};
+use crate::session::{ContentBlock, TaskHook, TaskState};
 use crate::{debug, error, info};
 
 /// The channel id and session prefix. A session id is `{CHANNEL_ID}:{chat_id}`
@@ -51,6 +54,19 @@ pub(crate) enum InboundDecision {
     IgnoreEmpty,
 }
 
+/// A transport-agnostic view of one inbound attachment. It carries only a
+/// Feishu **file-key handle** — there is no URL field by construction, so the
+/// channel cannot be coaxed into fetching an arbitrary address (ADR 0017).
+#[derive(Debug, Clone)]
+pub(crate) struct InboundResource {
+    /// The SDK resource type: `"image"`, `"file"`, `"media"`, `"audio"`, ….
+    pub resource_type: String,
+    /// The opaque Feishu file-key handle. Never a URL.
+    pub file_key: String,
+    /// Original file name when Feishu reports one (usually empty for images).
+    pub file_name: String,
+}
+
 /// A transport-agnostic view of one inbound message: just the fields the
 /// decision and the run need, so no SDK type leaks past the seam.
 #[derive(Debug, Clone)]
@@ -59,8 +75,9 @@ pub(crate) struct InboundMessage {
     pub chat_type: String,
     pub sender_open_id: String,
     pub text: String,
-    #[allow(dead_code)] // the reply target matters once cards stream (ticket 28)
     pub message_id: String,
+    /// Attachments that came with the message (empty for a text-only DM).
+    pub resources: Vec<InboundResource>,
 }
 
 /// Decide whether an inbound message should start a run, from the conversation
@@ -103,6 +120,13 @@ fn note(level: LogLevel, line: String) {
 #[cfg(test)]
 static CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// Serializes the log-capturing tests. `CAPTURED` is a process-wide static that
+/// any concurrent test's `captured_lines()` drains, so a capture-and-scan test
+/// must hold this lock from its initial drain through its final read or another
+/// test steals its lines mid-flight.
+#[cfg(test)]
+static CAPTURE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 fn captured_lines() -> Vec<String> {
     std::mem::take(&mut CAPTURED.lock().unwrap())
@@ -136,9 +160,14 @@ fn error_class(e: &larksuite_oapi_sdk_rs::LarkError) -> String {
 
 /// Turns inbound messages into owner-authored bus requests. Shared between the
 /// long-connection pump and the tests, so the routing decision is one place.
+/// When a media downloader and a media directory are wired ([`Self::with_media`]),
+/// attachments are fetched by file-key and folded into the request; without them
+/// (offline tests, or a channel built for text only) resources are skipped.
 pub(crate) struct InboundRouter {
     owner_open_id: String,
     inbound_tx: mpsc::Sender<BusRequest>,
+    downloader: Option<Arc<dyn MediaDownloader>>,
+    media_dir: Option<PathBuf>,
 }
 
 impl InboundRouter {
@@ -146,12 +175,82 @@ impl InboundRouter {
         Self {
             owner_open_id,
             inbound_tx,
+            downloader: None,
+            media_dir: None,
         }
     }
 
-    /// Route one message. Only an owner DM with text becomes a run; anything
-    /// else is a silent drop. The session id is two-segment so repeated turns
-    /// on the same chat accumulate on one session (JSONL persistence).
+    /// Wire the attachment path: a downloader (file-key → bytes) and the
+    /// directory non-image files are saved into so the run can read them by
+    /// path. Images are inlined as multimodal blocks and need no directory.
+    fn with_media(mut self, downloader: Arc<dyn MediaDownloader>, media_dir: PathBuf) -> Self {
+        self.downloader = Some(downloader);
+        self.media_dir = Some(media_dir);
+        self
+    }
+
+    /// Fetch each attachment by its file-key handle. A URL-shaped handle is
+    /// refused outright (no fetch). Images become inline multimodal blocks;
+    /// other files are saved under the media dir and reported back as a path
+    /// line so the run references them by path. Returns (image blocks, path
+    /// lines). Never logs a handle, file name, or body (ADR 0017).
+    async fn fetch_attachments(&self, msg: &InboundMessage) -> (Vec<ContentBlock>, Vec<String>) {
+        let mut images = Vec::new();
+        let mut file_lines = Vec::new();
+        if msg.resources.is_empty() {
+            return (images, file_lines);
+        }
+        for res in &msg.resources {
+            // Accept only an opaque file-key handle. A remote address shaped
+            // like `scheme://…` is refused before any request is attempted.
+            if looks_like_url(&res.file_key) {
+                note(
+                    LogLevel::Debug,
+                    "[feishu] refused an attachment handle shaped like a URL".to_string(),
+                );
+                continue;
+            }
+            let Some(dl) = self.downloader.as_ref() else {
+                // No downloader wired (text-only channel): skip the attachment
+                // rather than fabricate one; a bare-media DM still starts.
+                continue;
+            };
+            let bytes = match dl
+                .download(&msg.message_id, &res.file_key, &res.resource_type)
+                .await
+            {
+                Ok(b) => b,
+                Err(_) => {
+                    // Only the failure is noted, never the handle or body.
+                    note(
+                        LogLevel::Error,
+                        "[feishu] an attachment download failed".to_string(),
+                    );
+                    continue;
+                }
+            };
+            if res.resource_type == "image" {
+                images.push(ContentBlock::Image {
+                    mime_type: image_mime_from_name(&res.file_name).to_string(),
+                    base64_data: BASE64.encode(&bytes),
+                });
+            } else if let Some(dir) = self.media_dir.as_ref() {
+                match save_media_file(dir, &msg.message_id, &res.file_name, &bytes) {
+                    Some(path) => file_lines.push(format!("[attached file saved to: {path}]")),
+                    None => note(
+                        LogLevel::Error,
+                        "[feishu] an attachment could not be written to disk".to_string(),
+                    ),
+                }
+            }
+        }
+        (images, file_lines)
+    }
+
+    /// Route one message. Only an owner DM with something to act on (text or an
+    /// attachment) becomes a run; anything else is a silent drop. The session id
+    /// is two-segment so repeated turns on the same chat accumulate on one
+    /// session (JSONL persistence).
     async fn handle(&self, msg: InboundMessage) -> InboundDecision {
         let decision = classify_inbound(&msg.chat_type, &msg.sender_open_id, &self.owner_open_id);
         match decision {
@@ -171,17 +270,26 @@ impl InboundRouter {
                 );
                 decision
             }
-            InboundDecision::StartRun if msg.text.trim().is_empty() => {
-                // Text is this ticket's only payload; an empty body (a bare
-                // image or file) is handled when media lands in ticket 28.
+            InboundDecision::StartRun if msg.text.trim().is_empty() && msg.resources.is_empty() => {
+                // Nothing to act on: no text and no attachment.
                 InboundDecision::IgnoreEmpty
             }
             InboundDecision::StartRun => {
                 let session_id = format!("{CHANNEL_ID}:{}", msg.chat_id);
                 let hook = TaskHook::new(&session_id);
+                // Fold attachments into the run: inline images and file-path
+                // references appended to the caption text.
+                let (images, file_lines) = self.fetch_attachments(&msg).await;
+                let mut content = msg.text.clone();
+                for line in file_lines {
+                    if !content.trim().is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(&line);
+                }
                 // The sender is bound by config, so this is the owner's message:
                 // it carries the owner's authority for consequential actions.
-                let request = BusRequest::owner(session_id, msg.text, hook);
+                let request = BusRequest::owner(session_id, content, hook).with_attachments(images);
                 if let Err(e) = self.inbound_tx.send(request).await {
                     // The bus is gone; nothing to deliver, and the text is not
                     // logged even in the failure line (a SendError's Display
@@ -198,11 +306,58 @@ impl InboundRouter {
     }
 }
 
-/// The outbound half of the seam: post a finished answer back to a chat. The
-/// real implementation talks to Feishu; tests record what was asked.
+/// Persist a downloaded non-image attachment under `dir`, returning the path to
+/// hand to the run. The file name is reduced to its last path component so a
+/// crafted name can never escape the media directory (no path traversal). None
+/// on any I/O failure.
+fn save_media_file(
+    dir: &PathBuf,
+    message_id: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    use std::io::Write;
+    let safe_name = std::path::Path::new(file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "attachment.bin".to_string());
+    // Prefix with the (opaque) message id so two attachments never collide.
+    let name = format!("{message_id}_{safe_name}");
+    let path = dir.join(name);
+    if std::fs::create_dir_all(dir).is_err() {
+        return None;
+    }
+    let mut file = std::fs::File::create(&path).ok()?;
+    file.write_all(bytes).ok()?;
+    Some(path.to_string_lossy().to_string())
+}
+
+/// The outbound half of the seam: post a finished answer (text or media) back
+/// to a chat. The real implementation talks to Feishu; tests record what was
+/// asked.
+// `double_must_use` is an `async_trait` desugaring artifact on methods returning
+// `Result`, not a real attribute on this code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub(crate) trait FeishuSender: Send + Sync {
     async fn send_text_to_chat(&self, chat_id: &str, text: &str) -> Result<()>;
+    /// Deliver an agent-produced image/file to a chat. The path is a local
+    /// file the SDK uploads; a caption, if any, accompanies it. Never logs the
+    /// path, caption, or bytes (ADR 0017).
+    async fn send_media_to_chat(
+        &self,
+        chat_id: &str,
+        media: &crate::message_bus::OutboundMedia,
+        caption: Option<&str>,
+    ) -> Result<()>;
+    /// Open a streaming card on a chat and return its message id. `markdown`
+    /// is the initial body; `streaming` shows the typing indicator. A failure
+    /// here makes the channel fall back to a plain text answer.
+    async fn create_card(&self, chat_id: &str, markdown: &str, streaming: bool) -> Result<String>;
+    /// Update a previously created card in place with a new body. `streaming`
+    /// off marks the card final. Never logs the body (ADR 0017).
+    async fn update_card(&self, message_id: &str, markdown: &str, streaming: bool) -> Result<()>;
 }
 
 /// The inbound half of the seam: open the single long connection and pump
@@ -210,6 +365,65 @@ pub(crate) trait FeishuSender: Send + Sync {
 /// (ADR 0017), so exactly one connection exists per configured app.
 pub(crate) trait FeishuTransport: Send + Sync {
     fn connect(&self, router: Arc<InboundRouter>) -> IoHandle;
+}
+
+/// The attachment-fetch half of the seam. It takes ONLY a Feishu file-key
+/// handle (plus the message it belongs to) and returns raw bytes — there is no
+/// URL parameter by construction, so a caller cannot turn an inbound message
+/// into an SSRF probe (ADR 0017). The real implementation calls the `im`
+/// resource API; tests record which handles were requested.
+#[allow(clippy::double_must_use)]
+#[async_trait]
+pub(crate) trait MediaDownloader: Send + Sync {
+    async fn download(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        resource_type: &str,
+    ) -> Result<Vec<u8>>;
+}
+
+/// True when a handle looks like a remote URL rather than an opaque file-key.
+/// Feishu keys are scheme-less (`img_v2_…`, `file_v2_…`); anything shaped
+/// `scheme://…` is refused before a fetch is attempted. The outbound `send_file`
+/// tool mirrors this exact rule, so the two directions share one discipline.
+fn looks_like_url(handle: &str) -> bool {
+    let lower = handle.trim().to_ascii_lowercase();
+    match lower.find("://") {
+        Some(idx) => {
+            let scheme = &lower[..idx];
+            !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        }
+        None => false,
+    }
+}
+
+/// A best-effort image MIME type from a file name/extension. Feishu image
+/// resources often carry no name, in which case `image/png` is the safe inline
+/// default for a multimodal block.
+fn image_mime_from_name(file_name: &str) -> &'static str {
+    let ext = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        // Images usually arrive nameless; png is the conservative default.
+        "" | "png" => "image/png",
+        _ => "image/png",
+    }
 }
 
 /// Parsed `channels.feishu` configuration. The open `extra` map is flattened, so
@@ -223,6 +437,9 @@ pub(crate) struct FeishuConfig {
     base_url: Option<String>,
     verification_token: String,
     encrypt_key: String,
+    /// Stream a multi-chunk answer into one in-place card. On by default;
+    /// `false` keeps the plain p2p text round trip.
+    streaming: bool,
 }
 
 impl FeishuConfig {
@@ -255,8 +472,23 @@ impl FeishuConfig {
             base_url: field("base_url").filter(|s| !s.trim().is_empty()),
             verification_token: field("verification_token").unwrap_or_default(),
             encrypt_key: field("encrypt_key").unwrap_or_default(),
+            // Streaming defaults on: only an explicit `"streaming": false` (or
+            // `false`) turns it off, preserving the plain text round trip.
+            streaming: match config.get("streaming") {
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(serde_json::Value::String(s)) => !s.trim().eq_ignore_ascii_case("false"),
+                _ => true,
+            },
         })
     }
+}
+
+/// One streaming card currently open on a session.
+struct ActiveCard {
+    message_id: String,
+    /// Set once a create/update fails, so later updates are skipped and the
+    /// final answer falls back to plain text (never message spam).
+    failed: bool,
 }
 
 /// The Feishu channel. It owns the routing decision and both network seams; it
@@ -266,6 +498,14 @@ pub(crate) struct FeishuChannel {
     router: Arc<InboundRouter>,
     sender: Arc<dyn FeishuSender>,
     transport: Arc<dyn FeishuTransport>,
+    /// Whether a multi-chunk answer streams into one in-place card. Off keeps
+    /// the plain p2p text round trip (ticket 27) intact.
+    streaming: bool,
+    /// One open card per session, keyed by session id.
+    cards: std::collections::HashMap<String, ActiveCard>,
+    /// run_ids whose final answer was already delivered through a card, so
+    /// `write_output` must not also send the same text.
+    carded_runs: std::collections::HashSet<String>,
 }
 
 impl FeishuChannel {
@@ -273,6 +513,7 @@ impl FeishuChannel {
         router: Arc<InboundRouter>,
         sender: Arc<dyn FeishuSender>,
         transport: Arc<dyn FeishuTransport>,
+        streaming: bool,
     ) -> Self {
         Self {
             // A placeholder for the trait's single-chat accessor; the real chat
@@ -281,6 +522,9 @@ impl FeishuChannel {
             router,
             sender,
             transport,
+            streaming,
+            cards: std::collections::HashMap::new(),
+            carded_runs: std::collections::HashSet::new(),
         }
     }
 
@@ -290,6 +534,36 @@ impl FeishuChannel {
             .split_once(':')
             .map(|(_, rest)| rest)
             .unwrap_or("")
+    }
+
+    /// Finalize (or drop) the card for a run at its terminal event. On a
+    /// successful final update the run is recorded as card-delivered so the
+    /// matching `write_output` is suppressed. A missing or failed card leaves
+    /// the run unrecorded, so the text answer still goes out.
+    async fn finish_card(&mut self, session_id: &str, run_id: &str, text: &str) {
+        let Some(card) = self.cards.remove(session_id) else {
+            return; // no card was open (streaming off, or never created)
+        };
+        if card.failed {
+            return; // fall back to text via write_output
+        }
+        if self
+            .sender
+            .update_card(&card.message_id, text, false)
+            .await
+            .is_ok()
+        {
+            self.remember_carded_run(run_id.to_string());
+        }
+    }
+
+    /// Bound the dedup set: entries live only between the terminal event and
+    /// the matching write_output, but a run that never emits one must not leak.
+    fn remember_carded_run(&mut self, run_id: String) {
+        if self.carded_runs.len() >= 512 {
+            self.carded_runs.clear();
+        }
+        self.carded_runs.insert(run_id);
     }
 }
 
@@ -316,11 +590,98 @@ impl Channel for FeishuChannel {
         if result.content.trim().is_empty() {
             return Ok(());
         }
+        // Dedup: if this run's answer already landed in a finalized card, do
+        // not send the same text a second time.
+        if self.carded_runs.remove(&result.run_id) {
+            return Ok(());
+        }
         let chat_id = Self::chat_id_from(&result.session_id).to_string();
         // The content is the agent's answer; a send failure is reported without
         // echoing the body.
         self.sender
             .send_text_to_chat(&chat_id, &result.content)
+            .await
+    }
+
+    async fn write_event(&mut self, event: &crate::session::AgentEvent) -> Result<()> {
+        use crate::session::AgentEvent as E;
+        if !self.streaming {
+            return Ok(()); // ticket 27's plain text path drives delivery via write_output
+        }
+        match event {
+            E::TaskStarted {
+                session_id,
+                run_id: _,
+            } => {
+                let chat_id = Self::chat_id_from(session_id).to_string();
+                // Open an empty streaming card. On failure, record a failed
+                // placeholder so interim updates are skipped and the answer
+                // falls back to text.
+                match self.sender.create_card(&chat_id, "", true).await {
+                    Ok(message_id) => {
+                        self.cards.insert(
+                            session_id.clone(),
+                            ActiveCard {
+                                message_id,
+                                failed: false,
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        self.cards.insert(
+                            session_id.clone(),
+                            ActiveCard {
+                                message_id: String::new(),
+                                failed: true,
+                            },
+                        );
+                    }
+                }
+            }
+            E::AssistantMessage {
+                session_id,
+                content,
+            } => {
+                if let Some(card) = self.cards.get_mut(session_id)
+                    && !card.failed
+                    && !content.trim().is_empty()
+                {
+                    // An update failure flips the card to failed; the final
+                    // answer then falls back to text.
+                    if self
+                        .sender
+                        .update_card(&card.message_id, content, true)
+                        .await
+                        .is_err()
+                    {
+                        card.failed = true;
+                    }
+                }
+            }
+            E::TaskCompleted {
+                session_id,
+                run_id,
+                result,
+            } => self.finish_card(session_id, run_id, result).await,
+            E::TaskFailed {
+                session_id,
+                run_id,
+                error,
+            } => self.finish_card(session_id, run_id, error).await,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn write_media(&mut self, delivery: &crate::message_bus::MediaDelivery) -> Result<()> {
+        // Defense-in-depth against the outbound mirror of the inbound rule: a
+        // media path shaped like a URL is refused, never fetched.
+        if looks_like_url(delivery.media.path()) {
+            anyhow::bail!("feishu refuses a media path shaped like a URL");
+        }
+        let chat_id = Self::chat_id_from(&delivery.session_id).to_string();
+        self.sender
+            .send_media_to_chat(&chat_id, &delivery.media, delivery.caption.as_deref())
             .await
     }
 
@@ -348,19 +709,23 @@ impl Channel for FeishuChannel {
 pub struct FeishuChannelFactory {
     message_bus: Arc<crate::message_bus::MessageBus>,
     shutdown_tx: broadcast::Sender<()>,
+    workspace_dir: PathBuf,
 }
 
 impl FeishuChannelFactory {
     /// `shutdown_tx` is the gateway's channel-shutdown broadcast: the long
     /// connection observes it so `ChannelManager::shutdown` can join the
-    /// connection task instead of timing out.
+    /// connection task instead of timing out. `workspace_dir` roots the media
+    /// directory inbound files are saved into (ticket 28).
     pub fn new(
         message_bus: Arc<crate::message_bus::MessageBus>,
         shutdown_tx: broadcast::Sender<()>,
+        workspace_dir: PathBuf,
     ) -> Self {
         Self {
             message_bus,
             shutdown_tx,
+            workspace_dir,
         }
     }
 }
@@ -372,14 +737,21 @@ impl ChannelFactory for FeishuChannelFactory {
 
     fn create(&self, config: &serde_json::Value) -> Result<Box<dyn Channel>> {
         let config = FeishuConfig::from_value(config)?;
-        let router = Arc::new(InboundRouter::new(
-            config.owner_open_id.clone(),
-            self.message_bus.inbound_tx(),
-        ));
+        let streaming = config.streaming;
+        // Inbound files land under `{workspace}/media/feishu`; the run then
+        // reads them by path. Images are inlined and need no directory.
+        let media_dir = self.workspace_dir.join("media").join(CHANNEL_ID);
+        let downloader: Arc<dyn MediaDownloader> = Arc::new(SdkDownloader::new(&config)?);
+        let router = Arc::new(
+            InboundRouter::new(config.owner_open_id.clone(), self.message_bus.inbound_tx())
+                .with_media(downloader, media_dir),
+        );
         let sender: Arc<dyn FeishuSender> = Arc::new(SdkSender::new(&config)?);
         let transport: Arc<dyn FeishuTransport> =
             Arc::new(SdkTransport::new(config, self.shutdown_tx.clone()));
-        Ok(Box::new(FeishuChannel::new(router, sender, transport)))
+        Ok(Box::new(FeishuChannel::new(
+            router, sender, transport, streaming,
+        )))
     }
 }
 
@@ -421,6 +793,169 @@ impl FeishuSender for SdkSender {
                 anyhow::anyhow!("feishu send failed")
             })
             .map(|_| ())
+    }
+
+    async fn send_media_to_chat(
+        &self,
+        chat_id: &str,
+        media: &crate::message_bus::OutboundMedia,
+        caption: Option<&str>,
+    ) -> Result<()> {
+        use crate::message_bus::OutboundMedia;
+        use larksuite_oapi_sdk_rs::channel::SendInput;
+        let opt = &larksuite_oapi_sdk_rs::RequestOption::default();
+        let log_err = |e: larksuite_oapi_sdk_rs::LarkError| {
+            // Class only: the SDK Display can echo request parameters, and a
+            // local path or caption must never reach the log (ADR 0017).
+            note(
+                LogLevel::Error,
+                format!("[feishu] outbound media send failed: {}", error_class(&e)),
+            );
+            anyhow::anyhow!("feishu media send failed")
+        };
+        // A caption is sent as its own text message so the media maps cleanly
+        // to a single native image/file message.
+        if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
+            let t = SendInput {
+                chat_id: Some(chat_id.to_string()),
+                text: Some(cap.to_string()),
+                ..Default::default()
+            };
+            self.client
+                .channel_messaging()
+                .send(&t, opt)
+                .await
+                .map_err(log_err)?;
+        }
+        let mut input = SendInput {
+            chat_id: Some(chat_id.to_string()),
+            ..Default::default()
+        };
+        match media {
+            OutboundMedia::Image { path } => input.image_path = Some(path.clone()),
+            OutboundMedia::File { path, .. } => input.file_path = Some(path.clone()),
+        }
+        self.client
+            .channel_messaging()
+            .send(&input, opt)
+            .await
+            .map_err(log_err)
+            .map(|_| ())
+    }
+
+    async fn create_card(&self, chat_id: &str, markdown: &str, streaming: bool) -> Result<String> {
+        use larksuite_oapi_sdk_rs::channel::SendInput;
+        let card = build_streaming_card(markdown, streaming)?;
+        let input = SendInput {
+            chat_id: Some(chat_id.to_string()),
+            card: Some(card),
+            ..Default::default()
+        };
+        let result = self
+            .client
+            .channel_messaging()
+            .send(&input, &larksuite_oapi_sdk_rs::RequestOption::default())
+            .await
+            .map_err(card_err)?;
+        Ok(result.message_id)
+    }
+
+    async fn update_card(&self, message_id: &str, markdown: &str, streaming: bool) -> Result<()> {
+        use larksuite_oapi_sdk_rs::card::v2::{
+            Body, Card, CardDocument, Config, Element, Markdown,
+        };
+        let doc = CardDocument::new(
+            Card::new()
+                .config(Config::new().update_multi().streaming_mode(streaming))
+                .body(Body::new().element(Element::Markdown(Markdown::new(markdown)))),
+        )
+        .map_err(|_| anyhow::anyhow!("invalid streaming card"))?;
+        self.client
+            .channel_messaging()
+            .edit_card(
+                message_id,
+                &doc,
+                &larksuite_oapi_sdk_rs::RequestOption::default(),
+            )
+            .await
+            .map_err(card_err)
+            .map(|_| ())
+    }
+}
+
+/// Build a Card JSON 2.0 document (as a serialized string) whose single body
+/// element is `markdown`. `streaming` toggles the typing indicator: on while an
+/// answer is still arriving, off on the final update. `update_multi` is
+/// required by the v2 schema (the only supported update mode).
+fn build_streaming_card(markdown: &str, streaming: bool) -> Result<String> {
+    use larksuite_oapi_sdk_rs::card::v2::{Body, Card, CardDocument, Config, Element, Markdown};
+    let doc = CardDocument::new(
+        Card::new()
+            .config(Config::new().update_multi().streaming_mode(streaming))
+            .body(Body::new().element(Element::Markdown(Markdown::new(markdown)))),
+    )
+    .map_err(|_| anyhow::anyhow!("invalid streaming card"))?;
+    serde_json::to_string(doc.card()).map_err(|e| anyhow::anyhow!("card serialize: {e}"))
+}
+
+/// Log a card failure by class only; the SDK Display can carry free text tied
+/// to the request (and the card body is the agent's answer). ADR 0017.
+fn card_err(e: larksuite_oapi_sdk_rs::LarkError) -> anyhow::Error {
+    note(
+        LogLevel::Error,
+        format!("[feishu] card update failed: {}", error_class(&e)),
+    );
+    anyhow::anyhow!("feishu card update failed")
+}
+
+/// Inbound attachment fetch through the SDK's message-resource API. It accepts
+/// only a file-key handle; a URL-shaped handle is refused here too as
+/// defense-in-depth, so the seam can never be turned into a remote fetch.
+struct SdkDownloader {
+    client: larksuite_oapi_sdk_rs::LarkClient,
+}
+
+impl SdkDownloader {
+    fn new(config: &FeishuConfig) -> Result<Self> {
+        Ok(Self {
+            client: build_client(config)?,
+        })
+    }
+}
+
+#[async_trait]
+impl MediaDownloader for SdkDownloader {
+    async fn download(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        resource_type: &str,
+    ) -> Result<Vec<u8>> {
+        // Mirror the router's rule at the seam boundary: a handle shaped like a
+        // URL is refused, never dereferenced.
+        if looks_like_url(file_key) {
+            anyhow::bail!("refused an attachment handle shaped like a URL");
+        }
+        let resp = self
+            .client
+            .channel_messaging()
+            .download_message_resource(
+                message_id,
+                file_key,
+                resource_type,
+                &larksuite_oapi_sdk_rs::RequestOption::default(),
+            )
+            .await
+            .map_err(|e| {
+                // Class only: the SDK Display can carry free text tied to the
+                // request, and the file-key is itself an identifier.
+                note(
+                    LogLevel::Error,
+                    format!("[feishu] attachment download failed: {}", error_class(&e)),
+                );
+                anyhow::anyhow!("feishu attachment download failed")
+            })?;
+        Ok(resp.data)
     }
 }
 
@@ -529,6 +1064,17 @@ async fn run_connection(
                     message_id: msg.message_id.clone(),
                     sender_open_id,
                     text: msg.text.clone().unwrap_or_default(),
+                    // Map each attachment to an opaque file-key handle; the SDK
+                    // never surfaces a URL here (ADR 0017).
+                    resources: msg
+                        .resources
+                        .iter()
+                        .map(|r| InboundResource {
+                            resource_type: r.resource_type.clone(),
+                            file_key: r.file_key.clone(),
+                            file_name: r.file_name.clone(),
+                        })
+                        .collect(),
                 };
                 router.handle(inbound).await;
                 Ok(())
@@ -559,9 +1105,15 @@ mod tests {
     use super::*;
     use crate::message_bus::MessageBus;
 
-    /// A sender that records what it was asked to deliver.
+    /// A sender that records what it was asked to deliver (text, media, cards).
+    #[derive(Default)]
     struct RecordingSender {
         sent: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        media: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        /// Ordered trace of card operations, e.g. `create card_0 true`.
+        cards: Arc<std::sync::Mutex<Vec<String>>>,
+        /// When true, card create/update fail, to exercise the text fallback.
+        fail_card: bool,
     }
 
     #[async_trait]
@@ -571,6 +1123,55 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((chat_id.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        async fn send_media_to_chat(
+            &self,
+            chat_id: &str,
+            media: &crate::message_bus::OutboundMedia,
+            _caption: Option<&str>,
+        ) -> Result<()> {
+            let kind = match media {
+                crate::message_bus::OutboundMedia::Image { .. } => "image",
+                crate::message_bus::OutboundMedia::File { .. } => "file",
+            };
+            self.media.lock().unwrap().push((
+                chat_id.to_string(),
+                media.path().to_string(),
+                kind.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn create_card(
+            &self,
+            _chat_id: &str,
+            _markdown: &str,
+            streaming: bool,
+        ) -> Result<String> {
+            if self.fail_card {
+                anyhow::bail!("card create failed");
+            }
+            let mut ops = self.cards.lock().unwrap();
+            let id = format!("card_{}", ops.len());
+            ops.push(format!("create {id} streaming={streaming}"));
+            Ok(id)
+        }
+
+        async fn update_card(
+            &self,
+            message_id: &str,
+            _markdown: &str,
+            streaming: bool,
+        ) -> Result<()> {
+            if self.fail_card {
+                anyhow::bail!("card update failed");
+            }
+            self.cards
+                .lock()
+                .unwrap()
+                .push(format!("update {message_id} streaming={streaming}"));
             Ok(())
         }
     }
@@ -589,6 +1190,27 @@ mod tests {
         }
     }
 
+    /// A downloader that records every handle it is asked to fetch and
+    /// returns canned bytes, so the file-key-only rule and the multimodal
+    /// fold-in are testable without Feishu credentials or the network.
+    struct StubDownloader {
+        requested: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl MediaDownloader for StubDownloader {
+        async fn download(
+            &self,
+            _message_id: &str,
+            file_key: &str,
+            _resource_type: &str,
+        ) -> Result<Vec<u8>> {
+            self.requested.lock().unwrap().push(file_key.to_string());
+            // A fixed non-empty payload stands in for the real bytes.
+            Ok(vec![0u8; 8])
+        }
+    }
+
     fn dm(chat_type: &str, sender: &str, text: &str) -> InboundMessage {
         InboundMessage {
             chat_id: "oc_conv1".to_string(),
@@ -596,6 +1218,28 @@ mod tests {
             sender_open_id: sender.to_string(),
             text: text.to_string(),
             message_id: "om_1".to_string(),
+            resources: Vec::new(),
+        }
+    }
+
+    /// Same as [`dm`] but with attachments riding on the message.
+    fn dm_with_resources(
+        chat_type: &str,
+        sender: &str,
+        text: &str,
+        resources: Vec<InboundResource>,
+    ) -> InboundMessage {
+        InboundMessage {
+            resources,
+            ..dm(chat_type, sender, text)
+        }
+    }
+
+    fn resource(resource_type: &str, file_key: &str, file_name: &str) -> InboundResource {
+        InboundResource {
+            resource_type: resource_type.to_string(),
+            file_key: file_key.to_string(),
+            file_name: file_name.to_string(),
         }
     }
 
@@ -707,6 +1351,173 @@ mod tests {
         assert_eq!(a.1[0].session_id, b.1[0].session_id);
     }
 
+    // ── inbound media: file-key-only fetch folds into the run (ticket 28) ──
+
+    /// Route through a router wired with a stub downloader and a fresh temp
+    /// media dir. Returns the decision, the requests that reached the bus, and
+    /// the exact handles the downloader was asked to fetch (to prove a URL is
+    /// never dereferenced).
+    async fn route_media(
+        msg: InboundMessage,
+        owner: &str,
+        media_dir: PathBuf,
+    ) -> (InboundDecision, Vec<BusRequest>, Vec<String>) {
+        let (mb, mut receivers) = MessageBus::new();
+        let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let downloader = Arc::new(StubDownloader {
+            requested: requested.clone(),
+        });
+        let router = Arc::new(
+            InboundRouter::new(owner.to_string(), mb.inbound_tx())
+                .with_media(downloader, media_dir),
+        );
+        let decision = router.handle(msg).await;
+        drop(router);
+        let mut got = Vec::new();
+        while let Ok(req) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            receivers.inbound.recv(),
+        )
+        .await
+        {
+            match req {
+                Some(r) => got.push(r),
+                None => break,
+            }
+        }
+        (
+            decision,
+            got,
+            std::mem::take(&mut *requested.lock().unwrap()),
+        )
+    }
+
+    fn temp_media_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "slimbot_feishu_{}_{}_{}",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_inbound_image_becomes_a_multimodal_attachment() {
+        let dir = temp_media_dir("img");
+        let (decision, got, requested) = route_media(
+            dm_with_resources(
+                "p2p",
+                "ou_owner",
+                "",
+                vec![resource("image", "img_v2_abc", "")],
+            ),
+            "ou_owner",
+            dir.clone(),
+        )
+        .await;
+        assert_eq!(decision, InboundDecision::StartRun, "a bare image starts");
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            requested.as_slice(),
+            &["img_v2_abc".to_string()],
+            "the image is fetched by its file-key handle"
+        );
+        let imgs: Vec<_> = got[0]
+            .attachments
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .collect();
+        assert_eq!(
+            imgs.len(),
+            1,
+            "an image attachment becomes an inline multimodal block"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_file_is_saved_and_referenced_by_path() {
+        let dir = temp_media_dir("file");
+        let (decision, got, requested) = route_media(
+            dm_with_resources(
+                "p2p",
+                "ou_owner",
+                "take a look at this",
+                vec![resource("file", "file_v2_x", "report.pdf")],
+            ),
+            "ou_owner",
+            dir.clone(),
+        )
+        .await;
+        assert_eq!(decision, InboundDecision::StartRun);
+        assert_eq!(requested.as_slice(), &["file_v2_x".to_string()]);
+        assert!(
+            got[0].content.contains("[attached file saved to:"),
+            "a file is referenced by path in the run text: {:?}",
+            got[0].content
+        );
+        assert!(
+            got[0].content.starts_with("take a look at this"),
+            "the caption text is preserved ahead of the file reference"
+        );
+        assert!(
+            got[0].attachments.is_empty(),
+            "a non-image file is not inlined as a multimodal block"
+        );
+        // The file actually lands inside the media dir and cannot escape it.
+        assert!(
+            std::fs::read_dir(&dir).unwrap().count() >= 1,
+            "the downloaded file is written under the media dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_url_shaped_handle_is_refused_and_never_fetched() {
+        // Acceptance: inbound media fetch accepts only a file-key handle; a
+        // URL-shaped one is refused with no dereference (no SSRF probe).
+        let dir = temp_media_dir("ssrf");
+        let (decision, got, requested) = route_media(
+            dm_with_resources(
+                "p2p",
+                "ou_owner",
+                "",
+                vec![resource("image", "https://evil.example/x.png", "")],
+            ),
+            "ou_owner",
+            dir.clone(),
+        )
+        .await;
+        assert!(
+            requested.is_empty(),
+            "a URL-shaped handle must never reach the downloader"
+        );
+        // With nothing fetchable and no text, there is nothing to act on: the
+        // message is dropped, so no run starts either.
+        let _ = decision;
+        for req in &got {
+            assert!(
+                req.attachments.is_empty(),
+                "a refused handle produces no attachment"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_looks_like_url_rejects_remote_and_keeps_local_handles() {
+        assert!(looks_like_url("https://a/b"));
+        assert!(looks_like_url("HTTP://a/b"));
+        assert!(looks_like_url("file:///etc/passwd"));
+        // Feishu file-key handles and local paths are not URLs.
+        assert!(!looks_like_url("img_v2_abc"));
+        assert!(!looks_like_url("file_v2_x"));
+        assert!(!looks_like_url("./a/b"));
+        assert!(!looks_like_url("/abs/path"));
+    }
+
     // ── write_output: the answer goes back on the same chat ──
 
     #[tokio::test]
@@ -715,8 +1526,12 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut ch = FeishuChannel::new(
             Arc::new(InboundRouter::new("ou_owner".into(), mb.inbound_tx())),
-            Arc::new(RecordingSender { sent: sent.clone() }),
+            Arc::new(RecordingSender {
+                sent: sent.clone(),
+                ..Default::default()
+            }),
             Arc::new(StubTransport),
+            false,
         );
         let result = BusResult {
             session_id: "feishu:oc_conv1".to_string(),
@@ -736,8 +1551,12 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut ch = FeishuChannel::new(
             Arc::new(InboundRouter::new("ou_owner".into(), mb.inbound_tx())),
-            Arc::new(RecordingSender { sent: sent.clone() }),
+            Arc::new(RecordingSender {
+                sent: sent.clone(),
+                ..Default::default()
+            }),
             Arc::new(StubTransport),
+            false,
         );
         let result = BusResult {
             session_id: "feishu:oc_conv1".to_string(),
@@ -751,6 +1570,215 @@ mod tests {
         );
     }
 
+    // ── write_media: an agent-produced file arrives in the session chat ──
+
+    #[tokio::test]
+    async fn test_write_media_delivers_to_the_session_chat() {
+        use crate::message_bus::{MediaDelivery, OutboundMedia};
+        let (mb, _rx) = MessageBus::new();
+        let media = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender = Arc::new(RecordingSender {
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            media: media.clone(),
+            ..Default::default()
+        });
+        let mut ch = FeishuChannel::new(
+            Arc::new(InboundRouter::new("ou_owner".into(), mb.inbound_tx())),
+            sender,
+            Arc::new(StubTransport),
+            false,
+        );
+        let delivery = MediaDelivery {
+            session_id: "feishu:oc_conv1".to_string(),
+            media: OutboundMedia::File {
+                path: "out/report.pdf".to_string(),
+                name: Some("report.pdf".to_string()),
+            },
+            caption: None,
+        };
+        ch.write_media(&delivery).await.unwrap();
+        assert_eq!(
+            media.lock().unwrap().as_slice(),
+            &[(
+                "oc_conv1".to_string(),
+                "out/report.pdf".to_string(),
+                "file".to_string()
+            )],
+            "the file is delivered to the chat the session belongs to"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_media_refuses_a_url_shaped_path() {
+        // The outbound mirror of the inbound rule: a path shaped like a URL is
+        // refused before any upload is attempted.
+        use crate::message_bus::{MediaDelivery, OutboundMedia};
+        let (mb, _rx) = MessageBus::new();
+        let media = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender = Arc::new(RecordingSender {
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            media: media.clone(),
+            ..Default::default()
+        });
+        let mut ch = FeishuChannel::new(
+            Arc::new(InboundRouter::new("ou_owner".into(), mb.inbound_tx())),
+            sender,
+            Arc::new(StubTransport),
+            false,
+        );
+        let delivery = MediaDelivery {
+            session_id: "feishu:oc_conv1".to_string(),
+            media: OutboundMedia::Image {
+                path: "https://evil.example/x.png".to_string(),
+            },
+            caption: None,
+        };
+        let err = ch.write_media(&delivery).await.unwrap_err();
+        assert!(
+            err.to_string().contains("URL"),
+            "a URL-shaped media path is refused: {err}"
+        );
+        assert!(
+            media.lock().unwrap().is_empty(),
+            "a refused media path sends nothing"
+        );
+    }
+
+    // ── streaming card: one card in place, no message spam (ticket 28) ──
+
+    /// Build a Feishu channel over a RecordingSender, with streaming on/off and
+    /// an optional card-failure stub.
+    fn card_channel(streaming: bool, fail_card: bool) -> (FeishuChannel, Arc<RecordingSender>) {
+        let (mb, _rx) = MessageBus::new();
+        let sender = Arc::new(RecordingSender {
+            fail_card,
+            ..Default::default()
+        });
+        let ch = FeishuChannel::new(
+            Arc::new(InboundRouter::new("ou_owner".into(), mb.inbound_tx())),
+            sender.clone(),
+            Arc::new(StubTransport),
+            streaming,
+        );
+        (ch, sender)
+    }
+
+    use crate::session::AgentEvent;
+
+    #[tokio::test]
+    async fn test_streaming_card_updates_in_place_and_suppresses_text() {
+        let (mut ch, sender) = card_channel(true, false);
+        ch.write_event(&AgentEvent::TaskStarted {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+        })
+        .await
+        .unwrap();
+        ch.write_event(&AgentEvent::AssistantMessage {
+            session_id: "feishu:oc_conv1".into(),
+            content: "thinking…".into(),
+        })
+        .await
+        .unwrap();
+        ch.write_event(&AgentEvent::TaskCompleted {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+            result: "the final answer".into(),
+        })
+        .await
+        .unwrap();
+        // The final BusResult for the same run must NOT send duplicate text.
+        ch.write_output(&BusResult {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+            content: "the final answer".into(),
+        })
+        .await
+        .unwrap();
+
+        let ops = sender.cards.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[
+                "create card_0 streaming=true".to_string(),
+                "update card_0 streaming=true".to_string(),
+                "update card_0 streaming=false".to_string(),
+            ],
+            "one card is opened and updated in place, finalized without the \
+             typing indicator"
+        );
+        assert!(
+            sender.sent.lock().unwrap().is_empty(),
+            "a card-delivered run sends no duplicate text message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_card_fallback_sends_text_when_card_fails() {
+        // create_card fails → the run is not marked card-delivered, so the
+        // final answer still reaches the chat as plain text (no silent drop).
+        let (mut ch, sender) = card_channel(true, true);
+        ch.write_event(&AgentEvent::TaskStarted {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+        })
+        .await
+        .unwrap();
+        ch.write_event(&AgentEvent::TaskCompleted {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+            result: "the final answer".into(),
+        })
+        .await
+        .unwrap();
+        ch.write_output(&BusResult {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+            content: "the final answer".into(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            sender.cards.lock().unwrap().is_empty(),
+            "a failing card records no successful operation"
+        );
+        assert_eq!(
+            sender.sent.lock().unwrap().as_slice(),
+            &[("oc_conv1".to_string(), "the final answer".to_string())],
+            "the answer falls back to text"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_off_sends_plain_text_and_opens_no_card() {
+        let (mut ch, sender) = card_channel(false, false);
+        ch.write_event(&AgentEvent::TaskStarted {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+        })
+        .await
+        .unwrap();
+        ch.write_event(&AgentEvent::TaskCompleted {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+            result: "the final answer".into(),
+        })
+        .await
+        .unwrap();
+        ch.write_output(&BusResult {
+            session_id: "feishu:oc_conv1".into(),
+            run_id: "r1".into(),
+            content: "the final answer".into(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            sender.cards.lock().unwrap().is_empty(),
+            "streaming off opens no card"
+        );
+        assert_eq!(sender.sent.lock().unwrap().len(), 1, "text is the delivery");
+    }
+
     // ── the long connection is opened only through start (single holder) ──
 
     #[tokio::test]
@@ -760,8 +1788,10 @@ mod tests {
             Arc::new(InboundRouter::new("ou_owner".into(), mb.inbound_tx())),
             Arc::new(RecordingSender {
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                ..Default::default()
             }),
             Arc::new(StubTransport),
+            false,
         );
         let scheduler = IoScheduler::new(mb.inbound_tx());
         let handle = ch.start_with_scheduler(&scheduler);
@@ -798,6 +1828,7 @@ mod tests {
     /// singleton (which other lib tests initialize).
     #[tokio::test]
     async fn test_round_trip_logs_never_carry_pii() {
+        let _guard = CAPTURE_GUARD.lock().await;
         let _ = captured_lines(); // drain anything an earlier test captured
 
         let (mb, _rx) = MessageBus::new();
@@ -811,6 +1842,7 @@ mod tests {
             sender_open_id: sender.to_string(),
             text: text.to_string(),
             message_id: "om-ZZMSGMARKER".to_string(),
+            resources: Vec::new(),
         };
         router
             .handle(marked("p2p", "ou-ZZOWNERMARKER", "body-ZZBODYMARKER"))
@@ -825,8 +1857,12 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut ch = FeishuChannel::new(
             router,
-            Arc::new(RecordingSender { sent: sent.clone() }),
+            Arc::new(RecordingSender {
+                sent: sent.clone(),
+                ..Default::default()
+            }),
             Arc::new(StubTransport),
+            false,
         );
         ch.write_output(&BusResult {
             session_id: "feishu:oc-ZZCHATMARKER".to_string(),
@@ -856,5 +1892,89 @@ mod tests {
         ] {
             assert!(!log_text.contains(marker), "logs must never carry {marker}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_media_logs_never_carry_handles_names_or_paths() {
+        // Ticket 28 privacy: the media paths (inbound fetch + outbound send)
+        // obey the same guardrail — a file-key handle, an original file name,
+        // and a local send path must never appear in a log line.
+        use crate::message_bus::{MediaDelivery, OutboundMedia};
+        let _guard = CAPTURE_GUARD.lock().await;
+        let _ = captured_lines(); // drain anything an earlier test captured
+
+        // Inbound: a URL-shaped handle is refused (the refusal must log, but
+        // only fixed words), and a saved file carries a marked file-name.
+        let dir = temp_media_dir("pii");
+        let (decision, _got, requested) = route_media(
+            dm_with_resources(
+                "p2p",
+                "ou-ZZOWNERMARKER",
+                "",
+                vec![
+                    resource("image", "https://evil.example/ZZURLHANDLE", ""),
+                    resource("file", "ZZFILEKEYMARKER", "ZZFILENAMEMARKER.pdf"),
+                ],
+            ),
+            "ou-ZZOWNERMARKER",
+            dir.clone(),
+        )
+        .await;
+        assert_eq!(decision, InboundDecision::StartRun);
+        // Proof the fetch path ran: the marked file-key was handed to the
+        // downloader while the URL-shaped handle was not (SSRF refusal).
+        assert!(
+            requested.iter().any(|k| k == "ZZFILEKEYMARKER"),
+            "the file-key handle reached the downloader"
+        );
+        assert!(
+            !requested.iter().any(|k| k.contains("ZZURLHANDLE")),
+            "a URL-shaped handle is never dereferenced"
+        );
+
+        // Outbound: a marked local path and caption go through write_media.
+        let media = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mb, _rx) = MessageBus::new();
+        let mut ch = FeishuChannel::new(
+            Arc::new(InboundRouter::new("ou_owner".into(), mb.inbound_tx())),
+            Arc::new(RecordingSender {
+                media: media.clone(),
+                ..Default::default()
+            }),
+            Arc::new(StubTransport),
+            false,
+        );
+        ch.write_media(&MediaDelivery {
+            session_id: "feishu:oc-ZZCHATMARKER".to_string(),
+            media: OutboundMedia::File {
+                path: "/tmp/ZZLOCALPATHMARKER.bin".to_string(),
+                name: Some("ZZDISPLAYNAMEMARKER".to_string()),
+            },
+            caption: Some("ZZCAPTIONMARKER".to_string()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(media.lock().unwrap().len(), 1, "the media did deliver");
+
+        let log_text = captured_lines().join("\n");
+        // Capture proof: the URL-refusal line is present, so the scan is not
+        // passing on an empty capture.
+        assert!(
+            log_text.contains("refused an attachment handle shaped like a URL"),
+            "the SSRF refusal must log through `note`: {log_text}"
+        );
+        for marker in [
+            "ZZURLHANDLE",
+            "ZZFILEKEYMARKER",
+            "ZZFILENAMEMARKER",
+            "ZZLOCALPATHMARKER",
+            "ZZDISPLAYNAMEMARKER",
+            "ZZCAPTIONMARKER",
+            "ZZOWNERMARKER",
+            "ZZCHATMARKER",
+        ] {
+            assert!(!log_text.contains(marker), "logs must never carry {marker}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

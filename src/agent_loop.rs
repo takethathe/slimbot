@@ -801,7 +801,10 @@ impl AgentLoop {
                             let mut builder = SessionTaskBuilder::new(
                                 request.session_id.clone(),
                                 request.content,
-                                request.hook.with_owner_id(&owner_id),
+                                request
+                                    .hook
+                                    .with_owner_id(&owner_id)
+                                    .with_attachments(request.attachments),
                             )
                             .session_manager(session_manager.clone())
                             .tool_manager(tool_manager.clone())

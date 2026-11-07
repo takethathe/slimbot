@@ -24,7 +24,7 @@
 | [消息总线](message_bus.md) | `message_bus.rs` | 请求分发、任务封装、结果路由 |
 | [Provider](provider.md) | `provider/` | Provider 接口、OpenAI 兼容 API 集成 |
 | [通道](channel.md) | `channel/` | 通道抽象、工厂模式、并发 I/O 循环 |
-| [飞书通道](feishu.md) | `channel/feishu.rs` | 首个 IM 通道：单条 WS 长连（gateway 独占）、`owner_open_id` 绑 owner、仅 p2p 文本往返、隐私护栏（ADR 0017） |
+| [飞书通道](feishu.md) | `channel/feishu.rs` | 首个 IM 通道：单条 WS 长连（gateway 独占）、`owner_open_id` 绑 owner、p2p 文本往返 + 流式卡片原位更新、图片/文件收发（入站只按 file-key 拉、防 SSRF）、隐私护栏（ADR 0017） |
 | [触发器层](trigger.md) | `trigger/` | 固定 tick、数据源采集与快照、边沿判定、执行投递与 fire 账本 |
 | [子代理运行时](agent.md) | `agent/` | agent 定义与工具增量、一次性 run、并发闸、结果投递 |
 | [脚本沙箱](codemode.md) | `codemode/` | rquickjs 专职线程、双层超时、宿主函数白名单、凭证抹除 |

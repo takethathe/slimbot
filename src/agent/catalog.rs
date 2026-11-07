@@ -31,6 +31,7 @@ const STATIC_TOOL_NAMES: &[&str] = &[
     "web_fetch",
     "codemode",
     "message",
+    "send_file",
     "memory_search",
     "trigger",
     "trigger_source",

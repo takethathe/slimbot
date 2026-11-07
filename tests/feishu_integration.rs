@@ -40,6 +40,7 @@ fn manager_for(config: Config) -> ChannelManager {
         Box::new(FeishuChannelFactory::new(
             mb.clone(),
             tokio::sync::broadcast::channel(1).0,
+            std::env::temp_dir(),
         )),
     );
     cm
@@ -56,7 +57,11 @@ const VALID: &[(&str, &str)] = &[
 #[test]
 fn test_factory_create_yields_a_feishu_channel_with_two_segment_session() {
     let (mb, _rx) = MessageBus::new();
-    let factory = FeishuChannelFactory::new(mb, tokio::sync::broadcast::channel(1).0);
+    let factory = FeishuChannelFactory::new(
+        mb,
+        tokio::sync::broadcast::channel(1).0,
+        std::env::temp_dir(),
+    );
     let channel = factory
         .create(&serde_json::json!({
             "app_id": "cli_xxx",
@@ -74,7 +79,11 @@ fn test_factory_create_yields_a_feishu_channel_with_two_segment_session() {
 #[test]
 fn test_factory_error_names_the_missing_field_and_never_leaks_the_app_secret() {
     let (mb, _rx) = MessageBus::new();
-    let factory = FeishuChannelFactory::new(mb, tokio::sync::broadcast::channel(1).0);
+    let factory = FeishuChannelFactory::new(
+        mb,
+        tokio::sync::broadcast::channel(1).0,
+        std::env::temp_dir(),
+    );
     // Owner binding missing while a real-looking secret is present: the error
     // must point at the field, not echo the credential.
     let outcome = factory.create(&serde_json::json!({
@@ -102,7 +111,11 @@ fn test_factory_create_performs_no_network_io_even_with_placeholder_credentials(
     // the network, so `create` succeeding offline is the assertion. The long
     // connection is opened only by start (single holder), never by init.
     let (mb, _rx) = MessageBus::new();
-    let factory = FeishuChannelFactory::new(mb, tokio::sync::broadcast::channel(1).0);
+    let factory = FeishuChannelFactory::new(
+        mb,
+        tokio::sync::broadcast::channel(1).0,
+        std::env::temp_dir(),
+    );
     assert!(
         factory
             .create(&serde_json::json!({

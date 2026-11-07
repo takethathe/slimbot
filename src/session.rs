@@ -420,6 +420,11 @@ pub struct TaskHook {
     owner_id: String,
     /// How this run was started (user vs. unattended source).
     turn_kind: TurnKind,
+    /// Non-text content (images) that arrived with the inbound message and must
+    /// ride into the user message this turn writes. Carried on the hook because
+    /// `AgentRunner::run` keeps a fixed signature; the hook is already the
+    /// per-message context object that reaches `WriteUserMessageHook`.
+    attachments: Vec<ContentBlock>,
 }
 
 /// Events broadcast through TaskHook for fine-grained channel notifications.
@@ -498,7 +503,21 @@ impl TaskHook {
             run_id: uuid::Uuid::new_v4().to_string(),
             owner_id: crate::identity::DEFAULT_OWNER_ID.to_string(),
             turn_kind: TurnKind::User,
+            attachments: Vec::new(),
         }
+    }
+
+    /// Attach the non-text blocks (images) that came with this turn's inbound
+    /// message. `WriteUserMessageHook` folds them into a multi-modal user
+    /// message so the model sees the media, not just the caption text.
+    pub fn with_attachments(mut self, attachments: Vec<ContentBlock>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    /// The image blocks that must accompany this turn's user message.
+    pub fn attachments(&self) -> &[ContentBlock] {
+        &self.attachments
     }
 
     /// Pin the principal this task belongs to (the configured owner).
@@ -520,6 +539,7 @@ impl TaskHook {
             run_id: self.run_id,
             owner_id: self.owner_id,
             turn_kind: self.turn_kind,
+            attachments: self.attachments,
         }
     }
 
@@ -532,6 +552,7 @@ impl TaskHook {
             run_id: self.run_id,
             owner_id: self.owner_id,
             turn_kind: self.turn_kind,
+            attachments: self.attachments,
         }
     }
 
@@ -544,6 +565,7 @@ impl TaskHook {
             run_id: run_id.to_string(),
             owner_id: self.owner_id,
             turn_kind: self.turn_kind,
+            attachments: self.attachments,
         }
     }
 

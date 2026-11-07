@@ -26,6 +26,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     let (message_bus, receivers) = MessageBus::new();
     let outbound_rx = receivers.outbound;
     let inbound_rx = receivers.inbound;
+    let media_rx = receivers.media;
 
     // Reset trace file(s) on Gateway startup so the viewer reflects the
     // current process run. CLI mode never truncates (this is the only place
@@ -91,6 +92,31 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
                     .await
                     .map_err(|e| e.to_string())
                 })
+            }));
+            Some(Box::new(tool) as Box<dyn Tool>)
+        }),
+    );
+
+    // send_file delivers an agent-produced image/file on the dedicated media
+    // path (ticket 28), beside the text `message` path.
+    let media_tx = message_bus.media_tx();
+    {
+        let tx = media_tx.clone();
+        let mut send_file_tool = crate::tools::send_file::SendFileTool::new();
+        send_file_tool.set_send_callback(Arc::new(move |delivery| {
+            let tx = tx.clone();
+            Box::pin(async move { tx.send(delivery).await.map_err(|e| e.to_string()) })
+        }));
+        tool_manager.register(Box::new(send_file_tool));
+    }
+    catalog.register(
+        "send_file",
+        Arc::new(move || {
+            let tx = media_tx.clone();
+            let mut tool = crate::tools::send_file::SendFileTool::new();
+            tool.set_send_callback(Arc::new(move |delivery| {
+                let tx = tx.clone();
+                Box::pin(async move { tx.send(delivery).await.map_err(|e| e.to_string()) })
             }));
             Some(Box::new(tool) as Box<dyn Tool>)
         }),
@@ -421,8 +447,14 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         Box::new(crate::channel::FeishuChannelFactory::new(
             message_bus.clone(),
             channel_shutdown_tx.clone(),
+            paths.workspace_dir().to_path_buf(),
         )),
     );
+
+    // Attach the media path before the outbound loop starts: send_file results
+    // route through it to the owning channel (ticket 28). Wired unconditionally
+    // because the bus always creates the media receiver.
+    channel_manager.attach_media_rx(media_rx);
 
     channel_manager.init().await?;
     channel_manager.start_channels().await;
