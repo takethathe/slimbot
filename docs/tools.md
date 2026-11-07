@@ -158,6 +158,32 @@ SlimBot 的工具分四组：
 
 ---
 
+### `send_file`
+
+把 agent 产出的图片或文件作为**媒体**投递回会话（票 28 / ADR 0017）。`message` 只走文本；要真正让 owner 收到一张图、一份文档，用这个工具。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | **本地文件路径**；URL 形状（`scheme://…`）一律拒绝 |
+| `as_image` | boolean | 否 | `true` 按原生图片发送，否则按文件附件发送（默认 `false`） |
+| `caption` | string | 否 | 随文件一起发出的简短文本 |
+| `channel` | string | 否 | 目标 channel ID（默认使用发起请求的 channel） |
+| `chat_id` | string | 否 | 目标 chat ID（默认使用发起请求的 chat） |
+
+**行为：**
+- 风险级 `external_send`（ADR 0011）：默认走审批，无人值守轮次一律拒绝
+- 走**独立的 media 队列**（与 card 路径并列的专用 mpsc），按 session 前缀路由到拥有该会话的通道，再由通道上传发送；`BusResult` 的纯文本契约不变
+- 总线上只传**已解析的本地路径**，字节不过总线；文本通道（CLI、WebUI）继承默认 no-op 实现，直接丢弃该投递
+- 只接受本地路径：与入站「媒体只按 file-key 拉」同一条纪律，双向都不给 SSRF 探测面
+- 由 gateway 在代码中装配（不在 `create_tool()` 的内置工具集合里）
+
+**示例：**
+```json
+{ "path": "out/chart.png", "as_image": true, "caption": "本周趋势" }
+```
+
+---
+
 ### `cron`
 
 管理定时任务（创建/列表/删除）。用于 Gateway 模式下调度周期性任务或一次性提醒。
@@ -358,7 +384,7 @@ SlimBot 的工具分四组：
 
 ## 配置
 
-工具在 `config.json` 的 `tools` 数组中配置，数组为空时 10 个内置工具全部启用。`tools` 数组只能构造 `create_tool()` 支持的内置工具——`memory_search`、`subagent`、`message`、`cron`、catalog-only 的 `trigger_source` / `trigger` 与 Dream 的三个记忆工具在代码中装配，不在其中。
+工具在 `config.json` 的 `tools` 数组中配置，数组为空时 10 个内置工具全部启用。`tools` 数组只能构造 `create_tool()` 支持的内置工具——`memory_search`、`subagent`、`message`、`send_file`、`cron`、catalog-only 的 `trigger_source` / `trigger` 与 Dream 的三个记忆工具在代码中装配，不在其中。
 
 ```json
 {
