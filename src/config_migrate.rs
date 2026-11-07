@@ -6,7 +6,7 @@
 //! only while the legacy key is still in the file: the rewritten config no
 //! longer carries it, so it is a genuinely one-time message.
 //!
-//! See `docs/config.md` ("迁移说明") and `docs/adr/0013`.
+//! See the migration-notes heading in `docs/config.md` and `docs/adr/0013`.
 
 use serde_json::Value;
 

@@ -540,7 +540,8 @@ fn prune_empty_dirs(dir: &Path, stop: &Path) {
 /// copied marker in `old_string` would otherwise miss and fail the edit).
 /// The rule is deliberately the narrowest that fixes the leak: **end of line
 /// only**, **known marker forms only** (`← Nd`, `[Nd]`, `(N days old)`), never
-/// mid-sentence, so `每周三 10d 会议` survives untouched. A marker the model
+/// mid-sentence, so a bare `10d` inside a phrase survives untouched (see
+/// `test_strip_never_touches_mid_sentence_digits`). A marker the model
 /// invents in a new shape is not caught — widening the rule would start eating
 /// real content, which is the worse failure.
 pub fn strip_age_markers(text: &str) -> (String, usize) {

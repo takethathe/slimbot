@@ -9,7 +9,7 @@
 //! *kind* plus the provider's own message — never the raw body (privacy: the
 //! body must not land in session or logs).
 //!
-//! See `docs/adr/0018-reliability-minimal-posture.md` (票 11 / 票 19).
+//! See `docs/adr/0018-reliability-minimal-posture.md` (ticket 11 / ticket 19).
 
 use std::error::Error;
 use std::fmt;

@@ -433,7 +433,7 @@ If nothing noteworthy happened, output: (nothing)")
     }
 
     /// Relieve context pressure after the provider refused a request for
-    /// exceeding the window (`context_length_exceeded`, 票 19). Runs one
+    /// exceeding the window (`context_length_exceeded`, ticket 19). Runs one
     /// consolidation round to bring the session from the full window down to
     /// the consolidation target, so the next turn fits — the routing that maps
     /// a `context_length` provider error onto context-pressure handling rather
@@ -822,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_force_consolidate_runs_one_round_without_reported_tokens() {
-        // 票 19: a `context_length_exceeded` provider refusal arrives with no
+        // ticket 19: a `context_length_exceeded` provider refusal arrives with no
         // usable prompt_tokens — relief is driven by the anchor alone, so the
         // round still runs and still respects the summary budget.
         let provider = Arc::new(SequenceMockProvider::new(vec![(

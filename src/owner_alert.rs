@@ -1,4 +1,4 @@
-//! Owner-facing alerts for hard provider failures (票 19 / ADR 0018).
+//! Owner-facing alerts for hard provider failures (ticket 19 / ADR 0018).
 //!
 //! A hard auth/quota failure is something only the owner can fix — a dead key,
 //! a billing wall — so the provider's own message must reach them through the

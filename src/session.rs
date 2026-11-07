@@ -734,7 +734,7 @@ impl SessionTaskBuilder {
     }
 
     /// Attach the owner-primary store so a hard provider failure (auth/quota)
-    /// can alert the owner through the delivery seam (票 19). Without it the
+    /// can alert the owner through the delivery seam (ticket 19). Without it the
     /// classified error still fails the turn, but nobody beyond the session
     /// is told.
     pub fn owner_primary(mut self, store: Arc<crate::delivery::OwnerPrimaryStore>) -> Self {
@@ -821,7 +821,7 @@ impl SessionTaskBuilder {
                     })
                     .await;
 
-                // Post-run routing of classified provider failures (票 19):
+                // Post-run routing of classified provider failures (ticket 19):
                 // a hard auth/quota error alerts the owner once per streak
                 // through the delivery seam; a context-length error relieves
                 // pressure so the next turn fits. Both act on the classified
@@ -3025,7 +3025,7 @@ mod tests {
         );
     }
 
-    // ── 票 19: post-run routing of classified provider failures ──
+    // ── ticket 19: post-run routing of classified provider failures ──
 
     /// One-shot scripted HTTP server: serves `(status, body)` per connection,
     /// then stops accepting. Same shape as the provider seam's test server.
@@ -3072,7 +3072,7 @@ mod tests {
     async fn test_provider_auth_failure_alerts_owner_and_raw_body_absent_everywhere() {
         // A 401 with a body carrying a sensitive-looking audit blob: only the
         // structured error.message may travel. The raw body must appear in
-        // neither the session JSONL nor any outbound message (票 19).
+        // neither the session JSONL nor any outbound message (ticket 19).
         let body = r#"{"error":{"message":"Invalid API key provided","code":"invalid_api_key"},"audit_blob":"LEAK-RAW-BODY-SENTINEL","request_id":"req-secret-42"}"#;
         WorkerPool::init_global(2);
         let url = spawn_one_shot_server(vec![(401, body.to_string())]).await;

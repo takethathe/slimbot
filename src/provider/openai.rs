@@ -13,7 +13,7 @@ use super::{FinishReason, LLMResponse, StreamSignal, Usage};
 
 /// Total attempts for a single provider call, counting the first try. Only
 /// transient failures consume another attempt; a bounded count keeps a sustained
-/// outage from turning one turn into an unbounded retry storm (票 11).
+/// outage from turning one turn into an unbounded retry storm (ticket 11).
 const MAX_ATTEMPTS: usize = 3;
 
 pub struct OpenAIProvider {
@@ -26,7 +26,7 @@ pub struct OpenAIProvider {
 impl OpenAIProvider {
     pub fn new(config: &ProviderConfig) -> Self {
         let api_url = Self::resolve_api_url(config);
-        // The single-call timeout is read from config (票 19): a slow model is
+        // The single-call timeout is read from config (ticket 19): a slow model is
         // not killed by a hardcoded value, and a hung endpoint is not given an
         // infinite lease.
         let client = reqwest::Client::builder()
@@ -2334,7 +2334,7 @@ mod tests {
         serde_json::from_str(body_str).unwrap()
     }
 
-    // ── Retry / classification behavior at the Provider::chat seam (票 19) ──
+    // ── Retry / classification behavior at the Provider::chat seam (ticket 19) ──
     //
     // A tiny scripted HTTP server: each accepted connection replies with the
     // next canned (status, body) and the request count is observed, so tests

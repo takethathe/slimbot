@@ -196,7 +196,7 @@ pub struct AgentLoop {
     /// target for sources that have no origin (heartbeat, an origin-less cron).
     owner_primary: Arc<crate::delivery::OwnerPrimaryStore>,
     /// Owner-alert dedupe: one alert per hard-provider-failure streak, shared
-    /// across every task this loop builds (票 19).
+    /// across every task this loop builds (ticket 19).
     owner_alerts: Arc<crate::owner_alert::OwnerAlertDedup>,
     /// Shared pending approvals (never persisted; a restart fails closed).
     approvals: Arc<crate::approval::ApprovalStore>,
@@ -676,7 +676,7 @@ impl AgentLoop {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         // The identity layer's single principal: every run this loop starts
         // belongs to the configured owner, and only owner-authored input may
-        // authorize anything (ADR 0010 / 票 01).
+        // authorize anything (ADR 0010 / ticket 01).
         let owner = Owner::from_config(&self.config.gateway.owner);
         let owner_id = owner.id().to_string();
         let owner_primary = self.owner_primary.clone();

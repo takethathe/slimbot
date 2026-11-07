@@ -76,7 +76,7 @@ pub struct AgentResult {
     /// Set when the run ended on a provider failure, carrying the classified
     /// kind and the provider's own (safe) message. The caller uses it to route
     /// context-length failures into pressure and to alert the owner on hard
-    /// auth/quota failures — never the raw response body (票 19 / ADR 0018).
+    /// auth/quota failures — never the raw response body (ticket 19 / ADR 0018).
     pub provider_error: Option<crate::provider::ProviderError>,
 }
 
