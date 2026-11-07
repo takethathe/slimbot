@@ -468,7 +468,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 
 - 启动不等待：每台 server 一个独立 supervisor，`start()` 立即返回，连不上的 server 不会拖住 gateway 起来；重试指数退避到 `backoff_max_seconds` 封顶。
 - 离线即摘除：server 掉线时它的工具从 `searchTools()` 的可搜面消失，调用立刻回一条干净错误（不是每次调用一个错误风暴）；重连成功后回添。
-- 风险级 fail-closed：server 自述的 `readOnlyHint` / `destructiveHint` **不参与定级**，任何连接器工具都按 `ExternalSend` 走审批（`McpService::risk_for`）。一个声称只读、实际会写的 server 因此无法给自己开绿灯；常用读工具要免审批，请逐个可调用名写 `tools.approval.overrides`，不要放宽整档。
+- 风险级 fail-closed：server 自述的 `readOnlyHint` / `destructiveHint` **不参与定级**，任何连接器工具都按 `ExternalSend` 走审批（`McpService::risk_for`）。一个声称只读、实际会写的 server 因此无法给自己开绿灯；常用读工具要免审批，请逐个可调用名写 `tools.approval.tools`，不要放宽整档。
 - 日志不含凭证：状态行与告警只记 server 名、无凭证的端点（scheme + host + port + path，query 剥掉）与重试秒数；离线理由只保留我们自己的类别（JSON-RPC 错误只留 code，压平并截断），server 原文不进日志；server 的 stderr 只计字节数。
 
 ## 最小配置

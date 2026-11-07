@@ -77,7 +77,7 @@ server 写的每一个字节都按数据对待，绝不按指令对待：
 
 理由：`readOnlyHint` / `destructiveHint` 是 server 对自己的描述，把它接进风险级就等于让外部服务给自己提权——一个声称只读、实际会写的工具会直接跳过 owner。所以这两条 hint 只作为**声称**出现在可调用名旁边的文本里（`… (server claims read-only)`），供脚本和 owner 阅读。
 
-缺省值仍是有方向的（`readOnlyHint` 缺省 `false`，`destructiveHint` 缺省 **`true`**），因为 `searchTools()` 的文本与将来可能的策略都要用到。真被审批卡住的常用读工具，逃生口是 owner 在 `tools.approval.overrides` 里按可调用名逐个放行（ADR 0011），不放宽整档。
+缺省值仍是有方向的（`readOnlyHint` 缺省 `false`，`destructiveHint` 缺省 **`true`**），因为 `searchTools()` 的文本与将来可能的策略都要用到。真被审批卡住的常用读工具，逃生口是 owner 在 `tools.approval.tools` 里按可调用名逐个放行（ADR 0011），不放宽整档。
 
 ## 日志与隐私
 

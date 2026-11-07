@@ -347,7 +347,7 @@ impl McpService {
     /// raise what it is allowed to do (a claim of `readOnlyHint` on a tool that
     /// writes would be a silent approval bypass). An owner who has read the
     /// connector's tool list grants the exemption where it belongs, per callable
-    /// name, through `tools.approval.overrides` (ADR 0011).
+    /// name, through `tools.approval.tools` (ADR 0011).
     pub fn risk_for(&self, callable: &str) -> Option<RiskLevel> {
         let states = self.states.read();
         states
