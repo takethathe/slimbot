@@ -499,3 +499,8 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 - [x] **实现票 13（已完成）** — 判定与状态机：`src/trigger/subscription/`（judge 脚本、边沿+cooldown、ready 门槛、store/state.json 宿主独占写、试跑）+ `trigger` 工具
 - [x] **实现票 14（已完成）** — 执行投递与历史：`src/trigger/dispatch.rs`（有界队列、deliver 三级求值、同 tick 合并、失败告警例外、history.jsonl 六字段、三个并列 root span）
 - [x] **文档收口（票 07 §8 清单）** — 新增 `docs/trigger.md`、`docs/agent.md`、`docs/codemode.md`；同步 `docs/index.md`、`docs/architecture.md`、`docs/context.md`、`docs/tool.md`、`docs/tools.md`、`docs/agent_loop.md`、`CLAUDE.md`、`cron` 工具描述、memory skill 的 agents/skills 边界
+
+## trigger 测试方案（2026-11-09）
+
+- [x] **覆盖矩阵 + 端到端用例** — `docs/trigger-test-plan.md`；新增 `tests/trigger_integration.rs`（12 条，真 workspace / 真 rquickjs / 真 dispatcher / 假 provider 与假 MCP 子进程）与 1 条层内补测（热加载保快照、删源即消失）；顺带抽出 `trigger::assemble`（gateway 与测试共用装配）、`trigger.tick` span 补 `max_concurrent`、修正 `ctx.searchTools` 在 collect 入口需要 `await`
+- [ ] **手工烟测（不进 CI）** — `tmux` 起 `cargo run -- gateway`，造一条 `every 60s` 的 `record`/`notify` 规则，看两轮 tick 的 `history.jsonl` 与投递；专门覆盖 three accepted gaps：真 HTTP 采集链（`ctx.http` 拒 loopback，测试里造不出桩）、主循环把 `[Trigger notice]` 总结成人话（测试注入不了 provider）、真 60s 节奏

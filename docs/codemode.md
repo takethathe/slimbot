@@ -32,10 +32,10 @@
 
 | 装给谁 | 脚本可见的函数 |
 |--------|----------------|
-| collect | `ctx.http.get/post(url, opts?)`、`ctx.fs.stat/read/list(path)`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()`；**进程有连接器池时**再加只读连接器面 `ctx.tools.mcp__*(args?)` 与 `ctx.searchTools(query, limit?)`（见[连接器面](#连接器面一座桥四张过滤表)） |
+| collect | `ctx.http.get/post(url, opts?)`、`ctx.fs.stat/read/list(path)`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()`；**进程有连接器池时**再加只读连接器面 `ctx.tools.mcp__*(args?)` 与 `await ctx.searchTools(query, limit?)`（见[连接器面](#连接器面一座桥四张过滤表)） |
 | judge | `ctx.store.get/set/keys`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()` |
-| agent（`main`） | `ctx.tools.<name>(args?)`、`ctx.searchTools(query, limit?)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()` |
-| act（执行器） | `ctx.http.get/post(url, opts?)`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()`；**池存在时**再加连接器面 `ctx.tools.mcp__*(args?)` 与 `ctx.searchTools(query, limit?)`（读全开、写按 `allow_connectors`）—— **没有** fs / shell / store / 任何内置工具名 |
+| agent（`main`） | `ctx.tools.<name>(args?)`、`await ctx.searchTools(query, limit?)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()` |
+| act（执行器） | `ctx.http.get/post(url, opts?)`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()`；**池存在时**再加连接器面 `ctx.tools.mcp__*(args?)` 与 `await ctx.searchTools(query, limit?)`（读全开、写按 `allow_connectors`）—— **没有** fs / shell / store / 任何内置工具名 |
 | 测试基线 | `NoHost`（一个函数都不装） |
 
 判定侧**没有** http / fs / secret / subagent：条件只读已经采好的世界，永远不派活。时间三件是共享 helper `install_time`：`now()` 返回 `{epoch_ms, iso, hour, minute, weekday, date}`，`boot_at()` 是进程首次被问到时的 epoch 毫秒，`uptime_s()` 是**本次执行**开始以来的秒数；全部本地时间（`chrono::Local`），不提供时区配置。`install_log` 把 `log(msg)` 装成先脱敏再入 sink 的形式。
@@ -61,7 +61,7 @@
 
 本节讲宿主侧的实现与取舍。两个子代理读的同一份契约是 `references/connector.md`（bootstrap 到 workspace，指针在 `agents/trigger.md` 与 `agents/executor.md`；非 skill，见 [bootstrap.md](bootstrap.md#reference-文档不进-available-skills)）——那份讲脚本作者看到的规则，本节讲规则在哪儿实现。
 
-`ctx.tools.<name>(args?)` 与 `ctx.searchTools(query, limit?)` 只有**一份实现**（`src/codemode/connector.rs`），由每个入口传入自己的 catalog 子集与调用路径。复制出第二份 install 就等于造第二个安全边界，因此入口之间的差别只能是「传入哪一份目录」：
+`ctx.tools.<name>(args?)` 与 `await ctx.searchTools(query, limit?)` 只有**一份实现**（`src/codemode/connector.rs`），由每个入口传入自己的 catalog 子集与调用路径。复制出第二份 install 就等于造第二个安全边界，因此入口之间的差别只能是「传入哪一份目录」：
 
 | 入口 | `ctx.tools.*` / `searchTools()` 的目录 | 每次调用的去处 |
 |------|------------------------------------------|----------------|

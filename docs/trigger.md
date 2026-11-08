@@ -43,7 +43,7 @@ workspace/
 
 宿主函数白名单（详见 [codemode.md](codemode.md)）：`ctx.http.get` / `post`、`ctx.fs.stat` / `read` / `list`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()` / `boot_at()` / `uptime_s()`。**没有** shell，也没有 sleep——文件变更用轮询脚本表达。
 
-进程里有连接器池时，采集器还多一条**连接器读**：`ctx.tools.mcp__<server>__<tool>(args?)` 与 `ctx.searchTools(query, limit?)`，目录只含 server 声称只读（`readOnlyHint` 且非 `destructiveHint`）的工具——同一 server 的写工具既不装也搜不到，采集面因此是 act 写半的**读半镜像**。这是**加法**：基础原语一个不少，写面不存在，采集器**不接审批闸**（采集本来就无人值守、无审批，连接器读被限制在 owner 在 `mcp.servers[]` 里配过的 server 上，严格窄于既有 `ctx.http` 权限）。过滤口径、残余风险与理由见 [codemode.md](codemode.md#采集面的只读性票-17) 与 [mcp.md](mcp.md#风险映射fail-closed)。`ctx.http.get/post` 复用 `web_fetch` 的 SSRF 校验（`is_private_ip` / `resolve_and_pin`），fs 调用默认锁在 workspace 内，绝对路径要求源在 `allow_paths` 里声明过。
+进程里有连接器池时，采集器还多一条**连接器读**：`ctx.tools.mcp__<server>__<tool>(args?)` 与 `await ctx.searchTools(query, limit?)`，目录只含 server 声称只读（`readOnlyHint` 且非 `destructiveHint`）的工具——同一 server 的写工具既不装也搜不到，采集面因此是 act 写半的**读半镜像**。这是**加法**：基础原语一个不少，写面不存在，采集器**不接审批闸**（采集本来就无人值守、无审批，连接器读被限制在 owner 在 `mcp.servers[]` 里配过的 server 上，严格窄于既有 `ctx.http` 权限）。过滤口径、残余风险与理由见 [codemode.md](codemode.md#采集面的只读性票-17) 与 [mcp.md](mcp.md#风险映射fail-closed)。`ctx.http.get/post` 复用 `web_fetch` 的 SSRF 校验（`is_private_ip` / `resolve_and_pin`），fs 调用默认锁在 workspace 内，绝对路径要求源在 `allow_paths` 里声明过。
 
 ## 订阅规则（subscription）
 
@@ -137,10 +137,16 @@ append-only，每行只有六个字段：`{trigger_id, fired_at, action_kind, ok
 
 三个**并列**的 root span，靠 `trigger_id` / `run_id` 关联，彼此不设父子——异步 run 会活过发起它的 tick，挂成 child 会产生子 span 晚于父 span 结束的畸形 trace：
 
-- `trigger.tick`：`sources_due` / `sources_ok` / `sources_failed` / `triggers_judged` / `fired` / `elapsed_ms`；空 tick 不记，否则 60s 一条会把 trace 变成噪音墙
+- `trigger.tick`：`tick_index` / `max_concurrent` / `sources_due` / `sources_ok` / `sources_failed` / `triggers_judged` / `fired` / `elapsed_ms`；空 tick 不记，否则 60s 一条会把 trace 变成噪音墙
 - `trigger.fire`：`trigger_id` / `trigger_name` / `action_kind` / `agent` / `run_id` / `ok` / `merged`
 - `subagent.run`：`agent` / `run_id` / `ok` / `elapsed_ms`（见 [agent.md](agent.md)）
 
 ## Gateway 装配
 
 `cargo run -- gateway` 起三个并列的后台循环：cron（1s 轮询）、heartbeat、trigger tick（60s interval），外加 dispatcher 的单消费者任务。`TriggerService` 与两个工具共享同一份 layer 实例，所以 agent 写的规则就是下一个 tick 判定的规则。
+
+装配本身收在 `trigger::assemble`（layers + config + workspace + tracer + 可选子代理运行时 + bus → `Wiring{service, dispatch}`）：账本路径、队列边界、共享运行时**只拼一次**，gateway 与端到端测试调的是同一份。
+
+## 测试
+
+层内测试在各自模块的 `#[cfg(test)] mod tests`（真写盘、真跑 rquickjs 的 Harness 已在层内）；跨模块的端到端用例在 `tests/trigger_integration.rs`：前十条走 `trigger::assemble` 与 gateway 同一份装配（断言面 = 投递文本 + `history.jsonl` + span），后两条是注册面锁（主循环 schema 无触发器工具、能力只以 agent 存在）。覆盖矩阵、测试纪律与 accepted gaps 见 [触发器测试方案](trigger-test-plan.md)。

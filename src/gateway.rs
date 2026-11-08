@@ -145,8 +145,10 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     // declare them, while the tick itself runs in the background. Both tools and
     // the tick share the *same* layers, so what an agent creates is what the
     // next tick judges.
-    let (source_layer, rules_layer, trigger_secrets) =
-        crate::trigger::build_layers(&config.triggers, paths.workspace_dir());
+    let trigger_layers = crate::trigger::build_layers(&config.triggers, paths.workspace_dir());
+    let source_layer = trigger_layers.sources.clone();
+    let rules_layer = trigger_layers.rules.clone();
+    let trigger_secrets = trigger_layers.secrets.clone();
     let sources_for_catalog = source_layer.clone();
     catalog.register(
         "trigger_source",
@@ -518,24 +520,18 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             .unwrap_or_else(|| crate::trace::Tracer::new(vec![]));
         // One subagent runtime and one message bus for the whole process: a
         // trigger fire and a `subagent` tool call share the same concurrency
-        // gate and the same route back to a conversation.
-        let dispatch = crate::trigger::dispatch::Dispatcher::new(
+        // gate and the same route back to a conversation. The wiring itself
+        // lives in the trigger module so the tests run the same assembly.
+        let wiring = crate::trigger::assemble(
+            trigger_layers,
+            &config.triggers,
+            paths.workspace_dir(),
+            tracer,
             Some(agent_loop.subagent_runtime()),
             message_bus.clone(),
-            crate::trigger::history_path(paths.workspace_dir()),
-            config.triggers.history_lines,
-            config.triggers.max_queue,
-            config.triggers.max_merge,
-            tracer.clone(),
         );
-        let trigger_service = crate::trigger::TriggerService::from_parts(
-            source_layer.clone(),
-            rules_layer.clone(),
-            trigger_secrets.clone(),
-            dispatch.clone(),
-            &config.triggers,
-            tracer,
-        );
+        let dispatch = wiring.dispatch;
+        let trigger_service = wiring.service;
         if trigger_service.is_enabled() {
             info!(
                 "[gateway] trigger tick started (interval={}s)",

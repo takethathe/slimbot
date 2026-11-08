@@ -42,7 +42,7 @@ pub(crate) mod tool;
 pub(crate) mod tools;
 pub mod trace;
 pub(crate) mod trace_viewer;
-pub(crate) mod trigger;
+pub mod trigger;
 pub(crate) mod utils;
 pub(crate) mod worker;
 
@@ -54,7 +54,7 @@ pub use config::{
     HeartbeatConfig, OwnerConfig, ToolEntry, ToolsConfig, TraceBackendEntry, TraceConfig,
     WebFetchConfig,
 };
-pub use config_defs::{AgentConfig, PressureConfig, ProviderConfig};
+pub use config_defs::{AgentConfig, PressureConfig, ProviderConfig, SecretEntry, TriggersConfig};
 pub use config_macro::{FieldMeta, Normalizable};
 pub use consolidate::Consolidator;
 pub use context::{ContextBuilder, RunContext, build_runtime_context};
@@ -66,7 +66,7 @@ pub use mcp::{McpService, ServerStatus};
 pub use memory::backend::{EditOutcome, MemoryBackend, MemoryBackendKind};
 pub use memory::category::MemoryCategory;
 pub use memory::{MemoryService, SharedMemory};
-pub use message_bus::{BusRequest, BusResult, MessageBus};
+pub use message_bus::{BusRequest, BusResult, MessageBus, MessageBusReceivers};
 pub use owner_alert::{OwnerAlertDedup, deliver_provider_alert, provider_alert_text};
 pub use path::PathManager;
 pub use path::expand_home;

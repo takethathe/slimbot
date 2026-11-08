@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use crate::agent::SubagentRuntime;
 use crate::config::TriggersConfig;
 use crate::debug;
 use crate::message_bus::MessageBus;
@@ -75,21 +76,19 @@ impl TriggerService {
     ///
     /// The dispatcher has no subagent runtime and its bus has no consumers, so
     /// fires get booked and nothing reaches a conversation. That is the shape a
-    /// tick-only test wants; a real process builds the dispatcher itself and
-    /// uses [`Self::from_parts`].
+    /// tick-only test wants; a real process goes through [`assemble`] instead,
+    /// which is where the dispatcher, the ledger and the runtime are spelled.
     pub fn new(config: &TriggersConfig, workspace_dir: &Path, tracer: Tracer) -> Arc<Self> {
-        let (sources, rules, secrets) = build_layers(config, workspace_dir);
         let (bus, _idle_consumers) = MessageBus::new();
-        let dispatch = Dispatcher::new(
+        assemble(
+            build_layers(config, workspace_dir),
+            config,
+            workspace_dir,
+            tracer,
             None,
             bus,
-            history_path(workspace_dir),
-            config.history_lines,
-            config.max_queue,
-            config.max_merge,
-            tracer.clone(),
-        );
-        Self::assemble(sources, rules, secrets, dispatch, config, tracer)
+        )
+        .service
     }
 
     /// Build the service around existing layers and an existing dispatcher.
@@ -99,14 +98,19 @@ impl TriggerService {
     /// needs the dispatcher to share the subagent runtime and the message bus
     /// with the rest of the process. One layer, one snapshot, one queue.
     pub fn from_parts(
-        sources: Arc<SourceLayer>,
-        rules: Arc<SubscriptionLayer>,
-        secrets: Arc<BTreeMap<String, String>>,
+        layers: TriggerLayers,
         dispatch: Arc<Dispatcher>,
         config: &TriggersConfig,
         tracer: Tracer,
     ) -> Arc<Self> {
-        Self::assemble(sources, rules, secrets, dispatch, config, tracer)
+        Self::assemble(
+            layers.sources,
+            layers.rules,
+            layers.secrets,
+            dispatch,
+            config,
+            tracer,
+        )
     }
 
     fn assemble(
@@ -184,6 +188,7 @@ impl TriggerService {
         };
 
         span.set_attribute("tick_index", json!(index));
+        span.set_attribute("max_concurrent", json!(self.max_concurrent));
         span.set_attribute("sources_due", json!(due_sources.len()));
         span.set_attribute("sources_ok", json!(outcome.sources.succeeded.len()));
         span.set_attribute("sources_failed", json!(outcome.sources.failed.len()));
@@ -254,6 +259,46 @@ impl TriggerService {
     }
 }
 
+/// The three shared pieces the tools and the tick both read from: handing them
+/// around as one value is what keeps "one layer, one snapshot" honest.
+pub struct TriggerLayers {
+    pub sources: Arc<SourceLayer>,
+    pub rules: Arc<SubscriptionLayer>,
+    pub secrets: Arc<BTreeMap<String, String>>,
+}
+
+/// What the wiring layer hands back: the tick and the queue it feeds.
+pub struct Wiring {
+    pub service: Arc<TriggerService>,
+    pub dispatch: Arc<Dispatcher>,
+}
+
+/// Wire one dispatcher and one service around existing layers.
+///
+/// The gateway and the acceptance tests both go through here, so the ledger
+/// path, the queue bounds and the shared subagent runtime are spelled once.
+/// The layers stay theirs to hand to the tools: one layer, one snapshot.
+pub fn assemble(
+    layers: TriggerLayers,
+    config: &TriggersConfig,
+    workspace_dir: &Path,
+    tracer: Tracer,
+    runtime: Option<Arc<SubagentRuntime>>,
+    bus: Arc<MessageBus>,
+) -> Wiring {
+    let dispatch = Dispatcher::new(
+        runtime,
+        bus,
+        history_path(workspace_dir),
+        config.history_lines,
+        config.max_queue,
+        config.max_merge,
+        tracer.clone(),
+    );
+    let service = TriggerService::from_parts(layers, dispatch.clone(), config, tracer);
+    Wiring { service, dispatch }
+}
+
 /// Where the fire ledger lives: next to the rule directories, one file.
 pub fn history_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("triggers").join(dispatch::HISTORY_FILE)
@@ -262,14 +307,7 @@ pub fn history_path(workspace_dir: &Path) -> PathBuf {
 /// Build both layers plus the secret map they share. The wiring layer hands the
 /// layers to the tools and the service, so a tick and an agent always read the
 /// same snapshot.
-pub fn build_layers(
-    config: &TriggersConfig,
-    workspace_dir: &Path,
-) -> (
-    Arc<SourceLayer>,
-    Arc<SubscriptionLayer>,
-    Arc<BTreeMap<String, String>>,
-) {
+pub fn build_layers(config: &TriggersConfig, workspace_dir: &Path) -> TriggerLayers {
     let secrets: BTreeMap<String, String> = secret_map(config);
     let sources = Arc::new(SourceLayer::new(
         workspace_dir.join("triggers").join("sources"),
@@ -279,7 +317,11 @@ pub fn build_layers(
         source::DEFAULT_TTL,
     ));
     let rules = SubscriptionLayer::new(workspace_dir.join("triggers").join("triggers"));
-    (sources, rules, Arc::new(secrets))
+    TriggerLayers {
+        sources,
+        rules,
+        secrets: Arc::new(secrets),
+    }
 }
 
 pub(crate) fn secret_map(config: &TriggersConfig) -> BTreeMap<String, String> {
@@ -534,7 +576,8 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let workspace = tmp.path().to_path_buf();
             let cfg = config(true);
-            let (sources, rules, secrets) = build_layers(&cfg, &workspace);
+            let layers = build_layers(&cfg, &workspace);
+            let (sources, rules) = (layers.sources.clone(), layers.rules.clone());
             let (bus, consumers) = MessageBus::new();
             let dispatch = Dispatcher::new(
                 None,
@@ -545,14 +588,7 @@ mod tests {
                 cfg.max_merge,
                 Tracer::new(vec![]),
             );
-            let service = TriggerService::from_parts(
-                sources.clone(),
-                rules.clone(),
-                secrets,
-                dispatch,
-                &cfg,
-                Tracer::new(vec![]),
-            );
+            let service = TriggerService::from_parts(layers, dispatch, &cfg, Tracer::new(vec![]));
             Self {
                 _tmp: tmp,
                 sources,

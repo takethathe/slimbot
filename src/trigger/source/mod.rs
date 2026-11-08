@@ -580,6 +580,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reload_keeps_the_snapshot_and_forgets_a_deleted_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_source(tmp.path(), "src-0001", 1, Some(ONE_ITEM));
+        let layer = layer(tmp.path(), DEFAULT_TTL);
+        layer.collect(1, 1).await;
+        assert_eq!(layer.view("src-0001").unwrap().count, 2);
+
+        // Editing a definition is the normal repair loop: the new script is
+        // picked up, and what was already collected stays visible. A reload
+        // that reset the runtime would make every script fix cost a refetch.
+        write_source(
+            tmp.path(),
+            "src-0001",
+            1,
+            Some("function collect() { return {items: [{title: 'c'}]}; }"),
+        );
+        layer.reload();
+        assert_eq!(
+            layer.view("src-0001").unwrap().count,
+            2,
+            "a reload must not wipe the snapshot"
+        );
+        assert_eq!(layer.due(1), vec!["src-0001".to_string()]);
+
+        // Deleting the directory drops the source outright: no stale runtime,
+        // no stale view, nothing left to collect.
+        meta::remove_source(layer.root(), "src-0001").unwrap();
+        layer.reload();
+        assert!(layer.status().is_empty());
+        assert!(layer.due(1).is_empty());
+        assert!(layer.view("src-0001").is_none());
+    }
+
+    #[tokio::test]
     async fn test_collect_commits_items_into_the_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         write_source(tmp.path(), "src-0001", 1, Some(ONE_ITEM));
