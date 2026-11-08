@@ -11,15 +11,16 @@
 //!   `Config::load`. Validation failures are returned as per-field errors and
 //!   the caller must not persist the mutated config in that case.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
 use crate::approval::ControlLevel;
 use crate::config::{
     AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, ExecutorsConfig, HeartbeatConfig,
-    JsonRenderConfig, MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig, SecretEntry,
-    SubagentConfig, ToolEntry, TraceBackendEntry, TraceConfig, TriggersConfig, WebFetchConfig,
+    JsonRenderConfig, McpConfig, McpServerConfig, MemoryConfig, OwnerConfig, PressureConfig,
+    ProviderConfig, SecretEntry, SubagentConfig, ToolEntry, TraceBackendEntry, TraceConfig,
+    TriggersConfig, WebFetchConfig,
 };
 use crate::config_macro::FieldMeta;
 
@@ -201,6 +202,12 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
             PressureConfig::fields(),
             &to_value_map(&config.pressure),
         ),
+        scalar_section(
+            "mcp",
+            "MCP · Connection budgets",
+            McpConfig::fields(),
+            &mcp_value_map(config),
+        ),
         providers_section(config),
         tools_section(config),
         scalar_section(
@@ -212,6 +219,7 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
         channels_section(config),
         tracing_backends_section(config),
         trigger_secrets_section(config),
+        mcp_servers_section(config),
     ];
     SchemaTree { sections }
 }
@@ -320,6 +328,30 @@ fn triggers_value_map(config: &Config) -> serde_json::Map<String, serde_json::Va
                 .secrets
                 .iter()
                 .map(|entry| serde_json::json!({ "name": entry.name }))
+                .collect(),
+        ),
+    );
+    values
+}
+
+/// Values of the `mcp` scalar section.
+///
+/// The `servers` field only *advertises* names: each entry's `env` / `headers`
+/// maps hold credentials, so serializing the array here would put plaintext
+/// tokens into the state response. Clear the array before serializing, then
+/// advertise names only — the entries themselves live in their own section.
+fn mcp_value_map(config: &Config) -> serde_json::Map<String, serde_json::Value> {
+    let mut mcp = config.mcp.clone();
+    mcp.servers.clear();
+    let mut values = to_value_map(&mcp);
+    values.insert(
+        "servers".to_string(),
+        serde_json::Value::Array(
+            config
+                .mcp
+                .servers
+                .iter()
+                .map(|server| serde_json::json!({ "name": server.name }))
                 .collect(),
         ),
     );
@@ -564,6 +596,65 @@ fn trigger_secrets_section(config: &Config) -> SchemaSection {
     }
 }
 
+/// The masked map fields advertise only their entry count: the schema is sent
+/// to the browser in plaintext, so no configured env/header value or key may
+/// ride along in a description. The static metadata text itself is safe.
+fn masked_map_desc(desc: &str, count: usize) -> String {
+    format!(
+        "{} [{} entries configured; values are never shown; leave empty to keep unchanged]",
+        desc, count
+    )
+}
+
+/// `mcp.servers`: a Vec of MCP server declarations, addressed by numeric
+/// index. `env` / `headers` stay masked by their `secret` metadata — only the
+/// field descriptions may carry a count, never a value.
+fn mcp_servers_section(config: &Config) -> SchemaSection {
+    let metas = McpServerConfig::fields();
+    let item_fields = metas
+        .iter()
+        .map(|m| {
+            let mut f = field_from_meta(m, m.default.clone(), meta_name(m));
+            if matches!(meta_name(m), "env" | "headers") {
+                f.desc = masked_map_desc(&f.desc, 0);
+            }
+            f
+        })
+        .collect();
+
+    let items = config
+        .mcp
+        .servers
+        .iter()
+        .enumerate()
+        .map(|(i, server)| {
+            let mut fields =
+                fields_from_metas(metas, &to_value_map(server), &format!("mcp.servers.{}", i));
+            for f in fields.iter_mut() {
+                let count = match f.name.as_str() {
+                    "env" => server.env.len(),
+                    "headers" => server.headers.len(),
+                    _ => continue,
+                };
+                f.desc = masked_map_desc(&f.desc, count);
+            }
+            SchemaItem {
+                key: None,
+                fields,
+                extra: None,
+            }
+        })
+        .collect();
+
+    SchemaSection {
+        name: "mcp.servers".to_string(),
+        label: "MCP Servers".to_string(),
+        fields: Vec::new(),
+        item_fields: Some(item_fields),
+        items: Some(items),
+    }
+}
+
 // ── Patch engine ──
 
 /// Apply patches to a config with the same clamp → normalize → validate
@@ -601,7 +692,7 @@ pub fn apply_config_patch_with(
     candidate.resolve_secrets(store);
     match candidate.validate() {
         Ok(()) => Ok(Vec::new()),
-        Err(e) => Ok(validate_to_field_errors(&e.to_string())),
+        Err(e) => Ok(validate_to_field_errors(&e.to_string(), config)),
     }
 }
 
@@ -657,6 +748,8 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
         ["executors", field] => set_executors(config, field, value),
         ["triggers", field] => set_triggers(config, field, value),
         ["triggers", "secrets", idx, field] => set_secret_field(config, idx, field, value),
+        ["mcp", "servers", idx, field] => set_mcp_server_field(config, idx, field, value),
+        ["mcp", field] => set_mcp(config, field, value),
         ["pressure", field] => set_pressure(config, field, value),
         _ => Err(format!("Unsupported patch path: {}", segs.join("."))),
     }
@@ -726,6 +819,56 @@ fn set_secret_field(
         "name" => entry.name = value_str(value, &format!("{}.name", prefix))?,
         "value" => entry.value = value_str(value, &format!("{}.value", prefix))?,
         _ => return Err(format!("Unknown secret field: {}", field)),
+    }
+    Ok(())
+}
+
+fn set_mcp_server_field(
+    config: &mut Config,
+    idx: &str,
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let i = parse_index(idx)?;
+    let server = config
+        .mcp
+        .servers
+        .get_mut(i)
+        .ok_or_else(|| format!("mcp.servers.{}: index out of range", idx))?;
+    let path = format!("mcp.servers.{}.{}", idx, field);
+    match field {
+        "name" => server.name = value_str(value, &path)?,
+        "transport" => server.transport = value_str(value, &path)?,
+        "enabled" => server.enabled = value_bool(value, &path)?,
+        "command" => server.command = value_str(value, &path)?,
+        "args" => server.args = value_string_list(value, &path)?,
+        "url" => server.url = value_str(value, &path)?,
+        "env" => server.env = value_secret_map(value, &path)?,
+        "headers" => server.headers = value_secret_map(value, &path)?,
+        _ => return Err(format!("Unknown mcp server field: {}", field)),
+    }
+    Ok(())
+}
+
+fn set_mcp(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
+    let path = format!("mcp.{}", field);
+    match field {
+        "call_timeout_seconds" => {
+            config.mcp.call_timeout_seconds = value_u64(value, &path)?;
+        }
+        "connect_timeout_seconds" => {
+            config.mcp.connect_timeout_seconds = value_u64(value, &path)?;
+        }
+        "probe_interval_seconds" => {
+            config.mcp.probe_interval_seconds = value_u64(value, &path)?;
+        }
+        "backoff_initial_ms" => {
+            config.mcp.backoff_initial_ms = value_u64(value, &path)?;
+        }
+        "backoff_max_seconds" => {
+            config.mcp.backoff_max_seconds = value_u64(value, &path)?;
+        }
+        _ => return Err(format!("Unknown mcp field: {}", field)),
     }
     Ok(())
 }
@@ -1128,6 +1271,12 @@ fn add_path(config: &mut Config, op: &PatchOp, segs: &[&str]) -> Result<(), Stri
             config.triggers.secrets.push(entry);
             Ok(())
         }
+        ["mcp", "servers"] => {
+            let server: McpServerConfig = serde_json::from_value(op.value.clone())
+                .map_err(|e| format!("mcp.servers: invalid server object: {}", e))?;
+            config.mcp.servers.push(server);
+            Ok(())
+        }
         _ => Err(format!("add not supported for path: {}", segs.join("."))),
     }
 }
@@ -1175,6 +1324,15 @@ fn remove_path(config: &mut Config, segs: &[&str]) -> Result<(), String> {
                 Ok(())
             }
         }
+        ["mcp", "servers", idx] => {
+            let i = parse_index(idx)?;
+            if i >= config.mcp.servers.len() {
+                Err(format!("mcp.servers.{}: index out of range", idx))
+            } else {
+                config.mcp.servers.remove(i);
+                Ok(())
+            }
+        }
         _ => Err(format!("remove not supported for path: {}", segs.join("."))),
     }
 }
@@ -1198,6 +1356,36 @@ fn value_opt_str(v: &serde_json::Value, path: &str) -> Result<Option<String>, St
 fn value_bool(v: &serde_json::Value, path: &str) -> Result<bool, String> {
     v.as_bool()
         .ok_or_else(|| format!("{}: expected a boolean", path))
+}
+
+/// Parse an MCP server's masked map: a JSON object whose values are all
+/// strings. The whole table is replaced; an empty input never reaches here
+/// because the editor skips blank masked fields entirely.
+fn value_secret_map(v: &serde_json::Value, path: &str) -> Result<BTreeMap<String, String>, String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| format!("{}: expected a JSON object of strings", path))?;
+    let mut map = BTreeMap::new();
+    for (key, value) in obj {
+        let text = value
+            .as_str()
+            .ok_or_else(|| format!("{}.{}: expected a string", path, key))?;
+        map.insert(key.clone(), text.to_string());
+    }
+    Ok(map)
+}
+
+fn value_string_list(v: &serde_json::Value, path: &str) -> Result<Vec<String>, String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| format!("{}: expected an array of strings", path))?;
+    arr.iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{}: expected an array of strings", path))
+        })
+        .collect()
 }
 
 fn value_u32(v: &serde_json::Value, path: &str) -> Result<u32, String> {
@@ -1229,7 +1417,10 @@ fn value_f32(v: &serde_json::Value, path: &str) -> Result<f32, String> {
 // ── Validation error mapping ──
 
 /// Map the single `Config::validate()` error onto the affected field(s).
-fn validate_to_field_errors(message: &str) -> Vec<FieldError> {
+fn validate_to_field_errors(message: &str, config: &Config) -> Vec<FieldError> {
+    if let Some(error) = mcp_field_error(message, config) {
+        return vec![error];
+    }
     if message.starts_with("agent.provider") {
         return vec![FieldError {
             path: "agent.provider".to_string(),
@@ -1255,6 +1446,43 @@ fn validate_to_field_errors(message: &str) -> Vec<FieldError> {
     }]
 }
 
+/// MCP validation messages name a server (`mcp.servers.<name>: ...`) while
+/// the form addresses collection rows by numeric index. Resolve the name
+/// against the current config so the error lands on the right control.
+/// Cross-entry errors (a normalized-prefix collision) fall back to the
+/// section path, which the editor highlights as a whole.
+fn mcp_field_error(message: &str, config: &Config) -> Option<FieldError> {
+    if !message.starts_with("mcp.servers.") && !message.starts_with("mcp.servers:") {
+        return None;
+    }
+    // Resolve a named server to its row when possible. Every other MCP error
+    // (a name collision, a name we cannot find, an unknown detail) highlights
+    // the whole section rather than falling through to an empty path.
+    let path = message
+        .strip_prefix("mcp.servers.")
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(name, detail)| {
+            let idx = config
+                .mcp
+                .servers
+                .iter()
+                .position(|server| server.name == name)?;
+            let field = if detail.contains("needs a command") {
+                "command"
+            } else if detail.contains("needs a url") {
+                "url"
+            } else {
+                return None;
+            };
+            Some(format!("mcp.servers.{}.{}", idx, field))
+        })
+        .unwrap_or_else(|| "mcp.servers".to_string());
+    Some(FieldError {
+        path,
+        message: message.to_string(),
+    })
+}
+
 /// Extract the provider name from a message like `provider 'x'.api_key ...`.
 fn provider_name_from(message: &str) -> Option<String> {
     let start = message.find('\'')? + 1;
@@ -1267,6 +1495,7 @@ fn provider_name_from(message: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn op(kind: PatchOpKind, path: &str, value: serde_json::Value) -> PatchOp {
         PatchOp {
@@ -1386,12 +1615,14 @@ mod tests {
                 "executors",
                 "triggers",
                 "pressure",
+                "mcp",
                 "providers",
                 "tools",
                 "tools.approval",
                 "channels",
                 "tracing.backends",
                 "triggers.secrets",
+                "mcp.servers",
             ]
         );
     }
@@ -2453,5 +2684,450 @@ mod tests {
                 "`{name}` is a built-in tool but is missing from BUILTIN_TOOLS"
             );
         }
+    }
+
+    // ── MCP config editor ──
+
+    fn config_with_mcp_server() -> Config {
+        let mut config = make_config();
+        let headers = BTreeMap::from([(
+            "Authorization".to_string(),
+            "Bearer super-secret-token".to_string(),
+        )]);
+        let env = BTreeMap::from([("API_TOKEN".to_string(), "env-super-secret".to_string())]);
+        config.mcp.servers.push(McpServerConfig {
+            name: "gh".to_string(),
+            transport: "http".to_string(),
+            url: "https://example.com/mcp".to_string(),
+            headers,
+            env,
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn test_schema_mcp_section_advertises_budgets_without_plaintext_servers() {
+        let config = config_with_mcp_server();
+        let tree = serialize_schema(&config);
+
+        let mcp = section(&tree, "mcp");
+        for name in [
+            "call_timeout_seconds",
+            "connect_timeout_seconds",
+            "probe_interval_seconds",
+            "backoff_initial_ms",
+            "backoff_max_seconds",
+        ] {
+            let f = field(mcp, name);
+            assert_eq!(f.kind, "int", "{name} must be a numeric field");
+            assert!(f.min.is_some() && f.max.is_some(), "{name} needs a range");
+            assert!(!f.desc.is_empty(), "{name} needs a description");
+        }
+
+        let servers = field(mcp, "servers");
+        assert_eq!(servers.kind, "list");
+        assert_eq!(servers.value, json!([{ "name": "gh" }]));
+
+        // The scalar section must never inline the server array: doing so
+        // would put every env/header value into the browser's state response.
+        let rendered = serde_json::to_string(&tree).unwrap();
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(!rendered.contains("env-super-secret"));
+    }
+
+    #[test]
+    fn test_patch_set_mcp_budget_clamps_and_keeps_server_credentials() {
+        let mut config = config_with_mcp_server();
+        let before = serde_json::to_string(&config.mcp.servers).unwrap();
+        let ops = vec![
+            op(PatchOpKind::Set, "mcp.call_timeout_seconds", json!(42)),
+            op(PatchOpKind::Set, "mcp.connect_timeout_seconds", json!(9999)),
+            op(PatchOpKind::Set, "mcp.probe_interval_seconds", json!(60)),
+            op(PatchOpKind::Set, "mcp.backoff_initial_ms", json!(1200)),
+            op(PatchOpKind::Set, "mcp.backoff_max_seconds", json!(900)),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.mcp.call_timeout_seconds, 42);
+        assert_eq!(config.mcp.connect_timeout_seconds, 300);
+        assert_eq!(config.mcp.probe_interval_seconds, 60);
+        assert_eq!(config.mcp.backoff_initial_ms, 1200);
+        assert_eq!(config.mcp.backoff_max_seconds, 900);
+        assert_eq!(serde_json::to_string(&config.mcp.servers).unwrap(), before);
+    }
+
+    #[test]
+    fn test_patch_mcp_budget_keeps_other_sections_and_unknown_fields() {
+        let mut config = config_with_mcp_server();
+        config.agent.max_iterations = 77;
+        config.mcp.servers[0]
+            .unknown
+            .insert("vendor".to_string(), json!({ "keep": true }));
+        let ops = vec![op(PatchOpKind::Set, "mcp.backoff_initial_ms", json!(800))];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.agent.max_iterations, 77);
+        assert_eq!(
+            config.mcp.servers[0].unknown.get("vendor"),
+            Some(&json!({ "keep": true }))
+        );
+    }
+
+    #[test]
+    fn test_schema_mcp_servers_section_uses_numeric_indices_and_masks_secrets() {
+        let config = config_with_mcp_server();
+        let tree = serialize_schema(&config);
+        let servers = section(&tree, "mcp.servers");
+        let item = &servers.items.as_ref().unwrap()[0];
+
+        assert!(item.key.is_none(), "Vec collections have no map key");
+        let name = item.fields.iter().find(|f| f.name == "name").unwrap();
+        assert_eq!(name.path, "mcp.servers.0.name");
+        assert_eq!(name.value, json!("gh"));
+        let args = item.fields.iter().find(|f| f.name == "args").unwrap();
+        assert_eq!(args.kind, "list");
+        for masked in ["env", "headers"] {
+            let f = item.fields.iter().find(|f| f.name == masked).unwrap();
+            assert_eq!(f.kind, "secret");
+            assert!(f.secret);
+            assert_eq!(f.value, json!(null));
+        }
+
+        let template = servers.item_fields.as_ref().unwrap();
+        assert!(template.iter().all(|f| !f.path.contains('.')));
+        let rendered = serde_json::to_string(&tree).unwrap();
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(!rendered.contains("env-super-secret"));
+    }
+
+    #[test]
+    fn test_patch_add_set_remove_mcp_server() {
+        let mut config = make_config();
+        let ops = vec![
+            op(
+                PatchOpKind::Add,
+                "mcp.servers",
+                json!({
+                    "name": "fs",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "server-fs"]
+                }),
+            ),
+            op(PatchOpKind::Set, "mcp.servers.0.command", json!("node")),
+            op(PatchOpKind::Set, "mcp.servers.0.args", json!(["server.js"])),
+            op(PatchOpKind::Set, "mcp.servers.0.enabled", json!(false)),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(config.mcp.servers[0].name, "fs");
+        assert_eq!(config.mcp.servers[0].command, "node");
+        assert_eq!(config.mcp.servers[0].args, vec!["server.js"]);
+        assert!(!config.mcp.servers[0].enabled);
+
+        let ops = vec![op(PatchOpKind::Remove, "mcp.servers.0", json!(null))];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert!(config.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn test_patch_mcp_server_remove_then_edit_uses_post_removal_indices() {
+        let mut config = make_config();
+        config.mcp.servers.push(McpServerConfig {
+            name: "first".to_string(),
+            transport: "http".to_string(),
+            url: "https://a.example/mcp".to_string(),
+            ..Default::default()
+        });
+        config.mcp.servers.push(McpServerConfig {
+            name: "second".to_string(),
+            transport: "http".to_string(),
+            url: "https://b.example/mcp".to_string(),
+            ..Default::default()
+        });
+        let ops = vec![
+            op(PatchOpKind::Remove, "mcp.servers.0", json!(null)),
+            op(
+                PatchOpKind::Set,
+                "mcp.servers.0.url",
+                json!("https://changed.example/mcp"),
+            ),
+            op(
+                PatchOpKind::Add,
+                "mcp.servers",
+                json!({"name": "third", "transport": "stdio", "command": "npx"}),
+            ),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.mcp.servers.len(), 2);
+        assert_eq!(config.mcp.servers[0].name, "second");
+        assert_eq!(config.mcp.servers[0].url, "https://changed.example/mcp");
+        assert_eq!(config.mcp.servers[1].name, "third");
+    }
+
+    #[test]
+    fn test_patch_mcp_server_keeps_existing_validation_semantics() {
+        let mut config = make_config();
+        let ops = vec![op(
+            PatchOpKind::Add,
+            "mcp.servers",
+            json!({"name": "staged", "transport": "stdio", "enabled": false}),
+        )];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(
+            errors.is_empty(),
+            "a disabled half-configured entry is valid"
+        );
+
+        let ops = vec![op(PatchOpKind::Set, "mcp.servers.0.enabled", json!(true))];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("needs a command"));
+    }
+
+    #[test]
+    fn test_patch_accepts_all_rendered_mcp_server_item_paths() {
+        // Mirrors the global scalar-path lock but with a populated collection:
+        // item fields are not skipped for `list` kind, so `args` must be settable.
+        let mut config = config_with_mcp_server();
+        config.clamp();
+        config.normalize();
+        let tree = serialize_schema(&config);
+        let sec = section(&tree, "mcp.servers");
+        let ops: Vec<PatchOp> = sec.items.as_ref().unwrap()[0]
+            .fields
+            .iter()
+            .filter(|f| f.kind != "secret")
+            .map(|f| op(PatchOpKind::Set, &f.path, f.value.clone()))
+            .collect();
+        let expected = serde_json::to_string(&config).unwrap();
+        let mut patched = config.clone();
+        let errors = apply_config_patch(&mut patched, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(serde_json::to_string(&patched).unwrap(), expected);
+    }
+
+    fn masked_map_field<'a>(tree: &'a SchemaTree, name: &str) -> &'a SchemaField {
+        let servers = section(tree, "mcp.servers");
+        servers.items.as_ref().unwrap()[0]
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_schema_mcp_masked_maps_report_entry_count_without_values() {
+        let config = config_with_mcp_server();
+        let tree = serialize_schema(&config);
+        for name in ["env", "headers"] {
+            let f = masked_map_field(&tree, name);
+            assert_eq!(f.kind, "secret");
+            assert_eq!(f.value, json!(null));
+            assert!(
+                f.desc.contains("1 entries configured") && f.desc.contains("leave empty"),
+                "{name} desc must carry the count and the leave-empty hint: {}",
+                f.desc
+            );
+        }
+        let template = section(&tree, "mcp.servers").item_fields.as_ref().unwrap();
+        let env_template = template.iter().find(|f| f.name == "env").unwrap();
+        assert!(env_template.desc.contains("0 entries configured"));
+
+        let rendered = serde_json::to_string(&tree).unwrap();
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(!rendered.contains("env-super-secret"));
+        assert!(!rendered.contains("API_TOKEN"));
+        // Note: the metadata description itself mentions "Authorization" as
+        // an example header, so only values and real key names are checked.
+    }
+
+    #[test]
+    fn test_patch_set_mcp_server_map_replaces_whole_table() {
+        let mut config = config_with_mcp_server();
+        let env_before = config.mcp.servers[0].env.clone();
+        let ops = vec![op(
+            PatchOpKind::Set,
+            "mcp.servers.0.headers",
+            json!({"Authorization": "Bearer ${secret:token}", "X-Trace": "on"}),
+        )];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        let headers = &config.mcp.servers[0].headers;
+        assert_eq!(headers.len(), 2);
+        assert_eq!(
+            headers.get("Authorization").unwrap(),
+            "Bearer ${secret:token}"
+        );
+        assert_eq!(headers.get("X-Trace").unwrap(), "on");
+        assert_eq!(config.mcp.servers[0].env, env_before);
+    }
+
+    #[test]
+    fn test_patch_set_mcp_server_map_rejects_non_object_and_non_string() {
+        let mut config = config_with_mcp_server();
+        let before = serde_json::to_string(&config.mcp.servers).unwrap();
+
+        let err = apply_config_patch(
+            &mut config,
+            &[op(PatchOpKind::Set, "mcp.servers.0.env", json!("oops"))],
+        )
+        .unwrap_err();
+        assert!(err.contains("expected a JSON object"), "{err}");
+
+        let err = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "mcp.servers.0.headers",
+                json!({"X-Trace": 42}),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("expected a string"), "{err}");
+        assert_eq!(serde_json::to_string(&config.mcp.servers).unwrap(), before);
+    }
+
+    #[test]
+    fn test_patch_mcp_validation_error_points_at_command_field() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Add,
+                "mcp.servers",
+                json!({"name": "broken", "transport": "stdio", "command": ""}),
+            )],
+        )
+        .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "mcp.servers.0.command");
+        assert!(errors[0].message.contains("needs a command"));
+    }
+
+    #[test]
+    fn test_patch_mcp_validation_error_points_at_url_field() {
+        let mut config = config_with_mcp_server();
+        config.mcp.servers.push(McpServerConfig {
+            name: "remote".to_string(),
+            transport: "http".to_string(),
+            url: "ftp://not-http".to_string(),
+            ..Default::default()
+        });
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(PatchOpKind::Set, "mcp.call_timeout_seconds", json!(30))],
+        )
+        .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "mcp.servers.1.url");
+    }
+
+    #[test]
+    fn test_patch_mcp_name_collision_error_points_at_section() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[
+                op(
+                    PatchOpKind::Add,
+                    "mcp.servers",
+                    json!({"name": "gh-mcp", "transport": "stdio", "command": "npx"}),
+                ),
+                op(
+                    PatchOpKind::Add,
+                    "mcp.servers",
+                    json!({"name": "gh_mcp", "transport": "stdio", "command": "npx"}),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "mcp.servers");
+        assert!(errors[0].message.contains("both address tools"));
+    }
+
+    #[test]
+    fn test_patch_add_mcp_server_with_secret_maps_and_keep_them_on_edit() {
+        let mut config = make_config();
+        let ops = vec![op(
+            PatchOpKind::Add,
+            "mcp.servers",
+            json!({
+                "name": "remote",
+                "transport": "http",
+                "url": "https://example.com/mcp",
+                "headers": {"Authorization": "Bearer ${secret:token}"}
+            }),
+        )];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(
+            config.mcp.servers[0].headers.get("Authorization").unwrap(),
+            "Bearer ${secret:token}"
+        );
+
+        // Editing an unrelated field must not touch the masked maps.
+        let ops = vec![op(
+            PatchOpKind::Set,
+            "mcp.servers.0.url",
+            json!("https://other.example/mcp"),
+        )];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.mcp.servers[0].headers.len(), 1);
+        assert_eq!(
+            config.mcp.servers[0].headers.get("Authorization").unwrap(),
+            "Bearer ${secret:token}"
+        );
+    }
+
+    #[test]
+    fn test_patch_mcp_changes_survive_config_file_reload() {
+        let mut config = config_with_mcp_server();
+        let ops = vec![
+            op(PatchOpKind::Set, "mcp.call_timeout_seconds", json!(55)),
+            op(
+                PatchOpKind::Add,
+                "mcp.servers",
+                json!({
+                    "name": "fs",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "server-fs"],
+                    "env": {"TOKEN": "${secret:some-token}"}
+                }),
+            ),
+            op(
+                PatchOpKind::Set,
+                "mcp.servers.0.url",
+                json!("https://changed.example/mcp"),
+            ),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let path = path.to_str().unwrap();
+        config.save(path).unwrap();
+        let loaded = Config::load_for_preview(path).unwrap();
+        assert_eq!(loaded.mcp.call_timeout_seconds, 55);
+        assert_eq!(loaded.mcp.servers.len(), 2);
+        assert_eq!(loaded.mcp.servers[0].url, "https://changed.example/mcp");
+        assert_eq!(
+            loaded.mcp.servers[0].headers.get("Authorization").unwrap(),
+            "Bearer super-secret-token"
+        );
+        assert_eq!(
+            loaded.mcp.servers[1].env.get("TOKEN").unwrap(),
+            "${secret:some-token}"
+        );
+        assert_eq!(loaded.mcp.servers[1].args, vec!["-y", "server-fs"]);
+        assert_eq!(loaded.agent.provider, config.agent.provider);
     }
 }

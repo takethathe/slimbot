@@ -43,7 +43,7 @@
 | [卡片生成](channels.md#卡片下发card) | `card/` | Run 后独立流式调用、Catalog 注册、spec 编译、侧车回放、护栏（机制文档在通道文档「卡片下发」节） |
 | [工作池](worker.md) | `worker.rs` | 异步 Worker 与动态 WorkerPool |
 | [I/O 调度器](io_scheduler.md) | `io_scheduler.rs` | 阻塞读取循环、stdin 处理 |
-| [配置编辑 schema](config.md#webui-配置编辑器) | `config_schema.rs` | schema 序列化 + path-patch 引擎（WebUI 配置编辑器后端） |
+| [配置编辑 schema](config.md#webui-配置编辑器) | `config_schema.rs` | schema 序列化 + path-patch 引擎（WebUI 配置编辑器后端）；含 `mcp` 预算段与 `mcp.servers` 集合、掩码 `env`/`headers` 的裸 JSON 整表替换（ADR 0023） |
 | [Bootstrap 模板](bootstrap.md) | `bootstrap.rs`, `embed.rs` | 嵌入文件、模板加载、技能文件 |
 | [工具函数](utils.md) | `utils/mod.rs` | 文本截断、原子写入、持久化引用 |
 | [Trace](trace.md) | `trace/` | span 埋点、多 backend 导出（file / OpenTelemetry）；新建配置默认开启，覆盖所有模型调用（含 consolidation 与卡片回复），本地用 `/traces` 看（ADR 0022） |

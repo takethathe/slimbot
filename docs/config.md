@@ -656,10 +656,13 @@ Config::subscribe("agent", |change| {
 Gateway 模式的 WebUI 提供可视化配置编辑页面（入口 `/config`，从聊天页/查看器页顶部图标进入）。**表单由配置定义自动生成，前端不手写任何配置项**：
 
 - **Schema 自动生成** — 后端把 `define_config!` 宏生成的字段元数据（`FieldMeta`）序列化为 config schema（`src/config_schema.rs::serialize_schema`），前端按 schema 的 `kind` 渲染控件（bool 开关 / int/float 数字框带 min/max / string 文本框带 maxlength / select 下拉 / secret 密码框 / optional_string / 集合编辑器）。新增/修改 Rust 配置字段后表单自动跟随。
-- **集合编辑** — `providers`（键值映射，结构化增删改/重命名）、`tracing.backends`（数组）、`tools`（名称下拉 + enabled 开关）、`channels`（enabled 开关 + extra 裸 JSON）。
+- **集合编辑** — `providers`（键值映射，结构化增删改/重命名）、`tracing.backends`（数组）、`mcp.servers`（数组，数字索引）、`tools`（名称下拉 + enabled 开关）、`channels`（enabled 开关 + extra 裸 JSON）。
 - **写入语义** — 提交时把脏字段编译为 `[{op, path, value}]`（`set`/`add`/`remove`，dot-path 如 `agent.max_iterations`、`providers.<name>.temperature`、`gateway.cron.enabled`），服务端读取当前 `config.json` → 应用 patch → 按与 `Config::load` 相同的顺序执行 clamp → normalize → validate → 写回。校验失败**不写盘**，返回逐字段错误供前端高亮。校验用的是“解析链之后”的副本（跟一次真实启动看到的一样），所以 `api_key` 存在 keychain / 环境变量里、文件里留空时，编辑其他字段不会被误报；但写回的仍是文件形态，解析出来的值不会被持久化。未知 JSON 字段在 patch 写入中保留。重命名 provider 时 `add` 操作携带 `from`（源 key），服务端从源条目继承掩码字段（如 `api_key`）与未知字段，避免重命名丢密钥。
-- **密钥保护** — `api_key` 等 `secret` 字段在 schema 中 value 恒为 `null`，绝不回明文；编辑时留空 = 不变，填入新值即轮换密钥。`triggers` 段只列出 `secrets` 集合的名字（`[{name}]`），条目的值是 `secret` 字段，同样恒为 `null`。
-- **重启生效** — 改动写回 `config.json` 后需重启 Gateway 才生效（v1 不做进程内热重载，见 `docs/adr/0002`）。页面顶部常驻提示。
+- **密钥保护** — `api_key` 等 `secret` 字段在 schema 中 value 恒为 `null`，绝不回明文；编辑时留空 = 不变，填入新值即轮换密钥。`triggers` 段只列出 `secrets` 集合的名字（`[{name}]`），条目的值是 `secret` 字段，同样恒为 `null`。`mcp` 标量段同样只广告 server 名字，不内联 `servers` 数组。任何 Vec 集合（含 `triggers.secrets`）的掩码字段留空都不会被当成空串提交。
+- **MCP server 配置** — `mcp` 段列出 5 个连接预算字段（`call_timeout_seconds` / `connect_timeout_seconds` / `probe_interval_seconds` / `backoff_initial_ms` / `backoff_max_seconds`）；`mcp.servers` 集合可增删改 name / transport / enabled / command / args / url，`args` 用 JSON 数组文本框编辑。
+- **MCP 凭证 map** — `env` / `headers` 是掩码的字符串 map：字段说明在原有描述之外追加「已配置 N 项、值不回显、留空不改动」，value 恒为 `null`，界面给一个裸 JSON 输入框。**留空 = 不改动，填入 = 整表替换**（必须是 object，且每个 value 都是字符串，`${secret:...}` 占位符按原样写入）；填了非 object、非法 JSON 或含非字符串值，会在提交前按字段报错且不发请求。`mcp` 段的字段与连接行为的完整说明见上文 [`mcp` — MCP 连接器](#mcp--mcp-连接器)，决策见 `docs/adr/0023`：`/config` 的状态响应是明文，而 WebUI 按 ADR 0010 只监听 loopback 且无认证。
+- **改名请用编辑而非删后重建** — `mcp.servers` 是数组集合，没有 provider 重命名那样的 `from` 凭证继承：直接改已有条目的 `name` 会保留 `env` / `headers`，删掉再新建同名条目则会丢掉凭证。v1 接受这个限制。
+- **重启生效** — 改动写回 `config.json` 后需重启 Gateway 才生效（v1 不做进程内热重载，见 `docs/adr/0002`）。页面顶部常驻提示；新加的 MCP server 会在重启后由 McpService 自动建连。
 
 ## 完整示例
 

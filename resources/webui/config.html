@@ -608,6 +608,65 @@ function readControl(field, el) {
   }
 }
 
+// MCP server env / headers are secret string maps: the schema carries no
+// value, so the editor shows an empty JSON textarea and replaces the whole
+// table only when the owner actually types something.
+function isMcpSecretMap(field, path) {
+  return field && field.kind === 'secret'
+    && (field.name === 'env' || field.name === 'headers')
+    && String(path).startsWith('mcp.servers.');
+}
+
+// `args` stays a `list` kind field, but the generic list control is only a
+// hint pointing at a dedicated section. MCP server args have no section of
+// their own, so this one collection gets an editable JSON array control.
+function isMcpArgs(field, path) {
+  return field && field.kind === 'list' && field.name === 'args'
+    && String(path).startsWith('mcp.servers.');
+}
+
+function parseMcpJson(raw, path) {
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) {
+    return { error: { path: path, message: 'Invalid JSON: ' + e.message } };
+  }
+  return { value: parsed };
+}
+
+function parseMcpArgs(raw, path) {
+  if (raw == null || raw.trim() === '') return { value: null };
+  const parsed = parseMcpJson(raw, path);
+  if (parsed.error) return parsed;
+  if (!Array.isArray(parsed.value) || parsed.value.some(v => typeof v !== 'string')) {
+    return { error: { path: path, message: 'Expected a JSON array of strings' } };
+  }
+  return parsed;
+}
+
+function parseMcpSecretMap(raw, path) {
+  if (raw == null || raw === '') return { value: null };
+  const parsed = parseMcpJson(raw, path);
+  if (parsed.error) return parsed;
+  const value = parsed.value;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { error: { path: path, message: 'Expected a JSON object of strings' } };
+  }
+  for (const key of Object.keys(value)) {
+    if (typeof value[key] !== 'string') {
+      return { error: { path: path, message: 'Value of "' + key + '" must be a string' } };
+    }
+  }
+  return parsed;
+}
+
+// One lookup for the two MCP-specific controls; `null` means the field uses
+// the generic control and the ordinary patch rules.
+function mcpSpecialValue(field, path, el) {
+  if (isMcpArgs(field, path)) return parseMcpArgs(el ? el.value : '', path);
+  if (isMcpSecretMap(field, path)) return parseMcpSecretMap(el ? el.value.trim() : '', path);
+  return null;
+}
+
 function setValue(path, value, pristine) {
   if (JSON.stringify(value) === JSON.stringify(pristine)) {
     delete formValues[path];
@@ -710,6 +769,15 @@ function buildControl(field, path) {
       break;
     }
     case 'secret': {
+      if (isMcpSecretMap(field, path)) {
+        const ta = document.createElement('textarea');
+        ta.rows = 3;
+        ta.placeholder = field.desc;
+        ta.dataset.path = path;
+        ta.addEventListener('input', () => setValue(path, ta.value.trim(), ''));
+        wrap.appendChild(ta);
+        break;
+      }
       const input = document.createElement('input');
       input.type = 'password';
       input.placeholder = '••••••••  (leave empty to keep unchanged)';
@@ -742,6 +810,17 @@ function buildControl(field, path) {
       break;
     }
     case 'list': {
+      if (isMcpArgs(field, path)) {
+        const pristine = JSON.stringify(field.value, null, 2);
+        const ta = document.createElement('textarea');
+        ta.rows = 3;
+        ta.value = pristine;
+        ta.placeholder = 'JSON array of strings, e.g. ["-y", "server-fs"]';
+        ta.dataset.path = path;
+        ta.addEventListener('input', () => setValue(path, ta.value, pristine));
+        wrap.appendChild(ta);
+        break;
+      }
       const info = document.createElement('div');
       info.className = 'list-hint';
       const n = Array.isArray(field.value) ? field.value.length : 0;
@@ -811,6 +890,7 @@ function collectionNoun(secName) {
   if (secName === 'providers') return 'provider';
   if (secName === 'tools') return 'tool';
   if (secName === 'channels') return 'channel';
+  if (secName === 'mcp.servers') return 'server';
   return 'backend';
 }
 
@@ -1100,15 +1180,35 @@ function buildPatchOps() {
         if (row.isNew) {
           const obj = {};
           (sec.item_fields || []).forEach(f => {
-            const el = qPath(sec.name + '.' + row.id + '.' + f.name);
+            const controlPath = sec.name + '.' + row.id + '.' + f.name;
+            const el = qPath(controlPath);
+            const special = mcpSpecialValue(f, controlPath, el);
+            if (special) {
+              if (special.error) { errors.push(special.error); return; }
+              if (special.value !== null) obj[f.name] = special.value;
+              return;
+            }
             const val = el ? readControl(f, el) : f.value;
+            // A blank secret means "keep the default / inherit", never "".
+            if (f.kind === 'secret' && (val === '' || val == null)) return;
             if (val !== null && val !== undefined) obj[f.name] = val;
           });
           ops.push({ op: 'add', path: sec.name, value: obj });
           return;
         }
         row.fields.forEach(f => {
+          const special = mcpSpecialValue(f, f.path, qPath(f.path));
+          if (special) {
+            if (special.error) { errors.push(special.error); return; }
+            if (special.value !== null && !jsonEq(f.value, special.value)) {
+              const fieldName = f.path.split('.').pop();
+              ops.push({ op: 'set', path: sec.name + '.' + newIdx + '.' + fieldName, value: special.value });
+            }
+            return;
+          }
           const current = currentValue(f);
+          // Masked fields show no value; a blank control must not clear it.
+          if (f.kind === 'secret' && (current === '' || current == null)) return;
           if (current === null) return;
           if (!jsonEq(f.value, current)) {
             const fieldName = f.path.split('.').pop();
