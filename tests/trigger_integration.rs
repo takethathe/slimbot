@@ -692,7 +692,7 @@ impl Provider for CannedProvider {
         messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
         _recorder: Option<&dyn SpanRecorder>,
-    ) -> anyhow::Result<LLMResponse> {
+    ) -> slimbot::ProviderResult<LLMResponse> {
         // The rendered task is what the subagent was started with; if the
         // template stops reaching it, the run has nothing to act on.
         let last = match messages.last() {

@@ -1323,7 +1323,7 @@ mod tests {
             messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn crate::trace::SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 let task = messages
                     .iter()

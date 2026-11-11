@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -9,7 +8,7 @@ use crate::tool::ToolDefinition;
 use crate::trace::SpanRecorder;
 
 use super::error::{ProviderError, ProviderErrorKind, classify};
-use super::{FinishReason, LLMResponse, StreamSignal, Usage};
+use super::{FinishReason, LLMResponse, ProviderResult, StreamSignal, Usage};
 
 /// Total attempts for a single provider call, counting the first try. Only
 /// transient failures consume another attempt; a bounded count keeps a sustained
@@ -64,7 +63,7 @@ impl OpenAIProvider {
     ///
     /// `make_request` rebuilds the request each attempt (the builder is
     /// consumed by `send`), so the retry replays an identical call.
-    async fn send_with_retry<F>(&self, mut make_request: F) -> Result<reqwest::Response>
+    async fn send_with_retry<F>(&self, mut make_request: F) -> ProviderResult<reqwest::Response>
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
@@ -84,7 +83,7 @@ impl OpenAIProvider {
                         tokio::time::sleep(Self::backoff(attempt)).await;
                         continue;
                     }
-                    return Err(err.into());
+                    return Err(err);
                 }
                 Err(e) => {
                     // Transport-level failure (connection reset, DNS, the
@@ -93,13 +92,16 @@ impl OpenAIProvider {
                     // kind, never a response body, so it is safe to carry.
                     let err = ProviderError::new(
                         ProviderErrorKind::Transient,
-                        format!("request transport error: {e}"),
+                        // `without_url` drops the endpoint from the message:
+                        // a gateway that carries its key in the query string
+                        // must not leak it into a persisted provider error.
+                        format!("request transport error: {}", e.without_url()),
                     );
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(Self::backoff(attempt)).await;
                         continue;
                     }
-                    return Err(err.into());
+                    return Err(err);
                 }
             }
         }
@@ -434,7 +436,7 @@ impl crate::provider::Provider for OpenAIProvider {
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse> {
+    ) -> ProviderResult<LLMResponse> {
         debug!(
             "[OpenAIProvider] POST {} (model={}, messages={}, tools={})",
             self.api_url,
@@ -483,12 +485,22 @@ impl crate::provider::Provider for OpenAIProvider {
             })
             .await?;
 
-        let api_resp: ApiResponse = resp.json().await.context("Failed to parse API response")?;
+        let api_resp: ApiResponse = resp.json().await.map_err(|e| {
+            ProviderError::new(
+                ProviderErrorKind::Other,
+                format!(
+                    "the provider response did not parse as JSON: {}",
+                    e.without_url()
+                ),
+            )
+        })?;
 
-        let choice = api_resp
-            .choices
-            .first()
-            .context("API response has no result")?;
+        let choice = api_resp.choices.first().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::Other,
+                "the provider response carried no choices",
+            )
+        })?;
 
         let finish_reason = match choice.finish_reason.as_deref() {
             Some("stop") => FinishReason::Stop,
@@ -558,7 +570,7 @@ impl crate::provider::Provider for OpenAIProvider {
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
         on_signal: &mut (dyn FnMut(StreamSignal) + Send),
-    ) -> Result<LLMResponse> {
+    ) -> ProviderResult<LLMResponse> {
         if tools.is_some() {
             // Streaming only covers plain content (the card call never passes
             // tools): tool-calling requests fall back to non-streaming.
@@ -625,7 +637,15 @@ impl crate::provider::Provider for OpenAIProvider {
             Payload::Garbage => {}
         };
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Failed to read streaming chunk")?;
+            let chunk = chunk.map_err(|e| {
+                ProviderError::new(
+                    ProviderErrorKind::Other,
+                    format!(
+                        "the streaming response failed mid-flight: {}",
+                        e.without_url()
+                    ),
+                )
+            })?;
             reader.feed(&chunk, &mut |data| emit(&mut acc, data));
             if acc.done {
                 break;
@@ -2417,9 +2437,7 @@ mod tests {
         let user = Message::user("hi".to_string());
         let msgs: Vec<&Message> = vec![&user];
         let err = provider.chat(&msgs, None, None).await.unwrap_err();
-        let pe = err
-            .downcast_ref::<super::super::error::ProviderError>()
-            .expect("classified provider error");
+        let pe = &err;
         assert_eq!(pe.kind, super::super::error::ProviderErrorKind::AuthQuota);
         // The provider's own message reaches the caller verbatim (for passthrough).
         assert_eq!(pe.message, "Invalid API key");
@@ -2442,9 +2460,7 @@ mod tests {
         let user = Message::user("hi".to_string());
         let msgs: Vec<&Message> = vec![&user];
         let err = provider.chat(&msgs, None, None).await.unwrap_err();
-        let pe = err
-            .downcast_ref::<super::super::error::ProviderError>()
-            .expect("classified provider error");
+        let pe = &err;
         assert_eq!(
             pe.kind,
             super::super::error::ProviderErrorKind::ContextLength
@@ -2467,9 +2483,7 @@ mod tests {
         let user = Message::user("hi".to_string());
         let msgs: Vec<&Message> = vec![&user];
         let err = provider.chat(&msgs, None, None).await.unwrap_err();
-        let pe = err
-            .downcast_ref::<super::super::error::ProviderError>()
-            .unwrap();
+        let pe = &err;
         assert_eq!(pe.message, "try later");
         assert!(
             !err.to_string().contains("sk-live"),

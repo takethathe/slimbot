@@ -16,7 +16,7 @@ pub trait Provider: Send + Sync {
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse>;
+    ) -> ProviderResult<LLMResponse>;
 
     // 流式变体，默认实现降级为非流式（见下）
     async fn chat_stream(
@@ -25,7 +25,7 @@ pub trait Provider: Send + Sync {
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
         on_signal: &mut (dyn FnMut(StreamSignal) + Send),
-    ) -> Result<LLMResponse> { /* 默认：调 chat()，整段内容作为单个 Content 信号发出 */ }
+    ) -> ProviderResult<LLMResponse> { /* 默认：调 chat()，整段内容作为单个 Content 信号发出 */ }
 }
 ```
 
@@ -184,7 +184,7 @@ else → "https://api.openai.com/v1/chat/completions"
 
 **owner 告警**（`src/owner_alert.rs`）：`AuthQuota` 类硬错误在 run 结束后由 `SessionTaskBuilder` 的投递闭包经 `resolve_target(None, None, owner_primary)` 发出 `[Provider alert]`（票 17 投递接缝）；`OwnerAlertDedup` 按 kind 在 10 分钟窗口内去重——**重复硬错只发一条合并告警，不刷屏**。无 owner 主通道时降级 warn 日志。
 
-runner 侧：失败的 chat 调用把分类结果放入 `AgentResult.provider_error`，trace 的 `error.type` 记 `provider_<kind>`（低基数），下游路由只看 kind 不看字符串。
+runner 侧：失败的 chat 调用把分类结果放入 `AgentResult.provider_error`，trace 的 `error.type` 记 `provider_<kind>`（低基数），下游路由只看 kind 不看字符串。错误类型本身跨 `Provider` seam 传递（`ProviderResult<T> = Result<T, ProviderError>`），runner 不做 `downcast`：分类在 provider 内完成，未分类的失败归 `Other`，因此不存在「猜不回 kind 就静默跳过路由」的分支。
 
 ## 扩展自定义 Provider
 
@@ -195,12 +195,15 @@ pub struct MyProvider { ... }
 
 #[async_trait]
 impl Provider for MyProvider {
-    async fn chat(&self, messages: &[&Message], tools: Option<&[ToolDefinition]>, recorder: Option<&dyn SpanRecorder>) -> Result<LLMResponse> {
+    async fn chat(&self, messages: &[&Message], tools: Option<&[ToolDefinition]>, recorder: Option<&dyn SpanRecorder>) -> ProviderResult<LLMResponse> {
         // 调用你自己的 LLM API
-        // 将响应转换为 LLMResponse 格式返回
+        // 成功：Ok(LLMResponse { .. })
+        // 失败：Err(ProviderError::new(ProviderErrorKind::/* .. */, "安全可展示的原因"))
     }
 }
 ```
+
+错误必须分类：`Transient` 会被重试，`AuthQuota` 会告警 owner，`ContextLength` 会触发一轮压缩，拿不准就用 `Other`（只失败本回合）。`ProviderError.message` 会进入 session 与日志，**不要放原始响应体**。
 
 只需实现 `chat`；若上游 API 支持流式，再覆写 `chat_stream` 逐段交付信号（内容增量发 `Content`，无可展示内容但流存活时发 `Activity`，参考 `OpenAIProvider`）。
 

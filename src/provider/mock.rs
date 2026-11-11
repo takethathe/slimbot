@@ -1,11 +1,10 @@
-use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::session::Message;
 use crate::tool::ToolDefinition;
 use crate::trace::SpanRecorder;
 
-use super::{FinishReason, LLMResponse, Provider, Usage};
+use super::{FinishReason, LLMResponse, Provider, ProviderResult, Usage};
 
 /// Mock provider for testing - returns the same predefined response on every call.
 ///
@@ -50,7 +49,7 @@ impl Provider for MockProvider {
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
         _recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse> {
+    ) -> ProviderResult<LLMResponse> {
         Ok(self.response.clone())
     }
 }

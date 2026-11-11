@@ -5,8 +5,7 @@ use crate::tool::ToolCall;
 use crate::warn_log;
 
 use super::traits::{
-    AfterChatHook, AfterToolHook, AfterTurnHook, PostIterationHook, PreChatHook, PreToolHook,
-    PreTurnHook,
+    AfterChatHook, AfterToolHook, AfterTurnHook, PreChatHook, PreToolHook, PreTurnHook,
 };
 use super::types::{HookAction, HookPosition, RunSpec, RunState, ToolHookAction};
 
@@ -89,7 +88,6 @@ pub struct HookRegistry {
     after_chat: Vec<Arc<dyn AfterChatHook>>,
     pre_tool: Vec<Arc<dyn PreToolHook>>,
     after_tool: Vec<Arc<dyn AfterToolHook>>,
-    post_iteration: Vec<Arc<dyn PostIterationHook>>,
     after_turn: Vec<Arc<dyn AfterTurnHook>>,
 }
 
@@ -105,7 +103,6 @@ impl HookRegistry {
             && self.after_chat.is_empty()
             && self.pre_tool.is_empty()
             && self.after_tool.is_empty()
-            && self.post_iteration.is_empty()
             && self.after_turn.is_empty()
     }
 
@@ -144,11 +141,6 @@ impl HookRegistry {
     pub fn add_after_tool(&mut self, hook: Arc<dyn AfterToolHook>, pos: HookPosition) {
         let op = Self::apply_position(self.after_tool.len(), pos);
         insert_at(&mut self.after_tool, hook, op);
-    }
-
-    pub fn add_post_iteration(&mut self, hook: Arc<dyn PostIterationHook>, pos: HookPosition) {
-        let op = Self::apply_position(self.post_iteration.len(), pos);
-        insert_at(&mut self.post_iteration, hook, op);
     }
 
     pub fn add_after_turn(&mut self, hook: Arc<dyn AfterTurnHook>, pos: HookPosition) {
@@ -215,15 +207,6 @@ impl HookRegistry {
         result: &str,
     ) -> Result<HookAction, HookRunError> {
         run_ordered_with!(&self.after_tool, spec, state, tool_call, result)
-    }
-
-    /// Run all PostIteration hooks in order. Checks cancellation before each hook.
-    pub async fn run_post_iteration(
-        &self,
-        spec: &RunSpec<'_>,
-        state: &mut RunState,
-    ) -> Result<HookAction, HookRunError> {
-        run_ordered!(&self.post_iteration, spec, state)
     }
 
     /// Run all AfterTurn hooks. Cancellation is NOT checked: cleanup always runs.

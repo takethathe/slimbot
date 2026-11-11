@@ -9,7 +9,6 @@ pub use openai::OpenAIProvider;
 #[cfg(test)]
 pub use mock::MockProvider;
 
-use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::session::Message;
@@ -87,6 +86,15 @@ impl std::fmt::Display for LLMResponse {
     }
 }
 
+/// A provider call's result.
+///
+/// The classified failure crosses the `Provider` seam as itself: the runner
+/// routes on [`ProviderError::kind`] directly instead of recovering it from a
+/// type-erased error, so an unclassified failure can no longer slide past the
+/// routing by failing to downcast. A failure with no kind of its own is
+/// classified as [`ProviderErrorKind::Other`] by the provider.
+pub type ProviderResult<T> = std::result::Result<T, ProviderError>;
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Call the LLM.
@@ -99,7 +107,7 @@ pub trait Provider: Send + Sync {
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse>;
+    ) -> ProviderResult<LLMResponse>;
 
     /// Streaming variant of [`chat`](Self::chat): signals are handed to
     /// `on_signal` as they arrive; the returned `LLMResponse` carries the
@@ -116,7 +124,7 @@ pub trait Provider: Send + Sync {
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
         on_signal: &mut (dyn FnMut(StreamSignal) + Send),
-    ) -> Result<LLMResponse> {
+    ) -> ProviderResult<LLMResponse> {
         let resp = self.chat(messages, tools, recorder).await?;
         if let Some(content) = &resp.content
             && !content.is_empty()

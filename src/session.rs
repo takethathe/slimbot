@@ -14,7 +14,7 @@ use crate::consolidate::Consolidator;
 use crate::memory::SharedMemory;
 use crate::message_bus::BusResult;
 use crate::provider::Provider;
-use crate::runner::AgentRunner;
+use crate::runner::{AgentResult, AgentRunner, ProviderFailureRoute};
 use crate::snip;
 use crate::tool::{ToolCall, ToolManager};
 use crate::utils::write_file_atomic;
@@ -829,40 +829,22 @@ impl SessionTaskBuilder {
                 // Post-run routing of classified provider failures (ticket 19):
                 // a hard auth/quota error alerts the owner once per streak
                 // through the delivery seam; a context-length error relieves
-                // pressure so the next turn fits. Both act on the classified
-                // error only — the raw response body is not carried anywhere.
-                if let Some(pe) = &result.provider_error {
-                    match pe.kind {
-                        crate::provider::ProviderErrorKind::AuthQuota => {
-                            if let Some(store) = &owner_primary {
-                                let dedup = owner_alerts
-                                    .as_deref()
-                                    .unwrap_or(crate::owner_alert::global_dedup());
-                                crate::owner_alert::deliver_provider_alert(
-                                    &outbound_tx,
-                                    store,
-                                    dedup,
-                                    pe,
-                                )
-                                .await;
-                            }
-                        }
-                        crate::provider::ProviderErrorKind::ContextLength => {
-                            if let Some(consolidator) = &consolidator_for_alert {
-                                let protect = approvals_store.live_ids(&sid3);
-                                if let Err(e) =
-                                    consolidator.force_consolidate(&sid3, &protect).await
-                                {
-                                    crate::warn_log!(
-                                        "[session] context-length relief failed for {}: {e}",
-                                        sid3
-                                    );
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                // pressure so the next turn fits. The decision lives on
+                // `AgentResult`; this only carries it out. Both act on the
+                // classified error only — the raw response body is not carried
+                // anywhere.
+                apply_provider_failure_route(
+                    &result,
+                    ProviderFailureEffects {
+                        outbound: &outbound_tx,
+                        owner_primary: owner_primary.as_deref(),
+                        dedup: owner_alerts.as_deref(),
+                        consolidator: consolidator_for_alert.as_deref(),
+                        approvals: &approvals_store,
+                        session_id: &sid3,
+                    },
+                )
+                .await;
             })
         });
 
@@ -871,6 +853,63 @@ impl SessionTaskBuilder {
             session_id: sid_for_task,
             closure: exec_closure,
         }
+    }
+}
+
+/// Everything the post-run provider-failure routing needs to act.
+///
+/// Bundled so the routing takes one parameter instead of six, and so a test can
+/// drive the routing without assembling a whole session task.
+struct ProviderFailureEffects<'a> {
+    outbound: &'a tokio::sync::mpsc::Sender<BusResult>,
+    owner_primary: Option<&'a crate::delivery::OwnerPrimaryStore>,
+    /// The task's own dedupe table; `None` falls back to the process-wide one.
+    /// Kept optional so a turn with no alert never initialises it.
+    dedup: Option<&'a crate::owner_alert::OwnerAlertDedup>,
+    consolidator: Option<&'a Consolidator>,
+    approvals: &'a crate::approval::ApprovalStore,
+    session_id: &'a str,
+}
+
+/// Carry out the answer [`AgentResult::provider_failure_route`] gave.
+///
+/// The decision is a property of the result; the effects — a message on the
+/// bus, a forced consolidation round — belong to the session layer, which is
+/// why the two are split rather than fused into the run closure.
+async fn apply_provider_failure_route(result: &AgentResult, effects: ProviderFailureEffects<'_>) {
+    match result.provider_failure_route() {
+        ProviderFailureRoute::AlertOwner => {
+            // `AlertOwner` is only answered for a classified error, so the
+            // guard cannot hide a routable failure — it only covers the
+            // impossible "route without error" pairing.
+            let (Some(err), Some(store)) = (result.provider_error.as_ref(), effects.owner_primary)
+            else {
+                return;
+            };
+            // Resolved here, not at the call site: a turn with no alert must
+            // not initialise the process-wide table.
+            let dedup = match effects.dedup {
+                Some(dedup) => dedup,
+                None => crate::owner_alert::global_dedup(),
+            };
+            crate::owner_alert::deliver_provider_alert(effects.outbound, store, dedup, err).await;
+        }
+        ProviderFailureRoute::RelievePressure => {
+            let Some(consolidator) = effects.consolidator else {
+                return;
+            };
+            let protect = effects.approvals.live_ids(effects.session_id);
+            if let Err(e) = consolidator
+                .force_consolidate(effects.session_id, &protect)
+                .await
+            {
+                crate::warn_log!(
+                    "[session] context-length relief failed for {}: {e}",
+                    effects.session_id
+                );
+            }
+        }
+        ProviderFailureRoute::FailInPlace => {}
     }
 }
 
@@ -1725,6 +1764,239 @@ mod tests {
         let sent = rx.recv().await.expect("the run reports its result");
         assert_eq!(sent.session_id, "cli:main");
         assert_eq!(sent.content, "Mock response");
+    }
+
+    /// Provider that answers one summary, so a forced round has something to
+    /// write back.
+    struct SummaryProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for SummaryProvider {
+        async fn chat(
+            &self,
+            _messages: &[&Message],
+            _tools: Option<&[crate::tool::ToolDefinition]>,
+            _recorder: Option<&dyn crate::trace::SpanRecorder>,
+        ) -> crate::provider::ProviderResult<crate::provider::LLMResponse> {
+            Ok(crate::provider::LLMResponse {
+                content: Some("- summary of the earlier exchange".to_string()),
+                tool_calls: None,
+                finish_reason: crate::provider::FinishReason::Stop,
+                usage: crate::provider::Usage::default(),
+            })
+        }
+    }
+
+    /// Build a session with `pairs` user/assistant exchanges and the plumbing a
+    /// forced consolidation round needs.
+    async fn consolidation_env(
+        tmp: &tempfile::TempDir,
+        pairs: usize,
+    ) -> (
+        SharedSessionManager,
+        Arc<Consolidator>,
+        crate::approval::ApprovalStore,
+    ) {
+        let session_dir = tmp.path().join("sessions");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut sm = SessionManager::new(session_dir).unwrap();
+        sm.get_or_create("s1").await.unwrap();
+        for i in 0..pairs {
+            sm.add_message(
+                "s1",
+                user_msg(&format!(
+                    "question {i} with enough words to cost a token or two"
+                )),
+            )
+            .await
+            .unwrap();
+            sm.add_message(
+                "s1",
+                assistant_msg(&format!(
+                    "answer {i} with enough words to cost a token or two"
+                )),
+            )
+            .await
+            .unwrap();
+        }
+
+        let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
+        let ms: SharedMemory = Arc::new(Mutex::new(MemoryService::new(&workspace_dir)));
+        ms.lock().await.init().unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            Arc::new(SummaryProvider),
+            sm.clone(),
+            ms,
+            32_768,
+        ));
+        (sm, consolidator, crate::approval::ApprovalStore::default())
+    }
+
+    fn context_length_result() -> AgentResult {
+        AgentResult {
+            success: false,
+            provider_error: Some(crate::provider::ProviderError::new(
+                crate::provider::ProviderErrorKind::ContextLength,
+                "This model's maximum context length is 32768 tokens.",
+            )),
+            ..AgentResult::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_force_consolidate_branch_is_reachable() {
+        // ticket 19's second leg had zero coverage: a `context_length` refusal
+        // must actually run a forced round, not just be classified.
+        let tmp = tempfile::tempdir().unwrap();
+        let (sm, consolidator, approvals) = consolidation_env(&tmp, 40).await;
+        let before = sm.lock().await.message_count("s1");
+        assert!(before > 2);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<BusResult>(4);
+        let dedup = crate::owner_alert::OwnerAlertDedup::new();
+        apply_provider_failure_route(
+            &context_length_result(),
+            ProviderFailureEffects {
+                outbound: &tx,
+                owner_primary: None,
+                dedup: Some(&dedup),
+                consolidator: Some(consolidator.as_ref()),
+                approvals: &approvals,
+                session_id: "s1",
+            },
+        )
+        .await;
+
+        let after = sm.lock().await.message_count("s1");
+        assert!(
+            after < before,
+            "the forced round must shrink the session ({before} -> {after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_context_length_failure_without_a_consolidator_is_a_no_op() {
+        // The routing answers "relieve pressure"; a runner without a
+        // consolidator must simply do nothing rather than fail the turn twice.
+        let tmp = tempfile::tempdir().unwrap();
+        let (sm, _consolidator, approvals) = consolidation_env(&tmp, 2).await;
+        let before = sm.lock().await.message_count("s1");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<BusResult>(4);
+        let dedup = crate::owner_alert::OwnerAlertDedup::new();
+        apply_provider_failure_route(
+            &context_length_result(),
+            ProviderFailureEffects {
+                outbound: &tx,
+                owner_primary: None,
+                dedup: Some(&dedup),
+                consolidator: None,
+                approvals: &approvals,
+                session_id: "s1",
+            },
+        )
+        .await;
+
+        assert_eq!(sm.lock().await.message_count("s1"), before);
+    }
+
+    #[tokio::test]
+    async fn test_auth_failure_alerts_the_owner_once_per_streak() {
+        // The dedupe lives in owner_alert; this pins that routing reaches it,
+        // and that the second identical failure inside the window stays quiet.
+        let owner_dir = tempfile::tempdir().unwrap();
+        let owner = crate::delivery::OwnerPrimaryStore::load(owner_dir.path());
+        owner.record_first(
+            &crate::delivery::DeliveryTarget::new("webui", "main").expect("test target"),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusResult>(4);
+        let dedup = crate::owner_alert::OwnerAlertDedup::new();
+        let approvals = crate::approval::ApprovalStore::default();
+        let result = AgentResult {
+            success: false,
+            provider_error: Some(crate::provider::ProviderError::new(
+                crate::provider::ProviderErrorKind::AuthQuota,
+                "Invalid API key",
+            )),
+            ..AgentResult::default()
+        };
+
+        for _ in 0..2 {
+            apply_provider_failure_route(
+                &result,
+                ProviderFailureEffects {
+                    outbound: &tx,
+                    owner_primary: Some(&owner),
+                    dedup: Some(&dedup),
+                    consolidator: None,
+                    approvals: &approvals,
+                    session_id: "cli:main",
+                },
+            )
+            .await;
+        }
+
+        let msg = rx.recv().await.expect("one alert");
+        assert!(msg.content.contains("Invalid API key"), "{}", msg.content);
+        assert!(rx.try_recv().is_err(), "the streak merges into one alert");
+    }
+
+    #[tokio::test]
+    async fn test_a_failure_that_is_not_routable_sends_nothing() {
+        // Transient / content-filter / unclassified failures just fail in
+        // place: no alert, no forced round.
+        let tmp = tempfile::tempdir().unwrap();
+        let (sm, consolidator, approvals) = consolidation_env(&tmp, 20).await;
+        let before = sm.lock().await.message_count("s1");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusResult>(4);
+        let dedup = crate::owner_alert::OwnerAlertDedup::new();
+        let owner = crate::delivery::OwnerPrimaryStore::load(tmp.path());
+
+        for kind in [
+            crate::provider::ProviderErrorKind::Transient,
+            crate::provider::ProviderErrorKind::ContentFilter,
+            crate::provider::ProviderErrorKind::Other,
+        ] {
+            let result = AgentResult {
+                success: false,
+                provider_error: Some(crate::provider::ProviderError::new(kind, "nope")),
+                ..AgentResult::default()
+            };
+            // The decision itself is what keeps these quiet; asserting it here
+            // means a routing regression fails before the effect assertions do
+            // (`deliver_provider_alert` would filter them out anyway).
+            assert_eq!(
+                result.provider_failure_route(),
+                ProviderFailureRoute::FailInPlace,
+                "{kind} must not ask for an alert or a forced round"
+            );
+            apply_provider_failure_route(
+                &result,
+                ProviderFailureEffects {
+                    outbound: &tx,
+                    owner_primary: Some(&owner),
+                    dedup: Some(&dedup),
+                    consolidator: Some(consolidator.as_ref()),
+                    approvals: &approvals,
+                    session_id: "s1",
+                },
+            )
+            .await;
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no alert for a non-routable failure"
+        );
+        assert_eq!(
+            sm.lock().await.message_count("s1"),
+            before,
+            "no forced round for failures pressure cannot fix"
+        );
     }
 
     fn user_msg(content: &str) -> Message {

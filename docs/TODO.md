@@ -17,7 +17,9 @@
 - [x] 实现票 02 Config load 唯一路径（2026-11-11 完成：删 `Config::load` / 热重载设施与 20 个 diff 单测 / `config_normalize.rs` / `notify` 依赖，9 条集成测试迁到 `load_resolved`；启动装配 `install` 一份不可变快照，让 `web_fetch` 与快照保留策略真正读到配置；7 条行为测试 + 门禁三绿）
 - [x] 实现票 03 Recent History 锚定 Derivation anchor（2026-11-11 完成：`pressure.recent_history_ratio` 一处声明派生 default / clamp / schema / patch，`PressureLimits.recent_history_chars` 带 1,000–32,000 字符封顶；`ContextBuilder::new` 必传 `PressureAnchor`、`build_system_prompt` 显式接会话实测 ratio；删 `MAX_HISTORY_TOKENS` 与废弃的 4.0 换算；7 条行为测试 + 门禁三绿）
 - [x] 实现票 04 Run 装配单点与共享 fixture（2026-11-11 完成：`RunSpec` 退化为借用 `AgentRunner` 的视图，20 字段投影消失、Run 级依赖只经访问器读；`gate_context()` 保留为唯一真 seam；`SessionTask` 只剩 id / session_id / closure，三个假值与 `#[allow(dead_code)]` 删除；15 份手抄 `make_spec()` 收敛为 `src/runner/test_support.rs` 的 `RunFixture`；3 条结构锁 + 门禁三绿）
-- [ ] 实现票 05–13（frontier 现为 05 hook 内联与取消映射 / 07 Gateway 快照 / 11 Delivery 来源类别）
+- [x] 实现票 05 shallow hook 内联与取消映射收口（2026-11-11 完成：`AccumulateUsage` / `FireToolCall` / `FireToolResult` / `FirePostIteration` / `FireTaskCompleted` 五个 shallow hook 与 `PostIterationHook` trait 删除，事件发射、usage 累加、回合收尾（`close_turn()`）改为骨架内联；取消的「错误 → 状态」映射收成 `fail_cancelled()` 一处，`false` / `break` / `break 'outer` 三种出口各自保留，原先由 `run_*` 提供的取消检查点用 `cancel_here()` 在原位复刻；13 个 policy hook 与 `gate.rs` 未动；4 条行为测试 + 2 条结构锁 + 门禁三绿）
+- [x] 实现票 06 结果路由与显式 provider error kind（2026-11-11 完成：`Provider::chat` / `chat_stream` 的错误类型改为 `ProviderResult<T> = Result<T, ProviderError>`，删掉 runner 里从 `anyhow::Error` `downcast` 猜 kind 的分支——未分类的失败归 `Other` 而不是 `None`；结果路由收成 `AgentResult::provider_failure_route()`（`AlertOwner` / `RelievePressure` / `FailInPlace`）留在 `AgentResult` 旁，副作用抽到 `session.rs` 的 `apply_provider_failure_route` 使 `force_consolidate` 分支首次可测；`message_sent` 的 1 处赋值 + 2 处消费加结构锁作票 12 基线；3 条行为测试 + 3 条路由测试 + 2 条结构锁 + 门禁三绿）
+- [ ] 实现票 07–13（frontier 现为 07 Gateway 快照 / 09 Approval 共享不变量 / 11 Delivery 来源类别）
 - [ ] 08 文档与验收收口（task，前置票均已 resolved；文档回改 / 门禁 / commit 由实现票 13 承接）
 
 ## trace 本地可观测（2026-11-08 收官）
@@ -297,11 +299,11 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 
 ## Runner Phase Hooks 重构（2026-08-15 完成）
 
-- [x] **Phase Hook 管线** — `AgentRunner::run()` 重构为约 80 行骨架，七个 phase（PreTurn/PreChat/AfterChat/PreTool/AfterTool/PostIteration/AfterTurn）通过可插拔 hook 实现，`HookRegistry` 封装存储/执行/取消检查
+- [x] **Phase Hook 管线** — `AgentRunner::run()` 重构为约 80 行骨架，七个 phase（PreTurn/PreChat/AfterChat/PreTool/AfterTool/PostIteration/AfterTurn）通过可插拔 hook 实现，`HookRegistry` 封装存储/执行/取消检查（2026-11-11 实现票 05：五个 shallow hook 内联，phase 降为六个，骨架实测约 480 行）
 - [x] **Hook 注册 API** — builder 支持 `with_defaults()` + 每 phase 的 `add_*` 方法，`HookPosition::{Append, Replace, Insert}` 控制位置（越界退化为 Append）
 - [x] **流程控制** — `HookAction::{Continue, Abort}` / `ToolHookAction::{Execute, Skip, Abort}`，abort 跳转 after_turn，pre_tool 可跳过执行返回合成结果
 - [x] **RunSpec/RunState** — Run 级依赖与可变状态分离：`RunSpec<'_>` 借用 runner 的依赖集合（实现票 04 后不再逐字段投影），`RunState` 提供类型安全 `set_extension`/`get_extension` 跨 phase 传数据
-- [x] **默认 hook** — 14 个默认 hook 复刻原 run() 全部行为（`src/runner/hooks/` 每 hook 一文件），`AgentRunner::new()` 内部自动注册
+- [x] **默认 hook** — 14 个默认 hook 复刻原 run() 全部行为（`src/runner/hooks/` 每 hook 一文件），`AgentRunner::new()` 内部自动注册（实现票 05 后收敛为 13 个 policy hook，shallow 簿记回到骨架）
 - [x] **取消/回滚语义保留** — after_turn 始终执行（即使取消/出错），LLM 错误/取消回滚到 initial_message_count；PreTurn 阶段取消同样回滚（清除本轮已写入的用户消息，避免会话以未回复的 user 消息结尾）；chat 前增加取消检查，已取消时跳过 LLM 调用并回滚，不浪费请求
 - [x] **测试** — 现有 36 个 runner 测试无修改通过；新增 HookRegistry 单测、每 hook 单测、9 个 hook 行为集成测试
 

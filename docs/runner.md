@@ -4,12 +4,13 @@
 
 ## 概述
 
-`AgentRunner` 实现了 ReAct（Reasoning + Acting）循环的核心逻辑，是 SlimBot 与 LLM 交互的引擎。自 phase-hook 重构后，`AgentRunner::run()` 是一条分阶段的编排骨架（约 500 行），行为通过可插拔的 phase hook 实现。骨架自身只承担四件事：
+`AgentRunner` 实现了 ReAct（Reasoning + Acting）循环的核心逻辑，是 SlimBot 与 LLM 交互的引擎。自 phase-hook 重构后，`AgentRunner::run()` 是一条分阶段的编排骨架（约 480 行），行为通过可插拔的 phase hook 实现。骨架自身只承担五件事：
 
 1. **早返回** — `/stop` sentinel 与运行前取消走 `cancelled_result()`，不进入 hook 管线。
 2. **Run 装配** — 从 `AgentRunner` 借出依赖集合填一个 `RunSpec`，配 `RunState`，进 `with_turn_context` scope。
-3. **ReAct 循环** — 带 `timeout_seconds` 的 deadline 包裹 PreTurn → (PreChat → `provider.chat()` → AfterChat → PreTool → `tool_manager.execute()` → AfterTool → PostIteration)* → AfterTurn（始终执行）。
-4. **收尾** — `message_sent`、根 span 的 usage / 迭代数 / 状态映射。
+3. **ReAct 循环** — 带 `timeout_seconds` 的 deadline 包裹 PreTurn → (PreChat → `provider.chat()` → AfterChat → PreTool → `tool_manager.execute()` → AfterTool)* → AfterTurn（始终执行）。
+4. **循环自身的簿记** — `ToolCall` / `ToolResult` / `PostIteration` 事件、usage 累加、回合收尾（持久化或回滚 + 完成/失败事件）。这些是循环自己的记账而不是可变策略，所以内联在骨架里，不做成 hook。
+5. **收尾** — `message_sent`、根 span 的 usage / 迭代数 / 状态映射。
 
 ## 架构
 
@@ -20,15 +21,15 @@ src/runner/
 ├── mod.rs               # AgentResult / AgentRunnerBuilder / AgentRunner / run() 骨架
 ├── types.rs             # HookAction / ToolHookAction / HookPosition / RunSpec / RunState
 ├── test_support.rs      # RunFixture：唯一一份 Run 级测试夹具（cfg(test)）
-├── traits.rs            # 7 个 per-phase hook trait
+├── traits.rs            # 6 个 per-phase hook trait
 ├── registry.rs          # HookRegistry（存储 + 执行 + 取消检查）
 ├── tests.rs             # 集成测试
-└── hooks/               # 默认 hook 实现（每个 hook 一个文件）
+└── hooks/               # 13 个 policy hook（10 个文件）
 ```
 
 ### Phase Hook 管线
 
-七个 phase，每个 phase 可注册多个 hook，hook 按注册顺序串行执行：
+六个 phase，每个 phase 可注册多个 hook，hook 按注册顺序串行执行：
 
 | Phase | 触发时机 | 默认 Hook | 原逻辑 |
 |---|---|---|---|
@@ -40,16 +41,21 @@ src/runner/
 | PreChat | | `ApprovalContextHook` | `merge_approval_rounds` 构建时变换 |
 | AfterChat | 每次 LLM 调用后 | `HandleResponseHook` | 检查 tool_calls，无则标记 should_exit + AssistantMessage 事件 |
 | AfterChat | | `PersistAssistantMsgHook` | 持久化 assistant 消息 + 更新 token ratio |
-| AfterChat | | `AccumulateUsageHook` | 累计 token 用量 |
-| PreTool | 每个 tool call 执行前 | `FireToolCallEventHook` | ToolCall 事件 |
-| PreTool | | `ApprovalHook` | 唯一审批决策点（Allow/Deny/Ask + 兑现） |
-| AfterTool | 每个 tool call 执行后 | `FireToolResultEventHook` | ToolResult 事件 |
-| AfterTool | | `ProcessToolResultHook` | ensure_nonempty + persist + truncate |
+| PreTool | 每个 tool call 执行前 | `ApprovalHook` | 唯一审批决策点（Allow/Deny/Ask + 兑现） |
+| AfterTool | 每个 tool call 执行后 | `ProcessToolResultHook` | ensure_nonempty + persist + truncate |
 | AfterTool | | `PersistToolMessageHook` | 持久化 tool 消息 |
-| PostIteration | 所有 tool call 完成后 | `FirePostIterationEventHook` | PostIteration 事件 |
-| AfterTurn | 循环退出后（无论成败） | `FireTaskCompletedHook` | 持久化/回滚 + TaskCompleted/TaskFailed 事件 |
-| AfterTurn | | `TriggerConsolidationHook` | 触发 consolidation（pin 住待兑现审批） |
+| AfterTurn | 循环退出后（无论成败） | `TriggerConsolidationHook` | 触发 consolidation（pin 住待兑现审批） |
 | AfterTurn | | `ApprovalTurnEndHook` | 审批回合收尾：清理未兑现的携入记录 |
+
+以下是骨架内联、不再作为 hook 注册的行为：
+
+| 时机 | 行为 | 原 Hook（已内联） |
+|---|---|---|
+| 每个 tool call 前 | `ToolCall` 事件 | `FireToolCallEventHook` |
+| 每个 tool call 后 | `ToolResult` 事件 | `FireToolResultEventHook` |
+| 每次 LLM 调用后（AfterChat 之后） | 累计 token 用量 | `AccumulateUsageHook` |
+| 所有 tool call 完成后 | `PostIteration` 事件 | `FirePostIterationEventHook` |
+| 循环退出后（AfterTurn 之前） | 持久化/回滚 + TaskCompleted/TaskFailed 事件 | `FireTaskCompletedHook` |
 
 ### 流程控制
 
@@ -90,7 +96,7 @@ AgentRunner::builder()
     .build()
 ```
 
-每个 phase 有独立的 `add_*` 方法：`add_pre_turn`、`add_pre_chat`、`add_after_chat`、`add_pre_tool`、`add_after_tool`、`add_post_iteration`、`add_after_turn`。
+每个 phase 有独立的 `add_*` 方法：`add_pre_turn`、`add_pre_chat`、`add_after_chat`、`add_pre_tool`、`add_after_tool`、`add_after_turn`。
 
 `HookPosition` 越界时 `Replace` 退化为 `Append`，`Insert` 退化为插入到末尾。
 
@@ -110,8 +116,21 @@ pub struct AgentResult {
     pub completion_tokens: u32,
     pub iterations: u32,
     pub message_sent: bool,  // message 工具已投递输出时由调用方抑制最终回复
+    pub provider_error: Option<ProviderError>,  // 本回合终止于 provider 失败时的分类结果
 }
 ```
+
+`provider_error` 携带 kind + provider 自己的 message（原始响应体永不进入）。产生端不再从类型擦除的错误里 `downcast` 猜 kind：`Provider::chat` 的错误类型就是 `ProviderError`（见 `docs/provider.md`），所以 provider 失败一定有 kind。它只在 provider 调用失败时是 `Some`；取消、hook abort、达到迭代上限属于别的失败类别，仍是 `None`（`classify_run_error` 按 message 区分它们）。
+
+失败的回合怎么处置由 `AgentResult::provider_failure_route()` 一个函数给出，紧挨结果定义：
+
+| kind | route | 调用方行为 |
+|---|---|---|
+| `AuthQuota` | `AlertOwner` | 经投递 seam 告警 owner，10 分钟窗口内合并重复 |
+| `ContextLength` | `RelievePressure` | 跑一轮 `force_consolidate`，为下一轮腾窗口 |
+| 其余（`Transient` / `ContentFilter` / `Other`） | `FailInPlace` | 除本回合失败外不做别的 |
+
+决策在 `runner`，副作用在 `session`（`apply_provider_failure_route`）——前者可单独驱动断言，后者才需要 outbound bus 与 owner 主通道。
 
 ## run() 骨架
 
@@ -128,16 +147,19 @@ pub async fn run(&self, content, hook, session_id, _channel_inject, cancel_token
 5. 构建 `RunSpec`（借用 runner 的依赖集合，只填 per-turn 输入）+ `RunState`，进入 `with_turn_context` scope
 6. `run_pre_turn()` → 进入循环：
    - 检查 `max_iterations`
-   - `run_pre_chat()` → `provider.chat()`（内置）→ `run_after_chat()`
+   - `run_pre_chat()` → `provider.chat()`（内置）→ `run_after_chat()` → 累加 usage
    - `should_exit` 则退出循环
-   - 对每个 tool_call：`run_pre_tool()` → `tool_manager.execute()`（内置）→ `run_after_tool()`
-   - `run_post_iteration()` → `iterations += 1` → 通知 Running
-7. 循环退出后 `run_after_turn()`（**始终执行**，即使取消或出错）
-8. `finalize()` 设置 `message_sent` 并返回
+   - 对每个 tool_call：发 `ToolCall` 事件 → `run_pre_tool()` → `tool_manager.execute()`（内置）→ 发 `ToolResult` 事件 → `run_after_tool()`
+   - 发 `PostIteration` 事件 → `iterations += 1` → 通知 Running
+7. `close_turn()`：持久化或回滚 + `TaskCompleted`/`TaskFailed` 事件（**始终执行**）
+8. `run_after_turn()`（**始终执行**，即使取消或出错）
+9. `finalize()` 设置 `message_sent` 并返回
 
 > **run 级 deadline**：步骤 6 整个（PreTurn + 循环）被包在 `tokio::time::timeout(agent.timeout_seconds)` 里，到期走取消路径（见下文「超时处理」）；步骤 7–8 在 timeout 之外，所以超时也一定收尾。
 
-LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨架层处理，通过 `state.fail()` / `state.rollback_to` 传递，由 AfterTurn 的 `FireTaskCompletedHook` 统一执行持久化（或回滚）+ 完成/失败事件。
+LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨架层处理，通过 `state.fail()` / `state.rollback_to` 传递，由骨架的 `close_turn()` 统一执行持久化（或回滚）+ 完成/失败事件。取消的「错误 → 状态」映射只写一处（`fail_cancelled()`），但三种控制流出口（`false` / `break` / `break 'outer`）各自保留。
+
+> **取消检查点**：`HookRegistry` 的 `run_*` 在每个 hook 前检查 token。内联进来的四个行为（`ToolCall` / `ToolResult` / `PostIteration` 事件与 usage 累加）原先都排在某个 phase 的首位或队尾，因此骨架在发这些事件前用 `cancel_here()` 复刻同一个检查点 —— 取消时不发出未兑现的事件。
 
 > **PreTurn abort**：PreTurn hook 返回 `Abort`/错误/取消时，整个循环被跳过（不调用 provider），直接进入 AfterTurn。
 >
@@ -230,7 +252,7 @@ pending 记录存在期间，携带它的那个回合被 **pin 在历史尾部**
 `AgentConfig.timeout_seconds`（默认 120s，钳制 1–600）被真正执行：`run()` 把 **PreTurn + ReAct 循环**整体包进 `tokio::time::timeout(...)`。
 
 - 到期即**复用 `/stop` 取消路径**：取消本次 run 的 `CancellationToken`，`state.fail("Task cancelled: run deadline of Ns exceeded.")`，`rollback_to = initial_message_count`，然后 AfterTurn 照常跑（回滚会话、发 `TaskFailed`、必要时 consolidate）。
-- **只包 body**：AfterTurn（`FireTaskCompletedHook` / `TriggerConsolidationHook`）在 timeout 之外，所以超时也一定收尾，不会留下半截会话。
+- **只包 body**：收尾（`close_turn()` / `TriggerConsolidationHook`）在 timeout 之外，所以超时也一定收尾，不会留下半截会话。
 - **run 级 token 是派生的 child token**：run 仍能观察到调用方的 `/stop` 取消（child 跟随 parent），但 deadline 取消的只是本次 run，不会误伤同一会话排队的其它任务。
 - `timeout_seconds = 0` 视为不设 deadline（配置钳制后不会出现，仅作为防御）。
 - 部分进度不丢：`state` 由 `run()` 持有（timeout 只丢弃 body 的 future），已累计的 iteration / usage 仍会记到 root span；`error.type` 沿用取消分类（`cancelled`）。
@@ -253,11 +275,11 @@ ReAct 循环在关键节点通过 `TaskHook.fire_event()` 发出 `AgentEvent`，
 | `TaskStarted` | 循环开始前（NotifyRunningHook） | session_id |
 | `PreIteration` | 每轮迭代开始（BuildContextHook） | session_id, iteration |
 | `AssistantMessage` | LLM 返回后（HandleResponseHook） | session_id, content |
-| `ToolCall` | 工具执行前（FireToolCallEventHook） | session_id, name, args |
-| `ToolResult` | 工具执行后（FireToolResultEventHook） | session_id, name, output |
-| `PostIteration` | 工具循环结束后（FirePostIterationEventHook） | session_id, iteration |
-| `TaskCompleted` | 循环成功完成（FireTaskCompletedHook） | session_id, result |
-| `TaskFailed` | 循环失败（FireTaskCompletedHook） | session_id, error |
+| `ToolCall` | 工具执行前（骨架内联） | session_id, name, args |
+| `ToolResult` | 工具执行后（骨架内联） | session_id, name, output |
+| `PostIteration` | 工具循环结束后（骨架内联） | session_id, iteration |
+| `TaskCompleted` | 循环成功完成（骨架 `close_turn()`） | session_id, result |
+| `TaskFailed` | 循环失败（骨架 `close_turn()`） | session_id, error |
 | `ApprovalRedeemed` | 审批兑现、工具真正执行前（ApprovalHook） | session_id, approval_id, tool, args, risk |
 
 事件通过 `broadcast::Sender<AgentEvent>` 广播到 `ChannelManager`，各 Channel 的 `write_event()` 方法负责将其送达客户端（WebUI 中通过 SSE 的 `agent_event` 事件类型）。

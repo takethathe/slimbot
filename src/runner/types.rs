@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{AgentResult, AgentRunner};
 
-/// Flow control returned by phase hooks (PreTurn, PreChat, AfterChat, AfterTool, PostIteration).
+/// Flow control returned by phase hooks (PreTurn, PreChat, AfterChat, AfterTool).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookAction {
     /// Continue to the next hook in the phase.

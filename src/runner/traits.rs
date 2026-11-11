@@ -46,12 +46,6 @@ pub trait AfterToolHook: Send + Sync {
     ) -> Result<HookAction>;
 }
 
-/// Hook executed after all tool calls in an iteration complete.
-#[async_trait]
-pub trait PostIterationHook: Send + Sync {
-    async fn call(&self, spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction>;
-}
-
 /// Hook executed after the loop exits, regardless of success or failure.
 /// `after_turn` hooks always run, even on cancellation.
 #[async_trait]

@@ -477,7 +477,7 @@ mod tests {
             _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             tokio::time::sleep(self.delay).await;
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(LLMResponse {
@@ -906,7 +906,7 @@ mod tests {
             messages: &[&Message],
             tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             if let Some(tools) = tools {
                 self.offered_tools
                     .lock()

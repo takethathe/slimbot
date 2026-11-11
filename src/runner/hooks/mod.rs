@@ -1,18 +1,17 @@
-//! Default phase hooks that replicate the current `AgentRunner::run()` behavior.
+//! Default phase hooks.
 //!
 //! Each default hook is a stateless struct that reads everything it needs from
 //! the immutable [`RunSpec`] (session manager, tool manager, config, etc.) at
 //! call time, so the same hook instance can be reused across runs.
+//!
+//! Only behavior that genuinely varies per run is a hook. The loop's own
+//! bookkeeping — the `ToolCall` / `ToolResult` / `PostIteration` events, usage
+//! accumulation and turn finalization — lives in `AgentRunner::run()`.
 
 use crate::provider::LLMResponse;
 
-mod accumulate_usage;
 pub(crate) mod approval;
 mod build_context;
-mod fire_post_iteration;
-mod fire_task_completed;
-mod fire_tool_call;
-mod fire_tool_result;
 mod governance;
 mod handle_response;
 mod notify_running;
@@ -22,13 +21,8 @@ mod process_tool_result;
 mod trigger_consolidation;
 mod write_user_message;
 
-pub use accumulate_usage::AccumulateUsageHook;
 pub use approval::{ApprovalContextHook, ApprovalHook, ApprovalTurnEndHook, ApprovalTurnStartHook};
 pub use build_context::BuildContextHook;
-pub use fire_post_iteration::FirePostIterationEventHook;
-pub use fire_task_completed::FireTaskCompletedHook;
-pub use fire_tool_call::FireToolCallEventHook;
-pub use fire_tool_result::FireToolResultEventHook;
 pub use governance::GovernanceHook;
 pub use handle_response::HandleResponseHook;
 pub use notify_running::NotifyRunningHook;

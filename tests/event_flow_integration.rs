@@ -33,7 +33,7 @@ impl Provider for MockProvider {
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
         _recorder: Option<&dyn slimbot::trace::SpanRecorder>,
-    ) -> anyhow::Result<LLMResponse> {
+    ) -> slimbot::ProviderResult<LLMResponse> {
         let idx = self
             .call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -357,8 +357,11 @@ async fn test_event_task_failed_on_error() {
             _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn slimbot::trace::SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
-            Err(anyhow::anyhow!("Simulated LLM failure"))
+        ) -> slimbot::ProviderResult<LLMResponse> {
+            Err(slimbot::ProviderError::new(
+                slimbot::ProviderErrorKind::Other,
+                "Simulated LLM failure",
+            ))
         }
     }
 

@@ -88,7 +88,7 @@ impl Default for CardPolicy {
 /// call result plus the compiler's final state (the compiler lives on the
 /// worker because the signal closure owns it).
 struct GenerationOutcome {
-    resp: anyhow::Result<LLMResponse>,
+    resp: crate::provider::ProviderResult<LLMResponse>,
     spec: Option<serde_json::Value>,
     patch_count: usize,
 }
@@ -113,7 +113,7 @@ impl ChatSpan {
     }
 
     /// Record the call's outcome (usage, finish reason, failure) on the span.
-    fn settle(&mut self, resp: &anyhow::Result<LLMResponse>) {
+    fn settle(&mut self, resp: &crate::provider::ProviderResult<LLMResponse>) {
         self.settled = true;
         match resp {
             Ok(r) => {
@@ -777,9 +777,12 @@ mod tests {
             messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             if self.fail {
-                return Err(anyhow::anyhow!("provider down"));
+                return Err(crate::provider::ProviderError::new(
+                    crate::provider::ProviderErrorKind::Other,
+                    "provider down",
+                ));
             }
             for m in messages {
                 if let Message::User { content, .. } = m {
@@ -809,7 +812,7 @@ mod tests {
             _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             unreachable!("card generation must use chat_stream")
         }
 
@@ -819,7 +822,7 @@ mod tests {
             _tools: Option<&[ToolDefinition]>,
             recorder: Option<&dyn SpanRecorder>,
             on_signal: &mut (dyn FnMut(StreamSignal) + Send),
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             *self.saw_recorder.lock().unwrap() = recorder.is_some();
             if let Some(rec) = recorder {
                 rec.set_attribute("gen_ai.provider.name", json!("openai"));
@@ -898,7 +901,7 @@ mod tests {
             _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             unreachable!("card generation must use chat_stream")
         }
 
@@ -908,7 +911,7 @@ mod tests {
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
             _on_signal: &mut (dyn FnMut(StreamSignal) + Send),
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             std::future::pending::<()>().await;
             unreachable!("never resumed")
         }
@@ -927,7 +930,7 @@ mod tests {
             _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             unreachable!("card generation must use chat_stream")
         }
 
@@ -937,7 +940,7 @@ mod tests {
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
             on_signal: &mut (dyn FnMut(StreamSignal) + Send),
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             let mut full = String::new();
             for c in &self.chunks {
                 on_signal(StreamSignal::Content(c.clone()));
@@ -1287,7 +1290,7 @@ mod tests {
             _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             unreachable!("card generation must use chat_stream")
         }
 
@@ -1297,7 +1300,7 @@ mod tests {
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
             on_signal: &mut (dyn FnMut(StreamSignal) + Send),
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             for _ in 0..self.activity_before_content {
                 tokio::time::sleep(self.tick).await;
                 on_signal(StreamSignal::Activity);
@@ -1885,7 +1888,7 @@ mod tests {
             _messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             unreachable!("card generation must use chat_stream")
         }
 
@@ -1895,7 +1898,7 @@ mod tests {
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn SpanRecorder>,
             on_signal: &mut (dyn FnMut(StreamSignal) + Send),
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             let user_text = messages
                 .iter()
                 .find_map(|m| match m {

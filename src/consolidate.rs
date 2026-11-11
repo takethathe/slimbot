@@ -263,7 +263,7 @@ impl Consolidator {
                 }
             }
         }
-        result
+        result.map_err(Into::into)
     }
 
     async fn archive_traced(
@@ -842,7 +842,7 @@ mod tests {
             _messages: &[&Message],
             _tools: Option<&[crate::tool::ToolDefinition]>,
             recorder: Option<&dyn crate::trace::SpanRecorder>,
-        ) -> anyhow::Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             // Stand-in for the provider's request-body capture: the assertions
             // only care that the recorder reached the provider.
             if let Some(rec) = recorder {

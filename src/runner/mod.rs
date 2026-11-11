@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::config::AgentConfig;
 use crate::consolidate::Consolidator;
 use crate::memory::SharedMemory;
-use crate::provider::{Provider, Usage};
+use crate::provider::{Provider, ProviderErrorKind, Usage};
 use crate::session::{
     AgentEvent, Message, SharedSessionManager, TaskHook, TaskState, parse_session_origin,
 };
@@ -16,6 +16,9 @@ use tokio_util::sync::CancellationToken;
 /// Agent name reported on GenAI spans via `gen_ai.agent.name`.
 const AGENT_NAME: &str = "slimbot";
 
+/// Message every cancelled exit reports, so the exits cannot drift apart.
+const CANCELLED_MESSAGE: &str = "Task cancelled.";
+
 pub(crate) mod gate;
 mod hooks;
 mod registry;
@@ -26,8 +29,7 @@ mod types;
 
 pub use registry::{HookRegistry, HookRunError};
 pub use traits::{
-    AfterChatHook, AfterToolHook, AfterTurnHook, PostIterationHook, PreChatHook, PreToolHook,
-    PreTurnHook,
+    AfterChatHook, AfterToolHook, AfterTurnHook, PreChatHook, PreToolHook, PreTurnHook,
 };
 pub use types::{HookAction, HookPosition, RunSpec, RunState, RunTurn, ToolHookAction};
 
@@ -62,6 +64,85 @@ fn classify_run_error(result: &AgentResult) -> String {
     }
 }
 
+/// The one mapping from a hook-phase error to run state.
+///
+/// Cancellation fails the task and marks the turn for rollback (executed by
+/// `close_turn()` before the AfterTurn hooks); any other hook error only fails
+/// the task. The three control-flow exits (`false` / `break` / `break 'outer`)
+/// stay at their call sites — only the two lines they share live here.
+fn absorb_hook_error(state: &mut RunState, spec: &RunSpec<'_>, error: HookRunError) {
+    match error {
+        HookRunError::Cancelled => fail_cancelled(state, spec),
+        HookRunError::Hook(e) => state.fail(e.to_string()),
+    }
+}
+
+/// Fail the run as cancelled and mark the turn for rollback.
+fn fail_cancelled(state: &mut RunState, spec: &RunSpec<'_>) {
+    state.fail(CANCELLED_MESSAGE.to_string());
+    state.rollback_to = Some(spec.initial_message_count);
+}
+
+/// The per-phase cancellation checkpoint the hook registry used to provide.
+///
+/// Each inlined behavior sat behind a `run_*` method that checked the token
+/// before its first hook. With the hook gone the check has to be explicit, or a
+/// cancelled run would announce work it never did (an unpaired `ToolCall`, a
+/// `PostIteration` for an iteration that will not advance).
+///
+/// Returns `true` when the run was cancelled and the caller must exit.
+fn cancel_here(state: &mut RunState, spec: &RunSpec<'_>) -> bool {
+    if spec.is_cancelled() {
+        fail_cancelled(state, spec);
+        return true;
+    }
+    false
+}
+
+/// Close a turn: persist the session (or roll the turn back) and report the
+/// final task state.
+///
+/// Runs on every exit path and before the AfterTurn hooks: consolidation must
+/// see the settled session, and the approval turn close comes after both. It
+/// is the loop's own finalization, not a policy seam.
+///
+/// Takes `&mut RunState` (matching the hook signature it replaces) so the run
+/// future stays `Send`: `RunState` carries `Box<dyn Any + Send>` extensions,
+/// which are `Send` but not `Sync`, so a shared borrow would infect the whole
+/// `tokio::spawn`ed run.
+async fn close_turn(spec: &RunSpec<'_>, state: &mut RunState) {
+    let mut sm = spec.session_manager().lock().await;
+    if let Some(limit) = state.rollback_to {
+        // Roll back messages added during this turn; do not persist.
+        sm.truncate_messages(&spec.session_id, limit).await;
+    } else {
+        let _ = sm.persist(&spec.session_id).await;
+    }
+
+    let hook = &spec.task_hook;
+    if state.result.success {
+        let text = state.result.content.clone();
+        hook.notify_status_change(&TaskState::Completed {
+            result: text.clone(),
+        });
+        hook.fire_event(AgentEvent::TaskCompleted {
+            session_id: spec.session_id.clone(),
+            run_id: hook.run_id().to_string(),
+            result: text,
+        });
+    } else {
+        let error = state.result.content.clone();
+        hook.notify_status_change(&TaskState::Failed {
+            error: error.clone(),
+        });
+        hook.fire_event(AgentEvent::TaskFailed {
+            session_id: spec.session_id.clone(),
+            run_id: hook.run_id().to_string(),
+            error,
+        });
+    }
+}
+
 /// Result returned by AgentRunner after a ReAct loop completes.
 #[derive(Debug, Clone, Default)]
 pub struct AgentResult {
@@ -89,6 +170,35 @@ impl AgentResult {
         self.prompt_cache_hit_tokens += usage.prompt_cache_hit_tokens;
         self.completion_tokens += usage.completion_tokens;
     }
+
+    /// Where a classified provider failure should go once the turn is over.
+    ///
+    /// The decision lives next to the result it reads, so it is one function to
+    /// drive and assert instead of a branch buried in the run closure. Carrying
+    /// out the answer is the caller's job: this module does not know about the
+    /// outbound bus or the owner's primary channel.
+    pub fn provider_failure_route(&self) -> ProviderFailureRoute {
+        match self.provider_error.as_ref().map(|pe| pe.kind) {
+            Some(ProviderErrorKind::AuthQuota) => ProviderFailureRoute::AlertOwner,
+            Some(ProviderErrorKind::ContextLength) => ProviderFailureRoute::RelievePressure,
+            _ => ProviderFailureRoute::FailInPlace,
+        }
+    }
+}
+
+/// What a finished run should do about a provider failure.
+///
+/// Three answers cover the five kinds: only auth/quota needs the owner, only a
+/// context-length refusal can be relieved by compressing, and everything else
+/// (transient, content filter, unclassified) simply fails the turn in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderFailureRoute {
+    /// Alert the owner through the delivery seam, once per failure streak.
+    AlertOwner,
+    /// Run one forced consolidation round so the next turn fits.
+    RelievePressure,
+    /// Nothing beyond the failed turn itself.
+    FailInPlace,
 }
 
 /// Builder for constructing an `AgentRunner`.
@@ -213,6 +323,10 @@ impl AgentRunnerBuilder {
     pub fn with_defaults(mut self) -> Self {
         use crate::runner::hooks::*;
 
+        // The five shallow behaviors (the ToolCall / ToolResult / PostIteration
+        // events, usage accumulation, task-completed finalization) are the
+        // loop's own bookkeeping and live in `run()` itself. What is registered
+        // here is the policy that genuinely varies per run.
         // PreTurn
         // Approval turn opening runs first: the lifecycle must be armed (TTL
         // expiry + carried set) before anything reads it.
@@ -236,28 +350,18 @@ impl AgentRunnerBuilder {
             .add_after_chat(Arc::new(HandleResponseHook), HookPosition::Append);
         self.hooks
             .add_after_chat(Arc::new(PersistAssistantMsgHook), HookPosition::Append);
-        self.hooks
-            .add_after_chat(Arc::new(AccumulateUsageHook), HookPosition::Append);
         // PreTool
-        self.hooks
-            .add_pre_tool(Arc::new(FireToolCallEventHook), HookPosition::Append);
-        // The single enforcement point (ADR 0011) runs after the event so the
-        // channel has already been told which call the model is attempting.
+        // The single enforcement point (ADR 0011). `run()` fires the `ToolCall`
+        // event before this phase, so the channel has already been told which
+        // call the model is attempting.
         self.hooks
             .add_pre_tool(Arc::new(ApprovalHook), HookPosition::Append);
         // AfterTool
         self.hooks
-            .add_after_tool(Arc::new(FireToolResultEventHook), HookPosition::Append);
-        self.hooks
             .add_after_tool(Arc::new(ProcessToolResultHook), HookPosition::Append);
         self.hooks
             .add_after_tool(Arc::new(PersistToolMessageHook), HookPosition::Append);
-        // PostIteration
-        self.hooks
-            .add_post_iteration(Arc::new(FirePostIterationEventHook), HookPosition::Append);
         // AfterTurn
-        self.hooks
-            .add_after_turn(Arc::new(FireTaskCompletedHook), HookPosition::Append);
         self.hooks
             .add_after_turn(Arc::new(TriggerConsolidationHook), HookPosition::Append);
         // Close the approval turn last: consolidation has already run, and any
@@ -294,16 +398,6 @@ impl AgentRunnerBuilder {
     /// Append a hook to the AfterTool phase.
     pub fn add_after_tool(mut self, hook: Arc<dyn AfterToolHook>, pos: HookPosition) -> Self {
         self.hooks.add_after_tool(hook, pos);
-        self
-    }
-
-    /// Append a hook to the PostIteration phase.
-    pub fn add_post_iteration(
-        mut self,
-        hook: Arc<dyn PostIterationHook>,
-        pos: HookPosition,
-    ) -> Self {
-        self.hooks.add_post_iteration(hook, pos);
         self
     }
 
@@ -615,13 +709,8 @@ impl AgentRunner {
                         state.fail(reason);
                         false
                     }
-                    Err(HookRunError::Cancelled) => {
-                        state.fail("Task cancelled.".to_string());
-                        state.rollback_to = Some(spec.initial_message_count);
-                        false
-                    }
-                    Err(HookRunError::Hook(e)) => {
-                        state.fail(e.to_string());
+                    Err(e) => {
+                        absorb_hook_error(&mut state, &spec, e);
                         false
                     }
                 };
@@ -655,13 +744,8 @@ impl AgentRunner {
                                 state.fail(reason);
                                 break;
                             }
-                            Err(HookRunError::Cancelled) => {
-                                state.fail("Task cancelled.".to_string());
-                                state.rollback_to = Some(spec.initial_message_count);
-                                break;
-                            }
-                            Err(HookRunError::Hook(e)) => {
-                                state.fail(e.to_string());
+                            Err(e) => {
+                                absorb_hook_error(&mut state, &spec, e);
                                 break;
                             }
                         }
@@ -670,8 +754,7 @@ impl AgentRunner {
                         // hook; check here so a cancelled run skips the LLM call and
                         // rolls back instead of firing a wasted request.
                         if spec.is_cancelled() {
-                            state.fail("Task cancelled.".to_string());
-                            state.rollback_to = Some(spec.initial_message_count);
+                            fail_cancelled(&mut state, &spec);
                             break;
                         }
                         debug!("[AgentRunner] Sending chat request to provider");
@@ -697,35 +780,25 @@ impl AgentRunner {
                             .await
                         {
                             Ok(r) => r,
-                            Err(e) => {
-                                // Classify at the seam: carry the provider's
-                                // structured kind + message, never the raw body.
-                                let provider_err =
-                                    e.downcast_ref::<crate::provider::ProviderError>().cloned();
-                                let kind = provider_err.as_ref().map(|pe| pe.kind);
-                                let safe_msg = provider_err
-                                    .as_ref()
-                                    .map(|pe| pe.message.clone())
-                                    .unwrap_or_else(|| e.to_string());
+                            Err(provider_err) => {
+                                // The kind crosses the provider seam as itself:
+                                // there is no type recovery that can fail and
+                                // silently swallow an unclassified failure.
+                                let kind = provider_err.kind;
+                                let safe_msg = provider_err.message.clone();
                                 if let Some(span) = &chat_span {
-                                    let error_type = match kind {
-                                        Some(k) => format!("provider_{k}"),
-                                        None => "provider_error".to_string(),
-                                    };
                                     span.set_attribute(
                                         "error.type",
-                                        serde_json::json!(error_type),
+                                        serde_json::json!(format!("provider_{kind}")),
                                     );
                                     span.set_status(SpanStatus::Error(safe_msg.clone()));
                                 }
                                 warn_log!(
-                                    "[AgentRunner] provider call failed ({}): {}",
-                                    kind.map(|k| k.to_string()).unwrap_or_default(),
-                                    safe_msg
+                                    "[AgentRunner] provider call failed ({kind}): {safe_msg}"
                                 );
                                 // Fail the turn with the provider's own message
                                 // verbatim (privacy: no raw response body).
-                                state.result.provider_error = provider_err;
+                                state.result.provider_error = Some(provider_err);
                                 state.fail(safe_msg);
                                 state.rollback_to = Some(spec.initial_message_count);
                                 break;
@@ -766,24 +839,26 @@ impl AgentRunner {
                         );
                         state.response = Some(response);
 
-                        // AfterChat hooks: inspect response, persist assistant
-                        // message, accumulate usage.
+                        // AfterChat hooks: inspect the response and persist the
+                        // assistant message.
                         match self.hooks.run_after_chat(&spec, &mut state).await {
                             Ok(HookAction::Continue) => {}
                             Ok(HookAction::Abort { reason }) => {
                                 state.fail(reason);
                                 break;
                             }
-                            Err(HookRunError::Cancelled) => {
-                                state.fail("Task cancelled.".to_string());
-                                state.rollback_to = Some(spec.initial_message_count);
-                                break;
-                            }
-                            Err(HookRunError::Hook(e)) => {
-                                state.fail(e.to_string());
+                            Err(e) => {
+                                absorb_hook_error(&mut state, &spec, e);
                                 break;
                             }
                         }
+
+                        // Usage for this call is accounted for once, after the
+                        // AfterChat phase has inspected the response.
+                        if let Some(response) = &state.response {
+                            state.result.accumulate(&response.usage);
+                        }
+
                         if state.should_exit {
                             break;
                         }
@@ -830,19 +905,27 @@ impl AgentRunner {
                             } else {
                                 None
                             };
+                            // The PreTool phase used to check the token before
+                            // its first hook; the inlined event sits in that
+                            // slot, so the check moves here with it.
+                            if cancel_here(&mut state, &spec) {
+                                break 'outer;
+                            }
+                            // The call the model is attempting reaches the
+                            // channel before any policy hook sees it.
+                            spec.task_hook.fire_event(AgentEvent::ToolCall {
+                                session_id: spec.session_id.clone(),
+                                name: call.name.clone(),
+                                args: call.args.to_string(),
+                            });
                             let action = match self
                                 .hooks
                                 .run_pre_tool(&spec, &mut state, call)
                                 .await
                             {
                                 Ok(a) => a,
-                                Err(HookRunError::Cancelled) => {
-                                    state.fail("Task cancelled.".to_string());
-                                    state.rollback_to = Some(spec.initial_message_count);
-                                    break 'outer;
-                                }
-                                Err(HookRunError::Hook(e)) => {
-                                    state.fail(e.to_string());
+                                Err(e) => {
+                                    absorb_hook_error(&mut state, &spec, e);
                                     break 'outer;
                                 }
                             };
@@ -876,6 +959,18 @@ impl AgentRunner {
                                 }
                             };
 
+                            // Same checkpoint, now guarding the result event.
+                            if cancel_here(&mut state, &spec) {
+                                break 'outer;
+                            }
+                            // The channel sees the result before the AfterTool
+                            // policy hooks rewrite or persist it.
+                            spec.task_hook.fire_event(AgentEvent::ToolResult {
+                                session_id: spec.session_id.clone(),
+                                name: call.name.clone(),
+                                output: raw_result.clone(),
+                            });
+
                             match self
                                 .hooks
                                 .run_after_tool(&spec, &mut state, call, &raw_result)
@@ -886,35 +981,23 @@ impl AgentRunner {
                                     state.fail(reason);
                                     break 'outer;
                                 }
-                                Err(HookRunError::Cancelled) => {
-                                    state.fail("Task cancelled.".to_string());
-                                    state.rollback_to = Some(spec.initial_message_count);
-                                    break 'outer;
-                                }
-                                Err(HookRunError::Hook(e)) => {
-                                    state.fail(e.to_string());
+                                Err(e) => {
+                                    absorb_hook_error(&mut state, &spec, e);
                                     break 'outer;
                                 }
                             }
                         }
 
-                        // PostIteration hooks: fire the PostIteration event.
-                        match self.hooks.run_post_iteration(&spec, &mut state).await {
-                            Ok(HookAction::Continue) => {}
-                            Ok(HookAction::Abort { reason }) => {
-                                state.fail(reason);
-                                break;
-                            }
-                            Err(HookRunError::Cancelled) => {
-                                state.fail("Task cancelled.".to_string());
-                                state.rollback_to = Some(spec.initial_message_count);
-                                break;
-                            }
-                            Err(HookRunError::Hook(e)) => {
-                                state.fail(e.to_string());
-                                break;
-                            }
+                        // This was the iteration's last cancellation checkpoint
+                        // while PostIteration was a phase; keep it.
+                        if cancel_here(&mut state, &spec) {
+                            break;
                         }
+                        // The iteration's tool work is done: tell the channel.
+                        spec.task_hook.fire_event(AgentEvent::PostIteration {
+                            session_id: spec.session_id.clone(),
+                            iteration: state.iterations,
+                        });
                         // A PreTool hook may end the turn without another LLM
                         // call (approval `Ask`): the tool results for this
                         // iteration are written, and the run result is the
@@ -956,7 +1039,12 @@ impl AgentRunner {
                 state.rollback_to = Some(spec.initial_message_count);
             }
 
-            // AfterTurn hooks: persist/rollback + fire completed/failed + consolidate.
+            // Close the turn (persist or roll back, then report the final
+            // state) before consolidation and the approval turn close, which
+            // both need a settled session. Runs on every exit path.
+            close_turn(&spec, &mut state).await;
+
+            // AfterTurn hooks: consolidate, then close the approval turn.
             // Always executes, even on cancellation or error.
             self.hooks.run_after_turn(&spec, &mut state).await;
 
@@ -1007,7 +1095,7 @@ impl AgentRunner {
         session_id: &str,
         root_span: &Option<SpanGuard>,
     ) -> AgentResult {
-        let msg = "Task cancelled.".to_string();
+        let msg = CANCELLED_MESSAGE.to_string();
         // Record the cancellation on the root span, matching the run status
         // mapping (cancellation -> Error).
         if let Some(root) = root_span {

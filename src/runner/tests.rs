@@ -44,7 +44,7 @@ impl Provider for MockProvider {
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
         _recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse> {
+    ) -> crate::provider::ProviderResult<LLMResponse> {
         let idx = self
             .call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -196,7 +196,7 @@ impl Provider for RecordingProvider {
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
         _recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse> {
+    ) -> crate::provider::ProviderResult<LLMResponse> {
         let names = match tools {
             Some(defs) => defs.iter().map(|d| d.name.clone()).collect(),
             None => Vec::new(),
@@ -413,7 +413,7 @@ impl Provider for CancellingProvider {
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse> {
+    ) -> crate::provider::ProviderResult<LLMResponse> {
         let count = self
             .call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -425,8 +425,8 @@ impl Provider for CancellingProvider {
     }
 }
 
-/// Provider that always returns an error.
-struct FailingProvider;
+/// Provider that always returns a classified error of the given kind.
+struct FailingProvider(crate::provider::ProviderErrorKind);
 
 #[async_trait]
 impl Provider for FailingProvider {
@@ -435,12 +435,11 @@ impl Provider for FailingProvider {
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
         _recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse> {
+    ) -> crate::provider::ProviderResult<LLMResponse> {
         Err(crate::provider::ProviderError::new(
-            crate::provider::ProviderErrorKind::Other,
+            self.0,
             "Simulated LLM API failure",
-        )
-        .into())
+        ))
     }
 }
 
@@ -1648,7 +1647,7 @@ async fn test_llm_error_rolls_back_messages() {
     assert_eq!(pre_count, 1);
 
     // Provider that always fails
-    let provider = Arc::new(FailingProvider);
+    let provider = Arc::new(FailingProvider(crate::provider::ProviderErrorKind::Other));
 
     let runner = AgentRunner::new(
         tm,
@@ -1783,7 +1782,7 @@ async fn test_snip_truncates_context_before_chat() {
             messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn crate::trace::SpanRecorder>,
-        ) -> Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             self.received.lock().unwrap().push(messages.len());
             Ok(LLMResponse {
                 content: Some("done".to_string()),
@@ -2725,7 +2724,12 @@ async fn test_runner_emits_full_span_tree() {
 async fn test_runner_root_span_error_on_llm_failure() {
     let tmp = tempfile::TempDir::new().unwrap();
     let backend = Arc::new(RecordingTraceBackend::default());
-    let runner = make_traced_runner(&tmp, Arc::new(FailingProvider), backend.clone()).await;
+    let runner = make_traced_runner(
+        &tmp,
+        Arc::new(FailingProvider(crate::provider::ProviderErrorKind::Other)),
+        backend.clone(),
+    )
+    .await;
 
     let result = runner
         .run(
@@ -2868,7 +2872,7 @@ impl Provider for BodyRecordingProvider {
         messages: &[&Message],
         tools: Option<&[ToolDefinition]>,
         recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse> {
+    ) -> crate::provider::ProviderResult<LLMResponse> {
         if let Some(rec) = recorder {
             rec.set_attribute(
                 "http.request.body",
@@ -3181,7 +3185,7 @@ impl Provider for HangingProvider {
         _messages: &[&Message],
         _tools: Option<&[ToolDefinition]>,
         _recorder: Option<&dyn SpanRecorder>,
-    ) -> Result<LLMResponse> {
+    ) -> crate::provider::ProviderResult<LLMResponse> {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Longer than any deadline used by the tests, so only the deadline can
@@ -3290,5 +3294,558 @@ async fn test_run_exceeding_deadline_cancels_via_stop_path_and_rolls_back() {
     assert!(
         !cancel.is_cancelled(),
         "the deadline must not cancel the session-wide cancellation token"
+    );
+}
+
+// ── Ticket 05: the five shallow hooks live in the run loop ──
+
+/// The event's variant name, so a test can assert an exact sequence.
+fn event_name(event: &AgentEvent) -> &'static str {
+    match event {
+        AgentEvent::TaskStarted { .. } => "TaskStarted",
+        AgentEvent::TaskCompleted { .. } => "TaskCompleted",
+        AgentEvent::TaskFailed { .. } => "TaskFailed",
+        AgentEvent::PreIteration { .. } => "PreIteration",
+        AgentEvent::AssistantMessage { .. } => "AssistantMessage",
+        AgentEvent::ToolCall { .. } => "ToolCall",
+        AgentEvent::ToolResult { .. } => "ToolResult",
+        AgentEvent::PostIteration { .. } => "PostIteration",
+        AgentEvent::ApprovalRedeemed { .. } => "ApprovalRedeemed",
+    }
+}
+
+fn usage(prompt: u32, completion: u32) -> Usage {
+    Usage {
+        prompt_tokens: prompt,
+        prompt_cache_hit_tokens: 0,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+    }
+}
+
+/// Which control-flow exit a cancelled phase takes out of the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelPhase {
+    /// PreTurn sets the `pre_turn_ok` flag to `false` and skips the loop.
+    Turn,
+    /// A phase inside an iteration `break`s out of the iteration body.
+    Chat,
+    /// PreTool `break 'outer`s out of the whole tool loop.
+    Tool,
+}
+
+impl CancelPhase {
+    /// How far the turn got before the exit: the only thing the exits may
+    /// differ in.
+    fn expected_chat_calls(self) -> u32 {
+        match self {
+            CancelPhase::Turn | CancelPhase::Chat => 0,
+            CancelPhase::Tool => 1,
+        }
+    }
+}
+
+/// Cancels the run token when invoked (PreTool phase).
+///
+/// Inserted ahead of the default `ApprovalHook`, so the registry's next
+/// cancellation check aborts the tool loop after the model already answered.
+struct CancellingPreToolHook {
+    ct: CancellationToken,
+}
+
+#[async_trait]
+impl PreToolHook for CancellingPreToolHook {
+    async fn call(
+        &self,
+        _spec: &RunSpec<'_>,
+        _state: &mut RunState,
+        _tool_call: &ToolCall,
+    ) -> Result<ToolHookAction> {
+        self.ct.cancel();
+        Ok(ToolHookAction::Execute)
+    }
+}
+
+#[tokio::test]
+async fn test_shallow_hooks_inlined_emit_same_event_sequence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sm, tm, wd, ms) = make_test_env(&tmp, &[("echo", "echo-result")]).await;
+    let (event_tx, mut event_rx) = broadcast::channel::<AgentEvent>(64);
+
+    let provider = Arc::new(MockProvider::new(vec![
+        LLMResponse {
+            content: Some("calling".to_string()),
+            tool_calls: Some(vec![tool_call("tc-1", "echo")]),
+            finish_reason: FinishReason::ToolCalls,
+            usage: usage(10, 5),
+        },
+        LLMResponse {
+            content: Some("done".to_string()),
+            tool_calls: None,
+            finish_reason: FinishReason::Stop,
+            usage: usage(20, 7),
+        },
+    ]));
+    let runner = make_runner_with(sm.clone(), tm, provider, wd, ms, |b| b);
+
+    let result = runner
+        .run(
+            "hello".to_string(),
+            TaskHook::new("test-session").with_events(event_tx),
+            "test-session",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(result.success);
+    // Usage accumulation still happens exactly once per response, at the same
+    // point of the iteration the AfterChat hook used to sit at.
+    assert_eq!(result.total_tokens, 42);
+    assert_eq!(result.prompt_tokens, 30);
+    assert_eq!(result.completion_tokens, 12);
+
+    let mut events = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        events.push(event);
+    }
+    let observed: Vec<&str> = events.iter().map(event_name).collect();
+    assert_eq!(
+        observed,
+        vec![
+            "TaskStarted",
+            "PreIteration",
+            "AssistantMessage",
+            "ToolCall",
+            "ToolResult",
+            "PostIteration",
+            "PreIteration",
+            "AssistantMessage",
+            "TaskCompleted",
+        ],
+        "inlining must not reorder or drop events"
+    );
+
+    // PostIteration still carries the iteration that just finished.
+    let post: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PostIteration { iteration, .. } => Some(*iteration),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(post, vec![0], "PostIteration must report iteration 0");
+}
+
+#[tokio::test]
+async fn test_task_completed_still_persists_and_rolls_back() {
+    // The finalization that used to be `FireTaskCompletedHook` still writes the
+    // session on success and still rolls the turn back when asked to.
+    let success_tmp = tempfile::TempDir::new().unwrap();
+    let success_file = success_tmp
+        .path()
+        .join("sessions")
+        .join("test-session.jsonl");
+    let (sm, tm, wd, ms) = make_test_env(&success_tmp, &[]).await;
+    let runner = make_runner_with(sm, tm, provider_for_direct_reply(), wd, ms, |b| b);
+
+    let result = run_task(&runner, "hello").await;
+    assert!(result.success);
+
+    let on_disk = std::fs::read_to_string(&success_file).expect("session file must exist");
+    assert!(
+        on_disk.contains("hello"),
+        "the user message must be persisted, got: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("ok"),
+        "the assistant reply must be persisted, got: {on_disk}"
+    );
+
+    // Rollback path: a cancelled turn is truncated in memory and never reaches
+    // the session file.
+    let cancel_tmp = tempfile::TempDir::new().unwrap();
+    let cancel_file = cancel_tmp
+        .path()
+        .join("sessions")
+        .join("test-session.jsonl");
+    let (sm, tm, wd, ms) = make_test_env(&cancel_tmp, &[]).await;
+    sm.lock()
+        .await
+        .add_message("test-session", Message::user("prev".to_string()))
+        .await
+        .unwrap();
+    sm.lock()
+        .await
+        .add_message(
+            "test-session",
+            Message::assistant(Some("prev reply".to_string()), None, None, None),
+        )
+        .await
+        .unwrap();
+
+    let ct = CancellationToken::new();
+    let runner = make_runner_with(sm.clone(), tm, provider_for_direct_reply(), wd, ms, |b| {
+        b.add_pre_turn(
+            Arc::new(CancellingPreTurnHook { ct: ct.clone() }),
+            HookPosition::Insert(1),
+        )
+    });
+    let result = runner
+        .run(
+            "hello".to_string(),
+            TaskHook::new("test-session"),
+            "test-session",
+            None,
+            Some(ct),
+            None,
+            None,
+        )
+        .await;
+
+    assert!(!result.success);
+    let msgs = sm.lock().await.get_messages("test-session").await;
+    assert_eq!(msgs.len(), 2, "rollback must restore the pre-turn count");
+    let on_disk = std::fs::read_to_string(&cancel_file).unwrap_or_default();
+    assert!(
+        !on_disk.contains("hello"),
+        "a rolled-back turn must not be persisted, got: {on_disk}"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_mapping_lives_in_one_place() {
+    // Three distinct exits, one two-line mapping: every cancelled phase fails
+    // the run with the same message and rolls back to the pre-turn count. Only
+    // how far the turn got before the exit differs, which each case pins.
+    for phase in [CancelPhase::Turn, CancelPhase::Chat, CancelPhase::Tool] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sm, _tm, wd, ms) = make_test_env(&tmp, &[]).await;
+        sm.lock()
+            .await
+            .add_message("test-session", Message::user("prev".to_string()))
+            .await
+            .unwrap();
+        sm.lock()
+            .await
+            .add_message(
+                "test-session",
+                Message::assistant(Some("prev reply".to_string()), None, None, None),
+            )
+            .await
+            .unwrap();
+
+        let executions = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut tmm = ToolManager::new(wd.clone());
+        tmm.register(Box::new(CountingTool::new("echo", executions.clone())));
+        let tm = Arc::new(tmm);
+
+        let provider = Arc::new(MockProvider::new(vec![
+            LLMResponse {
+                content: Some("calling".to_string()),
+                tool_calls: Some(vec![tool_call("tc-1", "echo")]),
+                finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            },
+            LLMResponse {
+                content: Some("never reached".to_string()),
+                tool_calls: None,
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ]));
+
+        let ct = CancellationToken::new();
+        let hook_ct = ct.clone();
+        let runner = match phase {
+            CancelPhase::Turn => make_runner_with(
+                sm.clone(),
+                tm.clone(),
+                provider.clone(),
+                wd.clone(),
+                ms.clone(),
+                |b| {
+                    b.add_pre_turn(
+                        Arc::new(CancellingPreTurnHook { ct: hook_ct }),
+                        HookPosition::Insert(1),
+                    )
+                },
+            ),
+            CancelPhase::Chat => make_runner_with(
+                sm.clone(),
+                tm.clone(),
+                provider.clone(),
+                wd.clone(),
+                ms.clone(),
+                |b| {
+                    b.add_pre_chat(
+                        Arc::new(CancellingPreChatHook { ct: hook_ct }),
+                        HookPosition::Insert(0),
+                    )
+                },
+            ),
+            CancelPhase::Tool => make_runner_with(
+                sm.clone(),
+                tm.clone(),
+                provider.clone(),
+                wd.clone(),
+                ms.clone(),
+                |b| {
+                    b.add_pre_tool(
+                        Arc::new(CancellingPreToolHook { ct: hook_ct }),
+                        HookPosition::Insert(0),
+                    )
+                },
+            ),
+        };
+
+        let result = runner
+            .run(
+                "hello".to_string(),
+                TaskHook::new("test-session"),
+                "test-session",
+                None,
+                Some(ct),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(!result.success, "{phase:?}: a cancelled run must fail");
+        assert_eq!(
+            result.content, "Task cancelled.",
+            "{phase:?}: every exit reports the same message"
+        );
+        assert_eq!(
+            provider.call_count(),
+            phase.expected_chat_calls(),
+            "{phase:?}: the exit must not drift into another phase"
+        );
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{phase:?}: no tool runs after cancellation"
+        );
+        let msgs = sm.lock().await.get_messages("test-session").await;
+        assert_eq!(
+            msgs.len(),
+            2,
+            "{phase:?}: rollback must restore the pre-turn count"
+        );
+    }
+}
+
+/// Cancels the run token when invoked (AfterTool phase, last hook).
+///
+/// Runs after the tool result has been recorded, so the only checkpoint left in
+/// the iteration is the one that used to belong to PostIteration.
+struct CancellingAfterToolHook {
+    ct: CancellationToken,
+}
+
+#[async_trait]
+impl AfterToolHook for CancellingAfterToolHook {
+    async fn call(
+        &self,
+        _spec: &RunSpec<'_>,
+        _state: &mut RunState,
+        _tool_call: &ToolCall,
+        _result: &str,
+    ) -> Result<HookAction> {
+        self.ct.cancel();
+        Ok(HookAction::Continue)
+    }
+}
+
+#[tokio::test]
+async fn test_cancel_after_the_last_tool_call_still_rolls_back() {
+    // PostIteration used to be the iteration's last cancellation checkpoint.
+    // Without it a cancel landing here would be reported as "Reached max
+    // iterations" and the half-written turn would be persisted.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (sm, tm, wd, ms) = make_test_env(&tmp, &[("echo", "echo-result")]).await;
+    sm.lock()
+        .await
+        .add_message("test-session", Message::user("prev".to_string()))
+        .await
+        .unwrap();
+
+    let ct = CancellationToken::new();
+    let provider = Arc::new(MockProvider::new(vec![LLMResponse {
+        content: Some("calling".to_string()),
+        tool_calls: Some(vec![tool_call("tc-1", "echo")]),
+        finish_reason: FinishReason::ToolCalls,
+        usage: Usage::default(),
+    }]));
+
+    let runner = AgentRunnerBuilder::new()
+        .session_manager(sm.clone())
+        .tool_manager(tm)
+        .provider(provider)
+        .config(AgentConfig {
+            provider: "test".to_string(),
+            max_iterations: 1,
+            timeout_seconds: 120,
+            persist_tool_results: false,
+            unknown: Default::default(),
+        })
+        .workspace_dir(wd)
+        .memory_service(ms)
+        .max_tokens(4096)
+        .with_defaults()
+        .add_after_tool(
+            Arc::new(CancellingAfterToolHook { ct: ct.clone() }),
+            HookPosition::Append,
+        )
+        .build();
+
+    let result = runner
+        .run(
+            "hello".to_string(),
+            TaskHook::new("test-session"),
+            "test-session",
+            None,
+            Some(ct),
+            None,
+            None,
+        )
+        .await;
+
+    assert!(!result.success);
+    assert_eq!(
+        result.content, "Task cancelled.",
+        "a cancel must not be reported as a max-iterations failure"
+    );
+    let msgs = sm.lock().await.get_messages("test-session").await;
+    assert_eq!(
+        msgs.len(),
+        1,
+        "the half-written turn must be rolled back, got {} messages",
+        msgs.len()
+    );
+}
+
+#[test]
+fn test_shallow_hooks_are_inlined_into_the_run_loop() {
+    // The five shallow hooks are gone as types: their behavior lives in the
+    // loop, so a new event or usage rule is one edit in one file.
+    let module = include_str!("mod.rs");
+    for removed in [
+        "AccumulateUsageHook",
+        "FireToolCallEventHook",
+        "FireToolResultEventHook",
+        "FirePostIterationEventHook",
+        "FireTaskCompletedHook",
+    ] {
+        assert!(
+            !module.contains(removed),
+            "{removed} must be inlined into run()"
+        );
+    }
+}
+
+#[test]
+fn test_post_iteration_phase_is_gone() {
+    // PostIteration had exactly one hook; with it inlined the phase and its
+    // trait go away rather than stay as a one-adapter seam.
+    assert!(!include_str!("traits.rs").contains("PostIterationHook"));
+    assert!(!include_str!("registry.rs").contains("post_iteration"));
+}
+
+#[tokio::test]
+async fn test_provider_error_kind_survives_seam_without_downcast() {
+    use crate::provider::ProviderErrorKind;
+    use crate::runner::ProviderFailureRoute;
+
+    // The three routing answers. `Other` stands in for the failure class the
+    // old type-erased seam could not classify: it must still reach the caller
+    // as a classified `Some(..)`, never as `None` (which skipped routing).
+    let cases = [
+        (
+            ProviderErrorKind::AuthQuota,
+            ProviderFailureRoute::AlertOwner,
+        ),
+        (
+            ProviderErrorKind::ContextLength,
+            ProviderFailureRoute::RelievePressure,
+        ),
+        (
+            ProviderErrorKind::Transient,
+            ProviderFailureRoute::FailInPlace,
+        ),
+        (
+            ProviderErrorKind::ContentFilter,
+            ProviderFailureRoute::FailInPlace,
+        ),
+        (ProviderErrorKind::Other, ProviderFailureRoute::FailInPlace),
+    ];
+
+    for (kind, expected_route) in cases {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
+        let runner = make_runner(sm, tm, Arc::new(FailingProvider(kind)), wd, ms);
+
+        let result = runner
+            .run(
+                "fail me".to_string(),
+                TaskHook::new("test-session"),
+                "test-session",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.provider_error.as_ref().map(|e| e.kind),
+            Some(kind),
+            "the provider's kind must cross the seam intact for {kind}"
+        );
+        assert_eq!(
+            result.provider_failure_route(),
+            expected_route,
+            "{kind} must route to {expected_route:?}"
+        );
+    }
+}
+
+#[test]
+fn test_the_run_loop_no_longer_recovers_a_provider_error_by_downcast() {
+    // The seam carries `ProviderError` itself; guessing the kind back out of a
+    // type-erased error is what let an unclassified failure silently skip
+    // routing. `provider/error.rs` documents the erased form it replaced.
+    let module = include_str!("mod.rs");
+    assert!(
+        !module.contains("downcast"),
+        "run() must not recover a provider error by downcast"
+    );
+}
+
+#[test]
+fn test_message_sent_has_one_assignment_and_two_consumers() {
+    // Ticket 12's regression baseline: delivery state is written once, by the
+    // turn, and read by the two callers that decide whether to speak again.
+    let runner = include_str!("mod.rs");
+    assert_eq!(
+        runner.matches("message_sent =").count(),
+        1,
+        "message_sent is assigned in exactly one place"
+    );
+
+    let agent_loop = include_str!("../agent_loop.rs");
+    assert_eq!(
+        agent_loop.matches("result.message_sent").count(),
+        1,
+        "the loop suppresses its own reply when the turn already delivered"
+    );
+    let gateway = include_str!("../gateway.rs");
+    assert_eq!(
+        gateway.matches("!result.message_sent").count(),
+        1,
+        "the gateway only delivers a job payload that was not already sent"
     );
 }

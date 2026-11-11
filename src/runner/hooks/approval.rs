@@ -670,6 +670,45 @@ mod tests {
         assert_eq!(h.audit_decisions(), vec!["proposed", "cleared"]);
     }
 
+    #[tokio::test]
+    async fn test_approval_gate_context_shared_by_hook_and_codemode() {
+        // The top-level `ApprovalHook` and the codemode entry (`RunToolExec`)
+        // reach the gate through the same `gate_context`: one store, one
+        // session, one mark carrier. This is ADR 0011's regression lock for the
+        // seam `run()` shares between them.
+        let mut h = Harness::new(ApprovalConfig::default(), TurnKind::User);
+        h.turn_start().await;
+
+        let spec = harness_spec(&h.runner, &h.hook, h.cancel.clone());
+        let ctx = gate_context(&spec);
+        let nested = crate::runner::gate::RunToolExec::new(gate_context(&spec));
+
+        assert!(
+            Arc::ptr_eq(&ctx.approvals, &h.store),
+            "the gate must read the run's own approval store"
+        );
+
+        // Ask on the hook's view: the proposal lands in that store, and the
+        // PreTool-written mark is what the AfterTool stage reads back.
+        let call = h.call("tc-1", "shell", json!({ "cmd": "ls" }));
+        let action = ApprovalHook.call(&spec, &mut h.state, &call).await.unwrap();
+        assert!(
+            matches!(action, ToolHookAction::Skip { .. }),
+            "an Exec-risk call must defer to the owner"
+        );
+        let approval_id =
+            mark_for(&h.state, "tc-1").expect("the ask must leave a mark for the tool result");
+
+        // The nested view resolves the very same pending record, so a script
+        // cannot bypass or duplicate the decision the hook just made.
+        let pending = nested.pending_list_text();
+        assert!(
+            pending.contains(&approval_id),
+            "the nested gate must see the same pending approval, got: {pending}"
+        );
+        assert_eq!(h.runs(), 0, "neither view may execute a pending call");
+    }
+
     // ── runner seam ──
 
     /// Scripted provider that also records the message list it was handed.
@@ -703,7 +742,7 @@ mod tests {
             messages: &[&Message],
             _tools: Option<&[ToolDefinition]>,
             _recorder: Option<&dyn crate::trace::SpanRecorder>,
-        ) -> Result<LLMResponse> {
+        ) -> crate::provider::ProviderResult<LLMResponse> {
             self.seen
                 .lock()
                 .unwrap()

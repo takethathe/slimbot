@@ -70,7 +70,8 @@ pub use path::PathManager;
 pub use path::expand_home;
 pub use pressure::{PressureAnchor, PressureLimits};
 pub use provider::{
-    FinishReason, LLMResponse, OpenAIProvider, Provider, ProviderError, ProviderErrorKind, Usage,
+    FinishReason, LLMResponse, OpenAIProvider, Provider, ProviderError, ProviderErrorKind,
+    ProviderResult, Usage,
 };
 pub use runner::AgentRunner;
 pub use session::{
