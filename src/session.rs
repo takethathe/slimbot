@@ -363,16 +363,18 @@ pub enum TaskState {
     Failed { error: String },
 }
 
-#[allow(dead_code)]
+/// One queued turn.
+///
+/// A task is its run and nothing else: the session it belongs to (which routes
+/// it to that session's runner) and the closure that assembles and executes the
+/// run. Everything else — content, hook, live state — belongs to the run and is
+/// carried inside the closure, so no field here can hold a placeholder value.
 pub struct SessionTask {
     pub id: String,
     /// Session ID, used by SessionManager to find the correct SessionRunner.
     pub session_id: String,
-    pub content: String,
-    pub hook: TaskHook,
-    pub state: TaskState,
-    /// Optional execution closure. None for direct invocation via run_task.
-    pub closure: Option<Box<dyn FnOnce() -> BoxFuture + Send>>,
+    /// The run itself: assembles the runner, executes it, reports the result.
+    pub closure: Box<dyn FnOnce() -> BoxFuture + Send>,
 }
 
 /// How a run was started.
@@ -867,12 +869,7 @@ impl SessionTaskBuilder {
         SessionTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: sid_for_task,
-            content: String::new(),
-            hook: TaskHook::new(""),
-            state: TaskState::Running {
-                current_iteration: 0,
-            },
-            closure: Some(exec_closure),
+            closure: exec_closure,
         }
     }
 }
@@ -883,7 +880,7 @@ impl SessionTask {
     /// to mark idle and submit the next pending task.
     pub fn wrap(self, runner: SessionRunner) -> Box<dyn FnOnce() -> BoxFuture + Send> {
         Box::new(move || {
-            let closure = self.closure.unwrap();
+            let closure = self.closure;
             Box::pin(async move {
                 closure().await;
                 runner.on_task_complete();
@@ -1680,6 +1677,55 @@ mod tests {
     use crate::memory::MemoryService;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_session_task_has_no_placeholder_fields() {
+        // The lock is the destructuring below: a task is its id, the session it
+        // is queued on, and the run. Re-adding a field that only ever held a
+        // placeholder value fails to compile.
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BusResult>(4);
+        // The session exists before the task runs, as the loop guarantees.
+        let session_manager: SharedSessionManager = Arc::new(Mutex::new(
+            SessionManager::new(tmp.path().join("sessions")).unwrap(),
+        ));
+        session_manager
+            .lock()
+            .await
+            .get_or_create("cli:main")
+            .await
+            .unwrap();
+
+        let task = SessionTaskBuilder::new(
+            "cli:main".to_string(),
+            "hi".to_string(),
+            TaskHook::new("cli:main"),
+        )
+        .session_manager(session_manager)
+        .tool_manager(Arc::new(ToolManager::new(workspace_dir.clone())))
+        .provider(Arc::new(crate::provider::MockProvider::new()))
+        .config(AgentConfig::default())
+        .workspace_dir(workspace_dir)
+        .memory_service(Arc::new(Mutex::new(MemoryService::new(tmp.path()))))
+        .outbound_tx(tx)
+        .build();
+
+        let SessionTask {
+            id,
+            session_id,
+            closure,
+        } = task;
+        assert_eq!(session_id, "cli:main");
+        assert!(!id.is_empty(), "the id is a real uuid, not a placeholder");
+
+        // The closure is the whole turn: running it reports the result outbound.
+        closure().await;
+        let sent = rx.recv().await.expect("the run reports its result");
+        assert_eq!(sent.session_id, "cli:main");
+        assert_eq!(sent.content, "Mock response");
+    }
 
     fn user_msg(content: &str) -> Message {
         Message::User {

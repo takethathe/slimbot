@@ -205,7 +205,13 @@ async fn loop_with_config(
     }
     let config_path = data_dir.join("config.json");
     std::fs::write(&config_path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
-    let config = std::sync::Arc::new(Config::load(config_path.to_str().unwrap()).unwrap());
+    let config = std::sync::Arc::new(
+        Config::load_resolved_with(
+            config_path.to_str().unwrap(),
+            &slimbot::secrets::SecretStore::empty(),
+        )
+        .unwrap(),
+    );
 
     let paths = PathManager::resolve(
         Some(config_path.to_str().unwrap()),

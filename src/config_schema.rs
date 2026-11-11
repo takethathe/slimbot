@@ -8,10 +8,10 @@
 //!   plaintext.
 //! - [`apply_config_patch_with`] applies `[{op, path, value}]` patches to a
 //!   [`Config`] with the same clamp → normalize → validate pipeline as
-//!   `Config::load`. Validation failures are returned as per-field errors and
+//!   `Config::load_resolved`. Validation failures are returned as per-field errors and
 //!   the caller must not persist the mutated config in that case.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -124,90 +124,29 @@ pub struct SchemaTree {
 /// Pure: no I/O, no HTTP.
 pub fn serialize_schema(config: &Config) -> SchemaTree {
     let sections = vec![
-        scalar_section(
-            "agent",
-            "Agent",
-            AgentConfig::fields(),
-            &to_value_map(&config.agent),
-        ),
-        scalar_section(
-            "gateway.owner",
-            "Gateway · Owner",
-            OwnerConfig::fields(),
-            &to_value_map(&config.gateway.owner),
-        ),
-        scalar_section(
-            "gateway.cron",
-            "Gateway · Cron",
-            CronConfig::fields(),
-            &to_value_map(&config.gateway.cron),
-        ),
-        scalar_section(
-            "gateway.heartbeat",
+        derived_section::<AgentConfig>("Agent", &to_value_map(&config.agent)),
+        derived_section::<OwnerConfig>("Gateway · Owner", &to_value_map(&config.gateway.owner)),
+        derived_section::<CronConfig>("Gateway · Cron", &to_value_map(&config.gateway.cron)),
+        derived_section::<HeartbeatConfig>(
             "Gateway · Heartbeat",
-            HeartbeatConfig::fields(),
             &to_value_map(&config.gateway.heartbeat),
         ),
-        scalar_section(
-            "gateway.dream",
-            "Gateway · Dream",
-            DreamConfig::fields(),
-            &to_value_map(&config.gateway.dream),
-        ),
-        scalar_section(
-            "web_fetch",
+        derived_section::<DreamConfig>("Gateway · Dream", &to_value_map(&config.gateway.dream)),
+        derived_section::<WebFetchConfig>(
             "Web Fetch",
-            WebFetchConfig::fields(),
             &to_value_map(&config.web_fetch.clone().unwrap_or_default()),
         ),
-        scalar_section(
-            "json_render",
+        derived_section::<JsonRenderConfig>(
             "JSON Render · Cards",
-            JsonRenderConfig::fields(),
             &to_value_map(&config.json_render),
         ),
-        scalar_section(
-            "tracing",
-            "Tracing",
-            TraceConfig::fields(),
-            &to_value_map(&config.tracing),
-        ),
-        scalar_section(
-            "memory",
-            "Memory",
-            MemoryConfig::fields(),
-            &to_value_map(&config.memory),
-        ),
-        scalar_section(
-            "subagent",
-            "Subagent",
-            SubagentConfig::fields(),
-            &to_value_map(&config.subagent),
-        ),
-        scalar_section(
-            "executors",
-            "Executors",
-            ExecutorsConfig::fields(),
-            &to_value_map(&config.executors),
-        ),
-        scalar_section(
-            "triggers",
-            "Triggers",
-            TriggersConfig::fields(),
-            &triggers_value_map(config),
-        ),
-        scalar_section(
-            "pressure",
-            "Pressure · Context",
-            PressureConfig::fields(),
-            &to_value_map(&config.pressure),
-        ),
-        scalar_section(
-            "mcp",
-            "MCP · Connection budgets",
-            McpConfig::fields(),
-            &mcp_value_map(config),
-        ),
+        derived_section::<TraceConfig>("Tracing", &to_value_map(&config.tracing)),
+        derived_section::<MemoryConfig>("Memory", &to_value_map(&config.memory)),
+        derived_section::<SubagentConfig>("Subagent", &to_value_map(&config.subagent)),
+        derived_section::<ExecutorsConfig>("Executors", &to_value_map(&config.executors)),
+        derived_section::<TriggersConfig>("Triggers", &triggers_value_map(config)),
+        derived_section::<PressureConfig>("Pressure · Context", &to_value_map(&config.pressure)),
+        derived_section::<McpConfig>("MCP · Connection budgets", &mcp_value_map(config)),
         providers_section(config),
         tools_section(config),
         scalar_section(
@@ -233,6 +172,9 @@ fn kind_for(meta: &FieldMeta) -> &'static str {
         "bool" => "bool",
         "u32" | "u64" | "i64" | "usize" => "int",
         "f32" => "float",
+        // Hand-written metadata (`tools.approval`) spells a whole-object
+        // field `json`; without this arm it rendered as a text input.
+        "json" => "json",
         "Option<String>" => "optional_string",
         t if t.starts_with("Vec<") => "list",
         _ if !meta.allowed.is_empty() => "select",
@@ -292,6 +234,16 @@ fn to_value_map<T: serde::Serialize>(value: &T) -> serde_json::Map<String, serde
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default()
+}
+
+/// A scalar section that comes straight from a `define_config!` struct: the
+/// section name, its field list and every field path derive from that single
+/// declaration, so no section prefix is written twice.
+fn derived_section<T: crate::config_macro::ScalarConfig>(
+    label: &str,
+    value_map: &serde_json::Map<String, serde_json::Value>,
+) -> SchemaSection {
+    scalar_section(T::SECTION, label, T::field_metas(), value_map)
 }
 
 /// A scalar section: one field per macro `FieldMeta`, values from `value_map`.
@@ -658,7 +610,7 @@ fn mcp_servers_section(config: &Config) -> SchemaSection {
 // ── Patch engine ──
 
 /// Apply patches to a config with the same clamp → normalize → validate
-/// pipeline as `Config::load`. Returns `Err` for malformed ops / unknown
+/// pipeline as `Config::load_resolved`. Returns `Err` for malformed ops / unknown
 /// paths; returns `Ok(errors)` with per-field validation errors when the
 /// resulting config fails `Config::validate` (the caller must not persist in
 /// that case). A successful apply returns an empty error list.
@@ -712,10 +664,75 @@ fn parse_index(s: &str) -> Result<usize, String> {
 
 // ── Set ──
 
+/// One scalar section seen through its `define_config!` declaration.
+///
+/// Object-safe so the patch router can hand back "the section this path names"
+/// without spelling out each struct type at every call site.
+trait ScalarSection {
+    fn set_scalar_field(
+        &mut self,
+        section: &str,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), String>;
+}
+
+impl<T: crate::config_macro::ScalarConfig> ScalarSection for T {
+    fn set_scalar_field(
+        &mut self,
+        section: &str,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), String> {
+        crate::config_macro::set_scalar(self, section, field, value)
+    }
+}
+
+/// The mutable scalar section a dot-path prefix names, or `None` when the
+/// prefix is not one (collections and hand-written shapes).
+///
+/// This is the only place a section name maps to its storage. Every scalar
+/// field below it is written out of the `define_config!` declaration alone, so
+/// declaring a field is enough to make it schema-visible and patchable.
+fn scalar_section_mut<'a>(
+    config: &'a mut Config,
+    section: &str,
+) -> Option<&'a mut dyn ScalarSection> {
+    Some(match section {
+        "agent" => &mut config.agent,
+        "gateway.owner" => &mut config.gateway.owner,
+        "gateway.cron" => &mut config.gateway.cron,
+        "gateway.heartbeat" => &mut config.gateway.heartbeat,
+        "gateway.dream" => &mut config.gateway.dream,
+        "web_fetch" => config.web_fetch.get_or_insert_with(Default::default),
+        "json_render" => &mut config.json_render,
+        "tracing" => &mut config.tracing,
+        "memory" => &mut config.memory,
+        "subagent" => &mut config.subagent,
+        "executors" => &mut config.executors,
+        "triggers" => &mut config.triggers,
+        "pressure" => &mut config.pressure,
+        "mcp" => &mut config.mcp,
+        _ => return None,
+    })
+}
+
+/// Route a `set` patch.
+///
+/// Scalar sections delegate wholesale. The arms left here are the shapes that
+/// are not `define_config!` structs (tools, channels, the approval policy) and
+/// the collection sections, which locate one element and then delegate that
+/// element as a scalar section of its own.
 fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Result<(), String> {
     match segs {
-        ["agent", field] => set_agent(config, field, value),
-        ["providers", name, field] => set_provider_field(config, name, field, value),
+        ["providers", name, field] => {
+            let section = format!("providers.{}", name);
+            let provider = config
+                .providers
+                .get_mut(*name)
+                .ok_or_else(|| format!("{}: provider not found", section))?;
+            crate::config_macro::set_scalar(provider, &section, field, value)
+        }
         ["tools", "approval", level] if is_risk_level(level) => {
             set_approval_level(config, level, value)
         }
@@ -729,259 +746,53 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
         ["tools", idx, field] => set_tool_field(config, idx, field, value),
         ["channels", name, "enabled"] => set_channel_enabled(config, name, value),
         ["channels", name, "extra"] => set_channel_extra(config, name, value),
-        ["gateway", sub, field] if matches!(*sub, "owner" | "cron" | "heartbeat" | "dream") => {
-            set_gateway(config, sub, field, value)
+        ["tracing", "backends", idx, field] => {
+            let i = parse_index(idx)?;
+            let section = format!("tracing.backends.{}", idx);
+            let backend = config
+                .tracing
+                .backends
+                .get_mut(i)
+                .ok_or_else(|| format!("{}: index out of range", section))?;
+            crate::config_macro::set_scalar(backend, &section, field, value)
         }
-        ["web_fetch", field] => set_web_fetch(config, field, value),
-        ["json_render", field] => set_json_render(config, field, value),
-        ["memory", field] => set_memory(config, field, value),
-        ["tracing", "enabled"] => {
-            config.tracing.enabled = value_bool(value, "tracing.enabled")?;
-            Ok(())
+        ["triggers", "secrets", idx, field] => {
+            let i = parse_index(idx)?;
+            let section = format!("triggers.secrets.{}", idx);
+            let entry = config
+                .triggers
+                .secrets
+                .get_mut(i)
+                .ok_or_else(|| format!("{}: index out of range", section))?;
+            crate::config_macro::set_scalar(entry, &section, field, value)
         }
-        ["tracing", "reset_on_start"] => {
-            config.tracing.reset_on_start = value_bool(value, "tracing.reset_on_start")?;
-            Ok(())
+        ["mcp", "servers", idx, field] => {
+            let i = parse_index(idx)?;
+            let section = format!("mcp.servers.{}", idx);
+            let server = config
+                .mcp
+                .servers
+                .get_mut(i)
+                .ok_or_else(|| format!("{}: index out of range", section))?;
+            crate::config_macro::set_scalar(server, &section, field, value)
         }
-        ["tracing", "backends", idx, field] => set_backend_field(config, idx, field, value),
-        ["subagent", field] => set_subagent(config, field, value),
-        ["executors", field] => set_executors(config, field, value),
-        ["triggers", field] => set_triggers(config, field, value),
-        ["triggers", "secrets", idx, field] => set_secret_field(config, idx, field, value),
-        ["mcp", "servers", idx, field] => set_mcp_server_field(config, idx, field, value),
-        ["mcp", field] => set_mcp(config, field, value),
-        ["pressure", field] => set_pressure(config, field, value),
-        _ => Err(format!("Unsupported patch path: {}", segs.join("."))),
+        ["gateway", sub, field] => {
+            let section = format!("gateway.{}", sub);
+            match scalar_section_mut(config, &section) {
+                Some(target) => target.set_scalar_field(&section, field, value),
+                None => Err(unsupported_path(segs)),
+            }
+        }
+        [section, field] => match scalar_section_mut(config, section) {
+            Some(target) => target.set_scalar_field(section, field, value),
+            None => Err(unsupported_path(segs)),
+        },
+        _ => Err(unsupported_path(segs)),
     }
 }
 
-fn set_subagent(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
-    match field {
-        "max_concurrent" => {
-            config.subagent.max_concurrent = value_u32(value, "subagent.max_concurrent")? as usize
-        }
-        _ => return Err(format!("Unknown subagent field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_executors(
-    config: &mut Config,
-    field: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    match field {
-        "max_count" => {
-            config.executors.max_count = value_u64(value, "executors.max_count")? as usize
-        }
-        _ => return Err(format!("Unknown executors field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_triggers(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
-    match field {
-        "enabled" => config.triggers.enabled = value_bool(value, "triggers.enabled")?,
-        "tick_interval_s" => {
-            config.triggers.tick_interval_s = value_u64(value, "triggers.tick_interval_s")?
-        }
-        "tick_timeout_s" => {
-            config.triggers.tick_timeout_s = value_u64(value, "triggers.tick_timeout_s")?
-        }
-        "max_concurrent_collect" => {
-            config.triggers.max_concurrent_collect =
-                value_u32(value, "triggers.max_concurrent_collect")? as usize
-        }
-        "max_queue" => config.triggers.max_queue = value_u32(value, "triggers.max_queue")? as usize,
-        "max_merge" => config.triggers.max_merge = value_u32(value, "triggers.max_merge")? as usize,
-        "history_lines" => {
-            config.triggers.history_lines = value_u32(value, "triggers.history_lines")? as usize
-        }
-        _ => return Err(format!("Unknown triggers field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_secret_field(
-    config: &mut Config,
-    idx: &str,
-    field: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    let i = parse_index(idx)?;
-    let prefix = format!("triggers.secrets.{}", idx);
-    let entry = config
-        .triggers
-        .secrets
-        .get_mut(i)
-        .ok_or_else(|| format!("{}: index out of range", prefix))?;
-    match field {
-        "name" => entry.name = value_str(value, &format!("{}.name", prefix))?,
-        "value" => entry.value = value_str(value, &format!("{}.value", prefix))?,
-        _ => return Err(format!("Unknown secret field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_mcp_server_field(
-    config: &mut Config,
-    idx: &str,
-    field: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    let i = parse_index(idx)?;
-    let server = config
-        .mcp
-        .servers
-        .get_mut(i)
-        .ok_or_else(|| format!("mcp.servers.{}: index out of range", idx))?;
-    let path = format!("mcp.servers.{}.{}", idx, field);
-    match field {
-        "name" => server.name = value_str(value, &path)?,
-        "transport" => server.transport = value_str(value, &path)?,
-        "enabled" => server.enabled = value_bool(value, &path)?,
-        "command" => server.command = value_str(value, &path)?,
-        "args" => server.args = value_string_list(value, &path)?,
-        "url" => server.url = value_str(value, &path)?,
-        "env" => server.env = value_secret_map(value, &path)?,
-        "headers" => server.headers = value_secret_map(value, &path)?,
-        _ => return Err(format!("Unknown mcp server field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_mcp(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
-    let path = format!("mcp.{}", field);
-    match field {
-        "call_timeout_seconds" => {
-            config.mcp.call_timeout_seconds = value_u64(value, &path)?;
-        }
-        "connect_timeout_seconds" => {
-            config.mcp.connect_timeout_seconds = value_u64(value, &path)?;
-        }
-        "probe_interval_seconds" => {
-            config.mcp.probe_interval_seconds = value_u64(value, &path)?;
-        }
-        "backoff_initial_ms" => {
-            config.mcp.backoff_initial_ms = value_u64(value, &path)?;
-        }
-        "backoff_max_seconds" => {
-            config.mcp.backoff_max_seconds = value_u64(value, &path)?;
-        }
-        _ => return Err(format!("Unknown mcp field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_pressure(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
-    match field {
-        "single_tool_result_ratio" => {
-            config.pressure.single_tool_result_ratio =
-                value_f32(value, "pressure.single_tool_result_ratio")?
-        }
-        "persisted_preview_ratio" => {
-            config.pressure.persisted_preview_ratio =
-                value_f32(value, "pressure.persisted_preview_ratio")?
-        }
-        "snip_safety_ratio" => {
-            config.pressure.snip_safety_ratio = value_f32(value, "pressure.snip_safety_ratio")?
-        }
-        "consolidate_trigger_ratio" => {
-            config.pressure.consolidate_trigger_ratio =
-                value_f32(value, "pressure.consolidate_trigger_ratio")?
-        }
-        "consolidate_target_ratio" => {
-            config.pressure.consolidate_target_ratio =
-                value_f32(value, "pressure.consolidate_target_ratio")?
-        }
-        "summary_ratio" => {
-            config.pressure.summary_ratio = value_f32(value, "pressure.summary_ratio")?
-        }
-        "min_keep_messages" => {
-            config.pressure.min_keep_messages =
-                value_u32(value, "pressure.min_keep_messages")? as usize
-        }
-        "keep_recent_tool_results" => {
-            config.pressure.keep_recent_tool_results =
-                value_u32(value, "pressure.keep_recent_tool_results")? as usize
-        }
-        "tool_results_ttl_days" => {
-            config.pressure.tool_results_ttl_days =
-                value_u64(value, "pressure.tool_results_ttl_days")?
-        }
-        "memory_doc_ratio" => {
-            config.pressure.memory_doc_ratio = value_f32(value, "pressure.memory_doc_ratio")?
-        }
-        "memory_snapshot_recent_days" => {
-            config.pressure.memory_snapshot_recent_days =
-                value_u64(value, "pressure.memory_snapshot_recent_days")?
-        }
-        "memory_snapshot_daily_days" => {
-            config.pressure.memory_snapshot_daily_days =
-                value_u64(value, "pressure.memory_snapshot_daily_days")?
-        }
-        "memory_snapshot_max" => {
-            config.pressure.memory_snapshot_max =
-                value_u32(value, "pressure.memory_snapshot_max")? as usize
-        }
-        _ => return Err(format!("Unknown pressure field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_agent(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
-    match field {
-        "provider" => config.agent.provider = value_str(value, "agent.provider")?,
-        "max_iterations" => config.agent.max_iterations = value_u32(value, "agent.max_iterations")?,
-        "timeout_seconds" => {
-            config.agent.timeout_seconds = value_u64(value, "agent.timeout_seconds")?
-        }
-        "persist_tool_results" => {
-            config.agent.persist_tool_results = value_bool(value, "agent.persist_tool_results")?
-        }
-        _ => return Err(format!("Unknown agent field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_provider_field(
-    config: &mut Config,
-    name: &str,
-    field: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    let prefix = format!("providers.{}", name);
-    let provider = config
-        .providers
-        .get_mut(name)
-        .ok_or_else(|| format!("{}: provider not found", prefix))?;
-    match field {
-        "type" => provider.r#type = value_str(value, &format!("{}.type", prefix))?,
-        "api_url" => provider.api_url = value_str(value, &format!("{}.api_url", prefix))?,
-        "base_url" => provider.base_url = value_str(value, &format!("{}.base_url", prefix))?,
-        "api_key" => provider.api_key = value_str(value, &format!("{}.api_key", prefix))?,
-        "model" => provider.model = value_str(value, &format!("{}.model", prefix))?,
-        "temperature" => {
-            provider.temperature = value_f32(value, &format!("{}.temperature", prefix))?
-        }
-        "max_tokens" => provider.max_tokens = value_u32(value, &format!("{}.max_tokens", prefix))?,
-        "context_window_tokens" => {
-            provider.context_window_tokens =
-                value_u32(value, &format!("{}.context_window_tokens", prefix))?
-        }
-        "timeout_seconds" => {
-            provider.timeout_seconds = value_u64(value, &format!("{}.timeout_seconds", prefix))?
-        }
-        "prompt_cache_enabled" => {
-            provider.prompt_cache_enabled =
-                value_bool(value, &format!("{}.prompt_cache_enabled", prefix))?
-        }
-        "disable_thinking" => {
-            provider.disable_thinking = value_bool(value, &format!("{}.disable_thinking", prefix))?
-        }
-        _ => return Err(format!("Unknown provider field: {}", field)),
-    }
-    Ok(())
+fn unsupported_path(segs: &[&str]) -> String {
+    format!("Unsupported patch path: {}", segs.join("."))
 }
 
 /// Risk-level names accepted under `tools.approval.levels`.
@@ -1088,118 +899,6 @@ fn set_channel_extra(
     let extra: HashMap<String, serde_json::Value> =
         obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     config.channels.entry(name.to_string()).or_default().extra = extra;
-    Ok(())
-}
-
-fn set_gateway(
-    config: &mut Config,
-    sub: &str,
-    field: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    match (sub, field) {
-        ("owner", "id") => config.gateway.owner.id = value_str(value, "gateway.owner.id")?,
-        ("owner", "display_name") => {
-            config.gateway.owner.display_name = value_opt_str(value, "gateway.owner.display_name")?
-        }
-        ("cron", "enabled") => {
-            config.gateway.cron.enabled = value_bool(value, "gateway.cron.enabled")?
-        }
-        ("heartbeat", "enabled") => {
-            config.gateway.heartbeat.enabled = value_bool(value, "gateway.heartbeat.enabled")?
-        }
-        ("heartbeat", "interval_s") => {
-            config.gateway.heartbeat.interval_s = value_u64(value, "gateway.heartbeat.interval_s")?
-        }
-        ("heartbeat", "channel") => {
-            config.gateway.heartbeat.channel = value_opt_str(value, "gateway.heartbeat.channel")?
-        }
-        ("heartbeat", "to") => {
-            config.gateway.heartbeat.to = value_opt_str(value, "gateway.heartbeat.to")?
-        }
-        ("dream", "enabled") => {
-            config.gateway.dream.enabled = value_bool(value, "gateway.dream.enabled")?
-        }
-        ("dream", "interval_ms") => {
-            config.gateway.dream.interval_ms = value_i64(value, "gateway.dream.interval_ms")?
-        }
-        ("dream", "model_override") => {
-            config.gateway.dream.model_override =
-                value_opt_str(value, "gateway.dream.model_override")?
-        }
-        ("dream", "max_entries") => {
-            config.gateway.dream.max_entries = value_usize(value, "gateway.dream.max_entries")?
-        }
-        _ => return Err(format!("Unknown gateway field: {}.{}", sub, field)),
-    }
-    Ok(())
-}
-
-fn set_web_fetch(
-    config: &mut Config,
-    field: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    let wf = config.web_fetch.get_or_insert_with(Default::default);
-    match field {
-        "max_chars" => wf.max_chars = value_usize(value, "web_fetch.max_chars")?,
-        "timeout_s" => wf.timeout_s = value_u64(value, "web_fetch.timeout_s")?,
-        "user_agent" => wf.user_agent = value_str(value, "web_fetch.user_agent")?,
-        _ => return Err(format!("Unknown web_fetch field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_memory(config: &mut Config, field: &str, value: &serde_json::Value) -> Result<(), String> {
-    match field {
-        "backend" => config.memory.backend = value_str(value, "memory.backend")?,
-        _ => return Err(format!("Unknown memory field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_json_render(
-    config: &mut Config,
-    field: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    match field {
-        "enabled" => config.json_render.enabled = value_bool(value, "json_render.enabled")?,
-        "model_override" => {
-            config.json_render.model_override = value_opt_str(value, "json_render.model_override")?
-        }
-        "max_tokens" => config.json_render.max_tokens = value_u32(value, "json_render.max_tokens")?,
-        "timeout_seconds" => {
-            config.json_render.timeout_seconds = value_u64(value, "json_render.timeout_seconds")?
-        }
-        _ => return Err(format!("Unknown json_render field: {}", field)),
-    }
-    Ok(())
-}
-
-fn set_backend_field(
-    config: &mut Config,
-    idx: &str,
-    field: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    let i = parse_index(idx)?;
-    let backend = config
-        .tracing
-        .backends
-        .get_mut(i)
-        .ok_or_else(|| format!("tracing.backends.{}: index out of range", idx))?;
-    let prefix = format!("tracing.backends.{}", idx);
-    match field {
-        "type" => backend.r#type = value_str(value, &format!("{}.type", prefix))?,
-        "enabled" => backend.enabled = value_bool(value, &format!("{}.enabled", prefix))?,
-        "path" => backend.path = value_str(value, &format!("{}.path", prefix))?,
-        "endpoint" => backend.endpoint = value_str(value, &format!("{}.endpoint", prefix))?,
-        "service_name" => {
-            backend.service_name = value_str(value, &format!("{}.service_name", prefix))?
-        }
-        _ => return Err(format!("Unknown backend field: {}", field)),
-    }
     Ok(())
 }
 
@@ -1345,73 +1044,14 @@ fn value_str(v: &serde_json::Value, path: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{}: expected a string", path))
 }
 
-fn value_opt_str(v: &serde_json::Value, path: &str) -> Result<Option<String>, String> {
-    if v.is_null() {
-        Ok(None)
-    } else {
-        value_str(v, path).map(Some)
-    }
-}
-
 fn value_bool(v: &serde_json::Value, path: &str) -> Result<bool, String> {
     v.as_bool()
         .ok_or_else(|| format!("{}: expected a boolean", path))
 }
 
-/// Parse an MCP server's masked map: a JSON object whose values are all
-/// strings. The whole table is replaced; an empty input never reaches here
-/// because the editor skips blank masked fields entirely.
-fn value_secret_map(v: &serde_json::Value, path: &str) -> Result<BTreeMap<String, String>, String> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| format!("{}: expected a JSON object of strings", path))?;
-    let mut map = BTreeMap::new();
-    for (key, value) in obj {
-        let text = value
-            .as_str()
-            .ok_or_else(|| format!("{}.{}: expected a string", path, key))?;
-        map.insert(key.clone(), text.to_string());
-    }
-    Ok(map)
-}
-
-fn value_string_list(v: &serde_json::Value, path: &str) -> Result<Vec<String>, String> {
-    let arr = v
-        .as_array()
-        .ok_or_else(|| format!("{}: expected an array of strings", path))?;
-    arr.iter()
-        .map(|item| {
-            item.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| format!("{}: expected an array of strings", path))
-        })
-        .collect()
-}
-
-fn value_u32(v: &serde_json::Value, path: &str) -> Result<u32, String> {
-    value_u64(v, path)
-        .and_then(|n| u32::try_from(n).map_err(|_| format!("{}: integer out of range", path)))
-}
-
 fn value_u64(v: &serde_json::Value, path: &str) -> Result<u64, String> {
     v.as_u64()
         .ok_or_else(|| format!("{}: expected a non-negative integer", path))
-}
-
-fn value_i64(v: &serde_json::Value, path: &str) -> Result<i64, String> {
-    v.as_i64()
-        .ok_or_else(|| format!("{}: expected an integer", path))
-}
-
-fn value_usize(v: &serde_json::Value, path: &str) -> Result<usize, String> {
-    value_u64(v, path)
-        .and_then(|n| usize::try_from(n).map_err(|_| format!("{}: integer out of range", path)))
-}
-
-fn value_f32(v: &serde_json::Value, path: &str) -> Result<f32, String> {
-    v.as_f64()
-        .map(|f| f as f32)
-        .ok_or_else(|| format!("{}: expected a number", path))
 }
 
 // ── Validation error mapping ──
@@ -1549,33 +1189,23 @@ mod tests {
                     name: "shell".to_string(),
                     enabled: true,
                 }],
-                approval: Default::default(),
+                ..Default::default()
             },
             channels,
             gateway: crate::config::GatewayConfig {
-                owner: Default::default(),
                 cron: CronConfig {
                     enabled: true,
-                    unknown: Default::default(),
+                    ..Default::default()
                 },
                 heartbeat: HeartbeatConfig {
-                    channel: Default::default(),
-                    to: Default::default(),
                     enabled: true,
                     interval_s: 1800,
-                    unknown: Default::default(),
+                    ..Default::default()
                 },
-                dream: DreamConfig::default(),
+                ..Default::default()
             },
             web_fetch: Some(WebFetchConfig::default()),
-            tracing: Default::default(),
-            memory: Default::default(),
-            json_render: Default::default(),
-            subagent: Default::default(),
-            triggers: Default::default(),
-            pressure: Default::default(),
-            mcp: Default::default(),
-            executors: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2590,52 +2220,6 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_accepts_all_schema_scalar_paths() {
-        // Guard against drift between the macro FieldMeta (rendered in the
-        // form) and the patch engine's hand-written field matches: every path
-        // the schema renders must be accepted by `set` (re-applying the
-        // current value is a no-op, so the config must be unchanged).
-        let mut config = make_config();
-        // Mirror Config::load_for_preview so schema values match the
-        // clamp+normalize pipeline (api_url gets derived, etc.).
-        config.clamp();
-        config.normalize();
-        let tree = serialize_schema(&config);
-        let mut ops = Vec::new();
-        for sec in &tree.sections {
-            for f in &sec.fields {
-                if matches!(f.kind.as_str(), "list" | "json" | "secret") {
-                    continue; // display-only kinds / masked values
-                }
-                ops.push(op(PatchOpKind::Set, &f.path, f.value.clone()));
-            }
-            if let Some(items) = &sec.items {
-                for item in items {
-                    for f in &item.fields {
-                        if f.kind == "secret" {
-                            continue;
-                        }
-                        ops.push(op(PatchOpKind::Set, &f.path, f.value.clone()));
-                    }
-                }
-            }
-        }
-        assert!(
-            !ops.is_empty(),
-            "schema must render at least one scalar path"
-        );
-        let mut patched = config.clone();
-        let errors = apply_config_patch(&mut patched, &ops).unwrap();
-        assert!(errors.is_empty());
-        // Re-applying current values is a semantic no-op (Config has no
-        // PartialEq — compare serialized forms instead).
-        assert_eq!(
-            serde_json::to_value(&patched).unwrap(),
-            serde_json::to_value(&config).unwrap()
-        );
-    }
-
-    #[test]
     fn test_patch_serialize_roundtrip_consistent() {
         let mut config = make_config();
         let ops = vec![
@@ -3129,5 +2713,284 @@ mod tests {
         );
         assert_eq!(loaded.mcp.servers[1].args, vec!["-y", "server-fs"]);
         assert_eq!(loaded.agent.provider, config.agent.provider);
+    }
+
+    // ── Derive field coverage ──
+
+    use crate::define_config;
+
+    define_config! {
+        "fixture" => FixtureSection {
+            declared_once: u32 = 5, range(1, 10), desc: "The only declaration of this field",
+        }
+    }
+
+    /// The value the schema renders for `path`, read back from a fresh tree.
+    fn value_at(tree: &SchemaTree, path: &str) -> serde_json::Value {
+        for sec in &tree.sections {
+            for f in &sec.fields {
+                if f.path == path {
+                    return f.value.clone();
+                }
+            }
+            for item in sec.items.iter().flatten() {
+                for f in &item.fields {
+                    if f.path == path {
+                        return f.value.clone();
+                    }
+                }
+            }
+        }
+        panic!("no schema field rendered at {path}")
+    }
+
+    /// Equality that tolerates the `f32` → `f64` widening every float field
+    /// goes through when it is serialized (`0.95` comes back as `0.9499...`).
+    fn same_value(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+        if !(a.is_number() && b.is_number()) {
+            return a == b;
+        }
+        match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => (x - y).abs() <= 1e-6,
+            _ => false,
+        }
+    }
+
+    /// A value that is valid for `field` and differs from its current value,
+    /// or `None` for the display-only kinds (list / json / secret).
+    fn other_value(field: &SchemaField) -> Option<serde_json::Value> {
+        match field.kind.as_str() {
+            "bool" => Some(json!(!field.value.as_bool()?)),
+            "int" => {
+                let current = field.value.as_i64()?;
+                match field.max.as_ref().or(field.min.as_ref()) {
+                    Some(bound) if *bound != field.value => Some(bound.clone()),
+                    _ => Some(json!(current + 1)),
+                }
+            }
+            "float" => {
+                let current = field.value.as_f64()?;
+                match field.max.as_ref().or(field.min.as_ref()) {
+                    Some(bound) if *bound != field.value => Some(bound.clone()),
+                    _ => Some(json!(current + 0.5)),
+                }
+            }
+            "select" => field
+                .allowed
+                .iter()
+                .find(|option| json!(option) != field.value)
+                .map(|option| json!(option)),
+            "string" | "optional_string" => Some(json!("zz")),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_new_scalar_field_single_edit_point() {
+        // The one `define_config!` declaration above is the whole change:
+        // no schema arm, no patch arm, no clamp list to remember. Everything
+        // asserted here is read out of that single line.
+        let defaults = FixtureSection::default();
+        assert_eq!(
+            defaults.declared_once, 5,
+            "default comes from the declaration"
+        );
+        assert_eq!(
+            FixtureSection::defaults()["declared_once"],
+            json!(5),
+            "the rendered default table comes from the same declaration"
+        );
+
+        let mut section_value = FixtureSection {
+            declared_once: 99,
+            ..Default::default()
+        };
+        section_value.clamp();
+        assert_eq!(
+            section_value.declared_once, 10,
+            "constraint comes from range()"
+        );
+
+        crate::config_macro::set_scalar(&mut section_value, "fixture", "declared_once", &json!(7))
+            .unwrap();
+        assert_eq!(
+            section_value.declared_once, 7,
+            "write path comes from the type"
+        );
+
+        let rendered = derived_section::<FixtureSection>("Fixture", &to_value_map(&section_value));
+        assert_eq!(
+            rendered.name, "fixture",
+            "section prefix comes from the declaration"
+        );
+        let f = field(&rendered, "declared_once");
+        assert_eq!(
+            f.path, "fixture.declared_once",
+            "path is composed, never stored twice"
+        );
+        assert_eq!(f.kind, "int");
+        assert_eq!(f.min, Some(json!(1)));
+        assert_eq!(f.max, Some(json!(10)));
+        assert_eq!(f.value, json!(7));
+    }
+
+    #[test]
+    fn test_patch_writes_every_scalar_field() {
+        // Every editable scalar the schema renders must be writable by path
+        // alone. A hand-written field match would silently accept the path and
+        // drop the value for any field nobody remembered to add; the derived
+        // writer makes that impossible, and this test is what proves it.
+        let mut config = make_config();
+        config.clamp();
+        config.normalize();
+        let before = serialize_schema(&config);
+
+        let mut checked = 0usize;
+        let mut rejected: Vec<String> = Vec::new();
+        for sec in &before.sections {
+            let mut paths: Vec<(&String, &SchemaField)> = sec
+                .fields
+                .iter()
+                .map(|f| (&f.path, f))
+                .chain(
+                    sec.items
+                        .iter()
+                        .flatten()
+                        .flat_map(|item| item.fields.iter().map(|f| (&f.path, f))),
+                )
+                .collect();
+            paths.sort_by(|a, b| a.0.cmp(b.0));
+            for (path, f) in paths {
+                let Some(candidate) = other_value(f) else {
+                    continue; // display-only kind: list / json / secret
+                };
+                let mut probe = config.clone();
+                match apply_config_patch(
+                    &mut probe,
+                    &[op(PatchOpKind::Set, path, candidate.clone())],
+                ) {
+                    Err(e) => panic!("schema path {path} must be writable, got: {e}"),
+                    Ok(errors) if !errors.is_empty() => {
+                        // Valid but rejected by Config::validate (the value
+                        // must reference something that exists). Recorded so a
+                        // growing skip list is visible, not silent.
+                        rejected.push(path.clone());
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+                let landed = value_at(&serialize_schema(&probe), path);
+                assert!(
+                    same_value(&landed, &candidate),
+                    "writing {path} did not land: got {landed}, want {candidate}"
+                );
+                checked += 1;
+            }
+        }
+        // A floor, not the contract: it catches a section dropping out of the
+        // rendered tree, which would otherwise shrink this loop silently.
+        assert!(
+            checked >= 60,
+            "expected broad coverage, only checked {checked}"
+        );
+        assert_eq!(
+            rejected,
+            vec!["agent.provider".to_string()],
+            "only the provider pointer is allowed to fail validation"
+        );
+    }
+
+    #[test]
+    fn test_webui_patch_persists_and_applies_after_restart() {
+        // ADR 0002: the editor writes the file, the running process keeps the
+        // config it started with. The effective entry is the one a restart
+        // uses, so both halves are asserted through it, not through a preview.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let path = path.to_str().unwrap();
+        make_config().save(path).unwrap();
+        let store = crate::secrets::SecretStore::empty();
+
+        let live = Config::load_resolved_with(path, &store).unwrap();
+        let mut editing = Config::load_for_preview(path).unwrap();
+        let state = serialize_schema(&editing);
+        assert_eq!(
+            field(section(&state, "agent"), "max_iterations").value,
+            json!(40)
+        );
+
+        let errors = apply_config_patch_with(
+            &mut editing,
+            &[op(PatchOpKind::Set, "agent.max_iterations", json!(55))],
+            &store,
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        editing.save(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "a successful patch save keeps a secret-bearing file owner-only"
+            );
+        }
+
+        assert_eq!(
+            live.agent.max_iterations, 40,
+            "an already-loaded config must not change without a restart"
+        );
+        let restarted = Config::load_resolved_with(path, &store).unwrap();
+        assert_eq!(
+            restarted.agent.max_iterations, 55,
+            "a restart through the effective entry applies the write"
+        );
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(raw["agent"]["max_iterations"], json!(55));
+    }
+
+    #[test]
+    fn test_webui_patch_never_writes_resolved_secrets_back() {
+        // The patch engine resolves secrets on a throwaway candidate purely
+        // to run validation. The file-shaped config keeps its empty api_key
+        // and saving it must not leak the keychain value into config.json.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let path = path.to_str().unwrap();
+        let mut editing = make_config();
+        editing.providers.get_mut("default").unwrap().api_key = String::new();
+        editing.save(path).unwrap();
+
+        let store = crate::secrets::SecretStore::new(vec![(
+            crate::secrets::SourceKind::Keychain,
+            Box::new(crate::secrets::MapSource::new([(
+                crate::secrets::provider_key("default"),
+                "sk-from-keychain",
+            )])),
+        )]);
+        let errors = apply_config_patch_with(
+            &mut editing,
+            &[op(PatchOpKind::Set, "agent.max_iterations", json!(55))],
+            &store,
+        )
+        .unwrap();
+        assert!(errors.is_empty(), "a keychain key must satisfy validation");
+        assert_eq!(
+            editing.providers["default"].api_key, "",
+            "the editor keeps the file shape, not the resolved value"
+        );
+        editing.save(path).unwrap();
+
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(raw["providers"]["default"]["api_key"], json!(""));
+        assert!(!on_disk.contains("sk-from-keychain"));
+
+        let restarted = Config::load_resolved_with(path, &store).unwrap();
+        assert_eq!(restarted.providers["default"].api_key, "sk-from-keychain");
+        assert_eq!(restarted.agent.max_iterations, 55);
     }
 }

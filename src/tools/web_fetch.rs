@@ -474,8 +474,8 @@ impl Tool for WebFetchTool {
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum output length in characters (default 50000)",
-                    "default": 50000
+                    "description": "Maximum output length in characters",
+                    "default": self.max_chars
                 },
                 "extract_mode": {
                     "type": "string",

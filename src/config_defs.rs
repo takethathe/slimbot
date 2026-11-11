@@ -18,6 +18,7 @@ define_config! {
         consolidate_trigger_ratio: f32 = 0.50, range(0.05, 0.95), desc: "Share of the context window that triggers consolidation",
         consolidate_target_ratio: f32 = 0.60, range(0.05, 1.0), desc: "Share of the trigger point consolidation aims to reduce the prompt to",
         summary_ratio: f32 = 0.02, range(0.001, 0.50), desc: "Share of the context window allowed for one consolidation summary",
+        recent_history_ratio: f32 = 0.24, range(0.001, 0.50), desc: "Share of the context window the # Recent History system-prompt section may occupy (tokens, converted to chars)",
         min_keep_messages: usize = 4, range(1, 500), desc: "Floor on how many non-system messages snip keeps",
         keep_recent_tool_results: usize = 10, range(1, 500), desc: "How many recent tool results residual cleanup leaves untouched",
         tool_results_ttl_days: u64 = 7, range(1, 365), desc: "Retention for persisted tool results before Dream sweeps them",
@@ -261,7 +262,6 @@ pub fn approval_field_metas() -> &'static [crate::config_macro::FieldMeta] {
     let level = |name: &'static str, default: &'static str, desc: &'static str| -> FieldMeta {
         FieldMeta {
             name,
-            path: "",
             ty: "String",
             default: serde_json::json!(default),
             min: None,
@@ -300,7 +300,6 @@ pub fn approval_field_metas() -> &'static [crate::config_macro::FieldMeta] {
         ),
         FieldMeta {
             name: "tools",
-            path: "",
             ty: "json",
             default: serde_json::json!({}),
             min: None,
@@ -311,7 +310,6 @@ pub fn approval_field_metas() -> &'static [crate::config_macro::FieldMeta] {
         },
         FieldMeta {
             name: "timeout_seconds",
-            path: "",
             ty: "u64",
             default: serde_json::json!(1800),
             min: Some(serde_json::json!(1)),

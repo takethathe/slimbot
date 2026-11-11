@@ -48,7 +48,7 @@ Message::tool_marked("NOT EXECUTED…".to_string(), "call-id".to_string(), Some(
 pub struct SessionMeta {
     pub last_consolidated_id: usize,           // 已摘要消息的最大 ID
     pub next_message_id: usize,                 // 下一个自增消息 ID
-    pub char_per_token_ratio: f64,              // 平均每 token 字符数（默认 4.0）
+    pub char_per_token_ratio: f64,              // 平均每 token 字符数（默认 3.0）
     pub last_summary: Option<String>,           // 最后一次 consolidate 的摘要
 }
 ```
@@ -71,14 +71,13 @@ pub struct SessionData {
 
 ```rust
 pub struct SessionTask {
-    pub id: String,              // 任务唯一 ID（UUID）
-    pub session_id: String,      // 所属会话 ID
-    pub content: String,         // 任务内容（用户输入）
-    pub hook: TaskHook,          // 状态通知钩子
-    pub state: TaskState,        // 当前状态
-    pub closure: Option<Box<dyn FnOnce() -> BoxFuture + Send>>, // 执行闭包
+    pub id: String,            // 任务唯一 ID（UUID）
+    pub session_id: String,    // 所属会话 ID；SessionManager 据此路由到对应 SessionRunner
+    pub closure: Box<dyn FnOnce() -> BoxFuture + Send>, // 本次 run 本体
 }
 ```
+
+任务就是它的 run：内容、`TaskHook`、运行期状态都在闭包里，队里排的只是「哪个会话 + 怎么跑」。`wrap()` 在闭包外面套一层 `SessionRunner::on_task_complete`，`submit_task()` 只看 `session_id`。
 
 `SessionTaskBuilder::build()` 的执行闭包在 run 结束后除投递常规结果（成功原文 / `Error: …`）外，还按 `AgentResult.provider_error` 的分类做路由（票 19）：`AuthQuota` → 经 `resolve_target(…, owner_primary)` 发出合并去重的 owner 告警（`src/owner_alert.rs`）；`ContextLength` → `Consolidator::force_consolidate` 腾出窗口。两者只携带结构化分类结果，原始响应体不落 session/日志。
 
@@ -271,7 +270,7 @@ JSONL 文件中每条消息携带 `id` 字段（通过 serde flatten 嵌入）�
 estimated_tokens = total_chars / char_per_token_ratio
 ```
 
-`char_per_token_ratio` 默认 `4.0`（4 字符/token），`Session::update_token_ratio()` 在每次 LLM 调用后根据实际 prompt tokens 更新该值。
+`char_per_token_ratio` 默认 `3.0`（3 字符/token，保守冷启动值；旧的 4.0 已废弃），`Session::update_token_ratio()` 在每次 LLM 调用后根据实际 prompt tokens 更新该值。
 
 ## 并发模型
 

@@ -4,7 +4,12 @@
 
 ## 概述
 
-`AgentRunner` 实现了 ReAct（Reasoning + Acting）循环的核心逻辑，是 SlimBot 与 LLM 交互的引擎。自 phase-hook 重构后，`AgentRunner::run()` 是一个约 80 行的骨架，所有行为通过可插拔的 phase hook 实现。
+`AgentRunner` 实现了 ReAct（Reasoning + Acting）循环的核心逻辑，是 SlimBot 与 LLM 交互的引擎。自 phase-hook 重构后，`AgentRunner::run()` 是一条分阶段的编排骨架（约 500 行），行为通过可插拔的 phase hook 实现。骨架自身只承担四件事：
+
+1. **早返回** — `/stop` sentinel 与运行前取消走 `cancelled_result()`，不进入 hook 管线。
+2. **Run 装配** — 从 `AgentRunner` 借出依赖集合填一个 `RunSpec`，配 `RunState`，进 `with_turn_context` scope。
+3. **ReAct 循环** — 带 `timeout_seconds` 的 deadline 包裹 PreTurn → (PreChat → `provider.chat()` → AfterChat → PreTool → `tool_manager.execute()` → AfterTool → PostIteration)* → AfterTurn（始终执行）。
+4. **收尾** — `message_sent`、根 span 的 usage / 迭代数 / 状态映射。
 
 ## 架构
 
@@ -14,6 +19,7 @@
 src/runner/
 ├── mod.rs               # AgentResult / AgentRunnerBuilder / AgentRunner / run() 骨架
 ├── types.rs             # HookAction / ToolHookAction / HookPosition / RunSpec / RunState
+├── test_support.rs      # RunFixture：唯一一份 Run 级测试夹具（cfg(test)）
 ├── traits.rs            # 7 个 per-phase hook trait
 ├── registry.rs          # HookRegistry（存储 + 执行 + 取消检查）
 ├── tests.rs             # 集成测试
@@ -60,7 +66,7 @@ PreTool hook 特有：
 
 ### 上下文对象
 
-- **`RunSpec`**（不可变）：session_id、content、task_hook、max_iterations、max_tokens、cancel_token、workspace_dir、session_manager、tool_manager、config、memory_service、consolidator、initial_message_count、channel/chat_id、runtime_ctx、approvals（进程级共享的待审批存储）
+- **`RunSpec<'_>`**：一个 run 的 hook 视角。Run 级依赖（session / tool manager、config、pressure anchor、memory、consolidator、tracer、approvals、connectors、max_tokens）**借用** `AgentRunner` 上的那一份，经访问器（`spec.config()`、`spec.approvals()`…）读取，没有逐 turn 的复制；per-turn 输入来自 `RunTurn`（session_id、content、task_hook、channel/chat_id、runtime_ctx），`cancel_token` 与 `initial_message_count` 由 `run()` 在装配后补齐。装配点只有 `AgentRunnerBuilder` 一处；加一个 Run 级依赖 = builder + runner 字段 + 一行转发访问器，不存在第二份赋值。
 - **`RunState`**（可变）：iterations、result、messages、tools、response、tool_results、turn_context、should_exit、rollback_to、extensions
 
 `RunState` 提供类型安全的扩展存储：`set_extension::<T>(key, value)` / `get_extension::<T>(key)`，用于跨 phase 传递自定义数据。
@@ -119,7 +125,7 @@ pub async fn run(&self, content, hook, session_id, _channel_inject, cancel_token
 2. 运行前取消检查 → `cancelled_result`
 3. 记录 `initial_message_count`（用于回滚）
 4. 解析 turn context + 生成 runtime_ctx（每 turn 一次，缓存稳定）
-5. 构建 `RunSpec` + `RunState`，进入 `with_turn_context` scope
+5. 构建 `RunSpec`（借用 runner 的依赖集合，只填 per-turn 输入）+ `RunState`，进入 `with_turn_context` scope
 6. `run_pre_turn()` → 进入循环：
    - 检查 `max_iterations`
    - `run_pre_chat()` → `provider.chat()`（内置）→ `run_after_chat()`

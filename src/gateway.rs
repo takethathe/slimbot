@@ -49,6 +49,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     let config = Arc::new(Config::load_resolved(
         paths.config_path().to_str().unwrap(),
     )?);
+    Config::install(config.as_ref())?;
     let (message_bus, receivers) = MessageBus::new();
     let outbound_rx = receivers.outbound;
     let inbound_rx = receivers.inbound;
@@ -928,7 +929,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = make_test_paths(&tmp);
 
-        let config = Config::load(paths.config_path().to_str().unwrap());
+        let config = Config::load_resolved_with(
+            paths.config_path().to_str().unwrap(),
+            &crate::secrets::SecretStore::empty(),
+        );
         assert!(config.is_ok());
     }
 
@@ -941,7 +945,11 @@ mod tests {
         let trace_path = paths.workspace_dir().join("traces.jsonl");
         std::fs::write(&trace_path, "old span\n").unwrap();
 
-        let config = Config::load(paths.config_path().to_str().unwrap()).unwrap();
+        let config = Config::load_resolved_with(
+            paths.config_path().to_str().unwrap(),
+            &crate::secrets::SecretStore::empty(),
+        )
+        .unwrap();
         // The generated test config has tracing disabled; enable it with a file
         // backend so the resolution finds the default workspace path.
         let trace_paths = crate::agent_loop::resolve_trace_file_paths(

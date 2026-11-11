@@ -307,6 +307,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `consolidate_trigger_ratio` | float | range(0.05, 0.95) | `0.50` | prompt token 超过窗口的该比例时触发会话摘要 |
 | `consolidate_target_ratio` | float | range(0.05, 1.0) | `0.60` | 摘要把 prompt 压到触发点的该比例 |
 | `summary_ratio` | float | range(0.001, 0.50) | `0.02` | 单条摘要允许占窗口的比例（换算为字符） |
+| `recent_history_ratio` | float | range(0.001, 0.50) | `0.24` | system prompt 的 `# Recent History` 段允许占窗口的比例（按会话实测 ratio 换算为字符；固定取最近 50 条不变） |
 | `min_keep_messages` | uint | range(1, 500) | `4` | snip 至少保留的非 system 消息条数（找不到 User 时的兜底） |
 | `keep_recent_tool_results` | uint | range(1, 500) | `10` | 最近多少条工具结果不参与残留清理 |
 | `tool_results_ttl_days` | uint | range(1, 365) | `7` | `tool-results/` 落盘文件的保留天数，由 Dream 成功收尾时清扫（无独立定时器） |
@@ -329,7 +330,7 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 
 **冷启动比例：** 会话还没有真实用量时，字符/ token 换算比例默认取 `3.0`（中英混排的保守值）；首次收到 provider 返回的 `prompt_tokens` 后按会话实测值替换，并随会话元数据持久化。窗口为 `0` 时所有派生长度限制都退化为 `0`，各阶段（截断、清理、摘要）都不动手，而不是瞎猜。
 
-**绝对下限/上限：** 派生值仍会被夹住，避免极小窗口把限制压成不可用的数字——单条工具结果 1,000–64,000 字符、落盘预览 256–8,000 字符、snip 安全余量 128–8,192 token、摘要 256–8,192 字符、记忆文档 512–32,000 字符。
+**绝对下限/上限：** 派生值仍会被夹住，避免极小窗口把限制压成不可用的数字——单条工具结果 1,000–64,000 字符、落盘预览 256–8,000 字符、snip 安全余量 128–8,192 token、摘要 256–8,192 字符、`# Recent History` 段 1,000–32,000 字符、记忆文档 512–32,000 字符。`recent_history_ratio` 的作用范围包括 **system prompt 组装**（不只是截断动作），见 ADR 0013 的 Consequences 补节；窗口为 0 时该段预算为 0，表示「不知道锚、不截断」而非裁成空段。
 
 **两个锚（Dream）：** Dream 读**真实**的 provider/agent 配置（不再有 `AgentConfig::default()` 轻径），但故意保留**两个彼此分离的锚**：
 
@@ -607,7 +608,7 @@ crate 特性（见下方平台限制），v1 尚未启用。
 
 ## 规范化
 
-加载配置后，对每个模块执行 `normalize()` 方法（通过 `Normalizable` trait 实现）：
+加载配置后，`Config::normalize()` 一次完成全部归一化（没有 per-module 钩子，也没有 trait）：
 
 - 空 `agent.provider` → `"default"`
 - 对每个 Provider：
@@ -618,34 +619,13 @@ crate 特性（见下方平台限制），v1 尚未启用。
 
 规范化在 clamp 之后执行，确保归一化过程产生的值也经过约束检查。
 
-## 全局单例与热重载
+## 启动快照（不做热重载）
 
-配置通过全局单例访问：`Config::init(path)` 初始化，`Config::get()` 返回当前配置快照。
+启动时 `Config::load_resolved` 得到唯一生效配置，CLI 与 gateway 各调用一次 `Config::install` 把它装成进程内**不可变快照**；`Config::try_get()` 只读这份快照。没有文件监听、没有订阅者、没有 diff 通知：改动 `config.json` 只在重启后生效（见 `docs/adr/0002`）。
 
-### 文件监听
+需要配置、但构造时只拿到 `workspace_dir` 的消费方（`web_fetch` 工具的 `WebFetchConfig`、快照保留策略的 `pressure`）通过 `try_get()` 读这份快照。没有启动过的进程（单测）拿不到快照，各自回退到文档化默认值。patch 是变更侧入口：只在候选副本上解析密钥用于校验，不写回已解析的值，也不与加载路径合并。
 
-初始化后自动启动文件系统监听（基于 `notify` crate，macOS 使用 FSEvents）。当 `config.json` 被修改时：
-
-1. 重新读取文件，执行 clamp + normalize + 密钥解析 + validate
-2. 计算新旧配置差异（diff），生成 `ConfigChange { paths, old_values, new_values }`
-3. 通知匹配的订阅者（基于路径前缀匹配）
-
-重新读取走的是与启动相同的解析入口，因此 keychain / 环境变量里的密钥在重载时也会
-重新解析（keychain 里轮换了密钥，改一下 `config.json` 触发重载即可生效）。
-
-### 订阅机制
-
-模块可注册回调监听特定配置路径的变化：
-
-```rust
-Config::subscribe("agent", |change| {
-    println!("Agent config changed: {:?}", change.paths);
-});
-```
-
-订阅的路径前缀匹配规则：`"agent"` 会匹配所有以 `agent.` 开头的变更路径（如 `agent.max_iterations`）。
-
-### 向前兼容
+## 向前兼容
 
 未知 JSON 字段通过 `#[serde(flatten)]` 保留在配置的 `unknown` 字段中。这意味着：
 - 未来版本添加的新字段在旧版本加载时不会报错
@@ -655,7 +635,7 @@ Config::subscribe("agent", |change| {
 
 Gateway 模式的 WebUI 提供可视化配置编辑页面（入口 `/config`，从聊天页/查看器页顶部图标进入）。**表单由配置定义自动生成，前端不手写任何配置项**：
 
-- **Schema 自动生成** — 后端把 `define_config!` 宏生成的字段元数据（`FieldMeta`）序列化为 config schema（`src/config_schema.rs::serialize_schema`），前端按 schema 的 `kind` 渲染控件（bool 开关 / int/float 数字框带 min/max / string 文本框带 maxlength / select 下拉 / secret 密码框 / optional_string / 集合编辑器）。新增/修改 Rust 配置字段后表单自动跟随。
+- **Schema 自动生成** — 后端把 `define_config!` 宏生成的字段元数据（`FieldMeta`）序列化为 config schema（`src/config_schema.rs::serialize_schema`），前端按 schema 的 `kind` 渲染控件（bool 开关 / int/float 数字框带 min/max / string 文本框带 maxlength / select 下拉 / secret 密码框 / optional_string / 集合编辑器）。新增/修改 Rust 配置字段后表单**与写入路径**同时自动跟随：patch 写入按 `define_config!` 声明经该结构体自身的 serde 形态落值，没有按字段手写的 setter 分支（`FieldMeta` 也不再保存字段的 dot-path，路径由 section 前缀 + 字段名在渲染处合成一处）。
 - **集合编辑** — `providers`（键值映射，结构化增删改/重命名）、`tracing.backends`（数组）、`mcp.servers`（数组，数字索引）、`tools`（名称下拉 + enabled 开关）、`channels`（enabled 开关 + extra 裸 JSON）。
 - **写入语义** — 提交时把脏字段编译为 `[{op, path, value}]`（`set`/`add`/`remove`，dot-path 如 `agent.max_iterations`、`providers.<name>.temperature`、`gateway.cron.enabled`），服务端读取当前 `config.json` → 应用 patch → 按与 `Config::load` 相同的顺序执行 clamp → normalize → validate → 写回。校验失败**不写盘**，返回逐字段错误供前端高亮。校验用的是“解析链之后”的副本（跟一次真实启动看到的一样），所以 `api_key` 存在 keychain / 环境变量里、文件里留空时，编辑其他字段不会被误报；但写回的仍是文件形态，解析出来的值不会被持久化。未知 JSON 字段在 patch 写入中保留。重命名 provider 时 `add` 操作携带 `from`（源 key），服务端从源条目继承掩码字段（如 `api_key`）与未知字段，避免重命名丢密钥。
 - **密钥保护** — `api_key` 等 `secret` 字段在 schema 中 value 恒为 `null`，绝不回明文；编辑时留空 = 不变，填入新值即轮换密钥。`triggers` 段只列出 `secrets` 集合的名字（`[{name}]`），条目的值是 `secret` 字段，同样恒为 `null`。`mcp` 标量段同样只广告 server 名字，不内联 `servers` 数组。任何 Vec 集合（含 `triggers.secrets`）的掩码字段留空都不会被当成空串提交。

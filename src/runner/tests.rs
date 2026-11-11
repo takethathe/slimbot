@@ -10,7 +10,7 @@ use crate::memory::MemoryService;
 use crate::provider::{FinishReason, LLMResponse, Provider, Usage};
 use crate::session::AgentEvent;
 use crate::session::Content;
-use crate::session::{Message, SessionManager, SessionTask, TaskHook, TaskState};
+use crate::session::{Message, SessionManager, TaskHook, TaskState};
 use crate::tool::{
     Tool, ToolCall, ToolDefinition, ensure_nonempty_tool_result, format_tool_error,
     persist_tool_result, truncate_text_head_tail,
@@ -483,17 +483,6 @@ async fn make_test_env(
     (sm, Arc::new(tm), workspace_dir, ms)
 }
 
-fn make_task(content: &str) -> SessionTask {
-    SessionTask {
-        id: "task-1".to_string(),
-        session_id: "test-session".to_string(),
-        content: content.to_string(),
-        hook: TaskHook::new("test-session"),
-        state: TaskState::Pending,
-        closure: None,
-    }
-}
-
 fn make_runner(
     sm: SharedSessionManager,
     tm: Arc<ToolManager>,
@@ -548,12 +537,13 @@ async fn test_direct_reply_no_tool_calls() {
         },
     }]));
     let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-    let task = make_task("Say hi");
+    let content = "Say hi".to_string();
+    let hook = TaskHook::new("test-session");
 
     let result = runner
         .run(
-            task.content.clone(),
-            task.hook.clone(),
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -605,12 +595,13 @@ async fn test_single_tool_call_with_content() {
         },
     ]));
     let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-    let task = make_task("Run echo");
+    let content = "Run echo".to_string();
+    let hook = TaskHook::new("test-session");
 
     let result = runner
         .run(
-            task.content.clone(),
-            task.hook.clone(),
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -692,12 +683,13 @@ async fn test_multiple_tool_calls_content_preserved() {
         },
     ]));
     let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-    let task = make_task("List and read");
+    let content = "List and read".to_string();
+    let hook = TaskHook::new("test-session");
 
     let result = runner
         .run(
-            task.content.clone(),
-            task.hook.clone(),
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -771,12 +763,13 @@ async fn test_multiple_tool_calls_with_empty_content() {
         },
     ]));
     let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-    let task = make_task("Run two tools");
+    let content = "Run two tools".to_string();
+    let hook = TaskHook::new("test-session");
 
     let result = runner
         .run(
-            task.content.clone(),
-            task.hook.clone(),
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -816,12 +809,13 @@ async fn test_max_iterations_exceeded() {
         std::iter::repeat_n(base_response, 50).collect(),
     ));
     let runner = make_runner(sm.clone(), tm, provider.clone(), wd, ms);
-    let task = make_task("Loop forever");
+    let content = "Loop forever".to_string();
+    let hook = TaskHook::new("test-session");
 
     let result = runner
         .run(
-            task.content.clone(),
-            task.hook.clone(),
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -863,9 +857,8 @@ async fn test_task_state_transitions() {
         },
     ]));
     let runner = make_runner(sm.clone(), tm, provider, wd, ms);
-    let task = make_task("test");
+    let content = "test".to_string();
     let hook = TaskHook::new("test-session").with_status_channel(status_tx);
-    let content = task.content.clone();
 
     let _ = runner
         .run(content, hook, "test-session", None, None, None, None)
@@ -911,9 +904,8 @@ async fn test_agent_event_sequence() {
         },
     ]));
     let runner = make_runner(sm.clone(), tm, provider, wd, ms);
-    let task = make_task("test");
+    let content = "test".to_string();
     let hook = TaskHook::new("test-session").with_events(event_tx);
-    let content = task.content.clone();
 
     let result = runner
         .run(content, hook, "test-session", None, None, None, None)
@@ -985,12 +977,13 @@ async fn test_tool_error_continues_loop() {
         },
     ]));
     let runner = make_runner(sm.clone(), tm, provider, workspace_dir, ms);
-    let task = make_task("test");
+    let content = "test".to_string();
+    let hook = TaskHook::new("test-session");
 
     let result = runner
         .run(
-            task.content.clone(),
-            task.hook.clone(),
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -1021,12 +1014,13 @@ async fn test_persistence_and_reload() {
         usage: Usage::default(),
     }]));
     let runner = make_runner(sm.clone(), tm, provider, wd, ms);
-    let task = make_task("hello");
+    let content = "hello".to_string();
+    let hook = TaskHook::new("test-session");
 
     let result = runner
         .run(
-            task.content.clone(),
-            task.hook.clone(),
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -1269,12 +1263,13 @@ async fn test_runner_persist_long_output() {
     )
     // 4000-token window → 3000 chars per result, so this 20k-char result persists.
     .with_pressure(crate::pressure::PressureAnchor::from_window(4_000));
-    let task = make_task("test persist");
+    let content = "test persist".to_string();
+    let hook = TaskHook::new("test-session");
 
     let result = runner
         .run(
-            task.content.clone(),
-            task.hook.clone(),
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -1824,11 +1819,12 @@ async fn test_snip_truncates_context_before_chat() {
     )
     .with_pressure(crate::pressure::PressureAnchor::from_window(700));
 
-    let task = make_task("new user message");
+    let content = "new user message".to_string();
+    let hook = TaskHook::new("test-session");
     let result = runner
         .run(
-            task.content,
-            task.hook,
+            content.clone(),
+            hook.clone(),
             "test-session",
             None,
             None,
@@ -1861,7 +1857,7 @@ struct OrderRecorder {
 
 #[async_trait]
 impl PreChatHook for OrderRecorder {
-    async fn call(&self, _spec: &RunSpec, _state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, _spec: &RunSpec<'_>, _state: &mut RunState) -> Result<HookAction> {
         self.order.lock().await.push(self.id);
         Ok(HookAction::Continue)
     }
@@ -1874,7 +1870,7 @@ struct AbortPreChatHook {
 
 #[async_trait]
 impl PreChatHook for AbortPreChatHook {
-    async fn call(&self, _spec: &RunSpec, _state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, _spec: &RunSpec<'_>, _state: &mut RunState) -> Result<HookAction> {
         Ok(HookAction::Abort {
             reason: self.reason.clone(),
         })
@@ -1889,7 +1885,7 @@ struct SetExtensionPreChatHook {
 
 #[async_trait]
 impl PreChatHook for SetExtensionPreChatHook {
-    async fn call(&self, _spec: &RunSpec, state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, _spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
         state.set_extension(&self.key, self.value.clone());
         Ok(HookAction::Continue)
     }
@@ -1903,7 +1899,7 @@ struct ReadExtensionAfterChatHook {
 
 #[async_trait]
 impl AfterChatHook for ReadExtensionAfterChatHook {
-    async fn call(&self, _spec: &RunSpec, state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, _spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
         *self.seen.lock().await = state.get_extension::<String>(&self.key).cloned();
         Ok(HookAction::Continue)
     }
@@ -1918,7 +1914,7 @@ struct SkipPreToolHook {
 impl PreToolHook for SkipPreToolHook {
     async fn call(
         &self,
-        _spec: &RunSpec,
+        _spec: &RunSpec<'_>,
         _state: &mut RunState,
         _tool_call: &ToolCall,
     ) -> Result<ToolHookAction> {
@@ -1937,7 +1933,7 @@ struct AbortPreToolHook {
 impl PreToolHook for AbortPreToolHook {
     async fn call(
         &self,
-        _spec: &RunSpec,
+        _spec: &RunSpec<'_>,
         _state: &mut RunState,
         _tool_call: &ToolCall,
     ) -> Result<ToolHookAction> {
@@ -1954,7 +1950,7 @@ struct RecordingAfterTurnHook {
 
 #[async_trait]
 impl AfterTurnHook for RecordingAfterTurnHook {
-    async fn call(&self, _spec: &RunSpec, _state: &mut RunState) -> Result<()> {
+    async fn call(&self, _spec: &RunSpec<'_>, _state: &mut RunState) -> Result<()> {
         self.invoked
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -1971,7 +1967,7 @@ struct CancellingPreTurnHook {
 
 #[async_trait]
 impl PreTurnHook for CancellingPreTurnHook {
-    async fn call(&self, _spec: &RunSpec, _state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, _spec: &RunSpec<'_>, _state: &mut RunState) -> Result<HookAction> {
         self.ct.cancel();
         Ok(HookAction::Continue)
     }
@@ -1987,7 +1983,7 @@ struct CancellingPreChatHook {
 
 #[async_trait]
 impl PreChatHook for CancellingPreChatHook {
-    async fn call(&self, _spec: &RunSpec, _state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, _spec: &RunSpec<'_>, _state: &mut RunState) -> Result<HookAction> {
         self.ct.cancel();
         Ok(HookAction::Continue)
     }
@@ -2413,7 +2409,7 @@ struct AbortPreTurnHook {
 
 #[async_trait]
 impl PreTurnHook for AbortPreTurnHook {
-    async fn call(&self, _spec: &RunSpec, _state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, _spec: &RunSpec<'_>, _state: &mut RunState) -> Result<HookAction> {
         Ok(HookAction::Abort {
             reason: self.reason.clone(),
         })

@@ -12,20 +12,11 @@ fn test_default_config_structure() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
 
     // Normalize fills in default provider name
@@ -50,20 +41,11 @@ fn test_normalize_fills_empty_agent_provider() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
     config.agent.provider.clear();
 
@@ -76,20 +58,11 @@ fn test_normalize_derives_url_from_base_url() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -110,20 +83,11 @@ fn test_normalize_preserves_existing_api_url() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -143,20 +107,11 @@ fn test_normalize_falls_back_to_default_url_when_no_base() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -176,20 +131,11 @@ fn test_normalize_trailing_slash_stripped_from_base_url() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
 
     let provider = config.providers.get_mut("default").unwrap();
@@ -209,20 +155,11 @@ fn test_normalize_removes_empty_tools_and_channels() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
 
     config.tools.entries.push(ToolEntry {
@@ -254,20 +191,11 @@ fn test_normalize_does_not_touch_api_key() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
 
     config.providers.get_mut("default").unwrap().api_key = "sk-secret".to_string();
@@ -282,20 +210,11 @@ fn test_normalize_max_iterations_and_timeout_via_clamp() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
     config.agent.max_iterations = 0; // below range
     config.agent.timeout_seconds = 0; // below range
@@ -316,20 +235,11 @@ fn test_write_default_config_creates_file() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
     config.save(path).unwrap();
 
@@ -345,20 +255,11 @@ fn test_written_config_is_valid_json() {
     let mut providers = HashMap::new();
     providers.insert("default".to_string(), ProviderConfig::default());
     let config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig::default(),
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
     config.save(path).unwrap();
 
@@ -397,9 +298,6 @@ fn test_normalize_multiple_providers() {
         },
     );
     let mut config = Config {
-        pressure: Default::default(),
-        mcp: Default::default(),
-        executors: Default::default(),
         agent: AgentConfig {
             provider: "siliconflow".to_string(),
             max_iterations: 40,
@@ -408,15 +306,9 @@ fn test_normalize_multiple_providers() {
             unknown: Default::default(),
         },
         providers,
-        tools: Default::default(),
         channels: HashMap::new(),
-        gateway: Default::default(),
         web_fetch: None,
-        tracing: Default::default(),
-        memory: Default::default(),
-        json_render: Default::default(),
-        subagent: Default::default(),
-        triggers: Default::default(),
+        ..Default::default()
     };
 
     config.normalize();

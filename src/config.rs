@@ -1,13 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use notify::Watcher;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::config_normalize::apply_normalize;
 use crate::secrets::SecretStore;
 
 // Re-export for backward compatibility (other modules import these from crate::config)
@@ -246,6 +243,10 @@ impl Config {
             provider.clamp();
         }
         self.tracing.clamp();
+        for backend in self.tracing.backends.iter_mut() {
+            backend.clamp();
+        }
+        self.gateway.owner.clamp();
         self.gateway.cron.clamp();
         self.gateway.heartbeat.clamp();
         self.gateway.dream.clamp();
@@ -254,6 +255,9 @@ impl Config {
         self.subagent.clamp();
         self.executors.clamp();
         self.triggers.clamp();
+        for secret in self.triggers.secrets.iter_mut() {
+            secret.clamp();
+        }
         self.pressure.clamp();
         self.tools.approval.clamp();
         self.mcp.clamp();
@@ -265,8 +269,32 @@ impl Config {
         }
     }
 
+    /// Normalize the parts of the config that have a canonical form.
+    ///
+    /// This is the only normalization step and it runs once, right after
+    /// `clamp()` on the effective load path. A separate module with a trait
+    /// would leave the same rules in two places without adding a seam.
+    /// `api_key` is deliberately untouched: resolving the secret chain is a
+    /// later step on [`Self::load_resolved`], never a normalization.
     pub fn normalize(&mut self) {
-        apply_normalize(self);
+        if self.agent.provider.is_empty() {
+            self.agent.provider = "default".to_string();
+        }
+        for provider in self.providers.values_mut() {
+            if provider.api_url.is_empty() && !provider.base_url.is_empty() {
+                let base = provider.base_url.trim_end_matches('/');
+                provider.api_url = if base.ends_with("/chat/completions") {
+                    base.to_string()
+                } else if base.ends_with("/v1") {
+                    format!("{}/chat/completions", base)
+                } else {
+                    format!("{}/v1/chat/completions", base)
+                };
+            }
+            if provider.api_url.is_empty() {
+                provider.api_url = "https://api.openai.com/v1/chat/completions".to_string();
+            }
+        }
         // Remove entries with empty name/type
         self.tools.entries.retain(|t| !t.name.is_empty());
         self.channels.retain(|name, _| !name.is_empty());
@@ -347,21 +375,20 @@ impl Config {
         Ok(())
     }
 
-    pub fn load(path: &str) -> Result<Self> {
-        let config = Self::read(path)?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// Load config without validation (for setup preview where api_key may be empty).
+    /// Read the file without validation or secret resolution.
+    ///
+    /// A preview of disk state, not an effective config: setup and the WebUI
+    /// editor need to see a file whose `api_key` is empty, or whose provider
+    /// reference is not yet filled in, without `validate()` refusing it.
     pub fn load_for_preview(path: &str) -> Result<Self> {
         Self::read(path)
     }
 
-    /// Load config and resolve every secret-typed field through the chain
-    /// (OS keychain → environment → config file). Production entry point;
-    /// [`Self::load`] stays the plain file reader so previews, the WebUI editor
-    /// and tests never consult the keychain.
+    /// The single effective entry: read → resolve secrets → validate.
+    ///
+    /// Both startup paths (CLI and gateway) go through here. The WebUI editor
+    /// deliberately does not: it patches the file shape and validates a
+    /// resolved *candidate* without writing the resolved values back.
     pub fn load_resolved(path: &str) -> Result<Self> {
         Self::load_resolved_with(path, &SecretStore::system())
     }
@@ -461,23 +488,6 @@ impl Config {
     }
 }
 
-// ── ConfigChange, ConfigValue ──
-
-#[derive(Debug, Clone)]
-pub enum ConfigValue {
-    Str(String),
-    Num(f64),
-    Bool(bool),
-    Object(serde_json::Map<String, serde_json::Value>),
-}
-
-#[derive(Debug, Clone)]
-pub struct ConfigChange {
-    pub paths: Vec<String>,
-    pub old_values: BTreeMap<String, ConfigValue>,
-    pub new_values: BTreeMap<String, ConfigValue>,
-}
-
 /// Channel `extra` field names that are known to hold a credential. The open
 /// `extra` map has no schema to consult, so the list mirrors what the adapters
 /// read: a literal in one of these fields is a raw secret in the config file
@@ -489,262 +499,29 @@ fn is_secret_field_name(key: &str) -> bool {
     )
 }
 
-fn config_value_from_json(v: &serde_json::Value) -> ConfigValue {
-    match v {
-        serde_json::Value::String(s) => ConfigValue::Str(s.clone()),
-        serde_json::Value::Number(n) => ConfigValue::Num(n.as_f64().unwrap_or(0.0)),
-        serde_json::Value::Bool(b) => ConfigValue::Bool(*b),
-        serde_json::Value::Object(m) => ConfigValue::Object(m.clone()),
-        _ => ConfigValue::Str(String::new()),
-    }
-}
+// ── Startup snapshot ──
 
-// ── Global Singleton ──
-
-use std::sync::OnceLock;
-
-static CONFIG_INSTANCE: OnceLock<Arc<RwLock<ConfigInner>>> = OnceLock::new();
-
-/// Subscriber callback for config change notifications.
-type ConfigSubscriber = Arc<dyn Fn(ConfigChange) + Send + Sync>;
-
-struct ConfigInner {
-    config: Config,
-    config_path: String,
-    subscribers: Vec<(String, ConfigSubscriber)>,
-    watcher: Option<notify::RecommendedWatcher>,
-}
+/// The one config the running process was started with (ADR 0002).
+///
+/// Installed once at startup and never mutated afterwards: there is no hot
+/// reload. Consumers built from a path alone (tool factories, the snapshot
+/// store) read it instead of threading a config handle through every
+/// constructor. `None` means no startup happened (unit tests), in which case
+/// those consumers use their documented defaults.
+static STARTUP_CONFIG: OnceLock<Config> = OnceLock::new();
 
 impl Config {
-    pub fn init(path: &str) -> Result<()> {
-        let config = Self::load_resolved(path)?;
-        let inner = Arc::new(RwLock::new(ConfigInner {
-            config,
-            config_path: path.to_string(),
-            subscribers: Vec::new(),
-            watcher: None,
-        }));
-
-        // Start file watcher
-        {
-            let inner_clone = inner.clone();
-            let path_clone = path.to_string();
-            let mut watcher =
-                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                    if let Ok(event) = res
-                        && matches!(event.kind, notify::EventKind::Modify(_))
-                        && let Err(e) = Self::reload_with_inner(&inner_clone)
-                    {
-                        crate::error!("[Config] Reload failed: {}", e);
-                    }
-                })
-                .context("Failed to create config watcher")?;
-
-            watcher
-                .watch(Path::new(&path_clone), notify::RecursiveMode::NonRecursive)
-                .context("Failed to watch config file")?;
-
-            inner.write().watcher = Some(watcher);
-        }
-
-        CONFIG_INSTANCE
-            .set(inner)
-            .map_err(|_| anyhow::anyhow!("Config already initialized"))?;
-        Ok(())
+    /// Install the process-wide startup snapshot, before any tool or service
+    /// is built. A second install is a wiring bug, not a silent overwrite.
+    pub fn install(config: &Config) -> Result<()> {
+        STARTUP_CONFIG
+            .set(config.clone())
+            .map_err(|_| anyhow::anyhow!("startup config already installed"))
     }
 
-    pub fn get() -> Arc<Config> {
-        let inner = CONFIG_INSTANCE
-            .get()
-            .expect("Config not initialized. Call Config::init() first.");
-        Arc::new(inner.read().config.clone())
-    }
-
-    /// Like `get()`, but returns `None` if Config has not been initialized yet.
-    /// Useful in test contexts or during early bootstrap.
-    pub fn try_get() -> Option<Arc<Config>> {
-        CONFIG_INSTANCE
-            .get()
-            .map(|inner| Arc::new(inner.read().config.clone()))
-    }
-
-    pub fn subscribe<F>(path: &str, callback: F)
-    where
-        F: Fn(ConfigChange) + Send + Sync + 'static,
-    {
-        let inner = CONFIG_INSTANCE.get().expect("Config not initialized");
-        inner
-            .write()
-            .subscribers
-            .push((path.to_string(), Arc::new(callback)));
-    }
-
-    fn reload_with_inner(inner: &Arc<RwLock<ConfigInner>>) -> Result<()> {
-        let path = {
-            let guard = inner.read();
-            guard.config_path.clone()
-        };
-
-        // Reload re-resolves the chain, so a key rotated in the keychain or the
-        // environment is picked up without a restart.
-        let new_config = Self::load_resolved(&path)?;
-
-        let change = {
-            let guard = inner.read();
-            Self::compute_diff(&guard.config, &new_config)
-        };
-
-        if change.paths.is_empty() {
-            return Ok(());
-        }
-
-        // Swap
-        {
-            let mut guard = inner.write();
-            guard.config = new_config;
-        }
-
-        // Notify subscribers
-        let subscribers: Vec<_> = {
-            let guard = inner.read();
-            guard.subscribers.clone()
-        };
-
-        for (prefix, callback) in subscribers {
-            let matching: Vec<_> = change
-                .paths
-                .iter()
-                .filter(|p| p.starts_with(&prefix) || prefix.starts_with(p.as_str()))
-                .cloned()
-                .collect();
-            if !matching.is_empty() {
-                // Only include values for paths that matched this subscriber
-                let matching_old: BTreeMap<_, _> = matching
-                    .iter()
-                    .filter_map(|p| change.old_values.get(p).map(|v| (p.clone(), v.clone())))
-                    .collect();
-                let matching_new: BTreeMap<_, _> = matching
-                    .iter()
-                    .filter_map(|p| change.new_values.get(p).map(|v| (p.clone(), v.clone())))
-                    .collect();
-                callback(ConfigChange {
-                    paths: matching,
-                    old_values: matching_old,
-                    new_values: matching_new,
-                });
-            }
-        }
-
-        crate::info!(
-            "[Config] Reloaded config with {} changed paths",
-            change.paths.len()
-        );
-        Ok(())
-    }
-
-    fn compute_diff(old: &Config, new: &Config) -> ConfigChange {
-        let mut paths = Vec::new();
-        let mut old_values = BTreeMap::new();
-        let mut new_values = BTreeMap::new();
-
-        // Diff agent fields — cheap PartialEq check first, serialize only on difference
-        if old.agent != new.agent {
-            Self::diff_json_objects(
-                "agent",
-                &old.agent,
-                &new.agent,
-                &mut paths,
-                &mut old_values,
-                &mut new_values,
-            );
-        }
-
-        // Diff providers — only serialize when a provider actually changed
-        for (name, new_p) in &new.providers {
-            if let Some(old_p) = old.providers.get(name) {
-                if old_p != new_p {
-                    Self::diff_json_objects(
-                        &format!("providers.{}", name),
-                        old_p,
-                        new_p,
-                        &mut paths,
-                        &mut old_values,
-                        &mut new_values,
-                    );
-                }
-            } else {
-                // New provider added
-                let path = format!("providers.{}", name);
-                paths.push(path.clone());
-                new_values.insert(
-                    path,
-                    ConfigValue::Object(
-                        serde_json::to_value(new_p)
-                            .ok()
-                            .and_then(|v| v.as_object().cloned())
-                            .unwrap_or_default(),
-                    ),
-                );
-            }
-        }
-
-        // Diff pressure ratios (window-derived context limits)
-        if old.pressure != new.pressure {
-            Self::diff_json_objects(
-                "pressure",
-                &old.pressure,
-                &new.pressure,
-                &mut paths,
-                &mut old_values,
-                &mut new_values,
-            );
-        }
-
-        // Diff web_fetch config
-        if old.web_fetch != new.web_fetch {
-            Self::diff_json_objects(
-                "web_fetch",
-                &old.web_fetch,
-                &new.web_fetch,
-                &mut paths,
-                &mut old_values,
-                &mut new_values,
-            );
-        }
-
-        ConfigChange {
-            paths,
-            old_values,
-            new_values,
-        }
-    }
-
-    /// Diff two serializable values field-by-field, populating paths and value maps.
-    fn diff_json_objects<T: serde::Serialize>(
-        prefix: &str,
-        old: &T,
-        new: &T,
-        paths: &mut Vec<String>,
-        old_values: &mut BTreeMap<String, ConfigValue>,
-        new_values: &mut BTreeMap<String, ConfigValue>,
-    ) {
-        let old_j = serde_json::to_value(old).unwrap_or_default();
-        let new_j = serde_json::to_value(new).unwrap_or_default();
-        if let (Some(old_obj), Some(new_obj)) = (old_j.as_object(), new_j.as_object()) {
-            for (key, new_val) in new_obj {
-                if !old_obj.get(key).map(|v| v == new_val).unwrap_or(false) {
-                    let path = format!("{}.{}", prefix, key);
-                    paths.push(path.clone());
-                    old_values.insert(
-                        path.clone(),
-                        config_value_from_json(
-                            old_obj.get(key).unwrap_or(&serde_json::Value::Null),
-                        ),
-                    );
-                    new_values.insert(path, config_value_from_json(new_val));
-                }
-            }
-        }
+    /// The installed startup snapshot, or `None` outside a started process.
+    pub fn try_get() -> Option<&'static Config> {
+        STARTUP_CONFIG.get()
     }
 }
 
@@ -1093,7 +870,11 @@ mod tests {
         let path = write_config_file(tmp.path(), "sk-plaintext");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        Config::load(path.to_str().unwrap()).unwrap();
+        Config::load_resolved_with(
+            path.to_str().unwrap(),
+            &crate::secrets::SecretStore::empty(),
+        )
+        .unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -1158,24 +939,6 @@ mod tests {
         cfg.agent.provider = String::new();
         cfg.normalize();
         assert_eq!(cfg.agent.provider, "default");
-    }
-
-    #[test]
-    fn test_config_diff() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.agent.max_iterations = 50;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert_eq!(diff.paths.len(), 1);
-        assert!(diff.paths.iter().any(|p| p.contains("max_iterations")));
-    }
-
-    #[test]
-    fn test_config_diff_no_change() {
-        let cfg = make_test_config();
-        let diff = Config::compute_diff(&cfg, &cfg);
-        assert!(diff.paths.is_empty());
     }
 
     #[test]
@@ -1310,62 +1073,6 @@ mod tests {
         let result = Config::load_for_preview(path.to_str().unwrap());
         // Should either succeed with null ignored or fail gracefully
         assert!(result.is_err() || result.unwrap().providers.contains_key("default"));
-    }
-
-    #[test]
-    fn test_config_diff_multiple_changes() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.agent.max_iterations = 50;
-        new.agent.timeout_seconds = 200;
-        new.providers.get_mut("default").unwrap().model = "gpt-4-turbo".to_string();
-
-        let diff = Config::compute_diff(&old, &new);
-        assert_eq!(diff.paths.len(), 3);
-    }
-
-    #[test]
-    fn test_config_compute_diff_no_changes() {
-        let cfg = make_test_config();
-        let diff = Config::compute_diff(&cfg, &cfg);
-        assert!(diff.paths.is_empty());
-    }
-
-    #[test]
-    fn test_config_compute_diff_provider_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.get_mut("default").unwrap().temperature = 0.5;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("temperature")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_multiple_providers() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.insert(
-            "secondary".to_string(),
-            crate::config::ProviderConfig {
-                r#type: "openai".to_string(),
-                api_url: "".to_string(),
-                base_url: "https://api.openai.com".to_string(),
-                api_key: "sk-secondary".to_string(),
-                model: "gpt-3.5-turbo".to_string(),
-                temperature: 0.5,
-                max_tokens: 2048,
-                context_window_tokens: 32768,
-                prompt_cache_enabled: false,
-                disable_thinking: false,
-                timeout_seconds: 180,
-                unknown: Default::default(),
-            },
-        );
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
     }
 
     #[test]
@@ -1556,6 +1263,7 @@ mod tests {
         assert_eq!(pressure.consolidate_trigger_ratio, 0.50);
         assert_eq!(pressure.consolidate_target_ratio, 0.60);
         assert_eq!(pressure.summary_ratio, 0.02);
+        assert_eq!(pressure.recent_history_ratio, 0.24);
         assert_eq!(pressure.tool_results_ttl_days, 7);
     }
 
@@ -1669,10 +1377,10 @@ mod tests {
     }
 
     #[test]
-    fn test_tracing_config_clamp_leaves_backend_entries_untouched() {
-        // The config macro clamps struct-level fields only; backend entries
-        // are validated/ignored at tracer construction time (unknown types
-        // are skipped there), not clamped here.
+    fn test_tracing_config_clamp_falls_back_unknown_backend_type() {
+        // Backend entries carry their own constraints, so an unknown type is
+        // replaced by the declared default instead of surviving until tracer
+        // construction silently skips it.
         let config_str = r#"{
             "agent": {"provider": "test"},
             "providers": {"test": {"type": "openai", "api_key": "key", "model": "model"}},
@@ -1682,7 +1390,7 @@ mod tests {
         config.clamp();
         assert!(config.tracing.enabled);
         assert_eq!(config.tracing.backends.len(), 1);
-        assert_eq!(config.tracing.backends[0].r#type, "nope");
+        assert_eq!(config.tracing.backends[0].r#type, "file");
     }
 
     #[test]
@@ -1730,197 +1438,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_compute_diff_with_added_provider() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.insert(
-            "new-provider".to_string(),
-            crate::config::ProviderConfig {
-                r#type: "openai".to_string(),
-                api_url: "".to_string(),
-                base_url: "https://api.openai.com".to_string(),
-                api_key: "sk-new".to_string(),
-                model: "gpt-3.5-turbo".to_string(),
-                temperature: 0.9,
-                max_tokens: 2048,
-                context_window_tokens: 32768,
-                prompt_cache_enabled: false,
-                disable_thinking: false,
-                timeout_seconds: 180,
-                unknown: Default::default(),
-            },
-        );
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-    }
-
-    #[test]
-    fn test_config_compute_diff_agent_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.agent.max_iterations = 100;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("max_iterations")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_timeout_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.agent.timeout_seconds = 240;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("timeout_seconds")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_context_window_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers
-            .get_mut("default")
-            .unwrap()
-            .context_window_tokens = 128000;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(
-            diff.paths
-                .iter()
-                .any(|p| p.contains("context_window_tokens"))
-        );
-    }
-
-    #[test]
-    fn test_config_compute_diff_model_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.get_mut("default").unwrap().model = "gpt-4-turbo".to_string();
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("model")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_api_key_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.get_mut("default").unwrap().api_key = "sk-new-key".to_string();
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("api_key")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_temperature_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.get_mut("default").unwrap().temperature = 0.9;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("temperature")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_max_tokens_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.get_mut("default").unwrap().max_tokens = 8192;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("max_tokens")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_base_url_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.get_mut("default").unwrap().base_url = "https://custom.api.com".to_string();
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("base_url")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_prompt_cache_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers
-            .get_mut("default")
-            .unwrap()
-            .prompt_cache_enabled = false;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(
-            diff.paths
-                .iter()
-                .any(|p| p.contains("prompt_cache_enabled"))
-        );
-    }
-
-    #[test]
-    fn test_config_compute_diff_provider_type_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.providers.get_mut("default").unwrap().r#type = "anthropic".to_string();
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("type")));
-    }
-
-    #[test]
-    fn test_config_compute_diff_persist_tool_results_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.agent.persist_tool_results = !old.agent.persist_tool_results;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(
-            diff.paths
-                .iter()
-                .any(|p| p.contains("persist_tool_results"))
-        );
-    }
-
-    #[test]
-    fn test_config_compute_diff_pressure_ratio_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.pressure.single_tool_result_ratio = 0.5;
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(
-            diff.paths
-                .iter()
-                .any(|p| p.contains("single_tool_result_ratio"))
-        );
-    }
-
-    #[test]
-    fn test_config_compute_diff_agent_provider_change() {
-        let old = make_test_config();
-        let mut new = make_test_config();
-        new.agent.provider = "secondary".to_string();
-
-        let diff = Config::compute_diff(&old, &new);
-        assert!(!diff.paths.is_empty());
-        assert!(diff.paths.iter().any(|p| p.contains("provider")));
-    }
-
-    #[test]
     fn test_config_save_creates_config_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test-config.json");
@@ -1942,7 +1459,10 @@ mod tests {
         let cfg = make_test_config();
         cfg.save(path.to_str().unwrap()).unwrap();
 
-        let loaded = Config::load(path.to_str().unwrap());
+        let loaded = Config::load_resolved_with(
+            path.to_str().unwrap(),
+            &crate::secrets::SecretStore::empty(),
+        );
         assert!(loaded.is_ok());
         let loaded = loaded.unwrap();
         let validation = loaded.validate();

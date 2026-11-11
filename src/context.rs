@@ -5,6 +5,7 @@ use crate::MemoryCategory;
 use crate::debug;
 use crate::memory::SharedMemory;
 use crate::memory::frontmatter::parse_skill_frontmatter;
+use crate::pressure::{DEFAULT_CHAR_PER_TOKEN_RATIO, PressureAnchor};
 use crate::session::{Content, ContentBlock, Message, MessageMeta, SharedSessionManager};
 use crate::tool::{ToolDefinition, ToolManager};
 
@@ -41,36 +42,24 @@ pub struct RunContext {
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
-/// Maximum tokens allowed for recent history section in system prompt.
-const MAX_HISTORY_TOKENS: u32 = 8_000;
-
-/// Truncate recent history text to fit within token budget.
+/// Truncate the recent-history text to a char budget derived from the anchor.
 ///
-/// Uses `char_per_token_ratio` to estimate tokens. Drops entries from the
-/// front (keeping the most recent) and appends a truncation suffix.
-fn truncate_recent_history(
-    history_text: &str,
-    max_tokens: u32,
-    char_per_token_ratio: f64,
-) -> String {
-    if char_per_token_ratio <= 0.0 {
-        return history_text.to_string();
-    }
-    let estimated_tokens = (history_text.len() as f64 / char_per_token_ratio).ceil() as u32;
-    if estimated_tokens <= max_tokens {
+/// The chars-per-token conversion lives in `pressure::PressureLimits`; this
+/// function only performs the local action (drop lines from the front, keeping
+/// the most recent, then append the suffix). A zero budget means "no anchor
+/// known", in which case the text is left untouched.
+fn truncate_recent_history(history_text: &str, max_chars: usize) -> String {
+    if max_chars == 0 || history_text.len() <= max_chars {
         return history_text.to_string();
     }
 
-    // Drop lines from the front until we fit
     let mut lines: Vec<&str> = history_text.lines().collect();
     let suffix = "\n... (truncated)";
-    let suffix_tokens = (suffix.len() as f64 / char_per_token_ratio).ceil() as u32;
-    let budget = max_tokens.saturating_sub(suffix_tokens);
+    let budget = max_chars.saturating_sub(suffix.len());
 
     while !lines.is_empty() {
         let remaining_text = lines.join("\n");
-        let remaining_tokens = (remaining_text.len() as f64 / char_per_token_ratio).ceil() as u32;
-        if remaining_tokens <= budget {
+        if remaining_text.len() <= budget {
             return format!("{}{}", remaining_text, suffix);
         }
         lines.remove(0);
@@ -112,6 +101,9 @@ pub struct ContextBuilder {
     tool_manager: Arc<ToolManager>,
     workspace_dir: PathBuf,
     memory_service: SharedMemory,
+    /// The only source of length budgets for this builder (ADR 0013). Required
+    /// at construction so a new consumer cannot silently re-derive a local cap.
+    pressure: PressureAnchor,
     /// Gateway connector pool, when any MCP server is configured (ticket 26).
     connectors: Option<Arc<crate::mcp::McpService>>,
 }
@@ -122,12 +114,14 @@ impl ContextBuilder {
         tool_manager: Arc<ToolManager>,
         workspace_dir: PathBuf,
         memory_service: SharedMemory,
+        pressure: PressureAnchor,
     ) -> Self {
         Self {
             session_manager,
             tool_manager,
             workspace_dir,
             memory_service,
+            pressure,
             connectors: None,
         }
     }
@@ -139,10 +133,15 @@ impl ContextBuilder {
     }
 
     /// Build the system prompt string.
+    ///
+    /// `char_per_token_ratio` is the session's measured ruler (or the
+    /// cold-start default); every section length is derived from it and from
+    /// the required [`PressureAnchor`], never from a local constant.
     pub async fn build_system_prompt(
         &self,
         channel: &str,
         session_summary: Option<&str>,
+        char_per_token_ratio: f64,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
@@ -199,7 +198,11 @@ impl ContextBuilder {
                 .map(|e| format!("- [{}] {}", e.timestamp, e.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let capped_text = truncate_recent_history(&history_text, MAX_HISTORY_TOKENS, 4.0);
+            let budget = self
+                .pressure
+                .limits(char_per_token_ratio)
+                .recent_history_chars;
+            let capped_text = truncate_recent_history(&history_text, budget);
             parts.push(format!("# Recent History\n\n{capped_text}"));
         }
 
@@ -300,13 +303,20 @@ impl ContextBuilder {
 
         // Build system prompt. A session-scoped override (subagent runs, whose
         // agent body *is* the prompt) wins over the composed prompt.
-        let system_override = {
+        let (system_override, char_per_token_ratio) = {
             let sm = self.session_manager.lock().await;
-            sm.system_override(session_id)
+            let ratio = sm
+                .get_session_data(session_id)
+                .map(|data| data.char_per_token_ratio)
+                .unwrap_or(DEFAULT_CHAR_PER_TOKEN_RATIO);
+            (sm.system_override(session_id), ratio)
         };
         let system_prompt = match system_override {
             Some(prompt) => prompt,
-            None => self.build_system_prompt(channel, session_summary).await,
+            None => {
+                self.build_system_prompt(channel, session_summary, char_per_token_ratio)
+                    .await
+            }
         };
         let system_message = Message::system(system_prompt);
 
@@ -895,27 +905,22 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_recent_history_to_token_budget() {
-        // Create 100 entries, each ~200 chars
-        let entries: Vec<crate::memory::HistoryEntry> = (0..100)
-            .map(|i| crate::memory::HistoryEntry {
-                timestamp: format!("2026-06-20 12:{:02}", i % 60),
-                content: "x".repeat(200),
-            })
-            .collect();
-        let history_text = entries
-            .iter()
-            .map(|e| format!("- [{}] {}", e.timestamp, e.content))
+    fn test_truncate_recent_history_uses_the_anchor_budget() {
+        let history_text = (0..200)
+            .map(|i| format!("- [2026-06-20 12:00] entry-{i:03}-{}", "x".repeat(300)))
             .collect::<Vec<_>>()
             .join("\n");
-        // Total chars: ~100 * 220 = 22,000 → ~5,500 tokens at ratio 4.0
-        // With 8,000 token limit, should NOT be truncated
-        let truncated = truncate_recent_history(&history_text, 8_000, 4.0);
-        assert_eq!(truncated, history_text);
 
-        // Now with a tighter budget (1,000 tokens), should be truncated
-        let tight = truncate_recent_history(&history_text, 1_000, 4.0);
-        assert!(tight.len() < history_text.len());
-        assert!(tight.contains("truncated"));
+        // A zero budget means "no anchor known": do not act.
+        assert_eq!(truncate_recent_history(&history_text, 0), history_text);
+
+        let budget = PressureAnchor::default().limits(DEFAULT_CHAR_PER_TOKEN_RATIO);
+        let capped = truncate_recent_history(&history_text, budget.recent_history_chars);
+        assert!(capped.len() <= budget.recent_history_chars);
+        assert!(capped.ends_with("... (truncated)"));
+        assert!(
+            capped.contains("entry-199"),
+            "the most recent entry is kept when lines are dropped"
+        );
     }
 }

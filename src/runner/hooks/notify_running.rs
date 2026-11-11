@@ -10,7 +10,7 @@ pub struct NotifyRunningHook;
 
 #[async_trait]
 impl PreTurnHook for NotifyRunningHook {
-    async fn call(&self, spec: &RunSpec, _state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, spec: &RunSpec<'_>, _state: &mut RunState) -> Result<HookAction> {
         let hook = &spec.task_hook;
         hook.notify_status_change(&TaskState::Running {
             current_iteration: 0,
@@ -25,45 +25,15 @@ impl PreTurnHook for NotifyRunningHook {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+
     use std::sync::Arc;
 
-    use tokio::sync::{Mutex, broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc};
 
     use super::*;
-    use crate::memory::MemoryService;
-    use crate::runner::types::RunSpec;
-    use crate::session::{SessionManager, TaskHook};
-    use crate::tool::ToolManager;
+    use crate::runner::test_support::RunFixture;
 
-    fn make_spec(hook: TaskHook) -> RunSpec {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        RunSpec {
-            session_id: "s1".into(),
-            content: "hello".into(),
-            task_hook: hook,
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir,
-            session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
-            tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
-            config: crate::config::AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
-            consolidator: None,
-            initial_message_count: 0,
-            channel: "cli".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-            tracer: None,
-        }
-    }
+    use crate::session::TaskHook;
 
     #[tokio::test]
     async fn test_notify_running_fires_task_started_and_running_state() {
@@ -72,7 +42,8 @@ mod tests {
         let hook = TaskHook::new("s1")
             .with_status_channel(status_tx)
             .with_events(event_tx);
-        let spec = make_spec(hook);
+        let fixture = RunFixture::new();
+        let spec = fixture.spec_with(hook);
 
         let mut state = crate::runner::types::RunState::new(Arc::new(
             crate::tool::TurnContext::new("cli".into(), "c1".into()),

@@ -12,7 +12,7 @@ use crate::tool::{ToolCall, ToolDefinition, ToolManager, TurnContext};
 use crate::trace::Tracer;
 use tokio_util::sync::CancellationToken;
 
-use super::AgentResult;
+use super::{AgentResult, AgentRunner};
 
 /// Flow control returned by phase hooks (PreTurn, PreChat, AfterChat, AfterTool, PostIteration).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,39 +45,40 @@ pub enum HookPosition {
     Insert(usize),
 }
 
-/// Immutable run configuration handed to every hook invocation.
+/// The per-turn inputs: everything a run needs that is not a standing dependency.
 ///
-/// All fields are fixed for the duration of a single `AgentRunner::run()` call.
-#[derive(Clone)]
-pub struct RunSpec {
+/// Assembled in one place (`AgentRunner::run`), so no field here can default to
+/// a value the hooks would mistake for a real one.
+pub struct RunTurn {
+    pub session_id: String,
+    pub content: String,
+    pub task_hook: TaskHook,
+    /// Origin channel, resolved from the session id / injected origin.
+    pub channel: String,
+    /// Origin chat id, resolved from the session id / injected origin.
+    pub chat_id: String,
+    /// Runtime context string generated once per turn for cache stability.
+    pub runtime_ctx: String,
+}
+
+/// The hook-facing view of one run.
+///
+/// The run-level dependency set — managers, config, pressure anchor, stores —
+/// lives on [`AgentRunner`] and is filled in exactly one place, its builder.
+/// This view only *borrows* that set through the accessors below, so a new
+/// dependency never gets copied per turn: it is one builder/runner edit plus one
+/// forwarding accessor, with no second assignment to keep in sync.
+pub struct RunSpec<'a> {
+    /// The runner that assembled this turn; every dependency is read from it.
+    runner: &'a AgentRunner,
     /// The session being run.
     pub session_id: String,
     /// The raw user message that started this turn.
     pub content: String,
     /// The task hook used to fire events and notify status changes.
     pub task_hook: TaskHook,
-    /// Maximum number of ReAct iterations before the run is aborted.
-    pub max_iterations: u32,
-    /// Maximum number of tokens requested per LLM response.
-    pub max_tokens: u32,
     /// Cancellation token; checked before each hook invocation.
     pub cancel_token: Option<CancellationToken>,
-    /// Directory for persisted tool results and workspace files.
-    pub workspace_dir: PathBuf,
-    /// Shared session manager for message persistence.
-    pub session_manager: SharedSessionManager,
-    /// Shared tool manager (read-only access; execution is a framework built-in).
-    pub tool_manager: Arc<ToolManager>,
-    /// Agent configuration snapshot.
-    pub config: AgentConfig,
-    /// Context-pressure anchor for this run (window tokens + ratio table).
-    pub pressure: crate::pressure::PressureAnchor,
-    /// Shared memory store used by the context builder.
-    pub memory_service: SharedMemory,
-    /// Optional consolidator triggered after a successful turn.
-    pub consolidator: Option<Arc<Consolidator>>,
-    /// Optional tracer; when `None` (or with no backends) tracing is a no-op.
-    pub tracer: Option<Arc<Tracer>>,
     /// Message count recorded before this turn, used for rollback on error/cancellation.
     pub initial_message_count: usize,
     /// Origin channel resolved from the session id / injected origin.
@@ -86,21 +87,100 @@ pub struct RunSpec {
     pub chat_id: String,
     /// Runtime context string generated once per turn for cache stability.
     pub runtime_ctx: String,
-    /// The in-memory pending-approval store shared by every run of this
-    /// process (ADR 0011). Never persisted: a restart fails closed.
-    pub approvals: Arc<crate::approval::ApprovalStore>,
-    /// The gateway's MCP connector pool (ticket 26), when any server is
-    /// configured. Scripts reach its tools through the codemode agent entry;
-    /// they are never part of the model's tool schema.
-    pub connectors: Option<Arc<crate::mcp::McpService>>,
 }
 
-impl RunSpec {
+impl<'a> RunSpec<'a> {
+    /// Assemble the per-turn inputs; the dependency set stays on `runner`.
+    pub fn new(runner: &'a AgentRunner, turn: RunTurn) -> Self {
+        Self {
+            runner,
+            session_id: turn.session_id,
+            content: turn.content,
+            task_hook: turn.task_hook,
+            cancel_token: None,
+            initial_message_count: 0,
+            channel: turn.channel,
+            chat_id: turn.chat_id,
+            runtime_ctx: turn.runtime_ctx,
+        }
+    }
+
+    /// The runner this view borrows from (tests compare identity through it).
+    #[cfg(test)]
+    pub(crate) fn runner(&self) -> &'a AgentRunner {
+        self.runner
+    }
+
     /// Returns `true` if the cancellation token has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token
             .as_ref()
             .is_some_and(|ct| ct.is_cancelled())
+    }
+
+    // ── Run-level dependencies: borrowed from the assembly point ──
+
+    /// Agent configuration snapshot.
+    pub fn config(&self) -> &'a AgentConfig {
+        self.runner.config()
+    }
+
+    /// Maximum number of ReAct iterations before the run is aborted.
+    pub fn max_iterations(&self) -> u32 {
+        self.runner.config().max_iterations
+    }
+
+    /// Maximum number of tokens requested per LLM response.
+    pub fn max_tokens(&self) -> u32 {
+        self.runner.max_tokens()
+    }
+
+    /// Context-pressure anchor for this run (window tokens + ratio table).
+    pub fn pressure(&self) -> &'a crate::pressure::PressureAnchor {
+        self.runner.pressure()
+    }
+
+    /// Directory for persisted tool results and workspace files.
+    pub fn workspace_dir(&self) -> &'a PathBuf {
+        self.runner.workspace_dir()
+    }
+
+    /// Shared session manager for message persistence.
+    pub fn session_manager(&self) -> &'a SharedSessionManager {
+        self.runner.session_manager()
+    }
+
+    /// Shared tool manager (read-only access; execution is a framework built-in).
+    pub fn tool_manager(&self) -> &'a Arc<ToolManager> {
+        self.runner.tool_manager()
+    }
+
+    /// Shared memory store used by the context builder.
+    pub fn memory_service(&self) -> &'a SharedMemory {
+        self.runner.memory_service()
+    }
+
+    /// Optional consolidator triggered after a successful turn.
+    pub fn consolidator(&self) -> Option<Arc<Consolidator>> {
+        self.runner.consolidator()
+    }
+
+    /// Optional tracer; when `None` (or with no backends) tracing is a no-op.
+    pub fn tracer(&self) -> Option<Arc<Tracer>> {
+        self.runner.tracer()
+    }
+
+    /// The in-memory pending-approval store shared by every run of this
+    /// process (ADR 0011). Never persisted: a restart fails closed.
+    pub fn approvals(&self) -> &'a Arc<crate::approval::ApprovalStore> {
+        self.runner.approvals()
+    }
+
+    /// The gateway's MCP connector pool (ticket 26), when any server is
+    /// configured. Scripts reach its tools through the codemode agent entry;
+    /// they are never part of the model's tool schema.
+    pub fn connectors(&self) -> Option<Arc<crate::mcp::McpService>> {
+        self.runner.connectors()
     }
 }
 
@@ -169,6 +249,7 @@ impl RunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::test_support::RunFixture;
 
     #[test]
     fn test_run_state_set_get_extension_roundtrip() {
@@ -190,46 +271,14 @@ mod tests {
 
     #[test]
     fn test_run_spec_is_cancelled() {
-        let spec = make_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         assert!(!spec.is_cancelled());
 
         let ct = CancellationToken::new();
-        let mut spec2 = spec.clone();
+        let mut spec2 = fixture.spec();
         spec2.cancel_token = Some(ct.clone());
         ct.cancel();
         assert!(spec2.is_cancelled());
-    }
-
-    fn make_spec() -> RunSpec {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        RunSpec {
-            session_id: "s1".into(),
-            content: "hi".into(),
-            task_hook: TaskHook::new("s1"),
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir: workspace_dir.clone(),
-            session_manager: Arc::new(tokio::sync::Mutex::new(
-                crate::session::SessionManager::new(session_dir).unwrap(),
-            )),
-            tool_manager: Arc::new(ToolManager::new(workspace_dir.clone())),
-            config: AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryService::new(
-                &workspace_dir,
-            ))),
-            consolidator: None,
-            tracer: None,
-            initial_message_count: 0,
-            channel: "webui".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-        }
     }
 }

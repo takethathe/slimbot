@@ -19,6 +19,8 @@ const AGENT_NAME: &str = "slimbot";
 pub(crate) mod gate;
 mod hooks;
 mod registry;
+#[cfg(test)]
+mod test_support;
 mod traits;
 mod types;
 
@@ -27,7 +29,7 @@ pub use traits::{
     AfterChatHook, AfterToolHook, AfterTurnHook, PostIterationHook, PreChatHook, PreToolHook,
     PreTurnHook,
 };
-pub use types::{HookAction, HookPosition, RunSpec, RunState, ToolHookAction};
+pub use types::{HookAction, HookPosition, RunSpec, RunState, RunTurn, ToolHookAction};
 
 /// Max characters for the `args` attribute on tool spans.
 const ARGS_MAX_CHARS: usize = 200;
@@ -402,14 +404,64 @@ impl AgentRunner {
         self
     }
 
+    // ── Run-level dependencies ──
+    //
+    // These are the set a `RunSpec` borrows and hooks read: assembled once by
+    // the builder, never copied per turn.
+
+    pub(crate) fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
+    pub(crate) fn max_tokens(&self) -> u32 {
+        self.max_tokens
+    }
+
+    pub(crate) fn pressure(&self) -> &crate::pressure::PressureAnchor {
+        &self.pressure
+    }
+
+    pub(crate) fn workspace_dir(&self) -> &PathBuf {
+        &self.workspace_dir
+    }
+
+    pub(crate) fn session_manager(&self) -> &SharedSessionManager {
+        &self.session_manager
+    }
+
+    pub(crate) fn tool_manager(&self) -> &Arc<ToolManager> {
+        &self.tool_manager
+    }
+
+    pub(crate) fn memory_service(&self) -> &SharedMemory {
+        &self.memory_service
+    }
+
+    pub(crate) fn approvals(&self) -> &Arc<crate::approval::ApprovalStore> {
+        &self.approvals
+    }
+
+    pub(crate) fn consolidator(&self) -> Option<Arc<Consolidator>> {
+        self.consolidator.clone()
+    }
+
+    pub(crate) fn tracer(&self) -> Option<Arc<Tracer>> {
+        self.tracer.clone()
+    }
+
+    pub(crate) fn connectors(&self) -> Option<Arc<crate::mcp::McpService>> {
+        self.connectors.clone()
+    }
+
     /// Construct a runner with the stock default hooks.
     ///
     /// Existing callers that use `AgentRunner::new` keep working unchanged;
     /// they automatically get the default hook pipeline.
     //
-    // The 8-argument signature is part of the public API (see
+    // The 9-parameter signature is part of the public API (see
     // .scratch/runner-phase-hooks/issues/03: "keep AgentRunner::new()
-    // signature"); a `RunSpec`-style struct would change every call site.
+    // signature"); a struct would change every call site. New callers should
+    // use `builder()`, which is the single assembly point for a run.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tool_manager: Arc<ToolManager>,
@@ -438,8 +490,8 @@ impl AgentRunner {
 
     /// Run a ReAct loop turn against the phase-hook pipeline.
     //
-    // The 8-argument signature is part of the public API used by AgentLoop
-    // and the gateway; grouped params live in `RunSpec` internally.
+    // The signature (7 parameters plus `&self`) is part of the public API used
+    // by AgentLoop and the gateway; per-turn inputs are grouped into `RunSpec`.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
@@ -510,28 +562,21 @@ impl AgentRunner {
             None => CancellationToken::new(),
         };
 
-        let spec = RunSpec {
-            session_id: session_id.to_string(),
-            content,
-            task_hook: hook,
-            max_iterations: self.config.max_iterations,
-            max_tokens: self.max_tokens,
-            cancel_token: Some(run_cancel_token),
-            workspace_dir: self.workspace_dir.clone(),
-            session_manager: self.session_manager.clone(),
-            tool_manager: self.tool_manager.clone(),
-            config: self.config.clone(),
-            pressure: self.pressure.clone(),
-            memory_service: self.memory_service.clone(),
-            consolidator: self.consolidator.clone(),
-            tracer: self.tracer.clone(),
-            initial_message_count,
-            channel: tool_channel.clone(),
-            chat_id: tool_chat_id.clone(),
-            runtime_ctx,
-            approvals: self.approvals.clone(),
-            connectors: self.connectors.clone(),
-        };
+        // One borrow of the runner plus this turn's inputs: the dependency set
+        // is never re-projected, so a new Run-level dependency is a builder edit.
+        let mut spec = RunSpec::new(
+            self,
+            RunTurn {
+                session_id: session_id.to_string(),
+                content,
+                task_hook: hook,
+                channel: tool_channel,
+                chat_id: tool_chat_id,
+                runtime_ctx,
+            },
+        );
+        spec.cancel_token = Some(run_cancel_token);
+        spec.initial_message_count = initial_message_count;
 
         // Scope per-turn state (context + sent_in_turn) via a task-local so that
         // concurrent runs sharing one Arc<ToolManager> each see their own state.
@@ -541,7 +586,9 @@ impl AgentRunner {
         let tool_exec = Arc::new(crate::runner::gate::RunToolExec::new(
             hooks::approval::gate_context(&spec),
         ));
-        let turn = Arc::new(TurnContext::new(tool_channel, tool_chat_id).with_tool_exec(tool_exec));
+        let turn = Arc::new(
+            TurnContext::new(spec.channel.clone(), spec.chat_id.clone()).with_tool_exec(tool_exec),
+        );
         with_turn_context(turn.clone(), async {
             // Every exit must carry the sent_in_turn flag: callers suppress the
             // final response only when the message tool already delivered to the
@@ -558,7 +605,7 @@ impl AgentRunner {
             // longer hang the turn forever. Only the run body is wrapped: the
             // AfterTurn phase below stays outside so rollback/consolidation still
             // happen when the deadline fires.
-            let deadline_secs = self.config.timeout_seconds;
+            let deadline_secs = spec.config().timeout_seconds;
             let body = async {
                 // PreTurn hooks: write the user message and notify the running state.
                 // On abort/error/cancel the entire loop is skipped and we jump to AfterTurn.
@@ -582,8 +629,8 @@ impl AgentRunner {
                 if pre_turn_ok {
                     'outer: loop {
                         // Exceeded max iterations.
-                        if state.iterations >= spec.max_iterations {
-                            let err_msg = format!("Reached max iterations {}", spec.max_iterations);
+                        if state.iterations >= spec.max_iterations() {
+                            let err_msg = format!("Reached max iterations {}", spec.max_iterations());
                             warn_log!("[AgentRunner] {}", err_msg);
                             state.fail(err_msg);
                             break;

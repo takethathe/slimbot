@@ -12,22 +12,22 @@ pub struct GovernanceHook;
 
 #[async_trait]
 impl PreChatHook for GovernanceHook {
-    async fn call(&self, spec: &RunSpec, state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
         let mut all_messages = std::mem::take(&mut state.messages);
 
         // Every length limit below derives from the single window anchor,
         // measured with this session's estimation ratio.
         let limits = spec
-            .pressure
+            .pressure()
             .limits(super::char_per_token_ratio(spec).await);
         // One self-report decides what may be trimmed: the same predicate
         // gates both the full-result cleanup and the length truncation.
-        let exempt = |name: &str| spec.tool_manager.is_context_exempt(name);
+        let exempt = |name: &str| spec.tool_manager().is_context_exempt(name);
 
         // A live pending approval pins its turn to the tail: the model must keep
         // seeing what it is waiting for, so every trim stage below only ever
         // touches the part before the pin (ADR 0011).
-        let live = spec.approvals.live_ids(&spec.session_id);
+        let live = spec.approvals().live_ids(&spec.session_id);
         let pinned_from = crate::approval::protect_start(&all_messages, &live);
         let mut pinned_tail = Vec::new();
         if let Some(start) = pinned_from
@@ -40,16 +40,16 @@ impl PreChatHook for GovernanceHook {
         AgentRunner::drop_orphan_tool_results(&mut all_messages);
         AgentRunner::backfill_missing_tool_results(&mut all_messages);
         all_messages =
-            crate::snip::microcompact(all_messages, &limits, &spec.workspace_dir, &exempt);
+            crate::snip::microcompact(all_messages, &limits, spec.workspace_dir(), &exempt);
         all_messages = crate::snip::apply_tool_result_budget(
             all_messages,
             &limits,
-            &spec.workspace_dir,
+            spec.workspace_dir(),
             &exempt,
         );
 
         // Snip: truncate messages to fit within token budget (stateless, no persistence).
-        all_messages = crate::snip::snip_messages(all_messages, &limits, spec.max_tokens);
+        all_messages = crate::snip::snip_messages(all_messages, &limits, spec.max_tokens());
 
         // Post-snip cleanup: snipping may have created new orphans.
         AgentRunner::drop_orphan_tool_results(&mut all_messages);
@@ -65,45 +65,13 @@ impl PreChatHook for GovernanceHook {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+
     use std::sync::Arc;
 
-    use tokio::sync::Mutex;
-
     use super::*;
-    use crate::memory::MemoryService;
-    use crate::runner::types::RunSpec;
-    use crate::session::{Message, SessionManager, TaskHook};
-    use crate::tool::ToolManager;
+    use crate::runner::test_support::RunFixture;
 
-    fn make_spec() -> RunSpec {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        RunSpec {
-            session_id: "s1".into(),
-            content: "hello".into(),
-            task_hook: TaskHook::new("s1"),
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir,
-            session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
-            tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
-            config: crate::config::AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
-            consolidator: None,
-            initial_message_count: 0,
-            channel: "cli".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-            tracer: None,
-        }
-    }
+    use crate::session::Message;
 
     /// A live pending approval pins the turn that carries it: no trim stage may
     /// compact or drop the guidance result, even when it is old and large
@@ -125,11 +93,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_governance_pins_the_turn_carrying_a_live_approval() {
-        let mut spec = make_spec();
         // A window small enough that the tail alone blows the budget, so the
         // unpinned case really does drop the pending turn.
-        spec.max_tokens = 256;
-        spec.pressure = crate::pressure::PressureAnchor::from_window(1_024);
+        let fixture = RunFixture::builder()
+            .max_tokens(256)
+            .pressure(crate::pressure::PressureAnchor::from_window(1_024))
+            .build();
+        let spec = fixture.spec();
 
         let guidance = format!(
             "NOT EXECUTED: shell needs owner approval. {}",
@@ -197,9 +167,11 @@ mod tests {
         }
 
         // Without a live record, the guidance is compacted away.
-        let mut no_live = make_spec();
-        no_live.max_tokens = 256;
-        no_live.pressure = crate::pressure::PressureAnchor::from_window(1_024);
+        let no_live_fixture = RunFixture::builder()
+            .max_tokens(256)
+            .pressure(crate::pressure::PressureAnchor::from_window(1_024))
+            .build();
+        let no_live = no_live_fixture.spec();
         let mut state = crate::runner::types::RunState::new(Arc::new(
             crate::tool::TurnContext::new("cli".into(), "c1".into()),
         ));
@@ -214,7 +186,7 @@ mod tests {
         );
 
         // With it live, the whole pending turn survives verbatim.
-        spec.approvals.propose(pending_approval());
+        spec.approvals().propose(pending_approval());
         let mut state = crate::runner::types::RunState::new(Arc::new(
             crate::tool::TurnContext::new("cli".into(), "c1".into()),
         ));
@@ -238,7 +210,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_governance_preserves_user_and_system_messages() {
-        let spec = make_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         let mut state = crate::runner::types::RunState::new(Arc::new(
             crate::tool::TurnContext::new("cli".into(), "c1".into()),
         ));

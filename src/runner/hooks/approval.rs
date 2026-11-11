@@ -53,20 +53,20 @@ pub(crate) fn mark_for(state: &RunState, call_id: &str) -> Option<String> {
 }
 
 /// Write one audit event to the trace `approval` span (see `runner::gate`).
-fn audit(spec: &RunSpec, decision: &str, record: &PendingApproval) {
-    crate::runner::gate::audit(spec.tracer.as_ref(), decision, record);
+fn audit(spec: &RunSpec<'_>, decision: &str, record: &PendingApproval) {
+    crate::runner::gate::audit(spec.tracer().as_ref(), decision, record);
 }
 
 /// Snapshot the run's gate inputs; cheap Arc clones, no `RunState` access.
-pub(crate) fn gate_context(spec: &RunSpec) -> GateContext {
+pub(crate) fn gate_context(spec: &RunSpec<'_>) -> GateContext {
     GateContext {
         session_id: spec.session_id.clone(),
         task_hook: spec.task_hook.clone(),
-        tool_manager: spec.tool_manager.clone(),
-        approvals: spec.approvals.clone(),
-        tracer: spec.tracer.clone(),
+        tool_manager: spec.tool_manager().clone(),
+        approvals: spec.approvals().clone(),
+        tracer: spec.tracer().clone(),
         cancel_token: spec.cancel_token.clone(),
-        connectors: spec.connectors.clone(),
+        connectors: spec.connectors().clone(),
     }
 }
 
@@ -75,8 +75,8 @@ pub struct ApprovalTurnStartHook;
 
 #[async_trait]
 impl PreTurnHook for ApprovalTurnStartHook {
-    async fn call(&self, spec: &RunSpec, _state: &mut RunState) -> Result<HookAction> {
-        for record in spec.approvals.begin_turn(&spec.session_id) {
+    async fn call(&self, spec: &RunSpec<'_>, _state: &mut RunState) -> Result<HookAction> {
+        for record in spec.approvals().begin_turn(&spec.session_id) {
             audit(spec, "expired", &record);
         }
         Ok(HookAction::Continue)
@@ -88,8 +88,8 @@ pub struct ApprovalTurnEndHook;
 
 #[async_trait]
 impl AfterTurnHook for ApprovalTurnEndHook {
-    async fn call(&self, spec: &RunSpec, _state: &mut RunState) -> Result<()> {
-        for record in spec.approvals.end_turn(&spec.session_id) {
+    async fn call(&self, spec: &RunSpec<'_>, _state: &mut RunState) -> Result<()> {
+        for record in spec.approvals().end_turn(&spec.session_id) {
             audit(spec, "cleared", &record);
         }
         Ok(())
@@ -101,8 +101,8 @@ pub struct ApprovalContextHook;
 
 #[async_trait]
 impl PreChatHook for ApprovalContextHook {
-    async fn call(&self, spec: &RunSpec, state: &mut RunState) -> Result<HookAction> {
-        let live = spec.approvals.live_ids(&spec.session_id);
+    async fn call(&self, spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
+        let live = spec.approvals().live_ids(&spec.session_id);
         let messages = std::mem::take(&mut state.messages);
         state.messages = merge_approval_rounds(&messages, &live);
         Ok(HookAction::Continue)
@@ -116,7 +116,7 @@ pub struct ApprovalHook;
 impl PreToolHook for ApprovalHook {
     async fn call(
         &self,
-        spec: &RunSpec,
+        spec: &RunSpec<'_>,
         state: &mut RunState,
         tool_call: &ToolCall,
     ) -> Result<ToolHookAction> {
@@ -136,7 +136,7 @@ impl PreToolHook for ApprovalHook {
                 state.should_exit = true;
                 state.result.success = true;
                 state.result.iterations = state.iterations;
-                state.result.content = spec.approvals.pending_list_text(&spec.session_id);
+                state.result.content = spec.approvals().pending_list_text(&spec.session_id);
                 Ok(ToolHookAction::Skip { result })
             }
         }
@@ -159,7 +159,8 @@ mod tests {
     };
     use crate::memory::MemoryService;
     use crate::provider::{FinishReason, LLMResponse, Provider, Usage};
-    use crate::runner::AgentRunnerBuilder;
+    use crate::runner::test_support::default_turn;
+    use crate::runner::{AgentRunner, AgentRunnerBuilder};
     use crate::session::{
         AgentEvent, Message, SessionManager, SharedSessionManager, TaskHook, TurnKind,
     };
@@ -199,9 +200,25 @@ mod tests {
         }
     }
 
+    /// The hook-facing view of one harness turn, from the shared default turn
+    /// (session `s1`, origin `cli:c1`). Takes the pieces separately so a caller
+    /// can still borrow `state` mutably at the same time.
+    fn harness_spec<'a>(
+        runner: &'a AgentRunner,
+        hook: &TaskHook,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> RunSpec<'a> {
+        let mut spec = RunSpec::new(runner, default_turn(hook.clone()));
+        spec.cancel_token = cancel;
+        spec
+    }
+
     struct Harness {
         _tmp: tempfile::TempDir,
-        spec: RunSpec,
+        /// The assembled run every view below borrows from.
+        runner: AgentRunner,
+        hook: TaskHook,
+        cancel: Option<tokio_util::sync::CancellationToken>,
         state: RunState,
         runs: Arc<AtomicUsize>,
         store: Arc<ApprovalStore>,
@@ -253,40 +270,51 @@ mod tests {
                 crate::trace::backends::FileBackend::new(trace_path.to_str().unwrap()).unwrap(),
             )]);
 
-            let spec = RunSpec {
-                session_id: "s1".into(),
-                content: "hi".into(),
-                task_hook: TaskHook::new("s1")
-                    .with_events(event_tx)
-                    .with_turn_kind(kind),
-                max_iterations: 10,
-                max_tokens: 1024,
-                cancel_token: None,
-                workspace_dir: workspace.clone(),
-                session_manager,
-                tool_manager: Arc::new(tools),
-                config: crate::config::AgentConfig::default(),
-                pressure: Default::default(),
-                memory_service: Arc::new(tokio::sync::Mutex::new(MemoryService::new(&workspace))),
-                consolidator: None,
-                tracer: Some(Arc::new(tracer)),
-                initial_message_count: 0,
-                channel: "cli".into(),
-                chat_id: "c1".into(),
-                runtime_ctx: "ctx".into(),
-                approvals: store.clone(),
-                connectors: None,
-            };
+            let hook = TaskHook::new("s1")
+                .with_events(event_tx)
+                .with_turn_kind(kind);
+            let runner = AgentRunnerBuilder::new()
+                .session_manager(session_manager)
+                .tool_manager(Arc::new(tools))
+                .provider(Arc::new(crate::provider::MockProvider::new()))
+                .config(crate::config::AgentConfig::default())
+                .workspace_dir(workspace.clone())
+                .memory_service(Arc::new(tokio::sync::Mutex::new(MemoryService::new(
+                    &workspace,
+                ))))
+                .max_tokens(1024)
+                .tracer(Some(Arc::new(tracer)))
+                .approvals(store.clone())
+                .with_defaults()
+                .build();
             let state = RunState::new(Arc::new(TurnContext::new("cli".into(), "c1".into())));
             Self {
                 _tmp: tmp,
-                spec,
+                runner,
+                hook,
+                cancel: None,
                 state,
                 runs,
                 store,
                 events,
                 trace_path,
             }
+        }
+
+        async fn turn_start(&mut self) {
+            let spec = harness_spec(&self.runner, &self.hook, self.cancel.clone());
+            ApprovalTurnStartHook
+                .call(&spec, &mut self.state)
+                .await
+                .unwrap();
+        }
+
+        async fn turn_end(&mut self) {
+            let spec = harness_spec(&self.runner, &self.hook, self.cancel.clone());
+            ApprovalTurnEndHook
+                .call(&spec, &mut self.state)
+                .await
+                .unwrap();
         }
 
         fn call(&self, id: &str, tool: &str, args: serde_json::Value) -> ToolCall {
@@ -298,8 +326,9 @@ mod tests {
         }
 
         async fn decide(&mut self, call: &ToolCall) -> ToolHookAction {
+            let spec = harness_spec(&self.runner, &self.hook, self.cancel.clone());
             ApprovalHook
-                .call(&self.spec, &mut self.state, call)
+                .call(&spec, &mut self.state, call)
                 .await
                 .unwrap()
         }
@@ -395,7 +424,7 @@ mod tests {
         assert_eq!(pending[0].args_hash, args_hash(&pending[0].args));
         assert_eq!(pending[0].risk, RiskLevel::Exec);
         assert_eq!(pending[0].turn_kind, TurnKind::User);
-        assert_eq!(pending[0].run_id, h.spec.task_hook.run_id());
+        assert_eq!(pending[0].run_id, h.hook.run_id());
         assert_eq!(
             mark_for(&h.state, "tc-1").as_deref(),
             Some(pending[0].approval_id.as_str())
@@ -471,7 +500,7 @@ mod tests {
     async fn propose(h: &mut Harness) -> PendingApproval {
         let call = h.call("tc-1", "shell", json!({"command": "make deploy"}));
         h.decide(&call).await;
-        h.spec.approvals.pending_for("s1")[0].clone()
+        h.store.pending_for("s1")[0].clone()
     }
 
     #[tokio::test]
@@ -503,7 +532,7 @@ mod tests {
         let record = propose(&mut h).await;
 
         // Next turn opens, then the model replays the exact same call.
-        h.spec.approvals.begin_turn("s1");
+        h.store.begin_turn("s1");
         let replay = h.call("tc-9", "shell", json!({"command": "make deploy"}));
         assert_eq!(h.decide(&replay).await, ToolHookAction::Execute);
 
@@ -513,7 +542,7 @@ mod tests {
             "the hook decides; the executor does the running"
         );
         assert!(
-            h.spec.approvals.pending_for("s1").is_empty(),
+            h.store.pending_for("s1").is_empty(),
             "a redeemed record is consumed"
         );
         assert_eq!(h.audit_decisions(), vec!["proposed", "redeemed"]);
@@ -546,7 +575,7 @@ mod tests {
         let mut h = Harness::new(ApprovalConfig::default(), TurnKind::User);
         propose(&mut h).await;
 
-        h.spec.approvals.begin_turn("s1");
+        h.store.begin_turn("s1");
         let replay = h.call("tc-9", "shell", json!({"command": "make destroy"}));
         match h.decide(&replay).await {
             ToolHookAction::Skip { result } => {
@@ -559,7 +588,7 @@ mod tests {
             other => panic!("expected Skip, got {other:?}"),
         }
         assert!(
-            h.spec.approvals.pending_for("s1").is_empty(),
+            h.store.pending_for("s1").is_empty(),
             "a mismatch deletes the record instead of executing anything"
         );
         assert_eq!(h.audit_decisions(), vec!["proposed", "denied_by_policy"]);
@@ -576,7 +605,7 @@ mod tests {
             1_000 + DEFAULT_APPROVAL_TIMEOUT_SECONDS * 1000 + 1,
             Ordering::SeqCst,
         );
-        let expired = h.spec.approvals.begin_turn("s1");
+        let expired = h.store.begin_turn("s1");
         assert_eq!(expired.len(), 1);
 
         let replay = h.call("tc-9", "shell", json!({"command": "make deploy"}));
@@ -597,7 +626,7 @@ mod tests {
     async fn test_approval_hook_stop_in_the_redeem_window_prevents_the_call() {
         let mut h = Harness::new(ApprovalConfig::default(), TurnKind::User);
         propose(&mut h).await;
-        h.spec.approvals.begin_turn("s1");
+        h.store.begin_turn("s1");
 
         // The owner reacts to the broadcast by pressing /stop.
         let mut events = h.events.resubscribe();
@@ -608,7 +637,7 @@ mod tests {
                 token.cancel();
             }
         });
-        h.spec.cancel_token = Some(cancel);
+        h.cancel = Some(cancel);
 
         let replay = h.call("tc-9", "shell", json!({"command": "make deploy"}));
         match h.decide(&replay).await {
@@ -626,26 +655,17 @@ mod tests {
     #[tokio::test]
     async fn test_approval_hook_turn_end_clears_unredeemed_records() {
         let mut h = Harness::new(ApprovalConfig::default(), TurnKind::User);
-        h.spec.approvals.begin_turn("s1");
+        h.store.begin_turn("s1");
         propose(&mut h).await;
 
         // Proposed this turn: it rolls over, it does not vanish.
-        ApprovalTurnEndHook
-            .call(&h.spec, &mut h.state)
-            .await
-            .unwrap();
+        h.turn_end().await;
         assert_eq!(h.store.pending_for("s1").len(), 1);
         assert!(!h.audit_decisions().contains(&"cleared".to_string()));
 
         // Carried and not redeemed: it is cleared at turn end.
-        ApprovalTurnStartHook
-            .call(&h.spec, &mut h.state)
-            .await
-            .unwrap();
-        ApprovalTurnEndHook
-            .call(&h.spec, &mut h.state)
-            .await
-            .unwrap();
+        h.turn_start().await;
+        h.turn_end().await;
         assert!(h.store.pending_for("s1").is_empty());
         assert_eq!(h.audit_decisions(), vec!["proposed", "cleared"]);
     }

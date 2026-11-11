@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
+use slimbot::pressure::PressureAnchor;
 use slimbot::{
     Consolidator, ContextBuilder, FinishReason, LLMResponse, MemoryService, Message, Provider,
     SessionManager, SharedSessionManager, ToolDefinition, ToolManager, Usage,
@@ -151,7 +152,13 @@ async fn test_context_builder_injects_summary() {
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
 
-    let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
+    let cb = ContextBuilder::new(
+        sm.clone(),
+        tm.clone(),
+        workspace_dir.clone(),
+        ms.clone(),
+        PressureAnchor::default(),
+    );
 
     // Without summary
     let ctx = cb.build_messages("s1", "cli", "test", None, None).await;
@@ -199,7 +206,13 @@ async fn test_context_builder_skips_empty_summary() {
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
-    let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
+    let cb = ContextBuilder::new(
+        sm.clone(),
+        tm.clone(),
+        workspace_dir.clone(),
+        ms.clone(),
+        PressureAnchor::default(),
+    );
 
     // Empty summary should not add [Resumed Session] section
     let ctx = cb.build_messages("s1", "cli", "test", Some(""), None).await;
@@ -461,7 +474,13 @@ async fn test_context_builder_uses_summary_from_reloaded_session() {
         ms.lock().await.init().unwrap();
 
         let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
-        let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
+        let cb = ContextBuilder::new(
+            sm.clone(),
+            tm.clone(),
+            workspace_dir.clone(),
+            ms.clone(),
+            PressureAnchor::default(),
+        );
 
         // Get the summary from the reloaded session
         let summary = {

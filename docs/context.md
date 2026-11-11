@@ -49,6 +49,10 @@ system_parts = []
    # Recent History
    - [timestamp] content
    - ...
+   预算 = min(provider 窗口 × pressure.recent_history_ratio, 绝对封顶)，由
+   `PressureAnchor::limits(会话实测 char_per_token_ratio)` 派生（ADR 0013 的
+   第 7 个消费者）；`ContextBuilder::new` 必须传入 anchor，漏传即编译失败。
+   固定 50 条与 `... (truncated)` 后缀不变，窗口为 0 时不截断。
 
 6. 会话摘要（可选，来自 Consolidator 的 last_summary）
    [Archived Context Summary]

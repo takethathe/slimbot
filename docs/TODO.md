@@ -1,5 +1,25 @@
 # TODO
 
+## 架构深化（wayfinder：`.scratch/architecture-deepening/`，2026-11-10 开图）
+
+目的地 = 把 2026-11-10 架构审查的 7 个深化候选变成可实施的优化方案（`spec.md`）。审查报告 `architecture-review-20261110-114957.html` 是临时产物，权威证据以仓库 file:line 为准。8 张票：01 Config field 写侧单一真相源 / 02 Config load 唯一路径 / 03 Derivation anchor 第 7 个消费者 / 04 Run assembly 与 phase hook seam / 05 Gateway 启动接线 / 06 Approval redemption 归拢 / 07 Delivery target depth / 08 文档与验收收口。**01–07 已 resolved**（各含可测试行为点清单：6 / 8 / 8 / 10 / 10 / 11 / 11 条，共 64 条，七张 grilling 票全部收口）；**`spec.md` 已由 `/to-spec` 落稿并标 `ready-for-agent`**（7 处既有 seam）。**`/to-tickets` 已拆出 13 张实现票**：`.scratch/architecture-deepening-impl/issues/01–13`，全部 `ready-for-agent`（编号与 wayfinder 的 01–08 是两套；实现票 01 / 02 / 03 / 04 已 done，frontier 现为 05 / 07 / 11）。Frontier（无阻塞）：wayfinder 图已空，08 保持 open、不 claim（文档回改与门禁由实现票 13 承接）。**实现闸（用户 2026-11-10 设定，当日已逐栏解除）**：`spec.md` 由 `/to-spec` 解除；实现票由 `/to-tickets` + 用户「全按推荐」解除；`src/` 由用户明确「写 src/」解除，实现阶段开始。已复核的真缺陷：`Config::clamp` 漏 3 类（`gateway.owner` / `tracing.backends` / `triggers.secrets`）；`Config::init` 零调用导致 `try_get()` 生产恒 `None`、`WebFetchConfig` 配置实际不生效且 `tools/mod.rs:95` 注释与事实相反；`context.rs:45/202` 自算 8000 token + 废弃 ratio 4.0 违反 ADR 0013（已由实现票 03 修：历史段预算改由 `PressureAnchor` 派生，见 `docs/adr/0013` 的 Consequences 补节）。本 map 只出决策，实现代码走 `/to-tickets` + `/implement`。
+
+- [x] 01 Config field 的写侧单一真相源（grilling，两轮收口，Answer 含 6 条可测试行为点）
+- [x] 02 Config load 唯一路径与行为测试面（grilling，收口，Answer 含 8 条可测试行为点）
+- [x] 03 Derivation anchor 的第 7 个消费者（grilling，收口，Answer 含 8 条可测试行为点）
+- [x] 04 Run assembly 与 phase hook 的 seam 位置（grilling，收口，Answer 含 10 条可测试行为点）
+- [x] 05 Gateway 启动接线的可测 interface（grilling，收口，Answer 含 10 条可测试行为点）
+- [x] 06 Approval redemption 的不变量归拢（grilling，收口，Answer 含 11 条可测试行为点）
+- [x] 07 Delivery target 的 depth（grilling，收口，Answer 含 11 条可测试行为点）
+- [x] `spec.md` 落稿（`/to-spec`，`ready-for-agent`；55 条 User Stories / 64 条行为点 / 7 处 seam）
+- [x] `/to-tickets` 拆出 13 张实现票（`.scratch/architecture-deepening-impl/issues/`，含第 13 张收口票；Q2 新增 `03←01`，保留 `09←06` / `12←06+11`）
+- [x] 实现票 01 Config field 标量派生（2026-11-10 完成：`FieldMeta.path` 删除、`define_config!` 生成 `ScalarConfig`、`set_scalar` 派生写入、`set_path` 退化为按 section 委派、14 个手写 setter 删除；三条行为测试 + 门禁三绿）
+- [x] 实现票 02 Config load 唯一路径（2026-11-11 完成：删 `Config::load` / 热重载设施与 20 个 diff 单测 / `config_normalize.rs` / `notify` 依赖，9 条集成测试迁到 `load_resolved`；启动装配 `install` 一份不可变快照，让 `web_fetch` 与快照保留策略真正读到配置；7 条行为测试 + 门禁三绿）
+- [x] 实现票 03 Recent History 锚定 Derivation anchor（2026-11-11 完成：`pressure.recent_history_ratio` 一处声明派生 default / clamp / schema / patch，`PressureLimits.recent_history_chars` 带 1,000–32,000 字符封顶；`ContextBuilder::new` 必传 `PressureAnchor`、`build_system_prompt` 显式接会话实测 ratio；删 `MAX_HISTORY_TOKENS` 与废弃的 4.0 换算；7 条行为测试 + 门禁三绿）
+- [x] 实现票 04 Run 装配单点与共享 fixture（2026-11-11 完成：`RunSpec` 退化为借用 `AgentRunner` 的视图，20 字段投影消失、Run 级依赖只经访问器读；`gate_context()` 保留为唯一真 seam；`SessionTask` 只剩 id / session_id / closure，三个假值与 `#[allow(dead_code)]` 删除；15 份手抄 `make_spec()` 收敛为 `src/runner/test_support.rs` 的 `RunFixture`；3 条结构锁 + 门禁三绿）
+- [ ] 实现票 05–13（frontier 现为 05 hook 内联与取消映射 / 07 Gateway 快照 / 11 Delivery 来源类别）
+- [ ] 08 文档与验收收口（task，前置票均已 resolved；文档回改 / 门禁 / commit 由实现票 13 承接）
+
 ## trace 本地可观测（2026-11-08 收官）
 
 目的地 = 本地开箱看到所有模型请求和回复，已落地：spec `.scratch/trace-observability/spec.md`，5 张票全部完成（01 setup 默认开 + ADR-0022 / 02 consolidation 进 trace / 03 卡片回复进 trace / 04 OTLP 端到端验证 / 05 文档收口）。关键结果：`setup` 产物 `tracing.enabled=true` + file backend + 默认关闭的 otel backend，`TraceConfig` 默认值仍为关（老配置不被改写）；consolidation 产出 `consolidation → chat ×N`，卡片 `chat` span 记全量回复；`OtelBackend` 对无路径 endpoint 补 `/v1/traces`（导出器不会自动补，原始配置会 POST 到 `/` 被标准 collector 拒绝）；端到端测试用进程内假 collector 钉住 `POST /v1/traces` 与正文通达。仍出 scope：metrics/`/health`、采样、轮转与保留期、正文脱敏、OpenInference 映射、`/traces` 的 Chat 面板、常驻 collector。
@@ -280,7 +300,7 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 - [x] **Phase Hook 管线** — `AgentRunner::run()` 重构为约 80 行骨架，七个 phase（PreTurn/PreChat/AfterChat/PreTool/AfterTool/PostIteration/AfterTurn）通过可插拔 hook 实现，`HookRegistry` 封装存储/执行/取消检查
 - [x] **Hook 注册 API** — builder 支持 `with_defaults()` + 每 phase 的 `add_*` 方法，`HookPosition::{Append, Replace, Insert}` 控制位置（越界退化为 Append）
 - [x] **流程控制** — `HookAction::{Continue, Abort}` / `ToolHookAction::{Execute, Skip, Abort}`，abort 跳转 after_turn，pre_tool 可跳过执行返回合成结果
-- [x] **RunSpec/RunState** — 不可变配置 + 可变状态分离，`RunState` 提供类型安全 `set_extension`/`get_extension` 跨 phase 传数据
+- [x] **RunSpec/RunState** — Run 级依赖与可变状态分离：`RunSpec<'_>` 借用 runner 的依赖集合（实现票 04 后不再逐字段投影），`RunState` 提供类型安全 `set_extension`/`get_extension` 跨 phase 传数据
 - [x] **默认 hook** — 14 个默认 hook 复刻原 run() 全部行为（`src/runner/hooks/` 每 hook 一文件），`AgentRunner::new()` 内部自动注册
 - [x] **取消/回滚语义保留** — after_turn 始终执行（即使取消/出错），LLM 错误/取消回滚到 initial_message_count；PreTurn 阶段取消同样回滚（清除本轮已写入的用户消息，避免会话以未回复的 user 消息结尾）；chat 前增加取消检查，已取消时跳过 LLM 调用并回滚，不浪费请求
 - [x] **测试** — 现有 36 个 runner 测试无修改通过；新增 HookRegistry 单测、每 hook 单测、9 个 hook 行为集成测试
@@ -317,15 +337,10 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 
 - [x] 使用 `define_config!` 宏定义所有可配置项（`AgentConfig`、`ProviderConfig`），自动生成结构体、默认值、clamp 逻辑和 `FieldMeta` 元数据
 - [x] 宏支持多种约束：`range(min, max)` 数值范围、`str_max(n)` 字符串截断、`allowed([...])` 白名单、`allowed_max([...], n)` 白名单+长度、`none` 无限制
-- [x] 配置全局单例：`Config::init(path)` 初始化，`Config::get()` 返回 `Arc<Config>` 快照
-- [x] 文件监听：`notify` crate 监控 config.json 修改，自动重载
-- [x] 热重载 diff 通知：修改后计算新旧配置差异，通过 `Config::subscribe(path, callback)` 通知订阅者
+- [x] 全局单例 / `notify` 文件监听 / diff 订阅：曾实现但从未接线，2026-11-11 由架构深化实现票 02 判定为死代码并删除；改为启动时 `Config::install` 一份不可变快照（ADR 0002 仍不做热重载）
 - [x] `#[serde(flatten)]` 保留未知 JSON 字段，实现向前兼容
-- [x] `Normalizable` trait 提供模块级归一化钩子，在 clamp 后调用
+- [x] 归一化收为 `Config::normalize()` 一个方法（`Normalizable` trait 与单调用方 module 已随票 02 删除）
 - [x] `setup` 命令通过 `AgentConfig::default()` / `ProviderConfig::default()` 生成完整默认配置
-- [ ] 订阅者回调集成到运行时组件（如 gateway 热切换 provider 配置）
-- [ ] `Config::get()` 快照支持 per-provider 按需获取配置（避免全量拷贝）
-- [ ] 配置写保护：运行时通过 API 锁定关键配置，禁止热重载覆盖
 
 ## Heartbeat 机制
 
@@ -361,7 +376,7 @@ Spec 见 `.scratch/webui-trace-viewer/spec.md`。
 - [x] 用最后一次 consolidate 的摘要（`last_summary` 字段）代替所有已 evict 的 message 内容，注入到 system prompt 的 `[Resumed Session]` 段落
 - [x] Consolidate 在 user-turn 边界进行消息驱逐（eviction），保证语义完整性
 - [x] Consolidate 支持会话摘要持久化到 `SessionMeta`，重启后可恢复
-- [x] Consolidate 使用 `char_per_token_ratio` 估算消息 token（`total_chars / prompt_tokens`，默认 4.0）
+- [x] Consolidate 使用 `char_per_token_ratio` 估算消息 token（`total_chars / prompt_tokens`，默认 3.0）
 - [x] Consolidate 失败时降级处理（`archive` 返回错误时静默跳过，不中断主循环）
 - [x] Session 持久化重构：meta 数据单独 `.meta.json` 文件，messages 使用 append-only 写入 JSONL，每条消息自增 ID，consolidation 游标基于 ID 而非数组索引
 - [ ] Agent 可通过工具调用主动读取/搜索/更新记忆

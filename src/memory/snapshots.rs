@@ -111,11 +111,12 @@ pub struct SnapshotStore {
 }
 
 impl SnapshotStore {
-    /// A store for `workspace_dir`, with the policy from the global config.
+    /// A store for `workspace_dir`, with the policy from the startup snapshot.
     ///
-    /// The global lookup mirrors `web_fetch`'s precedent: the file tools are
-    /// constructed from a workspace path only, and threading a config handle
-    /// through every constructor would touch far more call sites than it buys.
+    /// The lookup mirrors `web_fetch`'s precedent: the file tools are built
+    /// from a workspace path only, so the one immutable config installed at
+    /// startup (ADR 0002) supplies the policy. Outside a started process the
+    /// documented defaults apply.
     pub fn new(workspace_dir: &Path) -> Self {
         let policy = match crate::config::Config::try_get() {
             Some(config) => SnapshotPolicy::from_config(&config.pressure),

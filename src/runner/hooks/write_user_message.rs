@@ -10,7 +10,7 @@ pub struct WriteUserMessageHook;
 
 #[async_trait]
 impl PreTurnHook for WriteUserMessageHook {
-    async fn call(&self, spec: &RunSpec, _state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, spec: &RunSpec<'_>, _state: &mut RunState) -> Result<HookAction> {
         // A plain text turn writes `Message::user` (Content::Plain). When the
         // inbound message carried image attachments, the same turn writes a
         // multi-modal message: a leading text block (the caption, which may be
@@ -39,7 +39,7 @@ impl PreTurnHook for WriteUserMessageHook {
                 runtime_content: None,
             }
         };
-        let mut sm = spec.session_manager.lock().await;
+        let mut sm = spec.session_manager().lock().await;
         sm.add_message(&spec.session_id, msg)
             .await
             .map_err(|e| anyhow!("Failed to write user message: {}", e))?;
@@ -49,50 +49,19 @@ impl PreTurnHook for WriteUserMessageHook {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+
     use std::sync::Arc;
 
-    use tokio::sync::Mutex;
-
     use super::*;
-    use crate::memory::MemoryService;
-    use crate::runner::types::RunSpec;
-    use crate::session::{SessionManager, SharedSessionManager, TaskHook};
-    use crate::tool::ToolManager;
+    use crate::runner::test_support::RunFixture;
 
-    fn make_spec() -> RunSpec {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        RunSpec {
-            session_id: "s1".into(),
-            content: "hello".into(),
-            task_hook: TaskHook::new("s1"),
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir,
-            session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
-            tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
-            config: crate::config::AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
-            consolidator: None,
-            initial_message_count: 0,
-            channel: "cli".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-            tracer: None,
-        }
-    }
+    use crate::session::SharedSessionManager;
 
     #[tokio::test]
     async fn test_write_user_message_writes_to_session() {
-        let spec = make_spec();
-        let sm: SharedSessionManager = spec.session_manager.clone();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
+        let sm: SharedSessionManager = spec.session_manager().clone();
         sm.lock().await.get_or_create("s1").await.unwrap();
 
         let mut state = crate::runner::types::RunState::new(Arc::new(
@@ -110,7 +79,8 @@ mod tests {
     async fn test_write_user_message_with_image_writes_multimodal() {
         // An inbound image rides on the hook and lands as a Content::Multi user
         // message: a text block for the caption plus the image block.
-        let mut spec = make_spec();
+        let fixture = RunFixture::new();
+        let mut spec = fixture.spec();
         spec.content = "what is in this photo?".into();
         spec.task_hook =
             spec.task_hook
@@ -119,7 +89,7 @@ mod tests {
                     mime_type: "image/png".into(),
                     base64_data: "AAAA".into(),
                 }]);
-        let sm: SharedSessionManager = spec.session_manager.clone();
+        let sm: SharedSessionManager = spec.session_manager().clone();
         sm.lock().await.get_or_create("s1").await.unwrap();
 
         let mut state = crate::runner::types::RunState::new(Arc::new(

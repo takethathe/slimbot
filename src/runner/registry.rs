@@ -10,7 +10,7 @@ use super::traits::{
 };
 use super::types::{HookAction, HookPosition, RunSpec, RunState, ToolHookAction};
 
-/// Ordered execution for hooks that take `(&RunSpec, &mut RunState)`.
+/// Ordered execution for hooks that take `(&RunSpec<'_>, &mut RunState)`.
 macro_rules! run_ordered {
     ($hooks:expr, $spec:expr, $state:expr) => {{
         let mut action = HookAction::Continue;
@@ -159,7 +159,7 @@ impl HookRegistry {
     /// Run all PreTurn hooks in order. Checks cancellation before each hook.
     pub async fn run_pre_turn(
         &self,
-        spec: &RunSpec,
+        spec: &RunSpec<'_>,
         state: &mut RunState,
     ) -> Result<HookAction, HookRunError> {
         run_ordered!(&self.pre_turn, spec, state)
@@ -168,7 +168,7 @@ impl HookRegistry {
     /// Run all PreChat hooks in order. Checks cancellation before each hook.
     pub async fn run_pre_chat(
         &self,
-        spec: &RunSpec,
+        spec: &RunSpec<'_>,
         state: &mut RunState,
     ) -> Result<HookAction, HookRunError> {
         run_ordered!(&self.pre_chat, spec, state)
@@ -177,7 +177,7 @@ impl HookRegistry {
     /// Run all AfterChat hooks in order. Checks cancellation before each hook.
     pub async fn run_after_chat(
         &self,
-        spec: &RunSpec,
+        spec: &RunSpec<'_>,
         state: &mut RunState,
     ) -> Result<HookAction, HookRunError> {
         run_ordered!(&self.after_chat, spec, state)
@@ -187,7 +187,7 @@ impl HookRegistry {
     /// Checks cancellation before each hook.
     pub async fn run_pre_tool(
         &self,
-        spec: &RunSpec,
+        spec: &RunSpec<'_>,
         state: &mut RunState,
         tool_call: &ToolCall,
     ) -> Result<ToolHookAction, HookRunError> {
@@ -209,7 +209,7 @@ impl HookRegistry {
     /// Run all AfterTool hooks in order. Checks cancellation before each hook.
     pub async fn run_after_tool(
         &self,
-        spec: &RunSpec,
+        spec: &RunSpec<'_>,
         state: &mut RunState,
         tool_call: &ToolCall,
         result: &str,
@@ -220,7 +220,7 @@ impl HookRegistry {
     /// Run all PostIteration hooks in order. Checks cancellation before each hook.
     pub async fn run_post_iteration(
         &self,
-        spec: &RunSpec,
+        spec: &RunSpec<'_>,
         state: &mut RunState,
     ) -> Result<HookAction, HookRunError> {
         run_ordered!(&self.post_iteration, spec, state)
@@ -228,7 +228,7 @@ impl HookRegistry {
 
     /// Run all AfterTurn hooks. Cancellation is NOT checked: cleanup always runs.
     /// Errors from individual hooks are logged and the remaining hooks still execute.
-    pub async fn run_after_turn(&self, spec: &RunSpec, state: &mut RunState) {
+    pub async fn run_after_turn(&self, spec: &RunSpec<'_>, state: &mut RunState) {
         for hook in &self.after_turn {
             if let Err(e) = hook.call(spec, state).await {
                 warn_log!("[HookRegistry] after_turn hook error: {}", e);
@@ -260,6 +260,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+    use crate::runner::test_support::RunFixture;
     use crate::runner::types::RunState;
     use crate::tool::TurnContext;
 
@@ -269,7 +270,11 @@ mod tests {
 
     #[async_trait]
     impl PreChatHook for RecordingHook {
-        async fn call(&self, _spec: &RunSpec, _state: &mut RunState) -> anyhow::Result<HookAction> {
+        async fn call(
+            &self,
+            _spec: &RunSpec<'_>,
+            _state: &mut RunState,
+        ) -> anyhow::Result<HookAction> {
             self.order.fetch_add(1, Ordering::SeqCst);
             Ok(HookAction::Continue)
         }
@@ -279,7 +284,11 @@ mod tests {
 
     #[async_trait]
     impl PreChatHook for AbortingHook {
-        async fn call(&self, _spec: &RunSpec, _state: &mut RunState) -> anyhow::Result<HookAction> {
+        async fn call(
+            &self,
+            _spec: &RunSpec<'_>,
+            _state: &mut RunState,
+        ) -> anyhow::Result<HookAction> {
             Ok(HookAction::Abort {
                 reason: "stop now".to_string(),
             })
@@ -292,44 +301,13 @@ mod tests {
     impl PreToolHook for SkipHook {
         async fn call(
             &self,
-            _spec: &RunSpec,
+            _spec: &RunSpec<'_>,
             _state: &mut RunState,
             _tool_call: &ToolCall,
         ) -> anyhow::Result<ToolHookAction> {
             Ok(ToolHookAction::Skip {
                 result: "cached".to_string(),
             })
-        }
-    }
-
-    fn dummy_spec() -> RunSpec {
-        RunSpec {
-            session_id: "s".into(),
-            content: "c".into(),
-            task_hook: crate::session::TaskHook::new("s"),
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir: std::path::PathBuf::from("/tmp"),
-            session_manager: Arc::new(tokio::sync::Mutex::new(
-                crate::session::SessionManager::new(std::path::PathBuf::from("/tmp/sess")).unwrap(),
-            )),
-            tool_manager: Arc::new(crate::tool::ToolManager::new(std::path::PathBuf::from(
-                "/tmp",
-            ))),
-            config: crate::config::AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(tokio::sync::Mutex::new(crate::memory::MemoryService::new(
-                std::path::Path::new("/tmp"),
-            ))),
-            consolidator: None,
-            initial_message_count: 0,
-            channel: "cli".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-            tracer: None,
         }
     }
 
@@ -360,7 +338,8 @@ mod tests {
             HookPosition::Append,
         );
 
-        let spec = dummy_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         let mut state = dummy_state();
         let action = reg.run_pre_chat(&spec, &mut state).await.unwrap();
         assert_eq!(action, HookAction::Continue);
@@ -386,7 +365,8 @@ mod tests {
             HookPosition::Append,
         );
 
-        let spec = dummy_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         let mut state = dummy_state();
         let action = reg.run_pre_chat(&spec, &mut state).await.unwrap();
         assert_eq!(
@@ -407,7 +387,8 @@ mod tests {
         let mut reg = HookRegistry::new();
         reg.add_pre_tool(Arc::new(SkipHook), HookPosition::Append);
 
-        let spec = dummy_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         let mut state = dummy_state();
         let action = reg
             .run_pre_tool(
@@ -432,7 +413,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_pre_chat_with_empty_registry_returns_continue() {
         let reg = HookRegistry::new();
-        let spec = dummy_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         let mut state = dummy_state();
         let action = reg.run_pre_chat(&spec, &mut state).await.unwrap();
         assert_eq!(action, HookAction::Continue);
@@ -465,7 +447,8 @@ mod tests {
         reg.add_pre_chat(Arc::new(AbortingHook), HookPosition::Append);
         // Insert index 5 (out of bounds) -> append.
         reg.add_pre_chat(Arc::new(AbortingHook), HookPosition::Insert(5));
-        let spec = dummy_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         let mut state = dummy_state();
         let action = reg.run_pre_chat(&spec, &mut state).await.unwrap();
         assert_eq!(
@@ -489,7 +472,8 @@ mod tests {
 
         let ct = tokio_util::sync::CancellationToken::new();
         ct.cancel();
-        let mut spec = dummy_spec();
+        let fixture = RunFixture::new();
+        let mut spec = fixture.spec();
         spec.cancel_token = Some(ct);
         let mut state = dummy_state();
         let err = reg.run_pre_chat(&spec, &mut state).await.unwrap_err();

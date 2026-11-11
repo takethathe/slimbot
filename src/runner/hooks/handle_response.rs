@@ -13,7 +13,7 @@ pub struct HandleResponseHook;
 
 #[async_trait]
 impl AfterChatHook for HandleResponseHook {
-    async fn call(&self, spec: &RunSpec, state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
         let response = state
             .response
             .as_ref()
@@ -43,51 +43,24 @@ impl AfterChatHook for HandleResponseHook {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+
     use std::sync::Arc;
 
-    use tokio::sync::{Mutex, broadcast};
+    use tokio::sync::broadcast;
 
     use super::*;
-    use crate::memory::MemoryService;
-    use crate::provider::{FinishReason, LLMResponse, Usage};
-    use crate::runner::types::RunSpec;
-    use crate::session::{SessionManager, TaskHook};
-    use crate::tool::{ToolCall, ToolManager};
+    use crate::runner::test_support::RunFixture;
 
-    fn make_spec() -> RunSpec {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        RunSpec {
-            session_id: "s1".into(),
-            content: "hello".into(),
-            task_hook: TaskHook::new("s1"),
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir,
-            session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
-            tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
-            config: crate::config::AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
-            consolidator: None,
-            initial_message_count: 0,
-            channel: "cli".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-            tracer: None,
-        }
-    }
+    use crate::provider::{FinishReason, LLMResponse, Usage};
+
+    use crate::session::TaskHook;
+    use crate::tool::ToolCall;
 
     #[tokio::test]
     async fn test_handle_response_no_tool_calls_sets_should_exit() {
         let (event_tx, _) = broadcast::channel::<AgentEvent>(8);
-        let mut spec = make_spec();
+        let fixture = RunFixture::new();
+        let mut spec = fixture.spec();
         spec.task_hook = TaskHook::new("s1").with_events(event_tx);
         let mut state = crate::runner::types::RunState::new(Arc::new(
             crate::tool::TurnContext::new("cli".into(), "c1".into()),
@@ -107,7 +80,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_response_with_tool_calls_does_not_exit() {
-        let spec = make_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         let mut state = crate::runner::types::RunState::new(Arc::new(
             crate::tool::TurnContext::new("cli".into(), "c1".into()),
         ));

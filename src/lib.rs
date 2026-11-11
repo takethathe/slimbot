@@ -11,7 +11,6 @@ pub(crate) mod config;
 pub(crate) mod config_defs;
 pub(crate) mod config_macro;
 pub(crate) mod config_migrate;
-pub(crate) mod config_normalize;
 pub(crate) mod config_schema;
 pub(crate) mod consolidate;
 pub(crate) mod context;
@@ -50,12 +49,11 @@ pub(crate) mod worker;
 pub use approval::{ApprovalConfig, ApprovalStore, ControlLevel, PendingApproval, RiskLevel};
 pub use channel::{Channel, ChannelFactory, ChannelManager, FeishuChannelFactory};
 pub use config::{
-    ChannelConfig, Config, ConfigChange, ConfigValue, CronConfig, DreamConfig, GatewayConfig,
-    HeartbeatConfig, OwnerConfig, ToolEntry, ToolsConfig, TraceBackendEntry, TraceConfig,
-    WebFetchConfig,
+    ChannelConfig, Config, CronConfig, DreamConfig, GatewayConfig, HeartbeatConfig, OwnerConfig,
+    ToolEntry, ToolsConfig, TraceBackendEntry, TraceConfig, WebFetchConfig,
 };
 pub use config_defs::{AgentConfig, PressureConfig, ProviderConfig, SecretEntry, TriggersConfig};
-pub use config_macro::{FieldMeta, Normalizable};
+pub use config_macro::FieldMeta;
 pub use consolidate::Consolidator;
 pub use context::{ContextBuilder, RunContext, build_runtime_context};
 pub use cron::{CronJob, CronPayload, CronSchedule, CronService};

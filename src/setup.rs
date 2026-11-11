@@ -397,9 +397,12 @@ mod tests {
             std::sync::Arc::new(crate::tool::ToolManager::new(workspace.to_path_buf())),
             workspace.to_path_buf(),
             ms.clone(),
+            crate::pressure::PressureAnchor::default(),
         );
 
-        let prompt = cb.build_system_prompt("cli", None).await;
+        let prompt = cb
+            .build_system_prompt("cli", None, crate::pressure::DEFAULT_CHAR_PER_TOKEN_RATIO)
+            .await;
         assert!(prompt.contains("# Available Skills"), "{prompt}");
         assert!(prompt.contains("skills/optional/SKILL.md"), "{prompt}");
         assert!(

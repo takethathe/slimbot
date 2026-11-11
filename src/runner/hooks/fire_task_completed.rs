@@ -14,8 +14,8 @@ pub struct FireTaskCompletedHook;
 
 #[async_trait]
 impl AfterTurnHook for FireTaskCompletedHook {
-    async fn call(&self, spec: &RunSpec, state: &mut RunState) -> Result<()> {
-        let mut sm = spec.session_manager.lock().await;
+    async fn call(&self, spec: &RunSpec<'_>, state: &mut RunState) -> Result<()> {
+        let mut sm = spec.session_manager().lock().await;
         if let Some(limit) = state.rollback_to {
             // Roll back messages added during this turn; do not persist.
             sm.truncate_messages(&spec.session_id, limit).await;
@@ -51,55 +51,26 @@ impl AfterTurnHook for FireTaskCompletedHook {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+
     use std::sync::Arc;
 
-    use tokio::sync::{Mutex, broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc};
 
     use super::*;
-    use crate::memory::MemoryService;
-    use crate::runner::types::RunSpec;
-    use crate::session::{Message, SessionManager, SharedSessionManager, TaskHook};
-    use crate::tool::ToolManager;
+    use crate::runner::test_support::RunFixture;
 
-    fn make_spec() -> RunSpec {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        RunSpec {
-            session_id: "s1".into(),
-            content: "hello".into(),
-            task_hook: TaskHook::new("s1"),
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir,
-            session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
-            tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
-            config: crate::config::AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
-            consolidator: None,
-            initial_message_count: 2,
-            channel: "cli".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-            tracer: None,
-        }
-    }
+    use crate::session::{Message, SharedSessionManager, TaskHook};
 
     #[tokio::test]
     async fn test_fire_task_completed_on_success() {
         let (status_tx, mut status_rx) = mpsc::channel::<(String, TaskState)>(8);
         let (event_tx, mut event_rx) = broadcast::channel::<AgentEvent>(8);
-        let mut spec = make_spec();
+        let fixture = RunFixture::new();
+        let mut spec = fixture.spec();
         spec.task_hook = TaskHook::new("s1")
             .with_status_channel(status_tx)
             .with_events(event_tx);
-        let sm: SharedSessionManager = spec.session_manager.clone();
+        let sm: SharedSessionManager = spec.session_manager().clone();
         sm.lock().await.get_or_create("s1").await.unwrap();
 
         let mut state = crate::runner::types::RunState::new(Arc::new(
@@ -118,8 +89,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_fire_task_completed_persists_session() {
-        let spec = make_spec();
-        let sm: SharedSessionManager = spec.session_manager.clone();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
+        let sm: SharedSessionManager = spec.session_manager().clone();
         sm.lock().await.get_or_create("s1").await.unwrap();
         sm.lock()
             .await
@@ -135,14 +107,15 @@ mod tests {
         FireTaskCompletedHook.call(&spec, &mut state).await.unwrap();
 
         // Session manager persisted the session to its configured session dir.
-        let jsonl = spec.session_manager.lock().await.get_messages("s1").await;
+        let jsonl = spec.session_manager().lock().await.get_messages("s1").await;
         assert_eq!(jsonl.len(), 1);
     }
 
     #[tokio::test]
     async fn test_fire_task_completed_rolls_back_when_requested() {
-        let spec = make_spec();
-        let sm: SharedSessionManager = spec.session_manager.clone();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
+        let sm: SharedSessionManager = spec.session_manager().clone();
         sm.lock().await.get_or_create("s1").await.unwrap();
         // Two pre-existing messages; initial_message_count = 2.
         sm.lock()

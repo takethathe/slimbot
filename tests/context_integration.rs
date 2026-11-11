@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use slimbot::pressure::{DEFAULT_CHAR_PER_TOKEN_RATIO, PressureAnchor};
 use slimbot::{
     ContextBuilder, MemoryService, Message, SessionManager, SharedSessionManager, ToolCall,
     ToolManager, build_runtime_context,
@@ -54,7 +55,13 @@ async fn test_runtime_context_stable_across_iterations() {
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
-    let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
+    let cb = ContextBuilder::new(
+        sm.clone(),
+        tm.clone(),
+        workspace_dir.clone(),
+        ms.clone(),
+        PressureAnchor::default(),
+    );
 
     // Generate runtime_ctx ONCE before the loop (simulating AgentRunner behavior)
     let runtime_ctx = build_runtime_context("webui", "chat-123");
@@ -156,7 +163,13 @@ async fn test_runtime_context_changes_without_pregeneration() {
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
-    let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
+    let cb = ContextBuilder::new(
+        sm.clone(),
+        tm.clone(),
+        workspace_dir.clone(),
+        ms.clone(),
+        PressureAnchor::default(),
+    );
 
     // First call without pre-generated runtime_ctx (None)
     let ctx1 = cb.build_messages("s1", "cli", "test", None, None).await;
@@ -197,7 +210,13 @@ async fn test_runtime_context_uses_pregenerated_timestamp() {
     ms.lock().await.init().unwrap();
 
     let tm = Arc::new(ToolManager::new(workspace_dir.clone()));
-    let cb = ContextBuilder::new(sm.clone(), tm.clone(), workspace_dir.clone(), ms.clone());
+    let cb = ContextBuilder::new(
+        sm.clone(),
+        tm.clone(),
+        workspace_dir.clone(),
+        ms.clone(),
+        PressureAnchor::default(),
+    );
 
     // Generate runtime_ctx and extract its timestamp
     let runtime_ctx = build_runtime_context("cli", "default");
@@ -287,9 +306,12 @@ async fn test_system_prompt_injects_categories_in_order() {
         tm,
         workspace_dir.clone(),
         ms.clone(),
+        PressureAnchor::default(),
     );
 
-    let prompt = cb.build_system_prompt("cli", None).await;
+    let prompt = cb
+        .build_system_prompt("cli", None, DEFAULT_CHAR_PER_TOKEN_RATIO)
+        .await;
 
     let pos_agents = prompt.find("[AGENTS.md] CUSTOM AGENTS").unwrap();
     let pos_soul = prompt.find("[SOUL.md] CUSTOM SOUL").unwrap();
@@ -332,6 +354,7 @@ async fn test_system_prompt_skips_unmodified_templates() {
         tm,
         workspace_dir.clone(),
         ms.clone(),
+        PressureAnchor::default(),
     );
 
     // Write the exact SOUL and Core template content — both must be treated
@@ -356,7 +379,9 @@ async fn test_system_prompt_skips_unmodified_templates() {
         .await
         .unwrap();
 
-    let prompt = cb.build_system_prompt("cli", None).await;
+    let prompt = cb
+        .build_system_prompt("cli", None, DEFAULT_CHAR_PER_TOKEN_RATIO)
+        .await;
     assert!(
         !prompt.contains("[SOUL.md]"),
         "unmodified SOUL template must not be injected"
@@ -398,9 +423,12 @@ async fn test_system_prompt_available_skill_listed() {
         tm,
         workspace_dir.clone(),
         ms.clone(),
+        PressureAnchor::default(),
     );
 
-    let prompt = cb.build_system_prompt("cli", None).await;
+    let prompt = cb
+        .build_system_prompt("cli", None, DEFAULT_CHAR_PER_TOKEN_RATIO)
+        .await;
     assert!(
         prompt.contains("# Available Skills"),
         "available skills header"
@@ -453,9 +481,12 @@ async fn test_system_prompt_layout_unaffected_by_memory_search() {
         tm,
         workspace_dir.clone(),
         ms.clone(),
+        PressureAnchor::default(),
     );
 
-    let prompt = cb.build_system_prompt("cli", None).await;
+    let prompt = cb
+        .build_system_prompt("cli", None, DEFAULT_CHAR_PER_TOKEN_RATIO)
+        .await;
     assert!(
         prompt.contains("# Active Skills\n\n### Skill: required\n\nRequired body"),
         "active skill injection must be byte-identical"

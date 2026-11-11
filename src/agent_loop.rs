@@ -2235,7 +2235,11 @@ mod tests {
         let paths = make_test_paths(tmp);
         let (message_bus, receivers) = MessageBus::new();
         let config = Arc::new(
-            crate::config::Config::load(paths.config_path().to_string_lossy().as_ref()).unwrap(),
+            crate::config::Config::load_resolved_with(
+                paths.config_path().to_string_lossy().as_ref(),
+                &crate::secrets::SecretStore::empty(),
+            )
+            .unwrap(),
         );
         let provider: Arc<dyn Provider> = Arc::new(crate::provider::MockProvider::new());
         let tool_manager = crate::tool::ToolManager::new(paths.workspace_dir().to_path_buf());

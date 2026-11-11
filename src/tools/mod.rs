@@ -91,14 +91,10 @@ pub fn create_tool(name: &str, workspace_dir: &Path) -> Option<Box<dyn Tool>> {
             workspace_dir.to_path_buf(),
         ))),
         "web_fetch" => {
-            // Read WebFetchConfig from the process-wide Config singleton.
-            // Config::init() must be called before tool construction (it is,
-            // in gateway/runner startup). If a caller builds tools before init
-            // (e.g. unit tests), try_get() returns None and the tool falls
-            // back to WebFetchConfig::default() -- safe, but config.json
-            // settings are not applied. Threading &Config through the factory
-            // signature would remove this global, at the cost of changing
-            // ~30 call sites; left as a documented trade-off.
+            // Read WebFetchConfig from the immutable startup snapshot (ADR
+            // 0002): installed once before any tool is built, never hot-
+            // reloaded. Outside a started process (unit tests) there is no
+            // snapshot and the tool keeps its documented defaults.
             let web_fetch_config = match crate::config::Config::try_get() {
                 Some(c) => c.web_fetch.clone(),
                 None => {
@@ -136,6 +132,36 @@ mod tests {
         assert!(!exempt("web_fetch"), "a lost page is only a refetch");
         assert!(!exempt("shell"), "shell output is trimmed under pressure");
         assert!(!exempt("grep"), "grep output is trimmed under pressure");
+    }
+
+    #[test]
+    fn test_config_reaches_web_fetch_and_snapshot_policy() {
+        // ADR 0002: one immutable startup snapshot is installed before any
+        // tool is built. These two consumers used to consult a global that was
+        // never initialized, so non-default `web_fetch` and `pressure` values
+        // were silently ignored in production.
+        let mut config = crate::config::Config::default();
+        config.web_fetch = Some(crate::config::WebFetchConfig {
+            max_chars: 7777,
+            ..Default::default()
+        });
+        config.pressure.memory_snapshot_max = 7;
+        crate::config::Config::install(&config).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = create_tool("web_fetch", tmp.path()).unwrap();
+        assert_eq!(
+            tool.parameters()["properties"]["max_chars"]["default"],
+            serde_json::json!(7777),
+            "create_tool must build web_fetch from the startup snapshot"
+        );
+
+        let store = crate::memory::snapshots::SnapshotStore::new(tmp.path());
+        assert_eq!(
+            store.policy().max_per_document,
+            7,
+            "SnapshotStore::new must read pressure from the startup snapshot"
+        );
     }
 
     #[test]

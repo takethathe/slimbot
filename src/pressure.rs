@@ -44,6 +44,12 @@ pub const MAX_SUMMARY_CHARS: usize = 8_192;
 pub const MIN_MEMORY_DOC_CHARS: usize = 512;
 pub const MAX_MEMORY_DOC_CHARS: usize = 32_000;
 
+/// Absolute clamps for the `# Recent History` section of the system prompt
+/// (chars). The section is assembled, not truncated by a pressure hook, but it
+/// is still a consumer of the one window anchor (ADR 0013).
+pub const MIN_RECENT_HISTORY_CHARS: usize = 1_000;
+pub const MAX_RECENT_HISTORY_CHARS: usize = 32_000;
+
 /// The single window anchor plus the ratio table that hangs off it.
 ///
 /// `Default` is the historical window (32k) with the documented default
@@ -223,6 +229,8 @@ pub struct PressureLimits {
     pub consolidate_target_tokens: u32,
     /// Maximum summary length in chars.
     pub summary_max_chars: usize,
+    /// Maximum length of the `# Recent History` section in chars.
+    pub recent_history_chars: usize,
     /// Floor on how many non-system messages snip keeps.
     pub min_keep_messages: usize,
     /// How many recent tool results residual cleanup leaves untouched.
@@ -257,6 +265,7 @@ impl PressureLimits {
                 consolidate_trigger_tokens: 0,
                 consolidate_target_tokens: 0,
                 summary_max_chars: 0,
+                recent_history_chars: 0,
                 min_keep_messages: config.min_keep_messages,
                 keep_recent_tool_results: config.keep_recent_tool_results,
             };
@@ -296,6 +305,13 @@ impl PressureLimits {
                 ratio,
                 MIN_SUMMARY_CHARS,
                 MAX_SUMMARY_CHARS,
+            ),
+            recent_history_chars: ratio_chars(
+                window_tokens,
+                config.recent_history_ratio,
+                ratio,
+                MIN_RECENT_HISTORY_CHARS,
+                MAX_RECENT_HISTORY_CHARS,
             ),
             min_keep_messages: config.min_keep_messages,
             keep_recent_tool_results: config.keep_recent_tool_results,
@@ -591,5 +607,47 @@ mod tests {
             MAX_MEMORY_DOC_CHARS
         );
         assert_eq!(MemoryDocBudget::derive(0, 0.075, 3.0).doc_tokens, 0);
+    }
+
+    // -- seventh consumer: the system prompt's recent-history section ---------
+
+    #[test]
+    fn test_derive_recent_history_scales_with_window_and_clamps() {
+        let small = PressureAnchor::from_window(32_768).limits(3.0);
+        let large = PressureAnchor::from_window(200_000).limits(3.0);
+        assert!(large.recent_history_chars > small.recent_history_chars);
+        assert_eq!(large.recent_history_chars, MAX_RECENT_HISTORY_CHARS);
+        assert_eq!(small.recent_history_chars, 23_592, "32768 × 0.24 × 3.0");
+    }
+
+    #[test]
+    fn test_derive_recent_history_uses_the_session_ratio() {
+        let anchor = PressureAnchor::from_window(32_768);
+        let measured = anchor.limits(4.0).recent_history_chars;
+        let cold = anchor
+            .limits(DEFAULT_CHAR_PER_TOKEN_RATIO)
+            .recent_history_chars;
+        assert!(measured > cold);
+        assert_eq!(anchor.limits(0.0).recent_history_chars, cold);
+    }
+
+    #[test]
+    fn test_derive_recent_history_honours_the_configured_ratio() {
+        let config = PressureConfig {
+            recent_history_ratio: 0.005,
+            ..Default::default()
+        };
+        let limits = PressureAnchor::new(32_768, config).limits(3.0);
+        assert_eq!(limits.recent_history_chars, MIN_RECENT_HISTORY_CHARS);
+    }
+
+    #[test]
+    fn test_derive_recent_history_zero_window_disables_the_budget() {
+        assert_eq!(
+            PressureAnchor::from_window(0)
+                .limits(3.0)
+                .recent_history_chars,
+            0
+        );
     }
 }

@@ -302,9 +302,9 @@ WebUI 上可视化编辑 slimbot 配置的页面（`/config`），表单由 conf
 _Avoid_: settings page, 设置页
 
 **Config schema**:
-由 `define_config!` 宏生成的字段元数据集合（名称、类型、描述、约束、默认值、是否密钥），是 Config editor 表单的单一数据源。
+由 `define_config!` 宏生成的字段元数据集合（名称、类型、描述、约束、默认值、是否密钥），是 Config field 的唯一权威描述；Config editor 表单与标量字段的读写都从它派生。
 _Avoid_: form spec, 表单定义
 
 **Config field**:
-config schema 中一个可编辑项，对应一份字段元数据。
+config schema 中一个可编辑项，对应一份字段元数据；其路径、类型、约束与默认值只在此声明一次。
 _Avoid_: setting, option

@@ -13,13 +13,13 @@ pub struct PersistAssistantMsgHook;
 
 #[async_trait]
 impl AfterChatHook for PersistAssistantMsgHook {
-    async fn call(&self, spec: &RunSpec, state: &mut RunState) -> Result<HookAction> {
+    async fn call(&self, spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
         let response = state
             .response
             .as_ref()
             .ok_or_else(|| anyhow!("PersistAssistantMsgHook: no response in state"))?;
 
-        let mut sm = spec.session_manager.lock().await;
+        let mut sm = spec.session_manager().lock().await;
         sm.add_message(
             &spec.session_id,
             Message::assistant(
@@ -42,51 +42,21 @@ impl AfterChatHook for PersistAssistantMsgHook {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+
     use std::sync::Arc;
 
-    use tokio::sync::Mutex;
-
     use super::*;
-    use crate::memory::MemoryService;
-    use crate::provider::{FinishReason, LLMResponse, Usage};
-    use crate::runner::types::RunSpec;
-    use crate::session::{SessionManager, SharedSessionManager, TaskHook};
-    use crate::tool::ToolManager;
+    use crate::runner::test_support::RunFixture;
 
-    fn make_spec() -> RunSpec {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        RunSpec {
-            session_id: "s1".into(),
-            content: "hello".into(),
-            task_hook: TaskHook::new("s1"),
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir,
-            session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
-            tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
-            config: crate::config::AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
-            consolidator: None,
-            initial_message_count: 0,
-            channel: "cli".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-            tracer: None,
-        }
-    }
+    use crate::provider::{FinishReason, LLMResponse, Usage};
+
+    use crate::session::SharedSessionManager;
 
     #[tokio::test]
     async fn test_persist_assistant_message_writes_message() {
-        let spec = make_spec();
-        let sm: SharedSessionManager = spec.session_manager.clone();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
+        let sm: SharedSessionManager = spec.session_manager().clone();
         sm.lock().await.get_or_create("s1").await.unwrap();
 
         let mut state = crate::runner::types::RunState::new(Arc::new(
@@ -117,8 +87,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_assistant_message_updates_token_ratio_on_final() {
-        let spec = make_spec();
-        let sm: SharedSessionManager = spec.session_manager.clone();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
+        let sm: SharedSessionManager = spec.session_manager().clone();
         sm.lock().await.get_or_create("s1").await.unwrap();
 
         let mut state = crate::runner::types::RunState::new(Arc::new(

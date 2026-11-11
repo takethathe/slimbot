@@ -16,7 +16,7 @@ pub struct ProcessToolResultHook;
 impl AfterToolHook for ProcessToolResultHook {
     async fn call(
         &self,
-        spec: &RunSpec,
+        spec: &RunSpec<'_>,
         state: &mut RunState,
         tool_call: &ToolCall,
         result: &str,
@@ -27,12 +27,13 @@ impl AfterToolHook for ProcessToolResultHook {
         // preview length are now two separate percentages instead of one field
         // that meant both things at once.
         let limits = spec
-            .pressure
+            .pressure()
             .limits(super::char_per_token_ratio(spec).await);
 
-        let processed = if spec.config.persist_tool_results && limits.single_tool_result_chars > 0 {
+        let processed = if spec.config().persist_tool_results && limits.single_tool_result_chars > 0
+        {
             persist_tool_result(
-                &spec.workspace_dir,
+                spec.workspace_dir(),
                 &tool_call.id,
                 &ensured,
                 limits.single_tool_result_chars,
@@ -54,49 +55,16 @@ impl AfterToolHook for ProcessToolResultHook {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+
     use std::sync::Arc;
 
-    use tokio::sync::Mutex;
-
     use super::*;
-    use crate::memory::MemoryService;
-    use crate::runner::types::RunSpec;
-    use crate::session::{SessionManager, TaskHook};
-    use crate::tool::ToolManager;
-
-    fn make_spec() -> RunSpec {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("sessions");
-        let workspace_dir = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        RunSpec {
-            session_id: "s1".into(),
-            content: "hello".into(),
-            task_hook: TaskHook::new("s1"),
-            max_iterations: 10,
-            max_tokens: 100,
-            cancel_token: None,
-            workspace_dir,
-            session_manager: Arc::new(Mutex::new(SessionManager::new(session_dir).unwrap())),
-            tool_manager: Arc::new(ToolManager::new(PathBuf::from("/tmp"))),
-            config: crate::config::AgentConfig::default(),
-            pressure: Default::default(),
-            memory_service: Arc::new(Mutex::new(MemoryService::new(std::path::Path::new("/tmp")))),
-            consolidator: None,
-            initial_message_count: 0,
-            channel: "cli".into(),
-            chat_id: "c1".into(),
-            runtime_ctx: "ctx".into(),
-            approvals: Default::default(),
-            connectors: None,
-            tracer: None,
-        }
-    }
+    use crate::runner::test_support::RunFixture;
 
     #[tokio::test]
     async fn test_process_tool_result_ensures_nonempty() {
-        let spec = make_spec();
+        let fixture = RunFixture::new();
+        let spec = fixture.spec();
         let mut state = crate::runner::types::RunState::new(Arc::new(
             crate::tool::TurnContext::new("cli".into(), "c1".into()),
         ));
@@ -117,11 +85,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_tool_result_truncates_long_output() {
-        let mut spec = make_spec();
-        // Disable persistence so truncation is exercised directly.
-        spec.config.persist_tool_results = false;
-        // 4000-token window → 1000 tokens per result → 3000 chars.
-        spec.pressure = crate::pressure::PressureAnchor::from_window(4_000);
+        let fixture = RunFixture::builder()
+            // Persistence off so truncation is exercised directly.
+            .config(|c| c.persist_tool_results = false)
+            // 4000-token window → 1000 tokens per result → 3000 chars.
+            .pressure(crate::pressure::PressureAnchor::from_window(4_000))
+            .build();
+        let spec = fixture.spec();
         let mut state = crate::runner::types::RunState::new(Arc::new(
             crate::tool::TurnContext::new("cli".into(), "c1".into()),
         ));

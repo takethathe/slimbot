@@ -88,7 +88,7 @@ pub struct Tracer {
 }
 ```
 
-- 显式 DI：`Option<Arc<Tracer>>` 注入 `RunSpec`（与 provider / consolidator 一致），不设全局态
+- 显式 DI：`Option<Arc<Tracer>>` 由 `AgentRunnerBuilder` 在装配点注入 `AgentRunner`，hook 经 `spec.tracer()` 借用（与 consolidator 一致），不设全局态
 - 每个 backend 独立、隔离：任一 backend 出错/变慢不影响其它 backend 与 run
 
 ## 埋点位置（骨架直插，不耦合 hook）
