@@ -106,10 +106,8 @@ fn cancel_here(state: &mut RunState, spec: &RunSpec<'_>) -> bool {
 /// see the settled session, and the approval turn close comes after both. It
 /// is the loop's own finalization, not a policy seam.
 ///
-/// Takes `&mut RunState` (matching the hook signature it replaces) so the run
-/// future stays `Send`: `RunState` carries `Box<dyn Any + Send>` extensions,
-/// which are `Send` but not `Sync`, so a shared borrow would infect the whole
-/// `tokio::spawn`ed run.
+/// Takes `&mut RunState` to match the hook signature it replaces and the call
+/// sites, which already hold a mutable borrow of the run state.
 async fn close_turn(spec: &RunSpec<'_>, state: &mut RunState) {
     let mut sm = spec.session_manager().lock().await;
     if let Some(limit) = state.rollback_to {

@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -206,8 +205,11 @@ pub struct RunState {
     pub rollback_to: Option<usize>,
     /// True when the after-turn phase triggered session consolidation.
     pub consolidated: bool,
-    /// Cross-phase custom data store with type-safe accessors.
-    extensions: HashMap<String, Box<dyn Any + Send>>,
+    /// `tool_call_id -> approval_id` for the calls this run turned into pending
+    /// approvals. Written in PreTool by the approval hook, read in AfterTool by
+    /// the persistence hook, which is what marks the guidance result the
+    /// build-time transform keys on later (ADR 0011).
+    pub approval_marks: HashMap<String, String>,
 }
 
 impl RunState {
@@ -224,18 +226,8 @@ impl RunState {
             should_exit: false,
             rollback_to: None,
             consolidated: false,
-            extensions: HashMap::new(),
+            approval_marks: HashMap::new(),
         }
-    }
-
-    /// Store an arbitrary value in the run state for cross-phase communication.
-    pub fn set_extension<T: Any + Send>(&mut self, key: &str, value: T) {
-        self.extensions.insert(key.to_string(), Box::new(value));
-    }
-
-    /// Retrieve a previously stored extension value by type.
-    pub fn get_extension<T: Any + Send>(&self, key: &str) -> Option<&T> {
-        self.extensions.get(key).and_then(|b| b.downcast_ref::<T>())
     }
 
     /// Mark the run as failed with the given error message.
@@ -250,14 +242,6 @@ impl RunState {
 mod tests {
     use super::*;
     use crate::runner::test_support::RunFixture;
-
-    #[test]
-    fn test_run_state_set_get_extension_roundtrip() {
-        let mut state = RunState::new(Arc::new(TurnContext::new("webui".into(), "c1".into())));
-        state.set_extension("budget", 42u32);
-        assert_eq!(state.get_extension::<u32>("budget"), Some(&42));
-        assert_eq!(state.get_extension::<String>("budget"), None);
-    }
 
     #[test]
     fn test_run_state_fail_sets_result() {

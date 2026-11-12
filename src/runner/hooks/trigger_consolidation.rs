@@ -14,13 +14,16 @@ impl AfterTurnHook for TriggerConsolidationHook {
         if !state.result.success {
             return Ok(());
         }
+        // One snapshot carries both the live set and the boundary rule, so a
+        // pending turn is protected by exactly the ids governance saw (ADR 0011).
+        let protect = crate::approval::LiveApprovals::collect(spec.approvals(), &spec.session_id);
         if let (Some(consolidator), Some(response)) =
             (spec.consolidator().as_ref(), state.response.as_ref())
             && let Ok(consolidated) = consolidator
                 .maybe_consolidate_protecting(
                     &spec.session_id,
                     response.usage.prompt_tokens,
-                    &spec.approvals().live_ids(&spec.session_id),
+                    &protect,
                 )
                 .await
         {

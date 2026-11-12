@@ -27,8 +27,8 @@ impl PreChatHook for GovernanceHook {
         // A live pending approval pins its turn to the tail: the model must keep
         // seeing what it is waiting for, so every trim stage below only ever
         // touches the part before the pin (ADR 0011).
-        let live = spec.approvals().live_ids(&spec.session_id);
-        let pinned_from = crate::approval::protect_start(&all_messages, &live);
+        let live = crate::approval::LiveApprovals::collect(spec.approvals(), &spec.session_id);
+        let pinned_from = live.protect_start(&all_messages);
         let mut pinned_tail = Vec::new();
         if let Some(start) = pinned_from
             && start < all_messages.len()

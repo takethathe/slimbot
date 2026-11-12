@@ -1876,34 +1876,6 @@ impl PreChatHook for AbortPreChatHook {
     }
 }
 
-/// Stores an extension in run state (cross-phase communication).
-struct SetExtensionPreChatHook {
-    key: String,
-    value: String,
-}
-
-#[async_trait]
-impl PreChatHook for SetExtensionPreChatHook {
-    async fn call(&self, _spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
-        state.set_extension(&self.key, self.value.clone());
-        Ok(HookAction::Continue)
-    }
-}
-
-/// Reads an extension from run state (AfterChat phase).
-struct ReadExtensionAfterChatHook {
-    key: String,
-    seen: Arc<Mutex<Option<String>>>,
-}
-
-#[async_trait]
-impl AfterChatHook for ReadExtensionAfterChatHook {
-    async fn call(&self, _spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
-        *self.seen.lock().await = state.get_extension::<String>(&self.key).cloned();
-        Ok(HookAction::Continue)
-    }
-}
-
 /// Skips tool execution and returns a synthetic result.
 struct SkipPreToolHook {
     result: String,
@@ -2172,45 +2144,6 @@ async fn test_pre_tool_hook_aborts_run() {
     let result = run_task(&runner, "run echo").await;
     assert!(!result.success);
     assert_eq!(result.content, "unsafe tool call");
-}
-
-#[tokio::test]
-async fn test_hook_extensions_cross_phase() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let (sm, tm, wd, ms) = make_test_env(&tmp, &[]).await;
-    let provider = Arc::new(MockProvider::new(vec![LLMResponse {
-        content: Some("final".to_string()),
-        tool_calls: None,
-        finish_reason: FinishReason::Stop,
-        usage: Usage::default(),
-    }]));
-    let seen = Arc::new(Mutex::new(None));
-    let seen_clone = seen.clone();
-    let runner = make_runner_with(sm.clone(), tm, provider, wd, ms, |b| {
-        b.add_pre_chat(
-            Arc::new(SetExtensionPreChatHook {
-                key: "flag".to_string(),
-                value: "set-in-pre-chat".to_string(),
-            }),
-            HookPosition::Append,
-        )
-        .add_after_chat(
-            Arc::new(ReadExtensionAfterChatHook {
-                key: "flag".to_string(),
-                seen: seen_clone,
-            }),
-            HookPosition::Append,
-        )
-    });
-
-    let result = run_task(&runner, "hello").await;
-    assert!(result.success);
-    let observed = seen.lock().await.clone();
-    assert_eq!(
-        observed.as_deref(),
-        Some("set-in-pre-chat"),
-        "after-chat hook must read the extension written by the pre-chat hook"
-    );
 }
 
 #[tokio::test]

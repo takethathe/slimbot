@@ -898,7 +898,8 @@ async fn apply_provider_failure_route(result: &AgentResult, effects: ProviderFai
             let Some(consolidator) = effects.consolidator else {
                 return;
             };
-            let protect = effects.approvals.live_ids(effects.session_id);
+            let protect =
+                crate::approval::LiveApprovals::collect(effects.approvals, effects.session_id);
             if let Err(e) = consolidator
                 .force_consolidate(effects.session_id, &protect)
                 .await
@@ -1788,10 +1789,13 @@ mod tests {
     }
 
     /// Build a session with `pairs` user/assistant exchanges and the plumbing a
-    /// forced consolidation round needs.
+    /// forced consolidation round needs. When `pinned_at` names an approval id
+    /// and a pair index, that turn carries a live approval marker and the
+    /// returned store holds the matching pending record.
     async fn consolidation_env(
         tmp: &tempfile::TempDir,
         pairs: usize,
+        pinned_at: Option<(&str, usize)>,
     ) -> (
         SharedSessionManager,
         Arc<Consolidator>,
@@ -1821,6 +1825,21 @@ mod tests {
             )
             .await
             .unwrap();
+            if let Some((approval_id, at)) = pinned_at
+                && at == i
+            {
+                sm.add_message(
+                    "s1",
+                    Message::tool_marked(
+                        "NOT EXECUTED".into(),
+                        format!("tc-{i}"),
+                        Some("shell".into()),
+                        approval_id.to_string(),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
         }
 
         let sm: SharedSessionManager = Arc::new(Mutex::new(sm));
@@ -1832,7 +1851,22 @@ mod tests {
             ms,
             32_768,
         ));
-        (sm, consolidator, crate::approval::ApprovalStore::default())
+        let approvals = crate::approval::ApprovalStore::default();
+        if let Some((approval_id, _)) = pinned_at {
+            approvals.propose(crate::approval::PendingApproval {
+                approval_id: approval_id.to_string(),
+                owner_id: "owner".into(),
+                session_id: "s1".into(),
+                run_id: "run".into(),
+                turn_kind: TurnKind::User,
+                tool: "shell".into(),
+                args: serde_json::json!({"command": "make deploy"}),
+                args_hash: String::new(),
+                risk: crate::approval::RiskLevel::Exec,
+                created_ms: 1_000,
+            });
+        }
+        (sm, consolidator, approvals)
     }
 
     fn context_length_result() -> AgentResult {
@@ -1851,7 +1885,7 @@ mod tests {
         // ticket 19's second leg had zero coverage: a `context_length` refusal
         // must actually run a forced round, not just be classified.
         let tmp = tempfile::tempdir().unwrap();
-        let (sm, consolidator, approvals) = consolidation_env(&tmp, 40).await;
+        let (sm, consolidator, approvals) = consolidation_env(&tmp, 40, None).await;
         let before = sm.lock().await.message_count("s1");
         assert!(before > 2);
 
@@ -1878,11 +1912,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_live_approval_set_reaches_both_consolidation_entries() {
+        // ADR 0011: one live approval pins its turn at every protection point.
+        // The post-turn trigger and the context-length relief used to resolve
+        // live ids on their own and had no behavioural coverage; both now
+        // collect the same snapshot from the same store.
+        const PINNED_PAIR: usize = 10;
+        let pinned_index = PINNED_PAIR * 2 + 2; // the marker follows that pair
+
+        let plain_tmp = tempfile::tempdir().unwrap();
+        let (plain_sm, plain_consolidator, plain_approvals) =
+            consolidation_env(&plain_tmp, 40, None).await;
+        let pinned_tmp = tempfile::tempdir().unwrap();
+        let (pinned_sm, pinned_consolidator, pinned_approvals) =
+            consolidation_env(&pinned_tmp, 40, Some(("appr-1", PINNED_PAIR))).await;
+        let trigger_tmp = tempfile::tempdir().unwrap();
+        let (trigger_sm, trigger_consolidator, trigger_approvals) =
+            consolidation_env(&trigger_tmp, 40, Some(("appr-1", PINNED_PAIR))).await;
+
+        // The baseline has no live approval; the differential below proves the
+        // pinned environment's store really supplies one (a tautological
+        // `contains` on the fixture would not).
+        assert!(
+            crate::approval::LiveApprovals::collect(&plain_approvals, "s1")
+                .ids()
+                .is_empty()
+        );
+
+        // Entry 2: the post-turn consolidation trigger. It must actually run a
+        // round (a zero cursor would make the boundary assertion vacuous).
+        trigger_consolidator
+            .maybe_consolidate_protecting(
+                "s1",
+                30_000,
+                &crate::approval::LiveApprovals::collect(&trigger_approvals, "s1"),
+            )
+            .await
+            .unwrap();
+        let trigger_lines = trigger_sm
+            .lock()
+            .await
+            .get_session_data("s1")
+            .unwrap()
+            .consolidated_lines;
+        assert!(trigger_lines > 0, "the trigger ran a round");
+        assert!(
+            trigger_lines <= pinned_index,
+            "the summary stopped before the pinned turn: {trigger_lines} <= {pinned_index}"
+        );
+
+        // Entry 3: context-length relief. The same route, once with the live id
+        // and once without, must reach different boundaries.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<BusResult>(4);
+        let dedup = crate::owner_alert::OwnerAlertDedup::new();
+        for (consolidator, approvals) in [
+            (pinned_consolidator.as_ref(), &pinned_approvals),
+            (plain_consolidator.as_ref(), &plain_approvals),
+        ] {
+            apply_provider_failure_route(
+                &context_length_result(),
+                ProviderFailureEffects {
+                    outbound: &tx,
+                    owner_primary: None,
+                    dedup: Some(&dedup),
+                    consolidator: Some(consolidator),
+                    approvals,
+                    session_id: "s1",
+                },
+            )
+            .await;
+        }
+
+        let pinned_lines = pinned_sm
+            .lock()
+            .await
+            .get_session_data("s1")
+            .unwrap()
+            .consolidated_lines;
+        let plain_lines = plain_sm
+            .lock()
+            .await
+            .get_session_data("s1")
+            .unwrap()
+            .consolidated_lines;
+        assert!(pinned_lines > 0, "the relief ran a round");
+        assert!(
+            pinned_lines < plain_lines,
+            "the live id shortened the relief round: {pinned_lines} < {plain_lines}"
+        );
+        assert!(
+            pinned_lines <= pinned_index,
+            "the pinned turn survived relief: {pinned_lines} <= {pinned_index}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_a_context_length_failure_without_a_consolidator_is_a_no_op() {
         // The routing answers "relieve pressure"; a runner without a
         // consolidator must simply do nothing rather than fail the turn twice.
         let tmp = tempfile::tempdir().unwrap();
-        let (sm, _consolidator, approvals) = consolidation_env(&tmp, 2).await;
+        let (sm, _consolidator, approvals) = consolidation_env(&tmp, 2, None).await;
         let before = sm.lock().await.message_count("s1");
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<BusResult>(4);
@@ -1950,7 +2079,7 @@ mod tests {
         // Transient / content-filter / unclassified failures just fail in
         // place: no alert, no forced round.
         let tmp = tempfile::tempdir().unwrap();
-        let (sm, consolidator, approvals) = consolidation_env(&tmp, 20).await;
+        let (sm, consolidator, approvals) = consolidation_env(&tmp, 20, None).await;
         let before = sm.lock().await.message_count("s1");
         let (tx, mut rx) = tokio::sync::mpsc::channel::<BusResult>(4);
         let dedup = crate::owner_alert::OwnerAlertDedup::new();

@@ -32,12 +32,12 @@ impl AfterToolHook for PersistToolMessageHook {
 
         // A result that answered a proposal carries its approval id, which is
         // what the build-time transform keys on later (ADR 0011).
-        let message = match super::approval::mark_for(state, &tool_call.id) {
+        let message = match state.approval_marks.get(&tool_call.id) {
             Some(approval_id) => Message::tool_marked(
                 content,
                 tool_call.id.clone(),
                 Some(tool_call.name.clone()),
-                approval_id,
+                approval_id.clone(),
             ),
             None => Message::tool(content, tool_call.id.clone(), Some(tool_call.name.clone())),
         };

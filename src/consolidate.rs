@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::LiveApprovals;
 use crate::info;
 use crate::memory::SharedMemory;
 use crate::pressure::{DEFAULT_CHAR_PER_TOKEN_RATIO, PressureAnchor};
@@ -148,32 +149,6 @@ impl Consolidator {
             }
         }
         None
-    }
-
-    /// Clamp the chunk end index so no pinned (live approval) message is
-    /// summarized. Returns `None` when the whole chunk is pinned.
-    fn clamp_boundary_for_pins(
-        messages: &[Message],
-        start_idx: usize,
-        end_idx: usize,
-        protect: &std::collections::HashSet<String>,
-    ) -> Option<usize> {
-        if protect.is_empty() {
-            return Some(end_idx);
-        }
-        // Nothing pinned inside this chunk: the boundary stands as chosen.
-        let Some(pinned) = messages[start_idx..end_idx]
-            .iter()
-            .position(|m| m.approval_id().is_some_and(|id| protect.contains(id)))
-        else {
-            return Some(end_idx);
-        };
-        let mut cut = start_idx + pinned;
-        // Walk back to a user-turn boundary so the chunk stays well-formed.
-        while cut > start_idx && !matches!(messages[cut], Message::User { .. }) {
-            cut -= 1;
-        }
-        (cut > start_idx).then_some(cut)
     }
 
     /// Summarize messages via LLM and append to history.jsonl.
@@ -417,7 +392,7 @@ If nothing noteworthy happened, output: (nothing)")
         &self,
         session_id: &str,
         tokens_to_remove: u32,
-        protect: &std::collections::HashSet<String>,
+        protect: &LiveApprovals,
     ) -> Result<Option<(usize, Option<String>)>> {
         let (messages, ratio) = {
             let sm = self.session_manager.lock().await;
@@ -449,9 +424,9 @@ If nothing noteworthy happened, output: (nothing)")
         };
 
         // A live pending approval is pinned: never summarize the turn carrying
-        // it, so the model keeps seeing what it is waiting for.
-        let Some(end_idx) = Self::clamp_boundary_for_pins(&messages, start_idx, end_idx, protect)
-        else {
+        // it, so the model keeps seeing what it is waiting for. The rule and the
+        // live set come from one shared snapshot (ADR 0011).
+        let Some(end_idx) = protect.clamp_boundary(&messages, start_idx, end_idx) else {
             return Ok(None);
         };
 
@@ -496,18 +471,18 @@ If nothing noteworthy happened, output: (nothing)")
     /// Summarize the session when the prompt exceeds the token budget.
     /// Returns `true` when a consolidation round actually ran.
     pub async fn maybe_consolidate(&self, session_id: &str, prompt_tokens: u32) -> Result<bool> {
-        self.maybe_consolidate_protecting(session_id, prompt_tokens, &Default::default())
+        self.maybe_consolidate_protecting(session_id, prompt_tokens, &LiveApprovals::empty())
             .await
     }
 
     /// [`Consolidator::maybe_consolidate`] that never summarizes messages
-    /// carrying one of `protect` (live approval ids, ADR 0011): a pending
-    /// confirmation must stay in the window until it is redeemed or cleared.
+    /// carrying one of `protect` (the live approval snapshot, ADR 0011): a
+    /// pending confirmation must stay in the window until redeemed or cleared.
     pub async fn maybe_consolidate_protecting(
         &self,
         session_id: &str,
         prompt_tokens: u32,
-        protect: &std::collections::HashSet<String>,
+        protect: &LiveApprovals,
     ) -> Result<bool> {
         // The trigger is judged on the authoritative track (provider-reported
         // `prompt_tokens`), so only the derived token numbers matter here; the
@@ -540,7 +515,7 @@ If nothing noteworthy happened, output: (nothing)")
     pub async fn force_consolidate(
         &self,
         session_id: &str,
-        protect: &std::collections::HashSet<String>,
+        protect: &LiveApprovals,
     ) -> Result<bool> {
         let limits = self.anchor.limits(DEFAULT_CHAR_PER_TOKEN_RATIO);
         let tokens_to_remove = self
@@ -690,25 +665,16 @@ mod tests {
 
         // The boundary would land after the pinned turn, so it is pulled back to
         // the user line that opens it: that turn is never summarized.
-        let protect = std::collections::HashSet::from(["appr-1".to_string()]);
-        assert_eq!(
-            Consolidator::clamp_boundary_for_pins(&messages, 0, 7, &protect),
-            Some(2)
-        );
+        let protect = LiveApprovals::from_ids(["appr-1".to_string()]);
+        assert_eq!(protect.clamp_boundary(&messages, 0, 7), Some(2));
 
         // An unrelated id protects nothing.
-        let other = std::collections::HashSet::from(["appr-9".to_string()]);
-        assert_eq!(
-            Consolidator::clamp_boundary_for_pins(&messages, 0, 7, &other),
-            Some(7)
-        );
+        let other = LiveApprovals::from_ids(["appr-9".to_string()]);
+        assert_eq!(other.clamp_boundary(&messages, 0, 7), Some(7));
 
         // A chunk that is entirely pinned has no boundary at all: skip this round
         // rather than summarize the pending turn.
-        assert_eq!(
-            Consolidator::clamp_boundary_for_pins(&messages, 2, 7, &protect),
-            None
-        );
+        assert_eq!(protect.clamp_boundary(&messages, 2, 7), None);
     }
 
     #[test]
@@ -939,7 +905,7 @@ mod tests {
         let (consolidator, _tmp, session_id) = setup_consolidator(provider).await;
 
         let did = consolidator
-            .force_consolidate(&session_id, &std::collections::HashSet::new())
+            .force_consolidate(&session_id, &LiveApprovals::empty())
             .await
             .unwrap();
         assert!(did, "a full session gets one forced round");
@@ -954,7 +920,7 @@ mod tests {
             32768,
         );
         let did = empty
-            .force_consolidate("missing", &std::collections::HashSet::new())
+            .force_consolidate("missing", &LiveApprovals::empty())
             .await;
         assert!(
             !did.unwrap_or(true),

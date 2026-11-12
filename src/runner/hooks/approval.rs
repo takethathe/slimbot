@@ -30,28 +30,6 @@ use crate::runner::traits::{AfterTurnHook, PreChatHook, PreToolHook, PreTurnHook
 use crate::runner::types::{HookAction, RunSpec, RunState, ToolHookAction};
 use crate::tool::ToolCall;
 
-/// Run-state extension key: `HashMap<tool_call_id, approval_id>` for the calls
-/// this run turned into pending approvals. `PersistToolMessageHook` reads it to
-/// mark the guidance tool result, which is what the build-time transform keys on.
-pub(crate) const MARKS_KEY: &str = "approval.marks";
-
-/// Mark the tool result of `call_id` as approval-related.
-pub(crate) fn mark_call(state: &mut RunState, call_id: &str, approval_id: &str) {
-    let mut marks = state
-        .get_extension::<std::collections::HashMap<String, String>>(MARKS_KEY)
-        .cloned()
-        .unwrap_or_default();
-    marks.insert(call_id.to_string(), approval_id.to_string());
-    state.set_extension(MARKS_KEY, marks);
-}
-
-/// The approval marker attached to the tool result of `call_id`, if any.
-pub(crate) fn mark_for(state: &RunState, call_id: &str) -> Option<String> {
-    state
-        .get_extension::<std::collections::HashMap<String, String>>(MARKS_KEY)
-        .and_then(|marks| marks.get(call_id).cloned())
-}
-
 /// Write one audit event to the trace `approval` span (see `runner::gate`).
 fn audit(spec: &RunSpec<'_>, decision: &str, record: &PendingApproval) {
     crate::runner::gate::audit(spec.tracer().as_ref(), decision, record);
@@ -102,9 +80,9 @@ pub struct ApprovalContextHook;
 #[async_trait]
 impl PreChatHook for ApprovalContextHook {
     async fn call(&self, spec: &RunSpec<'_>, state: &mut RunState) -> Result<HookAction> {
-        let live = spec.approvals().live_ids(&spec.session_id);
+        let live = crate::approval::LiveApprovals::collect(spec.approvals(), &spec.session_id);
         let messages = std::mem::take(&mut state.messages);
-        state.messages = merge_approval_rounds(&messages, &live);
+        state.messages = merge_approval_rounds(&messages, live.ids());
         Ok(HookAction::Continue)
     }
 }
@@ -129,7 +107,11 @@ impl PreToolHook for ApprovalHook {
                 result,
                 approval_id,
             } => {
-                mark_call(state, &tool_call.id, &approval_id);
+                // Tag the guidance result so AfterTool's `PersistToolMessageHook`
+                // can build `Message::tool_marked` (see `RunState::approval_marks`).
+                state
+                    .approval_marks
+                    .insert(tool_call.id.clone(), approval_id.clone());
 
                 // End the turn: the owner reads a plain-text list, and the same
                 // call replays next turn to redeem it.
@@ -426,7 +408,7 @@ mod tests {
         assert_eq!(pending[0].turn_kind, TurnKind::User);
         assert_eq!(pending[0].run_id, h.hook.run_id());
         assert_eq!(
-            mark_for(&h.state, "tc-1").as_deref(),
+            h.state.approval_marks.get("tc-1").map(String::as_str),
             Some(pending[0].approval_id.as_str())
         );
         assert_eq!(h.runs(), 0);
@@ -571,6 +553,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_redeem_revalidates_risk_before_execute() {
+        // ADR 0011: the risk class is recomputed against the live call before
+        // redemption, not trusted from the stored record. A record whose class
+        // no longer matches must be vetoed and consumed, never executed.
+        let mut h = Harness::new(ApprovalConfig::default(), TurnKind::User);
+        let mut record = propose(&mut h).await;
+        h.store.take("s1", &record.approval_id);
+        record.risk = RiskLevel::ReadOnly; // `shell` is declared Exec
+        h.store.propose(record);
+
+        h.store.begin_turn("s1");
+        let replay = h.call("tc-9", "shell", json!({"command": "make deploy"}));
+        match h.decide(&replay).await {
+            ToolHookAction::Skip { result } => {
+                assert!(
+                    result.contains("does not match the pending approval"),
+                    "{result}"
+                );
+            }
+            other => panic!("expected a revalidation veto, got {other:?}"),
+        }
+        assert_eq!(h.runs(), 0, "nothing executed on a stale risk class");
+        assert!(
+            h.store.pending_for("s1").is_empty(),
+            "the veto consumes the record"
+        );
+        assert!(
+            h.audit_decisions()
+                .contains(&"denied_by_policy".to_string()),
+            "the revalidation veto is audited"
+        );
+    }
+
+    #[tokio::test]
     async fn test_approval_hook_replay_with_other_args_vetoes_and_deletes() {
         let mut h = Harness::new(ApprovalConfig::default(), TurnKind::User);
         propose(&mut h).await;
@@ -696,8 +712,12 @@ mod tests {
             matches!(action, ToolHookAction::Skip { .. }),
             "an Exec-risk call must defer to the owner"
         );
-        let approval_id =
-            mark_for(&h.state, "tc-1").expect("the ask must leave a mark for the tool result");
+        let approval_id = h
+            .state
+            .approval_marks
+            .get("tc-1")
+            .cloned()
+            .expect("the ask must leave a mark for the tool result");
 
         // The nested view resolves the very same pending record, so a script
         // cannot bypass or duplicate the decision the hook just made.

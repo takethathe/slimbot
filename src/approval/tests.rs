@@ -405,6 +405,133 @@ fn test_protect_start_pins_the_turn_carrying_a_live_approval() {
 }
 
 #[test]
+fn test_pin_rules_share_one_boundary_function() {
+    // Two live pins in one history. The whole-history trim must take the
+    // *earliest* legal boundary; the chunk-local summary clamp must take only
+    // the first pin inside its chunk and never walk back below its floor.
+    let messages = vec![
+        Message::user("u0".into()),                                            // 0
+        Message::assistant(Some("a0".into()), None, None, None),               // 1
+        Message::user("u1".into()),                                            // 2
+        Message::assistant(Some("a1".into()), None, None, None),               // 3
+        Message::tool_marked("g1".into(), "t1".into(), None, "appr-1".into()), // 4
+        Message::user("u2".into()),                                            // 5
+        Message::assistant(Some("a2".into()), None, None, None),               // 6
+        Message::user("u3".into()),                                            // 7
+        Message::tool_marked("g2".into(), "t2".into(), None, "appr-2".into()), // 8
+    ];
+    let live: HashSet<String> = ["appr-1", "appr-2"]
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+
+    // Whole history: min(2, 7) = 2 — both pinned turns stay in the tail.
+    assert_eq!(protect_start(&messages, &live), Some(2));
+    // Chunk-local: the first pin in [5, 9) is at 8, whose user boundary is 7.
+    assert_eq!(clamp_boundary_for_pins(&messages, 5, 9, &live), Some(7));
+    // No live pin: the chosen boundary stands untouched.
+    assert_eq!(
+        clamp_boundary_for_pins(&messages, 0, 9, &HashSet::new()),
+        Some(9)
+    );
+    // A chunk whose only boundary is its floor is entirely pinned: skip it.
+    assert_eq!(clamp_boundary_for_pins(&messages, 7, 9, &live), None);
+
+    // Both rules are expressed through the same predicate and the same ruler,
+    // so changing what "pinned" means touches one function, not four call sites.
+    let src = include_str!("mod.rs");
+    for rule in [
+        "fn protect_start(messages: &[Message], live: &HashSet<String>)",
+        "fn clamp_boundary_for_pins(",
+    ] {
+        let start = src.find(rule).unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap() + 2;
+        let body = &src[start..end];
+        assert!(
+            body.contains("is_live_pin("),
+            "{rule} lost the shared predicate"
+        );
+        assert!(
+            body.contains("user_boundary_before("),
+            "{rule} lost the shared user-boundary ruler"
+        );
+    }
+}
+
+#[test]
+fn test_is_live_pin_ignores_unmarked_and_unknown_ids() {
+    let marked = Message::tool_marked("g".into(), "t".into(), None, "appr-1".into());
+    let unmarked = Message::user("plain".into());
+    let live = HashSet::from(["appr-1".to_string()]);
+
+    assert!(is_live_pin(&marked, &live));
+    assert!(!is_live_pin(&marked, &HashSet::new()));
+    assert!(!is_live_pin(&unmarked, &live));
+    assert!(!is_live_pin(
+        &marked,
+        &HashSet::from(["appr-2".to_string()])
+    ));
+
+    // The ruler never crosses below its floor, even when a user turn is there.
+    let history = vec![
+        Message::user("u0".into()),
+        Message::user("u1".into()),
+        Message::assistant(Some("a".into()), None, None, None),
+    ];
+    assert_eq!(user_boundary_before(&history, 0, 2), Some(1));
+    assert_eq!(user_boundary_before(&history, 1, 2), Some(1));
+    assert_eq!(user_boundary_before(&history, 2, 2), None);
+}
+
+#[test]
+fn test_live_ids_has_one_production_reader() {
+    // Every ADR 0011 protection point takes its live set from one snapshot;
+    // none reads the store directly or keeps a private copy of the rule.
+    let module = include_str!("mod.rs");
+    assert_eq!(
+        module.matches("live_ids(").count(),
+        2,
+        "one definition plus the single reader inside LiveApprovals::collect"
+    );
+    for (name, src, expected) in [
+        (
+            "governance.rs",
+            include_str!("../runner/hooks/governance.rs"),
+            "LiveApprovals::collect(",
+        ),
+        (
+            "trigger_consolidation.rs",
+            include_str!("../runner/hooks/trigger_consolidation.rs"),
+            "LiveApprovals::collect(",
+        ),
+        (
+            "approval.rs",
+            include_str!("../runner/hooks/approval.rs"),
+            "LiveApprovals::collect(",
+        ),
+        (
+            "consolidate.rs",
+            include_str!("../consolidate.rs"),
+            "protect: &LiveApprovals",
+        ),
+        (
+            "session.rs",
+            include_str!("../session.rs"),
+            "LiveApprovals::collect(",
+        ),
+    ] {
+        assert!(
+            !src.contains("live_ids("),
+            "{name} must not query the store on its own"
+        );
+        assert!(
+            src.contains(expected),
+            "{name} must take the shared snapshot via `{expected}`"
+        );
+    }
+}
+
+#[test]
 fn test_store_mismatching_only_reports_carried_records_with_other_args() {
     let (store, _now) = store_with_clock(1_000);
     store.begin_turn("s1");

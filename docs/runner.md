@@ -73,9 +73,9 @@ PreTool hook 特有：
 ### 上下文对象
 
 - **`RunSpec<'_>`**：一个 run 的 hook 视角。Run 级依赖（session / tool manager、config、pressure anchor、memory、consolidator、tracer、approvals、connectors、max_tokens）**借用** `AgentRunner` 上的那一份，经访问器（`spec.config()`、`spec.approvals()`…）读取，没有逐 turn 的复制；per-turn 输入来自 `RunTurn`（session_id、content、task_hook、channel/chat_id、runtime_ctx），`cancel_token` 与 `initial_message_count` 由 `run()` 在装配后补齐。装配点只有 `AgentRunnerBuilder` 一处；加一个 Run 级依赖 = builder + runner 字段 + 一行转发访问器，不存在第二份赋值。
-- **`RunState`**（可变）：iterations、result、messages、tools、response、tool_results、turn_context、should_exit、rollback_to、extensions
+- **`RunState`**（可变）：iterations、result、messages、tools、response、tool_results、turn_context、should_exit、rollback_to、consolidated、approval_marks
 
-`RunState` 提供类型安全的扩展存储：`set_extension::<T>(key, value)` / `get_extension::<T>(key)`，用于跨 phase 传递自定义数据。
+`RunState` 不再有通用的 `Any` 扩展字典：跨 phase 的数据只有 `approval_marks`（`tool_call_id → approval_id`）这一处，PreTool 的 `ApprovalHook` 写入、AfterTool 的 `PersistToolMessageHook` 读出以给引导结果打标。字段是具名的强类型字段而不是「字符串 key + `Any`」，字段名拼错或类型不符都是编译错误而不是静默 `None`；要加新的跨 phase 数据就加字段，不要退回字符串 key 的字典。
 
 ### Hook 注册
 
@@ -202,12 +202,18 @@ LLM 错误、取消（回滚到 initial_message_count）、hook abort 均在骨�
 
 ### 裁剪保护
 
-pending 记录存在期间，携带它的那个回合被 **pin 在历史尾部**：`GovernanceHook` 在 microcompact/snip 之前把它切出来、之后原样接回；`TriggerConsolidationHook` 通过 `maybe_consolidate_protecting` 把摘要边界收在该回合之前（整段被 pin 时本轮跳过摘要）。记录消失后回到普通裁剪范围。
+pending 记录存在期间，携带它的那个回合被 **pin 在历史尾部**：`GovernanceHook` 在 microcompact/snip 之前把它切出来、之后原样接回；`TriggerConsolidationHook` 通过 `maybe_consolidate_protecting` 把摘要边界收在该回合之前（整段被 pin 时本轮跳过摘要）；`ContextLength` 兜底的 `force_consolidate` 走同一份快照。记录消失后回到普通裁剪范围。
+
+四个保护点（`GovernanceHook` / `TriggerConsolidationHook` / `ApprovalContextHook` / `session.rs` 的 `RelievePressure`）都经 `approval::LiveApprovals::collect` 取同一份 live id 快照，live 判定统一走 `is_live_pin`；裁剪与摘要另共用 `user_boundary_before` 作为 User 边界尺子：`protect_start` 取全历史**最早**的 User 边界，`clamp_boundary_for_pins` 取 chunk 内**首个** pin 且不越过 floor（整段被 pin 时返回 `None` 跳过本轮）。改 pin 语义只需改 `src/approval/mod.rs` 一处（ADR 0011）。
 
 ### 审计与补偿
 
 - 决策（`proposed` / `redeemed` / `expired` / `cleared` / `denied_by_policy`）写 **trace 的 `approval` span**，不写 session JSONL——对话历史会被裁剪，审计放在那里会跟着消失。
-- 兑现执行**前**先广播 `AgentEvent::ApprovalRedeemed`，owner 可在此期间 `/stop`；`ApprovalHook` 在广播后 `yield_now` 再检查取消，命中则整个 run `Abort`。
+- 兑现执行**前**先广播 `AgentEvent::ApprovalRedeemed`，owner 可在此期间 `/stop`；`gate.rs::redeem` 先重校验 `risk` / `args_hash`，通过后才 `take` 消费记录并广播，`yield_now` 后再查取消，命中则整个 run `Abort`（重校验失败也会 `take` 掉记录并拒绝；`ApprovalHook` 只把 `GateDecision` 翻成 `ToolHookAction`）。
+
+### 端到端测试边界
+
+`tests/approval_integration.rs` 只经公开面驱动整条链路：自建 `Provider`（按脚本出队响应，并记录每次收到的消息）、`Tool`（统计执行次数）、`TaskHook` + `ApprovalStore` + `AgentRunner::new`，断言直接读 `{session_id}.jsonl` 的原始文本。`src/` 里的 `RunnerHarness` 是 `pub(crate)` 的钩子级夹具，层级不同（它要能直接碰 `RunState` 和 hook trait），两者不复用。
 
 ## 工具结果处理链
 
@@ -280,6 +286,6 @@ ReAct 循环在关键节点通过 `TaskHook.fire_event()` 发出 `AgentEvent`，
 | `PostIteration` | 工具循环结束后（骨架内联） | session_id, iteration |
 | `TaskCompleted` | 循环成功完成（骨架 `close_turn()`） | session_id, result |
 | `TaskFailed` | 循环失败（骨架 `close_turn()`） | session_id, error |
-| `ApprovalRedeemed` | 审批兑现、工具真正执行前（ApprovalHook） | session_id, approval_id, tool, args, risk |
+| `ApprovalRedeemed` | 审批兑现、工具真正执行前（`gate.rs::redeem`） | session_id, approval_id, tool, args, risk |
 
 事件通过 `broadcast::Sender<AgentEvent>` 广播到 `ChannelManager`，各 Channel 的 `write_event()` 方法负责将其送达客户端（WebUI 中通过 SSE 的 `agent_event` 事件类型）。

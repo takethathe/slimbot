@@ -10,6 +10,12 @@
 //! The single enforcement point is `runner::hooks::ApprovalHook`; this module
 //! only owns the data and the "what does the owner see" text. In particular it
 //! never persists the pending list: a restart is meant to fail closed.
+//!
+//! ADR 0011's pin rules are also answered here: [`is_live_pin`] and
+//! [`user_boundary_before`] are the shared primitives behind [`protect_start`]
+//! (whole-history trim) and [`clamp_boundary_for_pins`] (summary chunk).
+//! [`LiveApprovals`] is the one snapshot every protection point collects, so
+//! two stages of one run cannot disagree about which turn is pinned.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -586,12 +592,14 @@ pub fn merge_approval_rounds(messages: &[Message], live: &HashSet<String>) -> Ve
         else {
             continue;
         };
+        // The same live-pin predicate the trimming rules use: a live guidance
+        // result is kept visible, an expired or redeemed one is folded.
+        if is_live_pin(message, live) {
+            continue;
+        }
         let Some(approval_id) = meta.approval_id.as_deref() else {
             continue;
         };
-        if live.contains(approval_id) {
-            continue;
-        }
         let tool_name = name
             .clone()
             .or_else(|| original_call(messages, tool_call_id).map(|(_, call)| call.name.clone()))
@@ -646,27 +654,117 @@ pub fn merge_approval_rounds(messages: &[Message], live: &HashSet<String>) -> Ve
     merged
 }
 
+/// Whether a message is pinned by an approval that is still live (ADR 0011).
+///
+/// This is the one predicate behind every protection point: trimming before
+/// chat, the summary chunk boundary, context-length relief and the build-time
+/// fold all ask the same question, so changing what "pinned" means touches
+/// one function instead of four call sites.
+pub fn is_live_pin(message: &Message, live: &HashSet<String>) -> bool {
+    message
+        .approval_id()
+        .is_some_and(|approval_id| live.contains(approval_id))
+}
+
+/// Walk back from `pin` to the nearest user-turn boundary, never crossing below
+/// `floor`. A pinned region always starts on a user message so the history it
+/// leaves behind stays well-formed (ADR 0011). Both the whole-history trim and
+/// the chunk-local summary clamp use this one ruler; they differ only in where
+/// they set the floor and which pin they start from.
+pub fn user_boundary_before(messages: &[Message], floor: usize, pin: usize) -> Option<usize> {
+    (floor..=pin)
+        .rev()
+        .find(|&index| matches!(messages[index], Message::User { .. }))
+}
+
+/// One snapshot of the live approvals for a session — the single query behind
+/// every ADR 0011 protection point.
+///
+/// This is a value, not a lifecycle: the pending records stay owned by
+/// [`ApprovalStore`], and nothing here persists, expires or redeems them. A
+/// protection point collects the snapshot once and takes both the live set and
+/// its boundary rules from it, so two stages of one run cannot disagree about
+/// which turn is protected.
+pub struct LiveApprovals(HashSet<String>);
+
+impl LiveApprovals {
+    /// The only place production code reads the store's live ids.
+    pub fn collect(approvals: &ApprovalStore, session_id: &str) -> Self {
+        Self(approvals.live_ids(session_id))
+    }
+
+    /// No live approvals: used by consolidation paths that have no store in
+    /// scope and therefore nothing to protect.
+    pub fn empty() -> Self {
+        Self(HashSet::new())
+    }
+
+    /// Build from an explicit set (tests of the pin rules).
+    #[cfg(test)]
+    pub(crate) fn from_ids(ids: impl IntoIterator<Item = String>) -> Self {
+        Self(ids.into_iter().collect())
+    }
+
+    pub fn ids(&self) -> &HashSet<String> {
+        &self.0
+    }
+
+    /// Whole-history trim: the earliest legal boundary of any live pin.
+    pub fn protect_start(&self, messages: &[Message]) -> Option<usize> {
+        protect_start(messages, &self.0)
+    }
+
+    /// Summary chunk: clamp its end before the first live pin inside it.
+    pub fn clamp_boundary(
+        &self,
+        messages: &[Message],
+        start_idx: usize,
+        end_idx: usize,
+    ) -> Option<usize> {
+        clamp_boundary_for_pins(messages, start_idx, end_idx, &self.0)
+    }
+}
+
 /// The index of the first message that must survive trimming while an approval
 /// is still pending (ADR 0011: marked messages are pinned to the tail).
 ///
-/// The pin starts at the user message opening the turn that produced the
-/// guidance, so the pinned tail always starts on a legal boundary.
-pub fn protect_start(messages: &[Message], live: &HashSet<String>) -> Option<usize> {
+/// The whole-history rule takes the *earliest* user boundary among all live
+/// pins, so everything from there on is protected as one tail.
+fn protect_start(messages: &[Message], live: &HashSet<String>) -> Option<usize> {
     let mut start: Option<usize> = None;
     for (index, message) in messages.iter().enumerate() {
-        let Some(approval_id) = message.approval_id() else {
-            continue;
-        };
-        if !live.contains(approval_id) {
+        if !is_live_pin(message, live) {
             continue;
         }
-        let from = messages[..=index]
-            .iter()
-            .rposition(|m| matches!(m, Message::User { .. }))
-            .unwrap_or(index);
+        let from = user_boundary_before(messages, 0, index).unwrap_or(index);
         start = Some(start.map_or(from, |current: usize| current.min(from)));
     }
     start
+}
+
+/// Clamp a summary chunk's end so no live pinned turn is summarized. Returns
+/// `None` when the whole chunk is pinned, telling the caller to skip the round.
+///
+/// The chunk-local rule stops at the *first* live pin inside `[start_idx,
+/// end_idx)` and never walks back past `start_idx`; that is the semantic
+/// difference from [`protect_start`], which scans the whole history.
+fn clamp_boundary_for_pins(
+    messages: &[Message],
+    start_idx: usize,
+    end_idx: usize,
+    live: &HashSet<String>,
+) -> Option<usize> {
+    if live.is_empty() {
+        return Some(end_idx);
+    }
+    let Some(pinned) = messages[start_idx..end_idx]
+        .iter()
+        .position(|message| is_live_pin(message, live))
+    else {
+        return Some(end_idx);
+    };
+    let cut = user_boundary_before(messages, start_idx, start_idx + pinned).unwrap_or(start_idx);
+    (cut > start_idx).then_some(cut)
 }
 
 /// Tool result index by tool call id (first occurrence wins).
