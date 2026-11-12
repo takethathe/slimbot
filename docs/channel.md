@@ -1,57 +1,42 @@
 # Channel
 
-对应模块：`src/channel/mod.rs` + `src/channel/cli.rs`
+对应模块：`src/channel/mod.rs` + `src/channel/webui.rs` + `src/channel/feishu.rs`
 
 ## 概述
 
-`Channel` 抽象了 SlimBot 的所有 I/O 通道，支持 CLI、WebUI 等多种输入输出方式。通过工厂模式创建具体通道实例。
+`Channel` 抽象了 SlimBot 的所有 I/O 通道，支持 CLI（由 `ChannelManager` 的主线程 stdin 循环驱动）、WebUI、飞书。通过工厂模式创建具体通道实例。
 
 ## Channel 接口
 
 ```rust
 #[async_trait]
 pub trait Channel: Send + Sync {
-    /// 通道唯一标识
     fn id(&self) -> &str;
-
-    /// 通道名称（用于日志和调试）
     fn name(&self) -> &str;
-
-    /// 当前聊天的 chat_id
     fn chat_id(&self) -> &str;
 
-    /// 读取一行用户输入
     async fn read_input(&mut self) -> Result<String>;
-
-    /// 输出最终结果
     async fn write_output(&mut self, result: &BusResult) -> Result<()>;
-
-    /// 输出中间状态（如工具执行进度）
     async fn write_status(&mut self, session_id: &str, state: &TaskState) -> Result<()>;
-
-    /// 输出 Agent 运行时事件（tool_call、assistant_message 等）
-    async fn write_event(&mut self, event: &AgentEvent) -> Result<()> { Ok(()) }
-
-    /// 输出卡片事件（WebUI 生成式 UI）。默认 no-op——只有 WebUI 类通道渲染卡片，
-    /// CLI、cron、heartbeat 继承默认实现直接丢弃。
-    async fn write_card(&mut self, event: &CardEvent) -> Result<()> { Ok(()) }
-
-    /// 准备注入到上下文的额外信息（可选）
     async fn prepare_inject(&self) -> Result<String>;
 
-    /// 生成 Session ID，格式：{channel_id}:{chat_id}
     fn session_id(&self) -> String {
         format!("{}:{}", self.id(), self.chat_id())
     }
 
-    /// 启动通道内部客户端读取循环。由 ChannelManager 在创建后调用。
-    fn start(&self, inbound_tx: mpsc::Sender<BusRequest>);
+    /// 启动通道内部读取循环，由 ChannelManager 在创建后调用。
+    fn start(&self, inbound_tx: tokio::sync::mpsc::Sender<BusRequest>);
 
-    /// 向客户端发送输出消息。由 ChannelManager 的出站路由器调用。
-    /// 默认实现委托给 write_output。
-    async fn send_output(&mut self, result: &BusResult) -> Result<()> {
-        self.write_output(result).await
-    }
+    /// 走 IoScheduler 的启动入口；默认给一个空 IoHandle。
+    fn start_with_scheduler(&self, scheduler: &IoScheduler) -> IoHandle { .. }
+
+    /// 向客户端发送输出；默认委托 write_output。
+    async fn send_output(&mut self, result: &BusResult) -> Result<()> { self.write_output(result).await }
+
+    /// AgentEvent / 卡片 / 文件投递，默认全是 no-op。
+    async fn write_event(&mut self, event: &AgentEvent) -> Result<()> { Ok(()) }
+    async fn write_card(&mut self, event: &crate::card::CardEvent) -> Result<()> { Ok(()) }
+    async fn write_media(&mut self, delivery: &crate::message_bus::MediaDelivery) -> Result<()> { Ok(()) }
 }
 ```
 
@@ -74,35 +59,42 @@ pub struct ChannelManager {
     channels: Arc<Mutex<HashMap<String, Box<dyn Channel>>>>,
     factories: HashMap<String, Box<dyn ChannelFactory>>,
     message_bus: Arc<MessageBus>,
-    event_tx: Option<broadcast::Sender<AgentEvent>>,  // AgentEvent 广播发送端
+    outbound_rx: Mutex<Option<mpsc::Receiver<BusResult>>>,   // 单消费者，run 时取走
+    card_rx: Mutex<Option<mpsc::Receiver<CardEvent>>>,       // attach_card_rx 接
+    media_rx: Mutex<Option<mpsc::Receiver<MediaDelivery>>>,  // attach_media_rx 接
+    config: Arc<Config>,
+    event_tx: Option<broadcast::Sender<AgentEvent>>,
+    // io_handles / io_scheduler 略
 }
 ```
 
-### 自动注册内置工厂
+### 工厂注册
 
-`ChannelManager::new()` 自动注册所有内置通道工厂（CLI 等），无需在 main.rs 中手动注册：
-
-```rust
-let channel_manager = ChannelManager::new(message_bus);
-// 内置工厂已自动注册
-```
-
-### `init_from_config`
-
-从配置的 `channels` 数组中读取通道条目，在已注册的工厂中查找对应类型：
+工厂由装配层显式注册，`ChannelManager::new()` 本身不注册任何通道：
 
 ```rust
-channel_manager.init_from_config(&config.channels).await?;
+channel_manager.register_factory("feishu", Box::new(FeishuChannelFactory::new(..)));
+channel_manager.register_webui_factory(startup);   // 一份 WebuiStartup，见下
 ```
 
-对每个启用的通道：
-1. 通过工厂创建通道实例
-2. 调用 `channel.start(inbound_tx)` 启动内部读取循环
-3. 将通道存入共享 `Arc<Mutex<HashMap>>` 供出站路由使用
+### `init`
 
-### `run` — 出站路由循环
+从配置的 `channels` 映射中读取通道条目，在已注册的工厂中查找对应类型：
 
-在主线程上阻塞运行，监听出站消息并路由到对应通道：
+```rust
+channel_manager.init().await?;
+channel_manager.start_channels().await;
+```
+
+`init` 对每个启用条目：
+1. 通过工厂 `create(&Value)` 创建通道实例
+2. 将通道存入共享 `Arc<Mutex<HashMap>>` 供出站路由使用
+
+`start_channels` 再逐个调用 `start_with_scheduler`，把真正起服务的通道的 `IoHandle` 收进 `io_handles`。
+
+### `run_with_shutdown` — 出站路由循环
+
+gateway 里以 `tokio::spawn` 运行，监听出站消息并路由到对应通道：
 
 ```
 loop:
@@ -111,7 +103,27 @@ loop:
   channels.get_mut(channel_id).send_output(result)
 ```
 
-当所有通道关闭、outbound 发送端断开时，此方法返回。
+收到 `shutdown` 广播或所有发送端断开时返回。
+
+### WebUI 启动快照（`WebuiStartup`）
+
+WebUI 需要的每个运行时对象都写在同一份纯数据里，只经 `register_webui_factory` → `WebuiChannelFactory::create` 一条路径消费：
+
+```rust
+pub struct WebuiStartup {
+    pub session_manager: SharedSessionManager,
+    pub shutdown: broadcast::Sender<()>,   // 关停广播
+    pub events: broadcast::Sender<AgentEvent>,
+    pub trace_paths: Vec<String>,
+    pub trace_startup_ms: Option<i64>,
+    pub config_path: String,               // 启动快照，不可热更新（ADR 0002）
+    pub card: Option<Arc<CardService>>,
+}
+```
+
+- `ChannelManager::register_webui_factory(startup)` 只收这一个参数；`WebuiChannelFactory::new(message_bus, startup)` 只有两个参数；通道由 `WebuiChannel::with_wiring(message_bus, startup)` 一次装配，`AppState` 持有同一份快照。新增一个 channel-side 参数 = 往 `WebuiStartup` 加一个字段。
+- `config_path` 只是路径：Config editor 的三个 handler 每次自己读盘（`load_for_preview` / `save`），所以保存的改动在编辑器里立刻可见、在进程里要等重启。
+- `shutdown` 由通道在创建时 `subscribe()` 出接收端，与 `events`、`session_manager` 等一起代表「这个进程里的 WebUI 运行环境」。
 
 ### 卡片事件路由
 
@@ -123,43 +135,9 @@ channel_manager.attach_card_rx(card_rx); // Gateway 接线时调用，未接线�
 
 `run_with_shutdown` 循环同时监听 outbound 与 card 通道，卡片事件按 `session_id` 的通道前缀路由到对应通道并调用 `write_card`（`dispatch_card` 纯函数，路由决策可直接单测）。不支持卡片的通道由默认 no-op 实现兜底，无需感知卡片机制存在。
 
-## CliChannel
+## CLI 通道
 
-CLI 通道的具体实现：
-
-- `start()`: 使用 `spawn_blocking` 启动阻塞式 stdin 读取循环，不阻塞 tokio 运行时
-- `read_input()`: 从标准输入读取一行
-- `write_output()`: 将结果打印到标准输出
-- `write_status()`: 将状态打印到标准错误
-- `prepare_inject()`: 返回空字符串（CLI 无需额外注入）
-
-### `start` 实现
-
-```
-spawn_blocking:
-  loop:
-    显示 prompt
-    读取 stdin
-    如果 EOF → 退出
-    构建 BusRequest
-    inbound_tx.send(request)
-```
-
-使用 `spawn_blocking` 而非 `tokio::spawn`，因为 `stdin.read_line()` 是阻塞式系统调用，避免阻塞 tokio 工作线程。
-
-### CliChannelFactory
-
-```rust
-impl ChannelFactory for CliChannelFactory {
-    fn channel_type(&self) -> &str { "cli" }
-
-    fn create(&self, config: &serde_json::Value) -> Result<Box<dyn Channel>> {
-        Ok(Box::new(CliChannel::from_config(config)?))
-    }
-}
-```
-
-已在 `ChannelManager::new()` 中自动注册，配置中 `type: "cli"` 的条目会自动创建为 CLI 通道。
+CLI 没有独立的 `Channel` 实现：`agent` 模式下 `AgentLoop` 的入站循环照常运行，但输入输出由主线程的 `ShutdownHandle::run_main_thread_loop` 负责——阻塞读 stdin、构 `BusRequest`、`try_send` 进 inbound，遇到 channel-tier 命令（`/quit`）就广播关停。所以 `channels` 里没有 `cli` 条目，`ChannelManager` 也没有 CLI 工厂。
 
 ## WebUI 通道的边界与护栏（ADR 0010）
 

@@ -235,6 +235,21 @@ main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   └── log.rs + macros.rs ── 日志系统、级别过滤、彩色输出
 ```
 
+## Gateway 启动的两步：装配与运行
+
+`run_gateway` 只有两件事：等 `ctrl_c`、按顺序关停。真正的接线在 `assemble_gateway`，它返回一个 `Gateway`——组件已建好并起跑，还没等信号：
+
+```rust
+let gateway = assemble_gateway(&paths).await?;   // 可构造、可断言
+// ... 等待 ctrl_c ...
+gateway.shutdown().await;                       // 关停：channel 广播 → card 取消 → heartbeat/cron → 10s 超时
+```
+
+- **装配**里是所有「谁拿到谁」的决定：Config 快照、MessageBus 的四个 receiver、工具与 catalog、`AgentLoop`（含 tracer 与 connector 池）、Cron/Heartbeat/Trigger、ChannelManager 的工厂注册（Card 与 Feishu 各一次）、WebUI 启动快照。
+- **WebUI 启动快照**（`WebuiStartup`）是一份纯数据：session manager、关停广播、AgentEvent 广播、trace 路径与启动时刻、config 路径、card service。它只经 `register_webui_factory` → `WebuiChannelFactory::create` 一条路径消费，通道与 `AppState` 都持有这份快照，所以新增一个 channel-side 参数只改它。
+- **trace 同源**：`AgentLoop` 构造时解析一次 trace 文件路径，写侧（`FileBackend`）与读侧（viewer）共用；网关启动的截断只发生一次，CLI 从不截断（ADR 0022）。
+- **config 路径不是配置值**：快照只带路径，Config editor 的 handler 每次自己读盘，所以「保存即写盘、重启才生效」在代码里是看得见的（ADR 0002）。
+
 ## main.rs 初始化流程
 
 ```rust

@@ -93,7 +93,7 @@ pub use utils::{
 pub use agent::{AgentDefinition, AgentRegistry, SubagentRuntime, ToolCatalog};
 pub use agent_loop::AgentLoop;
 pub use cli::{CliArgs, Commands, run_agent_session};
-pub use gateway::run_gateway;
+pub use gateway::{Gateway, assemble_gateway, run_gateway};
 pub use log as log_module;
 pub use setup::run_setup;
 pub use worker::WorkerPool;

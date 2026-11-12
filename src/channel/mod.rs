@@ -4,7 +4,7 @@ mod webui;
 #[allow(unused_imports)]
 pub use feishu::FeishuChannelFactory;
 #[allow(unused_imports)]
-pub use webui::WebuiChannelFactory;
+pub use webui::{WebuiChannelFactory, WebuiStartup};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::io_scheduler::{ChannelCommandCallback, IoHandle, IoScheduler};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
-use crate::session::{AgentEvent, SharedSessionManager, TaskState};
+use crate::session::{AgentEvent, TaskState};
 use crate::{debug, error, info};
 use tokio::sync::broadcast;
 
@@ -284,28 +284,12 @@ impl ChannelManager {
         self.factories.insert(type_name.to_string(), factory);
     }
 
-    /// Register the webui channel factory (requires session_manager for chat listing).
-    #[allow(clippy::too_many_arguments)]
-    pub fn register_webui_factory(
-        &mut self,
-        session_manager: SharedSessionManager,
-        shutdown_tx: tokio::sync::broadcast::Sender<()>,
-        event_tx: broadcast::Sender<AgentEvent>,
-        trace_paths: Vec<String>,
-        trace_startup_ms: Option<i64>,
-        config_path: String,
-        card: Option<Arc<crate::card::CardService>>,
-    ) {
-        let factory = WebuiChannelFactory::new(
-            self.message_bus.clone(),
-            session_manager,
-            shutdown_tx,
-            event_tx,
-            trace_paths,
-            trace_startup_ms,
-            config_path,
-            card,
-        );
+    /// Register the webui channel factory from the process's startup snapshot.
+    ///
+    /// One parameter: the snapshot describes everything the WebUI needs, so
+    /// adding a runtime object touches that description and nothing here.
+    pub fn register_webui_factory(&mut self, startup: WebuiStartup) {
+        let factory = WebuiChannelFactory::new(self.message_bus.clone(), startup);
         self.factories
             .insert("webui".to_string(), Box::new(factory));
     }

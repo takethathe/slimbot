@@ -68,18 +68,32 @@ fn make_test_config(_data_dir: &std::path::Path) -> Config {
     }
 }
 
+/// The assembly step returns without waiting for Ctrl+C, and the WebUI startup
+/// snapshot it built is the one it handed to the channel: seven runtime
+/// objects, trace paths resolved by the write side, a config path that is a
+/// snapshot rather than a live value.
+///
+/// One assembly per process: `Config::install` refuses a second snapshot, so
+/// the wiring assertions share this gateway instead of assembling their own.
 #[tokio::test]
-async fn test_gateway_can_start_and_shutdown() {
+async fn test_gateway_assembly_without_ctrl_c_wires_the_webui_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let workspace_dir = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace_dir).unwrap();
+    let trace_path = workspace_dir.join("trace.jsonl");
 
-    // Create a minimal config file
-    let config = make_test_config(&data_dir);
+    let mut raw = serde_json::to_value(make_test_config(&data_dir)).unwrap();
+    raw["channels"] = serde_json::json!({
+        "webui": {"enabled": true, "host": "127.0.0.1", "port": 0}
+    });
+    raw["tracing"] = serde_json::json!({
+        "enabled": true,
+        "reset_on_start": true,
+        "backends": [{"type": "file", "enabled": true, "path": trace_path.to_str().unwrap()}]
+    });
     let config_path = data_dir.join("config.json");
-    let config_json = serde_json::to_string_pretty(&config).unwrap();
-    std::fs::write(&config_path, config_json).unwrap();
+    std::fs::write(&config_path, raw.to_string()).unwrap();
 
     let paths = PathManager::resolve(
         Some(config_path.to_str().unwrap()),
@@ -88,12 +102,76 @@ async fn test_gateway_can_start_and_shutdown() {
     )
     .unwrap();
 
-    // Gateway should be able to start (it will block on ctrl_c, so we can't fully test it)
-    // Instead, we verify the setup code doesn't panic
-    // Since we're not sending ctrl_c, this will block, so we use tokio::time::timeout
-    // For now, just verify the function can be called with valid paths
-    assert!(paths.workspace_dir().exists());
-    assert!(paths.data_dir().exists());
+    let gateway = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        slimbot::assemble_gateway(&paths),
+    )
+    .await
+    .expect("assembly must not block on Ctrl+C")
+    .expect("a valid config assembles");
+
+    let startup = gateway.webui_startup().expect("webui enabled -> snapshot");
+
+    // Seven runtime objects, each the one the assembly built.
+    assert_eq!(
+        startup.config_path,
+        paths.config_path().to_string_lossy(),
+        "the snapshot carries the config path it was started with"
+    );
+    assert!(startup.card.is_some(), "cards are wired for the gateway");
+    assert!(
+        startup.trace_startup_ms.is_some(),
+        "the file was reset at startup, so there is a startup instant"
+    );
+    assert!(
+        Arc::ptr_eq(&startup.session_manager, &gateway.session_manager()),
+        "the snapshot carries the loop's own session manager"
+    );
+    assert!(startup.shutdown.receiver_count() >= 1);
+    assert!(startup.events.receiver_count() >= 1);
+
+    // The viewer reads the paths the tracer writes: one resolution, not two.
+    assert_eq!(startup.trace_paths, gateway.trace_paths());
+    assert_eq!(
+        startup.trace_paths,
+        vec![trace_path.to_string_lossy().to_string()],
+        "the resolved path is the configured file backend"
+    );
+
+    // ADR 0002: rewriting the config file changes the editor's read-fresh view
+    // and leaves this process's wiring exactly as it was assembled.
+    let mut rewritten: serde_json::Value = serde_json::from_str(&raw.to_string()).unwrap();
+    rewritten["channels"]["webui"]["host"] = serde_json::json!("localhost");
+    std::fs::write(&config_path, rewritten.to_string()).unwrap();
+    assert_eq!(
+        startup.config_path,
+        paths.config_path().to_string_lossy(),
+        "the snapshot path never changes under the process"
+    );
+    assert_eq!(
+        slimbot::Config::try_get()
+            .unwrap()
+            .channels
+            .get("webui")
+            .unwrap()
+            .extra
+            .get("host"),
+        Some(&serde_json::json!("127.0.0.1")),
+        "the installed config is the startup snapshot, not the file"
+    );
+    assert_eq!(
+        slimbot::Config::load_for_preview(&startup.config_path)
+            .unwrap()
+            .channels
+            .get("webui")
+            .unwrap()
+            .extra
+            .get("host"),
+        Some(&serde_json::json!("localhost")),
+        "the editor's read-fresh view sees the new value"
+    );
+
+    gateway.shutdown().await;
 }
 
 #[tokio::test]

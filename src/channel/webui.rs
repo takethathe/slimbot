@@ -65,23 +65,42 @@ pub fn validate_bind_host(host: &str) -> Result<()> {
     )
 }
 
+/// Everything the WebUI needs from the process it starts in, as plain data.
+///
+/// This is the channel-side startup snapshot: the assembly hands it over once,
+/// through `register_webui_factory`, and the factory forwards it to the channel
+/// it creates. Adding a runtime object means adding a field here — the channel,
+/// its factory and the handler state all hold this struct instead of keeping
+/// copies of the field list.
+#[derive(Clone)]
+pub struct WebuiStartup {
+    pub session_manager: SharedSessionManager,
+    /// Ends the channel servers on graceful shutdown.
+    pub shutdown: broadcast::Sender<()>,
+    /// Agent events fanned out to the chat page over SSE.
+    pub events: broadcast::Sender<AgentEvent>,
+    /// Enabled file-backend trace paths (empty when tracing is off).
+    pub trace_paths: Vec<String>,
+    /// Epoch ms when the current process reset its trace file(s); `None` when
+    /// tracing is off or `reset_on_start` is false.
+    pub trace_startup_ms: Option<i64>,
+    /// Startup snapshot (ADR 0002): the path is captured once and never
+    /// hot-reloaded. The Config editor handlers read the file themselves, which
+    /// is what makes a saved patch visible before the next restart.
+    pub config_path: String,
+    /// Card generation service (None when cards are not wired).
+    pub card: Option<Arc<CardService>>,
+}
+
 struct AppState {
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<SsePayload>>>>>,
     inbound_tx: mpsc::Sender<BusRequest>,
     channel_id: String,
-    session_manager: Option<SharedSessionManager>,
     index_html: String,
     traces_html: String,
     config_html: String,
-    config_path: String,
-    event_tx: Option<broadcast::Sender<AgentEvent>>,
-    /// Enabled file-backend trace file paths (empty when tracing/file backend off).
-    trace_paths: Vec<String>,
-    /// Epoch ms when the current process reset its trace file(s); `None` when
-    /// tracing is off or `reset_on_start` is false (no clean startup boundary).
-    trace_startup_ms: Option<i64>,
-    /// Card generation service (None when cards are not wired).
-    card: Option<Arc<CardService>>,
+    /// The one description of the runtime objects every handler reads.
+    startup: WebuiStartup,
 }
 
 /// SSE payload with event type discrimination.
@@ -98,14 +117,11 @@ pub struct WebuiChannel {
     channel_id: String,
     session_prefix: String, // "{channel_id}:" for fast session_id stripping
     message_bus: Option<Arc<MessageBus>>,
-    session_manager: Option<SharedSessionManager>,
     chats: Arc<tokio::sync::Mutex<HashMap<String, Vec<mpsc::Sender<SsePayload>>>>>,
     shutdown_rx: Option<broadcast::Receiver<()>>,
-    event_tx: Option<broadcast::Sender<AgentEvent>>,
-    trace_paths: Vec<String>,
-    trace_startup_ms: Option<i64>,
-    config_path: String,
-    card: Option<Arc<CardService>>,
+    /// The startup snapshot; `None` only for a channel that was parsed from
+    /// config but never wired (tests, and the pre-start state).
+    startup: Option<WebuiStartup>,
 }
 
 impl WebuiChannel {
@@ -125,47 +141,42 @@ impl WebuiChannel {
             channel_id: "webui".to_string(),
             session_prefix: "webui:".to_string(),
             message_bus: None,
-            session_manager: None,
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             shutdown_rx: None,
-            event_tx: None,
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
-            config_path: String::new(),
-            card: None,
+            startup: None,
         })
     }
 
-    pub fn set_message_bus(&mut self, mb: Arc<MessageBus>) {
-        self.message_bus = Some(mb);
+    /// Attach everything the process hands the WebUI: one bus and one startup
+    /// snapshot. This is the single construction step — the per-object setters
+    /// it replaces each carried their own copy of the field list.
+    pub fn with_wiring(mut self, message_bus: Arc<MessageBus>, startup: WebuiStartup) -> Self {
+        self.shutdown_rx = Some(startup.shutdown.subscribe());
+        self.message_bus = Some(message_bus);
+        self.startup = Some(startup);
+        self
     }
 
-    pub fn set_session_manager(&mut self, sm: SharedSessionManager) {
-        self.session_manager = Some(sm);
-    }
-
-    pub fn set_shutdown_rx(&mut self, rx: broadcast::Receiver<()>) {
-        self.shutdown_rx = Some(rx);
-    }
-
-    pub fn set_event_tx(&mut self, tx: broadcast::Sender<AgentEvent>) {
-        self.event_tx = Some(tx);
-    }
-
-    pub fn set_trace_paths(&mut self, paths: Vec<String>) {
-        self.trace_paths = paths;
-    }
-
-    pub fn set_trace_startup_ms(&mut self, startup_ms: Option<i64>) {
-        self.trace_startup_ms = startup_ms;
-    }
-
-    pub fn set_config_path(&mut self, path: String) {
-        self.config_path = path;
-    }
-
-    pub fn set_card(&mut self, card: Arc<CardService>) {
-        self.card = Some(card);
+    /// The handler state for this channel, or `None` when it was never wired
+    /// (no message bus / no snapshot).
+    fn app_state(&self) -> Option<AppState> {
+        let startup = self.startup.clone()?;
+        let message_bus = self.message_bus.as_ref()?;
+        Some(AppState {
+            chats: self.chats.clone(),
+            inbound_tx: message_bus.inbound_tx(),
+            channel_id: self.channel_id.clone(),
+            index_html: embed::get_content_by_dest("webui/index.html")
+                .unwrap_or("<h1>SlimBot Gateway</h1>")
+                .to_string(),
+            traces_html: embed::get_content_by_dest("webui/traces.html")
+                .unwrap_or("<h1>Trace Viewer</h1>")
+                .to_string(),
+            config_html: embed::get_content_by_dest("webui/config.html")
+                .unwrap_or("<h1>Config Editor</h1>")
+                .to_string(),
+            startup,
+        })
     }
 
     /// Prune disconnected SSE subscribers for a chat and send payload to remaining.
@@ -216,49 +227,17 @@ impl WebuiChannel {
         let channel_name = self.name().to_string();
         let host = self.host.clone();
         let port = self.port;
-        let inbound_tx = match &self.message_bus {
-            Some(mb) => mb.inbound_tx(),
-            None => {
-                error!("[webui] No message bus configured");
-                return IoHandle {
-                    join_handle: None,
-                    session_id,
-                    channel_name,
-                };
-            }
+        let Some(state) = self.app_state() else {
+            error!("[webui] No message bus configured");
+            return IoHandle {
+                join_handle: None,
+                session_id,
+                channel_name,
+            };
         };
-        let chats = self.chats.clone();
-        let channel_id = self.channel_id.clone();
-        let session_manager = self.session_manager.clone();
         let shutdown_rx = self.shutdown_rx.as_ref().map(|rx| rx.resubscribe());
-        let event_tx = self.event_tx.clone();
-        let trace_paths = self.trace_paths.clone();
-        let trace_startup_ms = self.trace_startup_ms;
-        let config_path = self.config_path.clone();
-        let card = self.card.clone();
 
         let handle = tokio::spawn(async move {
-            let state = AppState {
-                chats,
-                inbound_tx,
-                channel_id,
-                session_manager,
-                index_html: embed::get_content_by_dest("webui/index.html")
-                    .unwrap_or("<h1>SlimBot Gateway</h1>")
-                    .to_string(),
-                traces_html: embed::get_content_by_dest("webui/traces.html")
-                    .unwrap_or("<h1>Trace Viewer</h1>")
-                    .to_string(),
-                config_html: embed::get_content_by_dest("webui/config.html")
-                    .unwrap_or("<h1>Config Editor</h1>")
-                    .to_string(),
-                config_path,
-                event_tx,
-                trace_paths,
-                trace_startup_ms,
-                card,
-            };
-
             let app = build_router(Arc::new(state));
 
             // Defense in depth: even a hand-constructed channel cannot bind a
@@ -491,7 +470,7 @@ fn load_trace_spans(paths: &[String]) -> (Vec<crate::trace_viewer::SpanRecord>, 
 /// `GET /traces/api/traces`: parse the trace file(s), group by trace id, and
 /// return summaries sorted by start time descending.
 async fn traces_list_handler(State(state): State<Arc<AppState>>) -> axum::Json<TracesListResponse> {
-    if state.trace_paths.is_empty() {
+    if state.startup.trace_paths.is_empty() {
         return axum::Json(TracesListResponse {
             disabled: true,
             too_large: false,
@@ -499,8 +478,8 @@ async fn traces_list_handler(State(state): State<Arc<AppState>>) -> axum::Json<T
             traces: Vec::new(),
         });
     }
-    let startup_ms = state.trace_startup_ms;
-    let (spans, too_large) = load_trace_spans(&state.trace_paths);
+    let startup_ms = state.startup.trace_startup_ms;
+    let (spans, too_large) = load_trace_spans(&state.startup.trace_paths);
     let traces = crate::trace_viewer::build_summaries(&spans);
     axum::Json(TracesListResponse {
         disabled: false,
@@ -515,10 +494,10 @@ async fn trace_detail_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<crate::trace_viewer::TraceDetail>, StatusCode> {
-    if state.trace_paths.is_empty() {
+    if state.startup.trace_paths.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
-    let (spans, _) = load_trace_spans(&state.trace_paths);
+    let (spans, _) = load_trace_spans(&state.startup.trace_paths);
     match crate::trace_viewer::build_detail(&id, &spans) {
         Some(detail) => Ok(axum::Json(detail)),
         None => Err(StatusCode::NOT_FOUND),
@@ -541,10 +520,11 @@ async fn config_page_handler(
 async fn config_state_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
-    let config = crate::config::Config::load_for_preview(&state.config_path).map_err(|e| {
-        crate::error!("[webui] Failed to load config for editor: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let config =
+        crate::config::Config::load_for_preview(&state.startup.config_path).map_err(|e| {
+            crate::error!("[webui] Failed to load config for editor: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let schema = crate::config_schema::serialize_schema(&config);
     Ok(axum::Json(serde_json::json!({ "schema": schema })))
 }
@@ -559,10 +539,11 @@ async fn config_update_handler(
         crate::error!("[webui] Invalid config patch body: {}", e);
         StatusCode::BAD_REQUEST
     })?;
-    let mut config = crate::config::Config::load_for_preview(&state.config_path).map_err(|e| {
-        crate::error!("[webui] Failed to load config for update: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let mut config =
+        crate::config::Config::load_for_preview(&state.startup.config_path).map_err(|e| {
+            crate::error!("[webui] Failed to load config for update: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     // Validate against the secret chain: an api_key that lives in the keychain
     // is what a real startup would use, so the editor must not reject it.
     let errors = crate::config_schema::apply_config_patch_with(
@@ -575,7 +556,7 @@ async fn config_update_handler(
         StatusCode::BAD_REQUEST
     })?;
     if errors.is_empty() {
-        config.save(&state.config_path).map_err(|e| {
+        config.save(&state.startup.config_path).map_err(|e| {
             crate::error!("[webui] Failed to save config: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
@@ -590,19 +571,17 @@ async fn config_update_handler(
 async fn list_chats_handler(State(state): State<Arc<AppState>>) -> axum::Json<Vec<ChatInfo>> {
     let prefix = format!("{}:", state.channel_id);
     let mut chats = Vec::new();
-    if let Some(sm) = &state.session_manager {
-        let guard = sm.lock().await;
-        for (session_id, msg_count, created) in guard.list_persisted_sessions(&prefix) {
-            let chat_id = session_id
-                .strip_prefix(&prefix)
-                .unwrap_or(&session_id)
-                .to_string();
-            chats.push(ChatInfo {
-                chat_id,
-                message_count: msg_count,
-                created_at_ms: created,
-            });
-        }
+    let guard = state.startup.session_manager.lock().await;
+    for (session_id, msg_count, created) in guard.list_persisted_sessions(&prefix) {
+        let chat_id = session_id
+            .strip_prefix(&prefix)
+            .unwrap_or(&session_id)
+            .to_string();
+        chats.push(ChatInfo {
+            chat_id,
+            message_count: msg_count,
+            created_at_ms: created,
+        });
     }
     axum::Json(chats)
 }
@@ -613,8 +592,8 @@ async fn session_history_handler(
 ) -> axum::Json<Vec<crate::session::FrontendMessage>> {
     let session_id = format!("{}:{}", state.channel_id, chat_id);
     let mut messages = Vec::new();
-    if let Some(sm) = &state.session_manager {
-        let guard = sm.lock().await;
+    {
+        let guard = state.startup.session_manager.lock().await;
         if let Ok(msgs) = guard.load_session_messages(&session_id) {
             messages = msgs;
         }
@@ -622,7 +601,7 @@ async fn session_history_handler(
     // Replay: attach sidecar cards by exact anchor match. A card whose
     // anchor no longer exists (consolidation rewrote it away) simply does
     // not attach — never guessed by index, never appended to the end.
-    if let Some(card) = &state.card {
+    if let Some(card) = &state.startup.card {
         let records = card.store().load(&chat_id);
         if !records.is_empty() {
             let by_ts: std::collections::HashMap<&str, &serde_json::Value> = records
@@ -645,10 +624,8 @@ async fn session_history_handler(
 async fn create_chat_handler(State(state): State<Arc<AppState>>) -> axum::Json<String> {
     let chat_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let session_id = format!("{}:{}", state.channel_id, chat_id);
-    if let Some(sm) = &state.session_manager {
-        let mut guard = sm.lock().await;
-        let _ = guard.get_or_create(&session_id).await;
-    }
+    let mut guard = state.startup.session_manager.lock().await;
+    let _ = guard.get_or_create(&session_id).await;
     axum::Json(chat_id)
 }
 
@@ -690,15 +667,12 @@ async fn message_handler(
     };
 
     let session_id = format!("{}:{}", state.channel_id, chat_id);
-    let mut hook = TaskHook::new(&session_id);
-    if let Some(ref tx) = state.event_tx {
-        hook = hook.with_events(tx.clone());
-    }
+    let hook = TaskHook::new(&session_id).with_events(state.startup.events.clone());
     // Mark this Run as WebUI-originated so the card service may generate a card
     // for it. cron / heartbeat mint their Run ids elsewhere and never appear
     // here, so their runs produce no card even when their events reuse a WebUI
     // session id. Registration is fail-closed: no id here means no card.
-    if let Some(card) = &state.card {
+    if let Some(card) = &state.startup.card {
         card.register_run(hook.run_id(), &session_id, &chat_id);
     }
     // The WebUI is a local-only surface: a request that reaches it comes from
@@ -725,7 +699,7 @@ struct CatalogRegistration {
 /// declares the client can render cards). 204 on success, 400 on empty or
 /// oversized prompt, 503 when cards are not wired.
 async fn catalog_register_handler(State(state): State<Arc<AppState>>, body: String) -> StatusCode {
-    let Some(card) = &state.card else {
+    let Some(card) = &state.startup.card else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
     let reg: CatalogRegistration = match serde_json::from_str(&body) {
@@ -804,37 +778,21 @@ impl Channel for WebuiChannel {
 
 pub struct WebuiChannelFactory {
     message_bus: Arc<MessageBus>,
-    session_manager: SharedSessionManager,
-    shutdown_tx: broadcast::Sender<()>,
-    event_tx: broadcast::Sender<AgentEvent>,
-    trace_paths: Vec<String>,
-    trace_startup_ms: Option<i64>,
-    config_path: String,
-    card: Option<Arc<CardService>>,
+    startup: WebuiStartup,
 }
 
 impl WebuiChannelFactory {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        message_bus: Arc<MessageBus>,
-        session_manager: SharedSessionManager,
-        shutdown_tx: broadcast::Sender<()>,
-        event_tx: broadcast::Sender<AgentEvent>,
-        trace_paths: Vec<String>,
-        trace_startup_ms: Option<i64>,
-        config_path: String,
-        card: Option<Arc<CardService>>,
-    ) -> Self {
+    pub fn new(message_bus: Arc<MessageBus>, startup: WebuiStartup) -> Self {
         Self {
             message_bus,
-            session_manager,
-            shutdown_tx,
-            event_tx,
-            trace_paths,
-            trace_startup_ms,
-            config_path,
-            card,
+            startup,
         }
+    }
+
+    /// The snapshot this factory will hand to every channel it creates.
+    #[cfg(test)]
+    pub fn startup(&self) -> &WebuiStartup {
+        &self.startup
     }
 }
 
@@ -844,18 +802,9 @@ impl ChannelFactory for WebuiChannelFactory {
     }
 
     fn create(&self, config: &serde_json::Value) -> Result<Box<dyn Channel>> {
-        let mut ch = WebuiChannel::from_config(config)?;
-        ch.set_message_bus(self.message_bus.clone());
-        ch.set_session_manager(self.session_manager.clone());
-        ch.set_shutdown_rx(self.shutdown_tx.subscribe());
-        ch.set_event_tx(self.event_tx.clone());
-        ch.set_trace_paths(self.trace_paths.clone());
-        ch.set_trace_startup_ms(self.trace_startup_ms);
-        ch.set_config_path(self.config_path.clone());
-        if let Some(card) = &self.card {
-            ch.set_card(card.clone());
-        }
-        Ok(Box::new(ch))
+        let channel = WebuiChannel::from_config(config)?
+            .with_wiring(self.message_bus.clone(), self.startup.clone());
+        Ok(Box::new(channel))
     }
 }
 
@@ -924,13 +873,15 @@ mod tests {
 
         let factory = WebuiChannelFactory::new(
             mb,
-            sm,
-            shutdown_tx,
-            event_tx,
-            Vec::new(),
-            None,
-            String::new(),
-            None,
+            WebuiStartup {
+                session_manager: sm,
+                shutdown: shutdown_tx,
+                events: event_tx,
+                trace_paths: Vec::new(),
+                trace_startup_ms: None,
+                config_path: String::new(),
+                card: None,
+            },
         );
         assert_eq!(factory.channel_type(), "webui");
 
@@ -1064,22 +1015,58 @@ mod tests {
         assert!(handle.join_handle.is_none());
     }
 
-    #[tokio::test]
-    async fn test_webui_list_chats_empty() {
-        let state = Arc::new(AppState {
+    /// A session manager rooted in a directory that outlives every state built
+    /// from it. Handler tests that never read sessions still need one, because
+    /// the snapshot has no "absent" case (production always has one).
+    fn detached_sessions() -> SharedSessionManager {
+        static DIR: std::sync::OnceLock<&'static std::path::Path> = std::sync::OnceLock::new();
+        let dir = DIR.get_or_init(|| Box::leak(Box::new(tempfile::tempdir().unwrap())).path());
+        Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(dir.join("sessions")).unwrap(),
+        ))
+    }
+
+    /// A snapshot with nothing wired beyond what a handler test needs.
+    fn plain_startup() -> WebuiStartup {
+        let (shutdown, _) = broadcast::channel(1);
+        let (events, _) = broadcast::channel(4);
+        WebuiStartup {
+            session_manager: detached_sessions(),
+            shutdown,
+            events,
+            trace_paths: Vec::new(),
+            trace_startup_ms: None,
+            config_path: String::new(),
+            card: None,
+        }
+    }
+
+    /// Handler state for tests: only the snapshot and the pages under test are
+    /// passed in.
+    fn state_with_pages(
+        startup: WebuiStartup,
+        index_html: &str,
+        traces_html: &str,
+        config_html: &str,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inbound_tx: MessageBus::new().0.inbound_tx(),
             channel_id: "webui".to_string(),
-            session_manager: None,
-            index_html: String::new(),
-            event_tx: None,
-            traces_html: String::new(),
-            config_html: String::new(),
-            config_path: String::new(),
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
-            card: None,
-        });
+            index_html: index_html.to_string(),
+            traces_html: traces_html.to_string(),
+            config_html: config_html.to_string(),
+            startup,
+        })
+    }
+
+    fn state_with(startup: WebuiStartup) -> Arc<AppState> {
+        state_with_pages(startup, "", "", "")
+    }
+
+    #[tokio::test]
+    async fn test_webui_list_chats_empty() {
+        let state = state_with(plain_startup());
         let result = list_chats_handler(State(state)).await;
         assert!(result.0.is_empty());
     }
@@ -1103,19 +1090,9 @@ mod tests {
             guard.persist("webui:chat1").await.unwrap();
         }
 
-        let state = Arc::new(AppState {
-            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().0.inbound_tx(),
-            channel_id: "webui".to_string(),
-            session_manager: Some(sm),
-            index_html: String::new(),
-            event_tx: None,
-            traces_html: String::new(),
-            config_html: String::new(),
-            config_path: String::new(),
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
-            card: None,
+        let state = state_with(WebuiStartup {
+            session_manager: sm,
+            ..plain_startup()
         });
         let result = list_chats_handler(State(state)).await;
         assert_eq!(result.0.len(), 1);
@@ -1146,19 +1123,9 @@ mod tests {
             guard.persist("webui:abc").await.unwrap();
         }
 
-        let state = Arc::new(AppState {
-            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().0.inbound_tx(),
-            channel_id: "webui".to_string(),
-            session_manager: Some(sm),
-            index_html: String::new(),
-            event_tx: None,
-            traces_html: String::new(),
-            config_html: String::new(),
-            config_path: String::new(),
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
-            card: None,
+        let state = state_with(WebuiStartup {
+            session_manager: sm,
+            ..plain_startup()
         });
         let result = session_history_handler(State(state), Path("abc".to_string())).await;
         assert_eq!(result.0.len(), 2);
@@ -1166,20 +1133,7 @@ mod tests {
 
     #[test]
     fn test_webui_create_chat_handler_generates_id() {
-        let state = Arc::new(AppState {
-            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().0.inbound_tx(),
-            channel_id: "webui".to_string(),
-            session_manager: None,
-            index_html: String::new(),
-            event_tx: None,
-            traces_html: String::new(),
-            config_html: String::new(),
-            config_path: String::new(),
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
-            card: None,
-        });
+        let state = state_with(plain_startup());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { create_chat_handler(State(state)).await });
         // Should return a non-empty chat_id
@@ -1216,16 +1170,17 @@ mod tests {
     #[tokio::test]
     async fn test_webui_server_starts_and_shuts_down() {
         let (mb, _receivers) = MessageBus::new();
-        let tmp = tempfile::tempdir().unwrap();
-        let sm = Arc::new(tokio::sync::Mutex::new(
-            crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
-        ));
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-        let mut ch = WebuiChannel::from_config(&json!({"host": "127.0.0.1", "port": 0})).unwrap();
-        ch.set_message_bus(mb);
-        ch.set_session_manager(sm);
-        ch.set_shutdown_rx(shutdown_tx.subscribe());
+        let ch = WebuiChannel::from_config(&json!({"host": "127.0.0.1", "port": 0}))
+            .unwrap()
+            .with_wiring(
+                mb,
+                WebuiStartup {
+                    shutdown: shutdown_tx.clone(),
+                    ..plain_startup()
+                },
+            );
 
         let handle = ch.start_server();
         assert!(handle.join_handle.is_some());
@@ -1248,49 +1203,19 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_webui_server_starts_without_shutdown_rx() {
-        // Server without shutdown_rx should still start (bind to port).
-        // We can't easily test it shutting down, but verify it starts without panic.
-        let (mb, _receivers) = MessageBus::new();
-        let tmp = tempfile::tempdir().unwrap();
-        let sm = Arc::new(tokio::sync::Mutex::new(
-            crate::session::SessionManager::new(tmp.path().join("sessions")).unwrap(),
-        ));
-
-        let mut ch = WebuiChannel::from_config(&json!({"host": "127.0.0.1", "port": 0})).unwrap();
-        ch.set_message_bus(mb);
-        ch.set_session_manager(sm);
-        // No set_shutdown_rx call
-
-        let handle = ch.start_server();
-        assert!(handle.join_handle.is_some());
-
-        // Brief wait then abort
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Drop the handle — server task will keep running until MB closes,
-        // which is fine for this test.
-        drop(handle);
-    }
-
     // ── Trace handlers ──
 
     /// Build a minimal AppState for trace handler tests.
     fn trace_state(trace_paths: Vec<String>) -> Arc<AppState> {
-        Arc::new(AppState {
-            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().0.inbound_tx(),
-            channel_id: "webui".to_string(),
-            session_manager: None,
-            index_html: String::new(),
-            traces_html: "<h1>Trace Viewer</h1>".to_string(),
-            config_html: String::new(),
-            config_path: String::new(),
-            event_tx: None,
-            trace_paths,
-            trace_startup_ms: None,
-            card: None,
-        })
+        state_with_pages(
+            WebuiStartup {
+                trace_paths,
+                ..plain_startup()
+            },
+            "",
+            "<h1>Trace Viewer</h1>",
+            "",
+        )
     }
 
     /// Write a realistic two-span trace to a file and return its path.
@@ -1442,15 +1367,10 @@ mod tests {
             chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             inbound_tx: MessageBus::new().0.inbound_tx(),
             channel_id: "webui".to_string(),
-            session_manager: None,
             index_html: "<h1>ok</h1>".to_string(),
             traces_html: String::new(),
             config_html: String::new(),
-            config_path: String::new(),
-            event_tx: None,
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
-            card: None,
+            startup: plain_startup(),
         });
         let app = build_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1608,20 +1528,15 @@ mod tests {
 
     /// Build a minimal AppState for config handler tests.
     fn config_state(config_path: String) -> Arc<AppState> {
-        Arc::new(AppState {
-            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().0.inbound_tx(),
-            channel_id: "webui".to_string(),
-            session_manager: None,
-            index_html: String::new(),
-            traces_html: String::new(),
-            config_html: "<h1>Config Editor</h1>".to_string(),
-            config_path,
-            event_tx: None,
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
-            card: None,
-        })
+        state_with_pages(
+            WebuiStartup {
+                config_path,
+                ..plain_startup()
+            },
+            "",
+            "",
+            "<h1>Config Editor</h1>",
+        )
     }
 
     /// Write a minimal valid config file and return its path.
@@ -1801,19 +1716,9 @@ mod tests {
             crate::card::CardStore::new(session_dir),
             card_tx,
         ));
-        let state = Arc::new(AppState {
-            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().0.inbound_tx(),
-            channel_id: "webui".to_string(),
-            session_manager: None,
-            index_html: String::new(),
-            traces_html: String::new(),
-            config_html: String::new(),
-            config_path: String::new(),
-            event_tx: None,
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
+        let state = state_with(WebuiStartup {
             card: Some(service.clone()),
+            ..plain_startup()
         });
         (state, service, dir)
     }
@@ -1909,19 +1814,10 @@ mod tests {
             crate::card::CardStore::new(session_dir),
             card_tx,
         ));
-        let state = Arc::new(AppState {
-            chats: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            inbound_tx: MessageBus::new().0.inbound_tx(),
-            channel_id: "webui".to_string(),
-            session_manager: Some(sm.clone()),
-            index_html: String::new(),
-            event_tx: None,
-            traces_html: String::new(),
-            config_html: String::new(),
-            config_path: String::new(),
-            trace_paths: Vec::new(),
-            trace_startup_ms: None,
+        let state = state_with(WebuiStartup {
+            session_manager: sm.clone(),
             card: Some(service.clone()),
+            ..plain_startup()
         });
         (state, service, sm, dir)
     }
@@ -2006,5 +1902,158 @@ mod tests {
         let (state, _service, _sm, _dir) = replay_state();
         let out = session_history_handler(State(state), Path("nope".to_string())).await;
         assert!(out.0.is_empty());
+    }
+
+    // ── Startup snapshot ──
+
+    fn snapshot_session_manager(dir: &std::path::Path) -> SharedSessionManager {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(dir.join("sessions")).unwrap(),
+        ))
+    }
+
+    /// The snapshot is the WebUI's only description of its runtime objects: a
+    /// channel built from it must hand all seven to the handler state. A field
+    /// dropped on the way fails here instead of in production.
+    #[tokio::test]
+    async fn test_webui_snapshot_delivers_all_seven_runtime_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mb, _mb_rx) = MessageBus::new();
+        let sm = snapshot_session_manager(tmp.path());
+        let (shutdown, _shutdown_rx) = broadcast::channel::<()>(1);
+        let (events, _events_rx) = broadcast::channel::<AgentEvent>(4);
+        let (card_tx, _card_rx) = mpsc::channel(1);
+        let card = Arc::new(CardService::new(
+            Arc::new(crate::provider::MockProvider::new()),
+            sm.clone(),
+            crate::card::CardStore::new(tmp.path().join("cards")),
+            card_tx,
+        ));
+        let startup = WebuiStartup {
+            session_manager: sm.clone(),
+            shutdown: shutdown.clone(),
+            events: events.clone(),
+            trace_paths: vec!["/tmp/a.jsonl".to_string(), "/tmp/b.jsonl".to_string()],
+            trace_startup_ms: Some(42),
+            config_path: "/tmp/config.json".to_string(),
+            card: Some(card.clone()),
+        };
+
+        let channel = WebuiChannel::from_config(&json!({}))
+            .unwrap()
+            .with_wiring(mb, startup.clone());
+        let state = channel.app_state().expect("a wired channel has state");
+
+        // The factory is the only path the assembly hands the snapshot through,
+        // so it must keep the same objects rather than a rebuilt copy.
+        let (factory_bus, _factory_rx) = MessageBus::new();
+        let factory = WebuiChannelFactory::new(factory_bus, startup);
+        assert!(Arc::ptr_eq(&factory.startup().session_manager, &sm));
+        assert_eq!(factory.startup().config_path, "/tmp/config.json");
+        assert!(Arc::ptr_eq(factory.startup().card.as_ref().unwrap(), &card));
+
+        assert!(
+            Arc::ptr_eq(&state.startup.session_manager, &sm),
+            "the session manager must be the one handed over"
+        );
+        assert_eq!(state.startup.trace_paths, ["/tmp/a.jsonl", "/tmp/b.jsonl"]);
+        assert_eq!(state.startup.trace_startup_ms, Some(42));
+        assert_eq!(state.startup.config_path, "/tmp/config.json");
+        assert!(
+            Arc::ptr_eq(state.startup.card.as_ref().unwrap(), &card),
+            "the card service must be the one handed over"
+        );
+        // Both broadcasts are the very senders the caller kept, so a subscriber
+        // established before assembly still hears the channel.
+        assert!(state.startup.shutdown.same_channel(&shutdown));
+        assert!(state.startup.events.same_channel(&events));
+        assert!(
+            channel.shutdown_rx.is_some(),
+            "the shutdown receiver is derived from the same snapshot"
+        );
+    }
+
+    /// ADR 0002: the snapshot carries a *path*, never a parsed config value,
+    /// so the Config editor reads fresh from the file on every request. That
+    /// the in-process wiring itself stays put is pinned by the gateway assembly
+    /// test through `Config::try_get()`.
+    #[tokio::test]
+    async fn test_webui_snapshot_config_path_is_a_startup_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = write_config_file(tmp.path());
+        let (mb, _mb_rx) = MessageBus::new();
+        let (shutdown, _shutdown_rx) = broadcast::channel::<()>(1);
+        let (events, _events_rx) = broadcast::channel::<AgentEvent>(4);
+        let startup = WebuiStartup {
+            session_manager: snapshot_session_manager(tmp.path()),
+            shutdown,
+            events,
+            trace_paths: Vec::new(),
+            trace_startup_ms: None,
+            config_path: config_path.clone(),
+            card: None,
+        };
+        let channel = WebuiChannel::from_config(&json!({}))
+            .unwrap()
+            .with_wiring(mb, startup);
+        let state = channel.app_state().unwrap();
+
+        // Rewrite the file behind the process's back.
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        raw["channels"]["webui"]["port"] = json!(3001);
+        std::fs::write(&config_path, raw.to_string()).unwrap();
+
+        // The snapshot's path still resolves to the live, rewritten file (not a
+        // stale copy), and the editor reads the new value through that path.
+        let on_disk = std::fs::read_to_string(&state.startup.config_path).unwrap();
+        assert!(
+            on_disk.contains("3001"),
+            "the snapshot path names the file that was just rewritten"
+        );
+        let fresh = crate::config::Config::load_for_preview(&state.startup.config_path).unwrap();
+        assert_eq!(
+            fresh.channels.get("webui").unwrap().extra.get("port"),
+            Some(&json!(3001))
+        );
+    }
+
+    /// One description, not three: the runtime objects are declared in
+    /// `WebuiStartup` alone, and the per-object setters are gone. A new
+    /// channel-side parameter therefore has exactly one place to go.
+    #[test]
+    fn test_channel_side_parameters_are_described_once() {
+        let src = include_str!("webui.rs");
+        // Split so the needles themselves do not count as occurrences.
+        for field in [
+            concat!("pub trace_paths", ": Vec<String>"),
+            concat!("pub trace_startup_ms", ": Option<i64>"),
+            concat!("pub config_path", ": String"),
+        ] {
+            assert_eq!(
+                src.matches(field).count(),
+                1,
+                "{field} must be declared exactly once"
+            );
+        }
+        for setter in [
+            concat!("pub fn set_", "message_bus"),
+            concat!("pub fn set_", "session_manager"),
+            concat!("pub fn set_", "shutdown_rx"),
+            concat!("pub fn set_", "event_tx"),
+            concat!("pub fn set_", "trace_paths"),
+            concat!("pub fn set_", "trace_startup_ms"),
+            concat!("pub fn set_", "config_path"),
+            concat!("pub fn set_", "card"),
+        ] {
+            assert!(!src.contains(setter), "{setter} must be gone");
+        }
+        assert!(
+            !src.contains(concat!("too_many_", "arguments")),
+            "the eight-argument constructor must be gone"
+        );
+        // The factory path is unchanged: channels are still created from the
+        // JSON value the ChannelManager hands over.
+        assert!(src.contains(concat!("fn create(&self, config: ", "&serde_json::Value)")));
     }
 }

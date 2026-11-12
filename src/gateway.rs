@@ -43,7 +43,82 @@ fn register_in_loop_and_catalog<T, F>(
     );
 }
 
-pub async fn run_gateway(paths: &PathManager) -> Result<()> {
+/// A fully assembled gateway: every component is wired and running, and nothing
+/// has waited on a shutdown signal yet.
+pub struct Gateway {
+    channel_manager: Arc<ChannelManager>,
+    agent_loop: Arc<AgentLoop>,
+    heartbeat: Arc<HeartbeatService>,
+    cron: Arc<CronService>,
+    card_service: Option<Arc<crate::card::CardService>>,
+    channel_shutdown: tokio::sync::broadcast::Sender<()>,
+    /// The snapshot handed to the WebUI factory, kept so a wiring test can
+    /// assert what was wired without reaching inside the channel.
+    webui_startup: Option<crate::channel::WebuiStartup>,
+}
+
+impl Gateway {
+    /// The WebUI startup snapshot, when the webui channel is configured.
+    pub fn webui_startup(&self) -> Option<&crate::channel::WebuiStartup> {
+        self.webui_startup.as_ref()
+    }
+
+    /// The trace files this process writes, as the write side resolved them.
+    pub fn trace_paths(&self) -> &[String] {
+        self.agent_loop.trace_paths()
+    }
+
+    /// The session manager the loop runs on, so a wiring test can prove the
+    /// snapshot carries the real one rather than a copy.
+    pub fn session_manager(&self) -> crate::session::SharedSessionManager {
+        self.agent_loop.session_manager()
+    }
+
+    /// Stop the services in the documented order, with the same 10s budget as
+    /// before the assembly step was split out.
+    pub async fn shutdown(self) {
+        // Signal channel servers to stop (webui etc.)
+        let _ = self.channel_shutdown.send(());
+
+        // Cancel in-flight card generations rather than let them hang the exit.
+        if let Some(card_service) = &self.card_service {
+            let cancelled = card_service.shutdown();
+            if !cancelled.is_empty() {
+                info!(
+                    "[gateway] cancelled {} inflight card generation(s)",
+                    cancelled.len()
+                );
+            }
+        }
+
+        // Graceful shutdown with overall timeout.
+        // Race against a second Ctrl+C for forced exit.
+        self.heartbeat.stop();
+        self.cron.stop();
+        let shutdown_timeout = std::time::Duration::from_secs(10);
+        tokio::select! {
+            result = tokio::time::timeout(
+                shutdown_timeout,
+                self.agent_loop.graceful_shutdown(&self.channel_manager),
+            ) => {
+                if result.is_err() {
+                    crate::error!("[gateway] Graceful shutdown timed out");
+                }
+            }
+            _ = signal::ctrl_c() => {
+                eprintln!("\n[gateway] Second Ctrl+C received, forcing exit");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Assemble the gateway: build and start every component, then return the
+/// handles the shutdown step needs.
+///
+/// The split is deliberate — assembly is plain construction a test can drive and
+/// assert on, while [`run_gateway`] owns only the wait and the stop sequence.
+pub async fn assemble_gateway(paths: &PathManager) -> Result<Gateway> {
     WorkerPool::init_global(64);
 
     let config = Arc::new(Config::load_resolved(
@@ -54,25 +129,6 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
     let outbound_rx = receivers.outbound;
     let inbound_rx = receivers.inbound;
     let media_rx = receivers.media;
-
-    // Reset trace file(s) on Gateway startup so the viewer reflects the
-    // current process run. CLI mode never truncates (this is the only place
-    // reset_trace_files is called). The append handle of a live FileBackend
-    // stays valid across truncation.
-    let trace_paths =
-        crate::agent_loop::resolve_trace_file_paths(config.as_ref(), paths.workspace_dir());
-    let reset_count =
-        crate::agent_loop::reset_trace_files(&trace_paths, config.tracing.reset_on_start);
-    // The startup instant of the current process's trace file. Recorded only
-    // when the file was actually reset (or created) so the viewer can show
-    // "started … · running …" that reflects this process, not the file mtime
-    // (which updates on every span append). None when tracing is off or
-    // `reset_on_start` is false — in those cases there is no clean "startup"
-    // boundary to display.
-    let trace_startup_ms = (reset_count > 0).then(crate::agent_loop::now_epoch_ms);
-    if reset_count > 0 {
-        info!("[gateway] Reset {} trace file(s) at startup", reset_count);
-    }
 
     // Build ToolManager with all tools including message + cron
     let mut tool_manager = ToolManager::new(paths.workspace_dir().to_path_buf());
@@ -207,6 +263,25 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
         info!("[gateway] MCP connectors: {}", names);
+    }
+
+    // Reset trace file(s) on Gateway startup so the viewer reflects the
+    // current process run. The paths come from the loop — the same list its
+    // tracer writes — so writer and viewer cannot disagree. CLI mode never
+    // truncates (this is the only place reset_trace_files is called); the
+    // append handle of a live FileBackend stays valid across truncation.
+    let trace_paths = agent_loop.trace_paths().to_vec();
+    let reset_count =
+        crate::agent_loop::reset_trace_files(&trace_paths, config.tracing.reset_on_start);
+    // The startup instant of the current process's trace file. Recorded only
+    // when the file was actually reset (or created) so the viewer can show
+    // "started … · running …" that reflects this process, not the file mtime
+    // (which updates on every span append). None when tracing is off or
+    // `reset_on_start` is false — in those cases there is no clean "startup"
+    // boundary to display.
+    let trace_startup_ms = (reset_count > 0).then(crate::agent_loop::now_epoch_ms);
+    if reset_count > 0 {
+        info!("[gateway] Reset {} trace file(s) at startup", reset_count);
     }
 
     // ChannelManager: init channels from config
@@ -404,6 +479,7 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     // Register webui factory with shutdown channel
     let mut card_service_for_shutdown: Option<Arc<crate::card::CardService>> = None;
+    let mut webui_startup: Option<crate::channel::WebuiStartup> = None;
     if config.channels.contains_key("webui") {
         // Card generation lives in the channel layer: it listens to Run
         // lifecycle events on the broadcast, produces cards off an independent
@@ -440,15 +516,21 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
         card_service_for_shutdown = Some(card_service.clone());
         crate::card::spawn_listener(card_service.clone(), event_tx.subscribe());
         channel_manager.attach_card_rx(card_rx);
-        channel_manager.register_webui_factory(
-            agent_loop.session_manager(),
-            channel_shutdown_tx.clone(),
-            event_tx.clone(),
-            trace_paths.clone(),
+        // The WebUI's runtime objects as one plain-data snapshot, consumed only
+        // through the factory registration below. `config_path` is a startup
+        // snapshot: the editor handlers read the file themselves, so a saved
+        // patch is visible there before the next restart and never here.
+        let startup = crate::channel::WebuiStartup {
+            session_manager: agent_loop.session_manager(),
+            shutdown: channel_shutdown_tx.clone(),
+            events: event_tx.clone(),
+            trace_paths: trace_paths.clone(),
             trace_startup_ms,
-            paths.config_path().to_string_lossy().to_string(),
-            Some(card_service),
-        );
+            config_path: paths.config_path().to_string_lossy().to_string(),
+            card: Some(card_service),
+        };
+        channel_manager.register_webui_factory(startup.clone());
+        webui_startup = Some(startup);
     }
 
     // Feishu is a gateway-only channel: it holds a single WebSocket long
@@ -483,19 +565,23 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     // Spawn outbound router
     let cm = Arc::new(channel_manager);
-    let cm_for_shutdown = cm.clone();
     let shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        cm.run_with_shutdown(shutdown_rx).await;
+    tokio::spawn({
+        let cm = cm.clone();
+        async move {
+            cm.run_with_shutdown(shutdown_rx).await;
+        }
     });
 
     // Spawn heartbeat tick loop
     let hb_arc = Arc::new(heartbeat);
-    let hb_for_shutdown = hb_arc.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(hb_arc.sleep_duration()).await;
-            hb_arc.tick().await;
+    tokio::spawn({
+        let hb = hb_arc.clone();
+        async move {
+            loop {
+                tokio::time::sleep(hb.sleep_duration()).await;
+                hb.tick().await;
+            }
         }
     });
 
@@ -547,46 +633,30 @@ pub async fn run_gateway(paths: &PathManager) -> Result<()> {
 
     info!("[gateway] Running, press Ctrl+C to stop");
 
-    // Wait for Ctrl+C
+    Ok(Gateway {
+        channel_manager: cm,
+        agent_loop,
+        heartbeat: hb_arc,
+        cron: cron_service_arc,
+        card_service: card_service_for_shutdown,
+        channel_shutdown: channel_shutdown_tx,
+        webui_startup,
+    })
+}
+
+/// Run the gateway until Ctrl+C, then stop it.
+///
+/// Everything that can be asserted lives in [`assemble_gateway`]; this function
+/// is the wait and the stop, which is exactly the part a test cannot drive.
+pub async fn run_gateway(paths: &PathManager) -> Result<()> {
+    let gateway = assemble_gateway(paths).await?;
+
     if let Err(e) = signal::ctrl_c().await {
         crate::error!("[gateway] Ctrl+C handler error: {}", e);
     }
     info!("[gateway] Shutdown signal received");
 
-    // Signal channel servers to stop (webui etc.)
-    let _ = channel_shutdown_tx.send(());
-
-    // Cancel in-flight card generations rather than let them hang the exit.
-    if let Some(card_service) = &card_service_for_shutdown {
-        let cancelled = card_service.shutdown();
-        if !cancelled.is_empty() {
-            info!(
-                "[gateway] cancelled {} inflight card generation(s)",
-                cancelled.len()
-            );
-        }
-    }
-
-    // Graceful shutdown with overall timeout.
-    // Race against a second Ctrl+C for forced exit.
-    hb_for_shutdown.stop();
-    cron_service_arc.stop();
-    let shutdown_timeout = std::time::Duration::from_secs(10);
-    tokio::select! {
-        result = tokio::time::timeout(
-            shutdown_timeout,
-            agent_loop.graceful_shutdown(&cm_for_shutdown),
-        ) => {
-            if result.is_err() {
-                crate::error!("[gateway] Graceful shutdown timed out");
-            }
-        }
-        _ = signal::ctrl_c() => {
-            eprintln!("\n[gateway] Second Ctrl+C received, forcing exit");
-            std::process::exit(1);
-        }
-    }
-
+    gateway.shutdown().await;
     Ok(())
 }
 
@@ -936,61 +1006,23 @@ mod tests {
         assert!(config.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_gateway_trace_reset_wiring_truncates_workspace_trace() {
-        // The gateway startup path resolves the default workspace trace path and
-        // resets it when `reset_on_start` is true (the default).
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_test_paths(&tmp);
-        let trace_path = paths.workspace_dir().join("traces.jsonl");
-        std::fs::write(&trace_path, "old span\n").unwrap();
-
-        let config = Config::load_resolved_with(
-            paths.config_path().to_str().unwrap(),
-            &crate::secrets::SecretStore::empty(),
-        )
-        .unwrap();
-        // The generated test config has tracing disabled; enable it with a file
-        // backend so the resolution finds the default workspace path.
-        let trace_paths = crate::agent_loop::resolve_trace_file_paths(
-            &Config {
-                pressure: Default::default(),
-                mcp: Default::default(),
-                executors: Default::default(),
-                tracing: serde_json::from_value(serde_json::json!({
-                    "enabled": true,
-                    "backends": [
-                        { "type": "file", "enabled": true, "path": "" }
-                    ]
-                }))
-                .unwrap(),
-                ..config
-            },
-            paths.workspace_dir(),
+    /// The wiring used to be verified by copying the startup call sequence into
+    /// a test. Now the sequence exists in exactly one place — the assembly — and
+    /// the reset is not repeated anywhere else (ADR 0022: once, at gateway
+    /// startup; CLI never truncates).
+    #[test]
+    fn test_gateway_wiring_tests_do_not_copy_the_call_sequence() {
+        let src = include_str!("gateway.rs");
+        // Split so the needle does not count this assertion itself.
+        assert!(
+            !src.contains(concat!("resolve_trace_", "file_paths")),
+            "the viewer must read the tracer's resolution, not resolve again"
         );
-        assert_eq!(trace_paths, vec![trace_path.to_string_lossy().to_string()]);
-
-        let count =
-            crate::agent_loop::reset_trace_files(&trace_paths, config.tracing.reset_on_start);
-        assert_eq!(count, 1);
-        assert_eq!(std::fs::read_to_string(&trace_path).unwrap(), "");
-    }
-
-    #[tokio::test]
-    async fn test_gateway_trace_reset_preserved_when_reset_off() {
-        // When `reset_on_start` is false the gateway startup leaves existing
-        // trace files intact (the CLI path never calls reset at all).
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = make_test_paths(&tmp);
-        let trace_path = paths.workspace_dir().join("traces.jsonl");
-        std::fs::write(&trace_path, "kept span\n").unwrap();
-
-        let count = crate::agent_loop::reset_trace_files(
-            &[trace_path.to_string_lossy().to_string()],
-            false,
+        assert_eq!(
+            src.matches(concat!("reset_trace_", "files(")).count(),
+            1,
+            "startup truncation happens once, inside the assembly"
         );
-        assert_eq!(count, 0);
-        assert_eq!(std::fs::read_to_string(&trace_path).unwrap(), "kept span\n");
     }
 
     #[tokio::test]

@@ -108,7 +108,7 @@ fn human_size(bytes: u64) -> String {
 /// Build a tracer from the `tracing` config section, or `None` when tracing
 /// is disabled or no backend is enabled. This is the wiring-layer mapping from
 /// config to backends; the trace module itself stays free of config.
-fn build_tracer(config: &Config, workspace_dir: &std::path::Path) -> Option<Arc<Tracer>> {
+fn build_tracer(config: &Config, file_paths: &[String]) -> Option<Arc<Tracer>> {
     if !config.tracing.enabled {
         return None;
     }
@@ -117,8 +117,7 @@ fn build_tracer(config: &Config, workspace_dir: &std::path::Path) -> Option<Arc<
     // viewer reads exactly the files the tracer writes. One startup line per
     // path makes growth visible: the CLI appends forever, the gateway resets
     // on start (both are documented semantics, not choices made here).
-    let file_paths = resolve_trace_file_paths(config, workspace_dir);
-    for path in &file_paths {
+    for path in file_paths {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         info!(
             "[Trace] File backend: {} ({}, CLI appends, gateway truncates on start)",
@@ -126,7 +125,7 @@ fn build_tracer(config: &Config, workspace_dir: &std::path::Path) -> Option<Arc<
             human_size(size)
         );
     }
-    for path in &file_paths {
+    for path in file_paths {
         match FileBackend::new(path) {
             Ok(fb) => backends.push(Arc::new(fb) as Arc<dyn TraceBackend>),
             Err(e) => {
@@ -208,6 +207,9 @@ pub struct AgentLoop {
     /// inbound requests (and the `/stop` sentinel) build their own runner via
     /// `SessionTaskBuilder`; cron/heartbeat instead reuse `self.runner`.
     tracer: Option<Arc<Tracer>>,
+    /// The trace files the tracer writes, resolved once here. The WebUI viewer
+    /// reads this list instead of resolving the paths a second time.
+    trace_paths: Vec<String>,
     /// Dream service for background dream tasks.
     dream_service: Arc<crate::dream::DreamService>,
     /// Subagent runtime, shared with the trigger dispatcher.
@@ -399,8 +401,11 @@ impl AgentLoop {
         let providers = Arc::new(providers_map);
 
         // Built before the consolidator and Dream so both are observable through
-        // the same tracer the main loop uses (ticket 06 #4, ADR 0022).
-        let tracer = build_tracer(&config, paths.workspace_dir());
+        // the same tracer the main loop uses (ticket 06 #4, ADR 0022). The paths
+        // are resolved once here and kept on the loop: the viewer consumes this
+        // list, so a file cannot be written without being readable.
+        let trace_paths = resolve_trace_file_paths(&config, paths.workspace_dir());
+        let tracer = build_tracer(&config, &trace_paths);
 
         // The window anchor lives on the provider section (ADR 0013): the
         // consolidator, the trimming hooks and Dream all read the same value.
@@ -574,6 +579,7 @@ impl AgentLoop {
             shutdown_tx,
             runner,
             tracer,
+            trace_paths,
             dream_service,
             subagent_runtime,
         })
@@ -585,6 +591,14 @@ impl AgentLoop {
 
     pub fn session_manager(&self) -> SharedSessionManager {
         self.session_manager.clone()
+    }
+
+    /// The trace files this process writes, as resolved at construction.
+    ///
+    /// The WebUI viewer reads this list rather than resolving the configured
+    /// paths again, so writer and viewer cannot disagree about the file.
+    pub fn trace_paths(&self) -> &[String] {
+        &self.trace_paths
     }
 
     /// The owner's primary channel store (delivery seam, ticket 17).
@@ -1199,6 +1213,45 @@ mod tests {
             paths,
             vec![home.join("traces.jsonl").to_string_lossy().to_string()]
         );
+    }
+
+    // ── Trace wiring: the loop keeps the resolution its tracer was built from ──
+
+    /// The viewer reads the files the tracer writes. Both come from one
+    /// resolution kept on the loop, so the gateway never re-derives the paths.
+    #[tokio::test]
+    async fn test_trace_paths_are_the_ones_the_tracer_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(&tmp);
+        let trace_path = paths.workspace_dir().join("custom-traces.jsonl");
+        let mut config = crate::config::Config::load_resolved_with(
+            paths.config_path().to_str().unwrap(),
+            &crate::secrets::SecretStore::empty(),
+        )
+        .unwrap();
+        config.tracing = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "reset_on_start": true,
+            "backends": [{"type": "file", "enabled": true, "path": trace_path.to_str().unwrap()}]
+        }))
+        .unwrap();
+
+        let (message_bus, _receivers) = MessageBus::new();
+        let agent_loop =
+            AgentLoop::from_config(&paths, message_bus, _receivers.inbound, Arc::new(config))
+                .await
+                .unwrap();
+
+        assert!(
+            agent_loop.tracer().is_some(),
+            "an enabled file backend means a tracer"
+        );
+        assert_eq!(
+            agent_loop.trace_paths(),
+            [trace_path.to_string_lossy().to_string()],
+            "the loop keeps the very resolution its tracer was built from"
+        );
+        agent_loop.shutdown_for_cli().await;
     }
 
     // ── Trace wiring: reset_trace_files ──

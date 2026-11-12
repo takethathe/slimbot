@@ -19,7 +19,8 @@
 - [x] 实现票 04 Run 装配单点与共享 fixture（2026-11-11 完成：`RunSpec` 退化为借用 `AgentRunner` 的视图，20 字段投影消失、Run 级依赖只经访问器读；`gate_context()` 保留为唯一真 seam；`SessionTask` 只剩 id / session_id / closure，三个假值与 `#[allow(dead_code)]` 删除；15 份手抄 `make_spec()` 收敛为 `src/runner/test_support.rs` 的 `RunFixture`；3 条结构锁 + 门禁三绿）
 - [x] 实现票 05 shallow hook 内联与取消映射收口（2026-11-11 完成：`AccumulateUsage` / `FireToolCall` / `FireToolResult` / `FirePostIteration` / `FireTaskCompleted` 五个 shallow hook 与 `PostIterationHook` trait 删除，事件发射、usage 累加、回合收尾（`close_turn()`）改为骨架内联；取消的「错误 → 状态」映射收成 `fail_cancelled()` 一处，`false` / `break` / `break 'outer` 三种出口各自保留，原先由 `run_*` 提供的取消检查点用 `cancel_here()` 在原位复刻；13 个 policy hook 与 `gate.rs` 未动；4 条行为测试 + 2 条结构锁 + 门禁三绿）
 - [x] 实现票 06 结果路由与显式 provider error kind（2026-11-11 完成：`Provider::chat` / `chat_stream` 的错误类型改为 `ProviderResult<T> = Result<T, ProviderError>`，删掉 runner 里从 `anyhow::Error` `downcast` 猜 kind 的分支——未分类的失败归 `Other` 而不是 `None`；结果路由收成 `AgentResult::provider_failure_route()`（`AlertOwner` / `RelievePressure` / `FailInPlace`）留在 `AgentResult` 旁，副作用抽到 `session.rs` 的 `apply_provider_failure_route` 使 `force_consolidate` 分支首次可测；`message_sent` 的 1 处赋值 + 2 处消费加结构锁作票 12 基线；3 条行为测试 + 3 条路由测试 + 2 条结构锁 + 门禁三绿）
-- [ ] 实现票 07–13（frontier 现为 07 Gateway 快照 / 09 Approval 共享不变量 / 11 Delivery 来源类别）
+- [x] 实现票 07 Gateway 启动快照与接线描述（2026-11-12 完成：`run_gateway` 拆成可构造的 `assemble_gateway`（返回 `Gateway`）与只负责 `ctrl_c` / 关停的 `run_gateway`；WebUI 的 7 个运行时对象收成一份纯数据 `WebuiStartup`，只经 `register_webui_factory` → `WebuiChannelFactory::create` 消费，`WebuiChannel` 与 `AppState` 都持有它，8 个 setter 收成一个 `with_wiring`、两处 `too_many_arguments` allow 删除；trace 解析在 `AgentLoop` 内做一次、写侧与 viewer 共用 `trace_paths()`，网关截断只发生一次；`config_path` 显式标注「启动快照、不可热更新」；4 条行为/接线测试 + 2 条结构锁，删掉只断言目录存在的空测试，+ 门禁三绿）
+- [ ] 实现票 08–13（frontier 现为 09 Approval 共享不变量 / 11 Delivery 来源类别）
 - [ ] 08 文档与验收收口（task，前置票均已 resolved；文档回改 / 门禁 / commit 由实现票 13 承接）
 
 ## trace 本地可观测（2026-11-08 收官）
