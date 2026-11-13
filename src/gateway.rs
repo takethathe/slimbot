@@ -435,17 +435,22 @@ pub async fn assemble_gateway(paths: &PathManager) -> Result<Gateway> {
     // owner's primary channel, else nowhere (log-only).
     let mb_for_notify = message_bus.clone();
     let owner_primary_for_hb = agent_loop.owner_primary();
-    let heartbeat_override = crate::delivery::DeliveryTarget::from_pair(
-        config.gateway.heartbeat.channel.as_deref(),
-        config.gateway.heartbeat.to.as_deref(),
-    );
+    // Hand the configured override over raw: whether it is a destination at all,
+    // and whether it beats the owner's channel, is the seam's decision.
+    let heartbeat_channel = config.gateway.heartbeat.channel.clone();
+    let heartbeat_to = config.gateway.heartbeat.to.clone();
     heartbeat.set_on_notify(Arc::new(move |response| {
         let mb = mb_for_notify.clone();
         let resp = response.clone();
-        let override_target = heartbeat_override.clone();
+        let channel = heartbeat_channel.clone();
+        let to = heartbeat_to.clone();
         let owner_primary = owner_primary_for_hb.current();
         Box::pin(async move {
-            match crate::delivery::heartbeat_target(override_target, owner_primary) {
+            match crate::delivery::heartbeat_target(
+                channel.as_deref(),
+                to.as_deref(),
+                owner_primary,
+            ) {
                 crate::delivery::Resolution::Deliver(target) => {
                     mb.publish_outbound(BusResult {
                         session_id: target.session_id(),

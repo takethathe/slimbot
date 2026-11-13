@@ -21,9 +21,9 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::agent::{AcquireMode, StartReject, StartRequest, SubagentRuntime};
+use crate::agent::{AcquireMode, Origin, StartReject, StartRequest, SubagentRuntime};
 use crate::debug;
-use crate::delivery::{DeliveryTarget, Resolution};
+use crate::delivery::{DeliverySource, DeliveryTarget, Resolution};
 use crate::message_bus::{BusRequest, BusResult, MessageBus};
 use crate::session::TaskHook;
 use crate::trace::{SpanRecorder, SpanStatus, Tracer};
@@ -182,19 +182,28 @@ fn push_notice(works: &mut Vec<Work>, dest: String, fire: Fire, max_merge: usize
     });
 }
 
+/// The rule's origin conversation as the seam's `(channel, chat_id)` pair.
+///
+/// Notify and alert describe the origin the same way; what that pair means for
+/// delivery (a target, or nothing when a half is empty) is the seam's decision.
+fn origin_pair(origin: Option<&Origin>) -> Option<(&str, &str)> {
+    origin.map(|origin| (origin.channel.as_str(), origin.chat_id.as_str()))
+}
+
 /// Where a `notify` goes, resolved by the shared delivery seam: an explicit
 /// channel and target, else the conversation the rule was created in.
 ///
 /// Triggers never fall back to the owner's primary channel — they always carry
 /// an origin, and an unreachable origin stays book-only rather than being
-/// misdelivered (`delivery::resolve_target`).
+/// misdelivered. That is the `Trigger` source's policy, not this call's.
 fn destination(fire: &Fire) -> Resolution {
     let action = &fire.action;
     crate::delivery::resolve_target(
-        DeliveryTarget::from_pair(action.channel.as_deref(), action.to.as_deref()),
-        fire.origin
-            .as_ref()
-            .and_then(|origin| DeliveryTarget::from_session_id(&origin.session_id())),
+        DeliverySource::Trigger {
+            channel: action.channel.as_deref(),
+            to: action.to.as_deref(),
+            origin: origin_pair(fire.origin.as_ref()),
+        },
         None,
     )
 }
@@ -546,11 +555,11 @@ impl Dispatcher {
     /// nothing to summarize, no model call.
     async fn send_alert(&self, alert: &Alert) {
         let Some(dest) = crate::delivery::resolve_target(
-            None,
-            alert
-                .origin
-                .as_ref()
-                .and_then(|origin| DeliveryTarget::from_session_id(&origin.session_id())),
+            DeliverySource::Trigger {
+                channel: None,
+                to: None,
+                origin: origin_pair(alert.origin.as_ref()),
+            },
             None,
         )
         .target()

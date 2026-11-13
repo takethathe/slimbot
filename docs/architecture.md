@@ -112,12 +112,17 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 
 ### 出站投递（投递目标解析）
 
-主动消息（cron / heartbeat / trigger / alert）的目标由**唯一一条规则**决定（`src/delivery.rs::resolve_target`）：
+主动消息（cron / heartbeat / trigger / provider alert）都经**同一个解析入口**（`src/delivery.rs::resolve_target`）；调用点只声明来源类别（`DeliverySource`）与自己持有的事实，优先级与兜底资格在 `DeliverySource::candidate()` 一处求值：
 
 ```
-显式 deliver-to  >  创建任务的 Origin session  >  Owner primary channel
+                            own target   origin   owner primary
+  cron (payload channel/to)     yes         —          yes
+  heartbeat (override)         yes         —          yes
+  trigger notify / alert       yes        yes         never
+  provider alert                —          —        only leg
 ```
 
+- 优先级与兜底资格按来源类别取舍：**cron / heartbeat** 是「显式目标 > Owner primary channel」（cron 的创建会话就是 payload 的 `channel`/`to`，属显式目标，没有独立 origin 腿）；**trigger** 是「显式 deliver-to > Origin session」，**永不到 owner**；**provider alert 只有 owner 一条腿**。来源类别是 seam 的显式输入，调用点不靠传 `None` 表达策略。
 - `DeliveryTarget{channel, chat_id}` 两段式；任一为空即「不存在」，不会被就近兜底。
 - `Owner primary channel` = owner 首次交互的会话，落在 `{data_dir}/owner-primary.json`（一条目标，不是投递账本），重启后仍可投递；未建立时降级 log-only。
 - **trigger 永不兜底到 owner**：它恒有 origin，origin 不可达即 book-only（不误投）。

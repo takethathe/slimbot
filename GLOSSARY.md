@@ -85,11 +85,11 @@ _Avoid_: sample, payload, excerpt
 ### Delivery
 
 **Delivery**:
-把一条消息送回某个 channel 的行为。主动消息（cron / heartbeat / trigger / agent 主动 `message`）都走同一投递模型，不因来源不同而分叉。
+把一条消息送回某个 channel 的行为。主动消息（cron / heartbeat / trigger / provider alert / agent 主动 `message`）都走同一投递模型、同一个解析入口，不因来源各自实现一套。
 _Avoid_: notify, push, send（泛化动词；`notify` 在代码里特指 trigger 的入站动作）
 
 **Delivery target**:
-一次投递的落点。解析优先级：**显式 deliver-to（创建任务时指定）> 创建该任务的 Origin session > Owner primary channel（最后兜底）**。显式目标一旦给出即胜过默认 origin。
+一次投递的落点。seam 的输入是来源类别，优先级与兜底资格按来源取舍：**cron / heartbeat** =「显式 deliver-to > Owner primary channel」（cron 的创建会话就是 payload 的 `channel`/`to`，属显式目标，没有独立 origin 腿）；**trigger** =「显式 deliver-to > Origin session」，**永不到 owner**；**provider alert 只有 owner 一条腿**。显式目标一旦给出即胜过默认 origin。
 _Avoid_: recipient, destination（代码层用 `DeliveryTarget{channel, chat_id}`）
 
 **Origin session**:

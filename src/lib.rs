@@ -57,7 +57,7 @@ pub use config_macro::FieldMeta;
 pub use consolidate::Consolidator;
 pub use context::{ContextBuilder, RunContext, build_runtime_context};
 pub use cron::{CronJob, CronPayload, CronSchedule, CronService};
-pub use delivery::{DeliveryTarget, OwnerPrimaryStore, Resolution, resolve_target};
+pub use delivery::{DeliverySource, DeliveryTarget, OwnerPrimaryStore, Resolution, resolve_target};
 pub use identity::{Author, DEFAULT_OWNER_ID, Owner};
 pub use log::{LogLevel, init as log_init, log, should_log};
 pub use mcp::{McpService, ServerStatus};

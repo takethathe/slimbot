@@ -20,9 +20,11 @@
 - [x] 实现票 05 shallow hook 内联与取消映射收口（2026-11-11 完成：`AccumulateUsage` / `FireToolCall` / `FireToolResult` / `FirePostIteration` / `FireTaskCompleted` 五个 shallow hook 与 `PostIterationHook` trait 删除，事件发射、usage 累加、回合收尾（`close_turn()`）改为骨架内联；取消的「错误 → 状态」映射收成 `fail_cancelled()` 一处，`false` / `break` / `break 'outer` 三种出口各自保留，原先由 `run_*` 提供的取消检查点用 `cancel_here()` 在原位复刻；13 个 policy hook 与 `gate.rs` 未动；4 条行为测试 + 2 条结构锁 + 门禁三绿）
 - [x] 实现票 06 结果路由与显式 provider error kind（2026-11-11 完成：`Provider::chat` / `chat_stream` 的错误类型改为 `ProviderResult<T> = Result<T, ProviderError>`，删掉 runner 里从 `anyhow::Error` `downcast` 猜 kind 的分支——未分类的失败归 `Other` 而不是 `None`；结果路由收成 `AgentResult::provider_failure_route()`（`AlertOwner` / `RelievePressure` / `FailInPlace`）留在 `AgentResult` 旁，副作用抽到 `session.rs` 的 `apply_provider_failure_route` 使 `force_consolidate` 分支首次可测；`message_sent` 的 1 处赋值 + 2 处消费加结构锁作票 12 基线；3 条行为测试 + 3 条路由测试 + 2 条结构锁 + 门禁三绿）
 - [x] 实现票 07 Gateway 启动快照与接线描述（2026-11-12 完成：`run_gateway` 拆成可构造的 `assemble_gateway`（返回 `Gateway`）与只负责 `ctrl_c` / 关停的 `run_gateway`；WebUI 的 7 个运行时对象收成一份纯数据 `WebuiStartup`，只经 `register_webui_factory` → `WebuiChannelFactory::create` 消费，`WebuiChannel` 与 `AppState` 都持有它，8 个 setter 收成一个 `with_wiring`、两处 `too_many_arguments` allow 删除；trace 解析在 `AgentLoop` 内做一次、写侧与 viewer 共用 `trace_paths()`，网关截断只发生一次；`config_path` 显式标注「启动快照、不可热更新」；4 条行为/接线测试 + 2 条结构锁，删掉只断言目录存在的空测试，+ 门禁三绿）
+- [x] 实现票 08 装配 / 运行分离（B 方案 `wontfix`：实质由票 07 的 `bc5fb4e` 一并交付，`assemble_gateway` 可脱离 `ctrl_c` 构造已有集成测试；三条未写出的具名回归断言——Card / Feishu 各注册一次、trace 只在 gateway 启动截断一次、关停顺序与 10s 预算——并入实现票 13 的回归锁清单，不重复开一次收口）
 - [x] 实现票 09 Approval 共享 pin 规则与 live_ids（2026-11-12 完成：`approval/mod.rs` 用 `is_live_pin` + `user_boundary_before` 统一 live 判定与 User 边界尺子，`protect_start`（全历史最早）与 `clamp_boundary_for_pins`（chunk 内首个、不越 floor）保留语义差异，`consolidate.rs` 的私有 clamp 删除；`LiveApprovals` 纯数据快照成为 `ApprovalStore::live_ids` 的唯一生产读取处，裁剪前 / 摘要前 / `ContextLength` 兜底 / 构建时变换四个保护点统一取同一份；`merge_approval_rounds` 也改走共享谓词；`docs/runner.md` 修正广播归属与 redeem 顺序；5 条新测试（含两处零覆盖的端到端行为断言与 2 条结构锁）+ 门禁三绿）
 - [x] 实现票 10 显式 marks 载体与两轮 redemption 测试（2026-11-13 完成：`RunState.extensions` 的 `Any` 字典、`set_extension` / `get_extension` 与 `MARKS_KEY` 全删，换成显式 `approval_marks: HashMap<tool_call_id, approval_id>`；PreTool 的 `ApprovalHook` 直接 `insert`、AfterTool 的 `PersistToolMessageHook` 直接 `get`，两个生产调用点各一行，`mark_call` / `mark_for` 两个转发 helper 一并消失；新增 `tests/approval_integration.rs`——自建 scripted `Provider` / 计数 `Tool` / `TaskHook` + `ApprovalStore` 经 `AgentRunner::new` 驱动整条链路，断言读 `{session_id}.jsonl` 原文：5 条行为测试（mark 跨阶段、两轮 redemption 后 append-only、unattended 五 kind 不写 Pending、未兑现改写为失败且不回写、两轮兑现端到端）+ 变异探针确认 3 条会红；删 3 条只测 `extensions` 的测试；门禁三绿）
-- [ ] 实现票 11–13（frontier 现为 11 Delivery 来源类别）
+- [x] 实现票 12 Delivery 组合行为测试与文档口径（2026-11-13 完成：新增 `tests/delivery_integration.rs`（7 条：静默 + 已投递 + origin 不可达三结果不塌缩、来源优先级的公开件断言、Silent 五处判定仍在调用方、`message_sent` 1 赋值 / 2 消费 + attended-only owner 门控、Nowhere 分支只记日志、重启不补投、结构锁），生产代码零改动（`src/delivery.rs` 只改模块注释的优先级表）；`docs/architecture.md` / `GLOSSARY.md` 的投递口径按 `DeliverySource::candidate()` 重写；勾掉投递验收行，手工烟测另列一行）
+- [ ] 实现票 13 文档与验收收口（frontier 现为 13）
 - [ ] 08 文档与验收收口（task，前置票均已 resolved；文档回改 / 门禁 / commit 由实现票 13 承接）
 
 ## trace 本地可观测（2026-11-08 收官）
@@ -115,7 +117,8 @@
 - [x] **owner 主通道来源** — 运行时记录 owner 首次交互的 `{channel}:{chat_id}`（飞书 owner p2p）作为最后兜底；未建立时降级 log-only
 - [x] **heartbeat 去硬编码** — 删除 `gateway.rs` 写死的 `webui:webui_main`；无创建对话 → 落 owner 主通道；可 `gateway.heartbeat.channel`/`to` 覆盖
 - [x] **静默语义** — `deliver:false` 是唯一策略静默条件；与“目标不存在”的 log-only 兜底区分
-- [ ] **验收** — 在 webui 建的“发到飞书”job → 落飞书（显式优先）；无 target 的系统事件 → 落 owner 主通道；`deliver:false` → 静默；重启不重复投；日志/session 无投递正文泄露（对齐票 09 隐私）
+- [x] **验收（投递，自动化）** — `tests/delivery_integration.rs` 覆盖：显式 deliver-to 胜过 origin；origin 不可达时**不误投**到 owner、**不落待投递记录**（无 outbox / 无补投，ADR 0018）；`deliver:false` 静默与 `Nowhere` 降级在 history 里分别记 `ok=true` / `ok=false`；重启**不补投**未送达的主动消息（owner primary 只恢复地址）。
+- [ ] **验收（投递，手工烟测，不进 CI）** — 在 webui 建「发到飞书」job 看真通道落点；`deliver:false` 与 log-only 的日志表现；日志 / session / trigger history 无投递正文泄露（对齐票 09 隐私）
 
 ## 可靠性与预算（票 11 裁决的实现切片，待 spec 落稿后展开）
 

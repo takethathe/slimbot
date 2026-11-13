@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::delivery::{OwnerPrimaryStore, Resolution, resolve_target};
+use crate::delivery::{DeliverySource, OwnerPrimaryStore, Resolution, resolve_target};
 use crate::message_bus::BusResult;
 use crate::provider::{ProviderError, ProviderErrorKind};
 
@@ -92,9 +92,12 @@ pub async fn deliver_provider_alert(
     if !is_owner_alertable(err) {
         return false;
     }
-    // The alert rides the owner-primary leg of the seam: it stands for
-    // "the operator must know", not "reply in this conversation".
-    let Resolution::Deliver(target) = resolve_target(None, None, owner_primary.current()) else {
+    // The alert stands for "the operator must know", not "reply in this
+    // conversation": the owner's own channel is the only leg, which is what the
+    // `OwnerAlert` source means to the seam.
+    let Resolution::Deliver(target) =
+        resolve_target(DeliverySource::OwnerAlert, owner_primary.current())
+    else {
         crate::warn_log!("[provider] hard failure but no owner channel to alert: {err}");
         return false;
     };
