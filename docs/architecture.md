@@ -11,9 +11,9 @@
 ┌─────────────────────────────────────────────┐
 │              ChannelManager                  │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
-│  │ CliChannel│  │ WebChannel│  │ ...     │  │
+│  │ WebUI    │  │ Feishu   │  │ ...      │  │
 │  └──────────┘  └──────────┘  └──────────┘  │
-│  每个通道独立 spawn_blocking 读取输入         │
+│  每个通道在自己的任务 / 线程里读取输入          │
 └────────────┬────────────────────────────────┘
              │ inbound_tx (mpsc)
              ▼
@@ -81,10 +81,10 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 
 管理所有 I/O 通道，路由出站消息：
 
-1. **自动注册**内置工厂（CLI 等），无需在 main.rs 手动注册
-2. 从配置读取通道列表，通过工厂模式创建对应通道实例
-3. 每个通道调用 `channel.start(inbound_tx)` 启动内部读取循环
-4. `run().await` 在主线程上监听 `outbound_rx`，按 `channel_id` 路由到对应通道的 `write_output()`
+1. `ChannelManager::new()` 的工厂表是空的：gateway 装配时用 `register_webui_factory(startup)` 加 WebUI、`register_factory("feishu", ..)` 加飞书，各一次（CLI 不是 `Channel` 实现，由 `ShutdownHandle::run_main_thread_loop` 在主线程读 stdin）
+2. 从配置的 `channels` 映射读取条目，通过工厂模式创建对应通道实例（`enabled:false` 的跳过）
+3. 每个通道用 `start_with_scheduler(&io_scheduler)` 起自己的读取循环（返回 `IoHandle`，关停时一起 join）
+4. `run().await` / `run_with_shutdown()` 监听 `outbound_rx` 与 `media_rx`，按 `channel_id` 路由到对应通道的 `write_output()`
 
 ### TriggerService + Dispatcher（gateway 常驻）
 
@@ -250,7 +250,7 @@ let gateway = assemble_gateway(&paths).await?;   // 可构造、可断言
 gateway.shutdown().await;                       // 关停：channel 广播 → card 取消 → heartbeat/cron → 10s 超时
 ```
 
-- **装配**里是所有「谁拿到谁」的决定：Config 快照、MessageBus 的四个 receiver、工具与 catalog、`AgentLoop`（含 tracer 与 connector 池）、Cron/Heartbeat/Trigger、ChannelManager 的工厂注册（Card 与 Feishu 各一次）、WebUI 启动快照。
+- **装配**里是所有「谁拿到谁」的决定：Config 快照、MessageBus 的三个 receiver（inbound / outbound / media）、工具与 catalog、`AgentLoop`（含 tracer 与 connector 池）、Cron/Heartbeat/Trigger、ChannelManager 的工厂注册（Card 与 Feishu 各一次）、WebUI 启动快照。
 - **WebUI 启动快照**（`WebuiStartup`）是一份纯数据：session manager、关停广播、AgentEvent 广播、trace 路径与启动时刻、config 路径、card service。它只经 `register_webui_factory` → `WebuiChannelFactory::create` 一条路径消费，通道与 `AppState` 都持有这份快照，所以新增一个 channel-side 参数只改它。
 - **trace 同源**：`AgentLoop` 构造时解析一次 trace 文件路径，写侧（`FileBackend`）与读侧（viewer）共用；网关启动的截断只发生一次，CLI 从不截断（ADR 0022）。
 - **config 路径不是配置值**：快照只带路径，Config editor 的 handler 每次自己读盘，所以「保存即写盘、重启才生效」在代码里是看得见的（ADR 0002）。
@@ -263,15 +263,17 @@ let args = CliArgs::parse();
 let log_level = LogLevel::from_u8(args.log).unwrap_or(LogLevel::Info);
 crate::log::init(log_level, log_file_path.as_deref())?;
 
-// 1. 创建 MessageBus（纯通道，无后台任务）
-let message_bus = Arc::new(MessageBus::new());
+// 1. 配置快照 + MessageBus（纯通道，无后台任务）
+let config = Arc::new(Config::load_resolved(..)?);
+Config::install(config.as_ref())?;
+let (message_bus, receivers) = MessageBus::new();
 
-// 2. 创建 AgentLoop，启动 inbound 监听
-let agent_loop = AgentLoop::from_config(&paths, message_bus.clone(), config.clone()).await?;
-agent_loop.start_inbound();
+// 2. 创建 AgentLoop：inbound receiver 以值交进去
+//    （CLI 不走 start_inbound，任务由 run_task 直接驱动；gateway 才跑 inbound 监听）
+let agent_loop = AgentLoop::from_config(paths, message_bus, receivers.inbound, config).await?;
 
 // 3. 启动 CLI agent session
-crate::cli::run_agent_session(&agent_loop, session_id).await;
+crate::cli::run_agent_session(&agent_loop, session_id, query).await?;
 ```
 
-SlimBot 使用子命令模式：`setup` 执行初始化，`agent` 启动 CLI 交互会话。
+SlimBot 使用子命令模式：`setup` 执行初始化，`agent` 启动 CLI 交互会话（上面的流程），`gateway` 走 `assemble_gateway` + `run_gateway` 两步常驻。

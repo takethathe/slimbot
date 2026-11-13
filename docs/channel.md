@@ -4,7 +4,7 @@
 
 ## 概述
 
-`Channel` 抽象了 SlimBot 的所有 I/O 通道，支持 CLI（由 `ChannelManager` 的主线程 stdin 循环驱动）、WebUI、飞书。通过工厂模式创建具体通道实例。
+`Channel` 抽象了 SlimBot 的所有 I/O 通道，支持 CLI（由 `ShutdownHandle::run_main_thread_loop` 在主线程上阻塞读 stdin 驱动，不是 `Channel` 实现）、WebUI、飞书。通过工厂模式创建具体通道实例。
 
 ## Channel 接口
 
@@ -178,24 +178,26 @@ WebUI 是**纯本机入口**：无认证、无 token，本机即 owner。
 
 1. 实现 `Channel` trait（包括 `start` 和 `send_output`）
 2. 实现 `ChannelFactory` trait，返回类型标识
-3. 在 `ChannelManager::new()` 中注册新工厂（或在外部调用 `register_factory`）
-4. 在配置文件的 `channels` 数组中添加对应类型的条目
+3. 在装配处注册工厂：`ChannelManager::new()` 的 `factories` 是空表，`register_factory(type_name, factory)` 加普通通道、`register_webui_factory(startup)` 加 WebUI（`src/gateway.rs::assemble_gateway` 各调一次）
+4. 在配置文件的 `channels` 映射里添加同名键的条目
 
 ```json
 {
-  "channels": [
-    { "type": "webui", "enabled": true, "config": { "port": 8080 } }
-  ]
+  "channels": {
+    "webui": { "enabled": true }
+  }
 }
 ```
 
 ## 配置结构
 
+`channels` 是 `HashMap<String, ChannelConfig>`，键就是工厂的类型名（`webui` / `feishu`）；每个条目的 `enabled` 决定是否实例化，其余键落在 `extra` 里由通道自己解释。CLI 不在 `channels` 里——它是进程的默认运行模式（`main` 走 `run_cli_agent`），没有条目也没有工厂。
+
 ```json
 {
-  "type": "cli",
-  "enabled": true,
-  "config": {}
+  "webui": {
+    "enabled": true
+  }
 }
 ```
 

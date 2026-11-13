@@ -4,7 +4,7 @@
 
 ## 概述
 
-`AgentRunner` 实现了 ReAct（Reasoning + Acting）循环的核心逻辑，是 SlimBot 与 LLM 交互的引擎。自 phase-hook 重构后，`AgentRunner::run()` 是一条分阶段的编排骨架（约 480 行），行为通过可插拔的 phase hook 实现。骨架自身只承担五件事：
+`AgentRunner` 实现了 ReAct（Reasoning + Acting）循环的核心逻辑，是 SlimBot 与 LLM 交互的引擎。自 phase-hook 重构后，`AgentRunner::run()` 是一条分阶段的编排骨架（约 500 行），行为通过可插拔的 phase hook 实现。骨架自身只承担五件事：
 
 1. **早返回** — `/stop` sentinel 与运行前取消走 `cancelled_result()`，不进入 hook 管线。
 2. **Run 装配** — 从 `AgentRunner` 借出依赖集合填一个 `RunSpec`，配 `RunState`，进 `with_turn_context` scope。
@@ -213,7 +213,7 @@ pending 记录存在期间，携带它的那个回合被 **pin 在历史尾部**
 
 ### 端到端测试边界
 
-`tests/approval_integration.rs` 只经公开面驱动整条链路：自建 `Provider`（按脚本出队响应，并记录每次收到的消息）、`Tool`（统计执行次数）、`TaskHook` + `ApprovalStore` + `AgentRunner::new`，断言直接读 `{session_id}.jsonl` 的原始文本。`src/` 里的 `RunnerHarness` 是 `pub(crate)` 的钩子级夹具，层级不同（它要能直接碰 `RunState` 和 hook trait），两者不复用。
+`tests/approval_integration.rs` 只经公开面驱动整条链路：自建 `Provider`（按脚本出队响应，并记录每次收到的消息）、`Tool`（统计执行次数）、`TaskHook` + `ApprovalStore` + `AgentRunner::new`，断言直接读 `{session_id}.jsonl` 的原始文本。`src/` 里的 `RunnerHarness`（`runner/hooks/approval.rs` 测试模块内的私有夹具）是钩子级夹具，层级不同（它要能直接碰 `RunState` 和 hook trait），两者不复用。
 
 ## 工具结果处理链
 

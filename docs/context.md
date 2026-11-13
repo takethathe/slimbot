@@ -13,7 +13,9 @@ pub struct ContextBuilder {
     session_manager: SharedSessionManager,    // 会话管理器
     tool_manager: Arc<ToolManager>,           // 工具管理器
     workspace_dir: PathBuf,                   // 工作区目录
-    memory_service: SharedMemory,               // 记忆 facade（Arc<tokio::sync::Mutex<MemoryService>>）
+    memory_service: SharedMemory,             // 记忆 facade（Arc<tokio::sync::Mutex<MemoryService>>）
+    pressure: PressureAnchor,                 // 长度预算的唯一来源（ADR 0013），构造时必填
+    connectors: Option<Arc<McpService>>,      // 网关的 MCP 连接池（有 server 配置时才有）
 }
 ```
 

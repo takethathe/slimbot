@@ -1030,6 +1030,124 @@ mod tests {
         );
     }
 
+    /// Structure locks scan code, not prose: a comment that quotes a call must
+    /// not look like a second call site.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The block opened by the first `needle` occurrence: brace-counted, so a
+    /// nested block inside it cannot end the slice early.
+    fn block_after<'a>(src: &'a str, needle: &str) -> &'a str {
+        let start = src.find(needle).expect("the needle must exist");
+        let mut depth = 0usize;
+        let mut opened = false;
+        for (offset, ch) in src[start..].char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if opened && depth == 0 {
+                        return &src[start..start + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        &src[start..]
+    }
+
+    /// Card and Feishu are both single-instance resources (ADR 0005 / 0017):
+    /// assembly must register each of them exactly once, and the card listener
+    /// must not be spawned twice. A second `register_*` call would silently
+    /// shadow the first, which is why this is locked by count and not by
+    /// behaviour.
+    #[test]
+    fn test_gateway_assembly_registers_each_factory_once() {
+        let src = code_only(include_str!("gateway.rs"));
+        // `concat!` keeps each needle out of its own assertion's text.
+        assert_eq!(
+            src.matches(concat!("register_webui_", "factory(")).count(),
+            1,
+            "the WebUI factory is registered once, with the startup snapshot"
+        );
+        assert_eq!(
+            src.matches(concat!("register_", "factory(")).count(),
+            1,
+            "Feishu is the only other channel factory the gateway registers"
+        );
+        assert_eq!(
+            src.matches(concat!("attach_card_", "rx(")).count(),
+            1,
+            "one card receiver, attached once"
+        );
+        assert_eq!(
+            src.matches(concat!("spawn_", "listener(")).count(),
+            1,
+            "one card event listener, spawned once"
+        );
+        assert_eq!(
+            src.matches(concat!("attach_media_", "rx(")).count(),
+            1,
+            "one media receiver, attached once"
+        );
+    }
+
+    /// Shutdown order and budget are the graceful-exit contract: stop the
+    /// producers, give the in-flight work a bounded window, then force-exit on a
+    /// second Ctrl+C. Order matters — stopping before the wait is what keeps new
+    /// work from being queued into the window being drained.
+    #[test]
+    fn test_gateway_shutdown_keeps_order_and_budget() {
+        let gateway_src = code_only(include_str!("gateway.rs"));
+        let shutdown = block_after(&gateway_src, concat!("pub async fn ", "shutdown("));
+        assert!(
+            shutdown.contains("Duration::from_secs(10)"),
+            "the drain window is 10s: {shutdown}"
+        );
+        let heartbeat = shutdown
+            .find("self.heartbeat.stop()")
+            .expect("heartbeat stops before the drain");
+        let cron = shutdown
+            .find("self.cron.stop()")
+            .expect("cron stops before the drain");
+        let drain = shutdown
+            .find("graceful_shutdown(")
+            .expect("the drain runs inside the timeout");
+        let forced = shutdown
+            .find("std::process::exit(1)")
+            .expect("a second Ctrl+C forces exit");
+        assert!(
+            heartbeat < cron && cron < drain && drain < forced,
+            "stop producers -> drain with a budget -> force exit on a second Ctrl+C"
+        );
+        assert!(
+            shutdown.contains("signal::ctrl_c()"),
+            "the forced exit is raced against a second Ctrl+C"
+        );
+    }
+
+    /// ADR 0022: the gateway truncates its trace files once at startup; the CLI
+    /// path never truncates (it appends to whatever is already there).
+    #[test]
+    fn test_gateway_cli_never_truncates_the_trace() {
+        let cli = code_only(include_str!("main.rs"));
+        assert!(
+            !cli.contains(concat!("reset_trace_", "files")),
+            "the CLI startup must append, never truncate"
+        );
+        assert!(
+            cli.contains("run_cli_agent"),
+            "the CLI path is still the one this lock is about"
+        );
+    }
+
     #[tokio::test]
     async fn test_gateway_agent_loop_creation() {
         let tmp = tempfile::tempdir().unwrap();

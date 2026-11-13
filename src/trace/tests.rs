@@ -355,3 +355,25 @@ async fn test_capture_restore_across_tokio_task() {
         .collect();
     assert_eq!(trace_ids.len(), 1);
 }
+
+/// ADR 0001: the trace module is a leaf — it knows nothing about the runner,
+/// the hooks, or `AgentEvent`. That is what lets any layer emit spans without a
+/// dependency edge back into it, and what keeps trace and events independent
+/// (neither derives from the other).
+#[test]
+fn test_trace_module_stays_a_leaf() {
+    for (name, src) in [
+        ("mod.rs", include_str!("mod.rs")),
+        ("span.rs", include_str!("span.rs")),
+    ] {
+        let code: String = src
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("crate::"),
+            "trace/{name} must not reach back into the crate: {code}"
+        );
+    }
+}
