@@ -54,6 +54,10 @@ _Avoid_: auto approve, retry
 被定期观察的一个外部或本地信息渠道。
 _Avoid_: feed, connector, watcher
 
+**Virtual source**:
+Data source 的一种：由连接器的声明构成、不属于任何本地文件的信息渠道——内容要么是连接器主动推送的，要么由系统向连接器询问而来。它和别的 data source 在规则与快照里长得一样，只是没有可编辑的定义。
+_Avoid_: built-in source, fake source, connector（那是声明它的东西，不是源本身）, MCP source（那是它的一种来源，不是它的种类）
+
 **Agent**:
 一份可被委托执行任务的独立定义：角色、可用能力、交付偏好。
 _Avoid_: agent profile, bot, persona

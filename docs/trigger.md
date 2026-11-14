@@ -6,14 +6,14 @@
 
 触发器是「一条持久规则：当某条件成立时，做某事并告知某人」。它是 **cron 之上的一层，而不是 cron 的超集**（见 [ADR 0007](adr/0007-trigger-layer-above-cron.md)）：自己有固定的 60s tick，不写 `cron/jobs.json`，也不迁移任何既有定时任务。分层的好处是 `every_n_ticks` 有确定含义——cron 循环在两轮之间会睡自己的剩余时间并累积误差，一个纯计数器不会。
 
-一个 tick 只做五件事：**热加载定义 → 冻结快照 → 采集到期的源 → 判定到期的规则 → 把命中丢进队列**。对命中采取行动（跑子代理、给用户发消息）刻意不在 tick 内，见 [dispatch](#执行与投递dispatch) 一节。
+一个 tick 只做五件事：**热加载定义 → 冻结快照 → 采集到期的源 → 判定到期的规则 → 把命中丢进队列**。热加载之后、采集之前还会把「本 tick 启用的规则读了哪些源」推给 source 层（引用计数，见[引用计数](#引用计数)）；对命中采取行动（跑子代理、给用户发消息）刻意不在 tick 内，见 [dispatch](#执行与投递dispatch) 一节。
 
 三个子层各司其职：
 
 | 子层 | 模块 | 职责 |
 |------|------|------|
-| 数据源 | `src/trigger/source/` | 采集、归一化、内存快照、健康度 |
-| 订阅规则 | `src/trigger/subscription/` | 定义、判定脚本、边沿状态机、试跑 |
+| 数据源 | `src/trigger/source/` | 采集、归一化、内存快照、健康度；虚拟源（MCP 订阅）的合成与冻结；引用计数过滤 |
+| 订阅规则 | `src/trigger/subscription/` | 定义、判定脚本、边沿状态机、试跑；`referenced_sources()` 是引用集合的唯一来源 |
 | 执行投递 | `src/trigger/dispatch.rs` | 队列、action、投递、fire 账本 |
 
 ## 目录布局
@@ -32,7 +32,7 @@ workspace/
 
 ## 数据源（source）
 
-一个源 = 一个目录 + 一个 `collect(ctx)` 脚本。脚本只有一条返回路径：`{items: [...]}`，源的 `mode` 决定这些条目怎么并入窗口——条件脚本因此不需要区分源是天气、邮箱还是文件清单。上限一律**截断而非失败**：单条 4KB（先裁最长的字符串，裁不动才丢弃）、单次 64KB，被砍掉的数量作为 warning 由 tick 记日志。
+一个源默认 = 一个目录 + 一个 `collect(ctx)` 脚本（`origin = disk`）；另外两类**虚拟源**没有目录也没有脚本，由 `mcp.servers[].triggers[]` 声明而来（见[虚拟源](#虚拟源mcp-订阅)）。脚本只有一条返回路径：`{items: [...]}`，源的 `mode` 决定这些条目怎么并入窗口——条件脚本因此不需要区分源是天气、邮箱还是文件清单。上限一律**截断而非失败**：单条 4KB（先裁最长的字符串，裁不动才丢弃）、单次 64KB，被砍掉的数量作为 warning 由 tick 记日志。
 
 - **mode**：`snapshot` 每轮整窗替换；`append` 按 fingerprint（脚本自带字段或整条哈希）去重追加，超出 `max_items`（默认 200）丢最旧。
 - **cadence**：`every_n_ticks` 用 tick 序号取模决定本轮是否采集；同 tick 内并发上限 `max_concurrent_collect`（默认 4）。
@@ -44,6 +44,66 @@ workspace/
 宿主函数白名单（详见 [codemode.md](codemode.md)）：`ctx.http.get` / `post`、`ctx.fs.stat` / `read` / `list`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()` / `boot_at()` / `uptime_s()`。**没有** shell，也没有 sleep——文件变更用轮询脚本表达。
 
 进程里有连接器池时，采集器还多一条**连接器读**：`ctx.tools.mcp__<server>__<tool>(args?)` 与 `await ctx.searchTools(query, limit?)`，目录只含 server 声称只读（`readOnlyHint` 且非 `destructiveHint`）的工具——同一 server 的写工具既不装也搜不到，采集面因此是 act 写半的**读半镜像**。这是**加法**：基础原语一个不少，写面不存在，采集器**不接审批闸**（采集本来就无人值守、无审批，连接器读被限制在 owner 在 `mcp.servers[]` 里配过的 server 上，严格窄于既有 `ctx.http` 权限）。过滤口径、残余风险与理由见 [codemode.md](codemode.md#采集面的只读性票-17) 与 [mcp.md](mcp.md#风险映射fail-closed)。`ctx.http.get/post` 复用 `web_fetch` 的 SSRF 校验（`is_private_ip` / `resolve_and_pin`），fs 调用默认锁在 workspace 内，绝对路径要求源在 `allow_paths` 里声明过。
+
+### 虚拟源（MCP 订阅）
+
+`mcp.servers[].triggers[]` 的每条订阅同时是一个源，**没有目录、没有 `collect.js`**：`source_id` 就是条件脚本里 `ctx.sources[...]` 的键。两类：
+
+| 订阅 `type` | 数据从哪来 | 何时进 frame |
+|-------------|------------|--------------|
+| `notification` | `McpService::notification_snapshot()`（server 推的 last-value 缓冲） | 每次 `freeze()` 直接读池，不经过 tick 的采集段 |
+| `tool` | 到期 tick 里调 `McpService::call("mcp__<server>__<tool>", args)` | `collect()` 的并发段，与磁盘采集器同一批 |
+
+- **来源标记**：runtime 带 `Origin::{Disk, Notification, Tool}`。`reload()` 按 config 重新合成虚拟项、保留旧的窗口与失败计数，config 删掉订阅即删项；磁盘目录与订阅撞 id 时订阅赢（并记一行 `warn`）。
+- **notify 只冻结不采集**：池里有推就是 `{params, received_at}` 一条；池里没有（无池 / 没推过 / 超过 TTL）就是一条 `observed_at: None` 的空视图——源的**存在**不变，只是未采样，所以命名它的规则被 ready 门槛挡住而不是报「源不存在」。
+- **tool 每次一个条目**：调用结果整段（字符串或结构化 JSON 序列化后）作为 `source_id` 名下的**唯一**一条 item，没有字段级拆分；`args` 缺省时调用传 `null`，由池归一成 `{}`。
+- **tool 失败与采集器同构**：server 离线、调用报错、没有连接器池，都记一条 `TickReport.failed`（原因形如 `mcp__ci__list_runs: transport error: ...` 或 `no connector pool is attached; cannot call ...`），进健康度与降频。
+- **配置校验**：每条订阅必须写 `source_id`；`type=notification` 必须写 `uri`，`type=tool` 必须写 `tool`，否则 `validate` 直接拒绝启动（形状校验跳过 disabled 的 server）。`source_id` 是帧里的键，一个 id 只能指一个源：**同一个 `source_id` 被两条订阅声明**（跨 server 或同一 server 内）由 `Config::validate_mcp()` 拒绝，报错点名撞名的 id 与涉及的 server，并在运行时不再「择一」——这条校验不看 `enabled`。
+- **不可编辑**：虚拟源没有磁盘形态，只能用 `trigger_source list` 读；`update` / `delete` 命中虚拟源时被明确拒绝（`updated: false` / `deleted: false`，`error` 为 `not updated: source '<id>' is a virtual source declared in mcp.servers[].triggers; edit the MCP config instead`），既不写盘也不改内存。改它只能改 `mcp.servers[].triggers[]` 再等下一次 `reload()`（下一 tick）。
+- **`trigger_source list`** 多一个 `origin` 字段（`disk` / `notification` / `tool`），仍然只报 shape、不回显值。
+
+### 引用计数
+
+只有**至少一个 `enabled` 规则**在 `meta.sources` 里点名的源才会被采集：`TriggerService::tick()` 在 `sources.reload()` 与 `rules.reload()` 之后把 `rules.referenced_sources()` 推给 source 层，`due()` / `due_sources()` / `freeze()` 都按这个集合过滤。规则停用或删除，它独占的源同 tick 就不再跑，但**定义仍在**（`list` 照常列）。
+
+- 从未推送过集合（`None`）＝不过滤，全部照常采集。这是兼容性契约：单独构造 `SourceLayer` 的调用方（测试、装配前的窗口）行为与之前完全一致；**显式推空集合**才是「没有源被引用」。
+- 未被引用的源**不出现在 frame 里**，所以规则点名一个它本不该读的源时拿到的是「sources not found」而不是旧数据。
+- 引用集合只由**规则的 `enabled` 与 `meta.sources`** 推出（`SubscriptionLayer::referenced_sources()`，停用的规则不贡献）；虚拟源也照此过滤——没被引用的 `tool` 订阅不调用，`notification` 订阅不进 frame。
+- `set_enabled`（`trigger update` 的 `enabled`、以及一次性 `At` 规则跑完自动停用）**会把新的 `enabled` 写回 `meta.json`**：`reload()` 每 tick 重读定义，只改内存的开关会在下一 tick 被翻回去。写盘失败只记 `warn`，内存里的状态照常生效到下次 reload。
+
+### 活跃 source 上限
+
+`triggers.max_active_sources`（默认 8，`0` = 不限，上限 100）限制的是**被计数**的源数量。上限按**被 enabled 规则引用的 source** 计；在第一次 tick 推送引用集合之前，所有 source 都计入（此时无法区分谁被引用，保守地把全部算进上限）。它只管 `trigger_source create`，`update` / `delete` 不受影响：
+
+- 上限**先查、后试跑**：已满时 `create` 直接返回 `created: false`，不跑脚本、不消耗 id。
+- 拒绝响应是一份**可比较的清单**，形状固定：
+
+```json
+{"created": false,
+ "error": "not created: 8 source(s) are active and `triggers.max_active_sources` is 8. Compare the sources below …",
+ "count": 8,
+ "max_active_sources": 8,
+ "sources": [{"id": "src-…", "name": "…", "description": "…",
+              "referenced": true, "origin": "disk", "status": "ready"}]}
+```
+
+`referenced` 通常恒为真（清单只含被计数的源），保留它是为了让调用方不必自己推断；删掉重复的源或改掉读它的规则，下一次 `create` 就能过。首次 tick 之前那一段是唯一的例外：那时清单里是所有源，包括还没有规则引用的孤儿——它们此刻正在占额度，**delete 掉它照样能腾出位置**。
+
+### create / update 内嵌试跑
+
+`trigger_source create` / `update` 在**写盘之前**先把采集器跑一次，用的是 tick 的同一条实现（`trial_collect`，`collect_one` 也走它）：同一份 `CollectHost`、同一份 `Limits::collect().with_timeout(meta.timeout_s)`、同一份 secret 与连接器池。所以「建的时候能过、下一个 tick 却跑不动」不会因为两套沙箱漂移而发生。
+
+- **create**：带 `script` 才试；不带 `script` 直接落盘成半成品（缺 `collect.js`），留给 `update` 补。
+- **update**：试跑的是**合并后的 meta + 本次的脚本**（本次没带脚本就用盘上已有的那份），所以只改 `timeout_s` / `allow_paths` 也会被验一次——把超时收紧到脚本跑不完，在这一步就该被拒。没有任何脚本的源无可试，保持半成品。
+- **失败不落盘**：`create` 回 `created: false`、`update` 回 `updated: false` 并保留旧版本，两者的 `error` 都以 `not created:` / `not updated:` 开头并带 `Cause:`，同一段原因另有一份结构化的 `test`。
+- **响应只报条数与耗时**，**绝不回显采集到的值**（外部内容不进工具结果，ADR 0009）：
+
+```json
+{"test": {"ok": true,  "items": 12, "elapsed_ms": 340, "warnings": ["…"]}}
+{"test": {"ok": false, "error": "…", "elapsed_ms": 8}}
+```
+
+`warnings` 是截断/丢弃计数一类的归一化告警，只在非空时出现。试跑**不写快照**：源的状态仍是 `pending`，要等第一个 tick 采到才有数据；`append` 模式在试跑时对着空窗口去重，所以报的是「脚本本身产出多少条」。
 
 ## 订阅规则（subscription）
 
@@ -121,17 +181,17 @@ append-only，每行只有六个字段：`{trigger_id, fired_at, action_kind, ok
 
 | 工具 | actions | 说明 |
 |------|---------|------|
-| `trigger_source` | `list` / `create` / `update` / `delete` | `list` 只回 `shape`（字段名、类型、条数、观测时间），**不回显真实值且绝不触发采集** |
-| `trigger` | `list` / `create` / `update` / `delete` / `test` | `create` 要求 `schedule` 与 `script` 至少有一个；`test` 用当前冻结快照立即跑一次，不 fire、不投递、不写状态 |
+| `trigger_source` | `list` / `create` / `update` / `delete` | `list` 只回 `shape`（字段名、类型、条数、观测时间）与 `origin`，**不回显真实值且绝不触发采集**；`create` / `update` 写盘前先试跑（见 [create / update 内嵌试跑](#create--update-内嵌试跑)），`create` 还受 `max_active_sources` 限制 |
+| `trigger` | `list` / `create` / `update` / `delete` / `test` | `create` 要求 `schedule` 与 `script` 至少有一个；`test` 用当前冻结快照立即跑一次，不 fire、不投递、不写状态；`update` 的 `enabled` 会写回 `meta.json` |
 | `executor` | `list` / `create` / `update` / `delete` / `run` | 只在 `executor` 子代理内可见，同属 catalog-only；`run` 与四道闸见 [executor.md](executor.md#executor-工具) |
 
 `trigger create` / `update` 会校验 `on_fire.agent` 指向的定义已落盘，所以写「fire 一个执行器」的规则前 `agents/executor.md` 必须已经存在（`setup` 铺出；老部署要重跑 `setup`）。
 
-用户侧入口是内置 agent `agents/trigger.md`（system prompt 里以 `# Available Agents` 一行出现）。**一个能力一个入口**：触发器只以 agent 存在，不注册 skill——两者并存时模型会走不用读文档的那条路。
+用户侧入口是内置 agent `agents/trigger.md`（system prompt 里以 `# Available Agents` 一行出现）。**一个能力一个入口**：触发器只以 agent 存在，不注册 skill——两者并存时模型会走不用读文档的那条路。它的 `tools:` 白名单是 `trigger_source, trigger, web_fetch`：前两个是唯一能改定义的入口，`web_fetch` 只用来在写采集器**之前**查一个陌生 API 的真实字段（一次性查证，不属于源，也不在 tick 里跑）。
 
 ## 配置
 
-`config.json` 的 `triggers` 段（详见 [config.md](config.md)）：`enabled`、`tick_interval_s`(60)、`tick_timeout_s`(30)、`max_concurrent_collect`(4)、`max_queue`(20)、`max_merge`(3)、`history_lines`(5000)、`secrets`（`name` + 掩码 `value` 的列表）。子代理并发上限在 `subagent.max_concurrent`(3)，因为子代理是主 loop 与触发器共用的能力。
+`config.json` 的 `triggers` 段（详见 [config.md](config.md)）：`enabled`、`tick_interval_s`(60)、`tick_timeout_s`(30)、`max_concurrent_collect`(4)、`max_queue`(20)、`max_merge`(3)、`history_lines`(5000)、`max_active_sources`(8，0 = 不限)、`secrets`（`name` + 掩码 `value` 的列表）以及 `triggers.secrets[]`。虚拟源不在这一节，在 `mcp.servers[].triggers[]`（见 [config.md](config.md#mcp--mcp-连接器)）。子代理并发上限在 `subagent.max_concurrent`(3)，因为子代理是主 loop 与触发器共用的能力。
 
 ## Trace
 

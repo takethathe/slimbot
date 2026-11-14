@@ -40,6 +40,64 @@
 
 `call()` 定位 server 靠 callable 前缀而不是查缓存：离线的 server 缓存已经空了，而"那个连接器现在不在线"比"没有这个工具"对脚本更有用。
 
+## 服务端推送（notification）
+
+server 可以不请自来地推一帧（无 `id`、有 `method`）。接收点是一个**默认空实现**的 transport 能力：
+
+```rust
+pub type NotificationSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
+
+fn set_notification_sink(&self, sink: NotificationSink) {}
+```
+
+`NotificationSink` 收的是「帧的 method + 它的 `params`」（server 没带 params 时是 `{}`）。默认实现丢弃，所以没有带外推送通道的 transport（脚本化的假 peer、只回答案的流）不必改写这个方法。`McpService` 在 `connect_and_cache()` 里、握手**之后**把它装到新 transport 上（`initialize` 本身就可能触发 `notifications/tools/list_changed`，装早了才能收得到）；一条连接服务一台 server，所以这个 sink 只带**该 server 自己的**订阅，写的是全池共享的那一个缓冲。
+
+两种 transport 的差别是**能力差别，不是缺口**：
+
+| transport | 推送什么时候能收到 |
+|-----------|--------------------|
+| stdio | 实时。ambient reader task 一直在读子进程 stdout，任何一帧推送当场交给 sink |
+| http | 只在**某次调用等待应答期间**。这里是一请求一 POST，没有常驻推送通道：server 穿插在那次应答 SSE 流里的帧会被交给 sink，两次调用之间推的东西永远不会被读到 |
+
+所以 `type = "notification"` 的虚拟源在 HTTP 连接器上**不会自己更新**：它只在有工具调用正好在等应答时顺带刷新。要让推送真的实时，用 stdio。
+
+缓冲是 last-value，**键为订阅的 `(server, uri)`**：只有 `mcp.servers[].triggers[]` 里 `type = "notification"` 且 `uri` 精确等于该 method 的订阅才会写入；未声明的 method、以及别的 server 推的同名 uri，一律静默丢弃。槽与订阅声明一一对应，所以条目数恒等于声明的订阅数（一条订阅一个槽，后来的覆盖先前的），天然有界；两个 server 各自声明、甚至声明同一个 uri，也各占一个槽，互不覆盖。另一条入口 `ingest_notification(server, method, params)` 走同一段判定，供池外的调用方与测试注入。
+
+读法只有一个：`notification_snapshot() -> BTreeMap<String, (Value, i64)>`（`source_id → (params, received_at_ms)`）。缓冲区按 `(server, uri)` 存，`source_id` 是在读快照时按配置查出来的——它是 `ctx.sources` 的键，也是这份 map 的键。配置里改掉某个订阅的 `source_id` 不会丢掉它已经收到的推送。两个订阅声明同一个 `source_id` 会在这张 map 上撞车，所以那种配置在 `Config::validate_mcp()` 就被拒绝（见 [config.md](config.md#mcp--mcp-连接器)），而不是在这里择一。它是**只读**的——没有任何路径能往槽里写，除了上面那两条受配置约束的入口。消费方是 trigger 层的虚拟源：每次 `freeze()` 把每条订阅变成 `{items: [{params, received_at}], count: 1, observed_at}`，见 [trigger.md](trigger.md#虚拟源mcp-订阅)。它**不返回** `trigger::source::SourceView`，因为 `trigger` 依赖 `mcp` 而不反过来；转换在 trigger 侧做。`received_at` 用本地时钟毫秒（`crate::cron::now_ms()`），与 source 层判断新鲜度用的是同一个钟。池不存在、槽为空或已过源的 TTL 时，读到的就是一条 `observed_at: None` 的空视图——源的**存在**不变，只是未采样。外部内容只作证据（ADR 0009）：它只活在内存快照里，从不落盘。
+
+## 配置声明订阅与虚拟源注入
+
+`mcp.servers[].triggers[]` 是**源声明**，不是工具白名单（工具面仍只由 ADR 0016 决定）。每条订阅在 trigger 层的 source 里对应一个源，键是 `source_id`，条件脚本用 `ctx.sources[source_id]` 读它。形状（字段全部见 [config.md](config.md#mcp--mcp-连接器)）：
+
+```json
+{
+  "name": "ci",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "some-ci-mcp"],
+  "triggers": [
+    { "type": "notification", "uri": "notifications/builds", "source_id": "ci-builds",
+      "description": "Latest build status pushed by the CI server" },
+    { "type": "tool", "tool": "list_runs", "args": {"limit": 5}, "source_id": "ci-runs",
+      "description": "The five most recent pipeline runs" }
+  ]
+}
+```
+
+| `type` | 必填 | 数据怎么来 | 在 tick 里的位置 |
+|--------|------|------------|------------------|
+| `notification` | `uri` | server 主动推，池保持 last-value | 不采集：`freeze()` 直接读 `notification_snapshot()` |
+| `tool` | `tool`（`mcp__<server>__` 前缀由 host 补） | 到期 tick 里 host 调 `McpService::call()` | 采集段的并发批次，与磁盘采集器混排、共享 `max_concurrent_collect` 与超时 |
+
+注入是**接线层的一次对账**，不是 MCP 池的职责：`trigger::assemble` 把 `&config.mcp.servers` 交给 `SourceLayer::attach_mcp_servers()`，它在 `reload()` 里按 `mcp::server_prefix` / `js_safe_ident` 把 `tool` 解析成可调用名，然后合成 `Origin::Tool` / `Origin::Notification` 的 runtime。所以：
+
+- 改订阅不用重启：下一次 `reload()`（下一 tick）就生效；删掉订阅，虚拟源同一 tick 消失。
+- 订阅与磁盘上的 `triggers/sources/<id>/` 撞 id 时订阅赢，并记一行 `warn`。
+- 两条订阅声明同一个 `source_id` 不是「谁赢」的问题，而是配置错误：`Config::validate_mcp()` 在加载时拒绝，报错点名 id 与涉及的 server（gateway 不会带着歧义起来）。
+- `args` 缺省时按 `null` 下发，池归一成 `{}`；返回值整段成为 `source_id` 下唯一一条 item（与 `ctx.tools.*` 的 `<codemode_output>` 包装无关——虚拟源不经过脚本，也就没有这层信封）。
+- 虚拟源**只能读**：`trigger_source update` / `delete` 命中它们时直接拒绝（`updated: false` / `deleted: false`，`error` 指向 `mcp.servers[].triggers`），既不写盘也不改内存。
+- `notification` 源的 `observed_at` 是那次推送的 `received_at`；池里没有、或推送已超过源的 TTL，视图就是 `observed_at: None` 的空视图。
+
 ## 生命周期
 
 ```
@@ -109,4 +167,4 @@ server 写的每一个字节都按数据对待，绝不按指令对待：
 
 ## 测试
 
-`cargo test --lib mcp::`（协议、两种 transport、池与退避、命名与路由、风险映射、离线理由收敛、`server_of()` 取最长前缀），`cargo test --lib codemode::act`（act 侧：读写判据、`allow_connectors` 双向、Ask/Deny 中止且不留 Pending、共用调用预算），`cargo test --lib executor::tool`（写成功带 receipt、无人值守拒因、evidence 逐条 4KB），`cargo test --lib agent::runtime`（子代理继承池、拒因回到 origin），`cargo test --test mcp_integration`（GitHub 式读链路端到端 + secret 链 + 无敏感日志 + 拒绝式 server），`cargo test --test gateway_integration`（配置里有/没有 server 时池的有无）。
+`cargo test --lib mcp::`（协议、两种 transport、池与退避、命名与路由、风险映射、离线理由收敛、`server_of()` 取最长前缀、notification 的投递/last-value/未声明丢弃/本地时间戳），`cargo test --lib codemode::act`（act 侧：读写判据、`allow_connectors` 双向、Ask/Deny 中止且不留 Pending、共用调用预算），`cargo test --lib executor::tool`（写成功带 receipt、无人值守拒因、evidence 逐条 4KB），`cargo test --lib agent::runtime`（子代理继承池、拒因回到 origin），`cargo test --test mcp_integration`（GitHub 式读链路端到端 + secret 链 + 无敏感日志 + 拒绝式 server），`cargo test --test gateway_integration`（配置里有/没有 server 时池的有无）。

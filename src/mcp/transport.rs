@@ -22,11 +22,37 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 
-use super::rpc::{McpError, McpTransport, notification_frame, request_frame, response_result};
+use super::rpc::{
+    McpError, McpTransport, NotificationSink, notification_frame, request_frame, response_result,
+};
 
 /// Requests waiting for their answer: the reader task hands a framed result
 /// back to whichever call owns the id.
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, McpError>>>>>;
+
+/// Where a transport delivers a server→client notification. `None` until the
+/// owning pool installs one, so a notification that arrives during the
+/// handshake is dropped rather than buffered by the transport itself.
+type SinkSlot = Arc<std::sync::Mutex<Option<NotificationSink>>>;
+
+/// Deliver one parsed frame to the sink, if it is a notification and a sink is
+/// installed. Shared by both transports so the "is this a notification" rule
+/// has one definition: no id, a `method` string, and not a response.
+fn deliver_notification(slot: &SinkSlot, frame: &Value) {
+    if frame.get("id").is_some() || frame.get("result").is_some() || frame.get("error").is_some() {
+        return;
+    }
+    let Some(method) = frame.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
+    // Cloning the Arc out of the lock keeps the callback off the critical
+    // section: a slow consumer must not block the reader task.
+    let sink = slot.lock().ok().and_then(|guard| guard.clone());
+    if let Some(sink) = sink {
+        sink(method, params);
+    }
+}
 
 /// stdio transport: spawn the server as a child process and speak
 /// newline-delimited JSON-RPC over its stdin/stdout.
@@ -39,6 +65,7 @@ pub struct StdioTransport {
     /// Bytes the server wrote to stderr. Counted, never captured: it is the
     /// only hint that a server is complaining, and its content may be secret.
     stderr_bytes: Arc<AtomicUsize>,
+    notifications: SinkSlot,
 }
 
 impl StdioTransport {
@@ -88,6 +115,7 @@ impl StdioTransport {
             child: Arc::new(Mutex::new(Some(child))),
             closed: closed.clone(),
             stderr_bytes: Arc::new(AtomicUsize::new(0)),
+            notifications: Arc::new(std::sync::Mutex::new(None)),
         });
 
         route_reader(
@@ -95,6 +123,7 @@ impl StdioTransport {
             transport.pending.clone(),
             transport.writer.clone(),
             closed,
+            transport.notifications.clone(),
         );
         if let Some(stderr) = stderr {
             spawn_stderr_counter(stderr, transport.stderr_bytes.clone());
@@ -105,13 +134,15 @@ impl StdioTransport {
 
 /// Read stdout lines and route them. Split out so tests can drive it with any
 /// async reader.
-fn route_reader<R>(
+fn route_reader<R, W>(
     reader: BufReader<R>,
     pending: Pending,
-    writer: Arc<Mutex<ChildStdin>>,
+    writer: Arc<Mutex<W>>,
     closed: Arc<AtomicBool>,
+    notifications: SinkSlot,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let mut lines = reader.lines();
@@ -142,7 +173,10 @@ fn route_reader<R>(
                             let _ = w.write_all(format!("{}\n", reply).as_bytes()).await;
                             let _ = w.flush().await;
                         }
-                        _ => {} // A notification from the server: logged output is out of scope.
+                        // A notification from the server. It carries no id
+                        // and expects no answer; the pool decides what it is
+                        // worth, and drops it when nothing declared it.
+                        _ => deliver_notification(&notifications, &frame),
                     }
                 }
                 Ok(None) | Err(_) => {
@@ -224,6 +258,14 @@ impl McpTransport for StdioTransport {
         }
     }
 
+    fn set_notification_sink(&self, sink: NotificationSink) {
+        // The reader task is already running and reads the slot per frame, so
+        // an installed sink takes effect on the next line the child writes.
+        if let Ok(mut slot) = self.notifications.lock() {
+            *slot = Some(sink);
+        }
+    }
+
     async fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
         let frame = notification_frame(method, params);
         let mut writer = self.writer.lock().await;
@@ -260,6 +302,7 @@ pub struct HttpTransport {
     headers: Vec<(String, String)>,
     session_id: Mutex<Option<String>>,
     protocol_version: Mutex<Option<String>>,
+    notifications: SinkSlot,
 }
 
 impl std::fmt::Debug for HttpTransport {
@@ -279,6 +322,7 @@ impl HttpTransport {
             headers,
             session_id: Mutex::new(None),
             protocol_version: Mutex::new(None),
+            notifications: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -385,6 +429,12 @@ impl McpTransport for HttpTransport {
         response_result(&frame)
     }
 
+    fn set_notification_sink(&self, sink: NotificationSink) {
+        if let Ok(mut slot) = self.notifications.lock() {
+            *slot = Some(sink);
+        }
+    }
+
     async fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
         let frame = notification_frame(method, params);
         let session = self.session_id.lock().await.clone();
@@ -447,34 +497,67 @@ impl HttpTransport {
     }
 
     /// Consume SSE frames until one carries the response for `id`, then stop.
+    ///
+    /// Server→client notifications that the server interleaves into *this*
+    /// response stream are handed to the sink on the way. HTTP here is one POST
+    /// per request, so there is no standing stream a server can push on: a
+    /// notification is only seen while some call is waiting, and whatever the
+    /// server pushes between calls is never read. That is a property of the
+    /// protocol language, not a gap this transport can close — stdio, which
+    /// keeps a reader on the child's stdout, is where notifications are live.
     async fn read_sse_for(&self, response: reqwest::Response, id: u64) -> Option<Value> {
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        while let Some(chunk) = stream.next().await {
-            let Ok(bytes) = chunk else { return None };
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-            // Frames are separated by a blank line; data lines may be split.
-            while let Some(edge) = buffer.find("\n\n") {
-                let frame = buffer[..edge].to_string();
-                buffer.drain(..edge + 2);
-                let mut data = String::new();
-                for line in frame.lines() {
-                    if let Some(payload) = line.strip_prefix("data:") {
-                        data.push_str(payload.trim_start());
-                    }
-                }
-                if data.is_empty() {
-                    continue;
-                }
-                if let Ok(parsed) = serde_json::from_str::<Value>(&data)
-                    && parsed.get("id").and_then(Value::as_u64) == Some(id)
-                {
-                    return Some(parsed);
+        // `bytes_stream` yields one `Bytes` chunk per read; the frame loop only
+        // ever needs the byte slice, so the error type is the only thing named.
+        let bytes = async_stream::try_stream! {
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                yield chunk?;
+            }
+        };
+        read_sse_for_frames::<_, _, reqwest::Error>(bytes, id, self.notifications.clone()).await
+    }
+}
+
+/// Consume SSE `data:` frames from `bytes` until one carries the response for
+/// `id`. Frames without that id are server→client notifications and go to the
+/// sink; a frame that is not JSON at all is skipped, since it is not ours.
+///
+/// Split from [`HttpTransport::read_sse_for`] so the frame handling is testable
+/// without a socket: an in-memory byte stream drives the same loop a live
+/// response would.
+async fn read_sse_for_frames<S, B, E>(bytes: S, id: u64, notifications: SinkSlot) -> Option<Value>
+where
+    S: futures::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    let mut stream = Box::pin(bytes);
+    let mut buffer = String::new();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { return None };
+        buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
+        // Frames are separated by a blank line; data lines may be split.
+        while let Some(edge) = buffer.find("\n\n") {
+            let frame = buffer[..edge].to_string();
+            buffer.drain(..edge + 2);
+            let mut data = String::new();
+            for line in frame.lines() {
+                if let Some(payload) = line.strip_prefix("data:") {
+                    data.push_str(payload.trim_start());
                 }
             }
+            if data.is_empty() {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if parsed.get("id").and_then(Value::as_u64) == Some(id) {
+                return Some(parsed);
+            }
+            deliver_notification(&notifications, &parsed);
         }
-        None
     }
+    None
 }
 
 #[cfg(test)]
@@ -604,6 +687,168 @@ mod tests {
             !transport.safe_endpoint().contains("token"),
             "{}",
             transport.safe_endpoint()
+        );
+    }
+
+    /// The sink a test installs: every delivered `(method, params)` in order.
+    type Seen = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+    fn collecting_sink() -> (NotificationSink, Seen) {
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let sink: NotificationSink = Arc::new(move |method, params| {
+            recorder
+                .lock()
+                .expect("recorder")
+                .push((method.to_string(), params));
+        });
+        (sink, seen)
+    }
+
+    /// A slot filled before the reader starts, standing in for the pool
+    /// installing its sink.
+    fn filled_slot(sink: NotificationSink) -> SinkSlot {
+        Arc::new(std::sync::Mutex::new(Some(sink)))
+    }
+
+    /// Let the reader task run until the recorder holds `n` entries.
+    async fn wait_for_count(seen: &Seen, n: usize) -> Vec<(String, Value)> {
+        for _ in 0..400 {
+            let recorded = seen.lock().expect("recorder").clone();
+            if recorded.len() >= n {
+                return recorded;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("reader delivered {n} notification(s) short of the expectation");
+    }
+
+    /// Drain one pending request's channel, asserting the frame arrived.
+    async fn answered(rx: oneshot::Receiver<Result<Value, McpError>>) -> Value {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the reader must answer id 7")
+            .expect("the sender must still be alive");
+        result.expect("id 7 carries a result")
+    }
+
+    #[tokio::test]
+    async fn test_stdio_reader_forwards_server_notifications_to_the_sink() {
+        // The reader sees every line the child writes. A frame with no id and a
+        // method is a server push: it must reach the sink with its params, a
+        // push without params must arrive as `{}`, and neither may disturb the
+        // answers routed around them.
+        let body = concat!(
+            r#"{"jsonrpc":"2.0","method":"notifications/builds","params":{"n":1}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/empty"}"#,
+            "\n",
+        );
+        let (reader, mut child) = tokio::io::duplex(4096);
+        child
+            .write_all(body.as_bytes())
+            .await
+            .expect("feed the reader");
+        let (writer, _child_stdin) = tokio::io::duplex(64);
+        let writer = Arc::new(Mutex::new(writer));
+
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(7, tx);
+        let (sink, seen) = collecting_sink();
+
+        route_reader(
+            BufReader::new(reader),
+            pending,
+            writer,
+            Arc::new(AtomicBool::new(false)),
+            filled_slot(sink),
+        );
+
+        assert_eq!(answered(rx).await, json!({"ok": true}));
+        let recorded = wait_for_count(&seen, 2).await;
+        assert_eq!(
+            recorded,
+            vec![
+                ("notifications/builds".to_string(), json!({"n": 1})),
+                ("notifications/empty".to_string(), json!({})),
+            ],
+            "notifications arrive in order, with params defaulted to {{}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stdio_reader_without_a_sink_drops_notifications_quietly() {
+        // A transport with no sink installed is what a connection looks like
+        // before the pool wires it: pushes are dropped, and the reader keeps
+        // answering what it is asked.
+        let (reader, mut child) = tokio::io::duplex(4096);
+        child
+            .write_all(
+                concat!(
+                    r#"{"jsonrpc":"2.0","method":"notifications/builds","params":{"n":1}}"#,
+                    "\n",
+                    r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("feed the reader");
+        let (writer, _child_stdin) = tokio::io::duplex(64);
+        let writer = Arc::new(Mutex::new(writer));
+
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(7, tx);
+
+        route_reader(
+            BufReader::new(reader),
+            pending,
+            writer,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+
+        assert_eq!(answered(rx).await, json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_forwards_an_interleaved_notification() {
+        // HTTP has no standing stream: a server push is only visible when the
+        // server interleaves it into the response stream of a request we are
+        // waiting on. That frame must reach the sink, and the answer we asked
+        // for must still come back.
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/builds\",\"params\":{\"n\":1}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![Ok(body.as_bytes().to_vec())];
+        let (sink, seen) = collecting_sink();
+
+        let frame = read_sse_for_frames(futures::stream::iter(chunks), 7, filled_slot(sink))
+            .await
+            .expect("the answer frame must be returned");
+
+        assert_eq!(response_result(&frame).unwrap(), json!({"ok": true}));
+        assert_eq!(
+            *seen.lock().expect("recorder"),
+            vec![("notifications/builds".to_string(), json!({"n": 1}))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_stops_at_the_answer_frame() {
+        // Frames after our answer are not read: the connection is finished with
+        // once the response for the id arrives, which is the whole shape of
+        // "one request, one response" over HTTP.
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/late\"}\n\n";
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![Ok(body.as_bytes().to_vec())];
+        let (sink, seen) = collecting_sink();
+
+        let _ = read_sse_for_frames(futures::stream::iter(chunks), 7, filled_slot(sink)).await;
+        assert!(
+            seen.lock().expect("recorder").is_empty(),
+            "nothing past the answer is consumed"
         );
     }
 

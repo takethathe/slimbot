@@ -91,12 +91,20 @@ Token 预算触发的会话摘要机制。作为 `Arc<Consolidator>` 在 AgentLo
 触发器是 cron 之上的一层，与 cron / heartbeat 并列跑自己的固定 60s tick（详见 [trigger.md](trigger.md)）：
 
 ```
-每 60s：reload 定义 → freeze 快照 → 采集到期的源 → 判定到期的规则 → 命中入队
+每 60s：reload 定义（含 MCP 订阅合成的虚拟源）→ 推本 tick 的引用集合 → freeze 快照
+        → 采集到期的源 → 判定到期的规则 → 命中入队
 队列外：单个消费者按创建顺序执行 action（起子代理 / 注入 notify / 只记历史）
 投递：publish_inbound(来源会话) → 主 loop 总结并回复；唯一例外是失败告警走 publish_outbound
 ```
 
 把行动挪出 tick 是为了让 30s 硬超时不会掩断一次正在跑的子代理；三个并列的 root span（`trigger.tick` / `trigger.fire` / `subagent.run`）靠 id 关联而不设父子。
+
+SourceLayer 的职责比「一组采集器」宽两层：
+
+- **虚拟源**：`mcp.servers[].triggers[]` 声明的订阅在 `reload()` 里被合成为没有目录的源（`type=notification` 读连接器池的 last-value 缓冲、`type=tool` 在采集段里调一个连接器只读工具），与磁盘采集器共用同一份快照、健康度与 TTL。合成的原料由 `trigger::assemble` 从 `config.mcp.servers` 一次交进去，所以虚拟源的生命周期跟着配置走，不跟文件走。
+- **引用计数**：只有被 enabled 规则点名的源才采集。`SubscriptionLayer::referenced_sources()` 是集合的唯一来源，`TriggerService::tick()` 在两层 reload 之后把它推给 SourceLayer；`due()` / `freeze()` 都按它过滤，所以停用一条规则会在同一 tick 让它独占的采集器停工。从未推送过集合＝不过滤（老调用方与单测的行为不变）。
+
+两条都收在 `trigger::assemble` 里（MCP 段 `attach_mcp_servers`、tick 里的 `set_referenced_sources`），gateway 与端到端测试走同一份装配。
 
 ### SubagentRuntime（与主 loop 共用）
 
@@ -194,6 +202,8 @@ AgentRunner 状态变更 → TaskHook.notify_status()
 | 工厂注册 | ChannelManager 内部自动注册 | 简化 main.rs，不需要手动注入工厂 |
 | Consolidator | 可选注入 `Arc<Consolidator>` | 不传入时跳过摘要，传入时自动触发 |
 | 触发器行动 | 在 tick 之外的单消费者队列执行 | 模型调用不能挤进 tick 的硬超时；队满丢弃而不顺延，迟到十分钟的提醒比不提醒更糟 |
+| 虚拟源 | MCP 订阅合成没有目录的源，配置即定义 | 一条订阅若只能靠模型写采集器，就等于让每个部署手抄一遍 server 的接口；声明在 `mcp.servers[].triggers[]` 里，`reload()` 对账、删订阅即删源（见 [mcp.md](mcp.md#配置声明订阅与虚拟源注入)） |
+| 源引用计数 | 只有被 enabled 规则点名的源才采集 | 暂停一条规则就该让它独占的采集器当 tick 停工，而不是继续替一个没人看的源花外部调用 |
 | 子代理会话 | `mark_ephemeral` + 跑完 `drop_session` | 不留 JSONL、不进 consolidator，一次性任务不该污染长期上下文 |
 | 外部内容 | 只以证据形式进入上下文，快照不落盘 | 见 [ADR 0009](adr/0009-no-raw-external-content.md) |
 | 连接器工具 | 不进模型 tool schema，只在 codemode 脚本里发现与调用 | 一个外部 server 就带来 30+ 工具，会把模型注意力从内置能力上拉走；脚本还能一次编排多调用（ADR 0016） |
@@ -231,7 +241,7 @@ main.rs ── 入口：CLI 解析 → Logger 初始化 → 子命令分发
   │     └── io_scheduler.rs ── I/O 调度、阻塞读取
   │
   ├── gateway.rs ── Gateway 模式：cron / heartbeat / trigger 三个常驻 tick
-  │     ├── trigger/ ── 触发器层（source 采集 → subscription 判定 → dispatch 投递）
+  │     ├── trigger/ ── 触发器层（source 采集 + 虚拟源合成与引用计数 → subscription 判定 → dispatch 投递）
   │     ├── agent/ ── 子代理定义 + ToolCatalog + SubagentRuntime
   │     ├── codemode/ ── 脚本沙箱（rquickjs + 专职线程 + 双层超时 + 宿主白名单）
   │     ├── cron/ ── 定时任务

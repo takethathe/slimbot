@@ -120,6 +120,11 @@ impl McpTool {
     }
 }
 
+/// Receives server→client notifications: the frame's method and its `params`
+/// (`{}` when the server sent none). Installed on a transport by whichever
+/// layer owns the buffer; the transport only forwards.
+pub type NotificationSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
+
 /// The framing layer a client speaks through. Implementations own correlation
 /// and liveness; the client only ever asks for one method's answer.
 #[async_trait]
@@ -130,6 +135,16 @@ pub trait McpTransport: Send + Sync {
 
     /// Send a notification: no id, no answer expected.
     async fn notify(&self, method: &str, params: Value) -> Result<(), McpError>;
+
+    /// Install the receiver for server→client notifications: a frame the server
+    /// pushes unprompted (no id, a `method`, optional `params`). It is called
+    /// with the frame's method and its `params` (`{}` when the server sent
+    /// none) as soon as the frame is parsed.
+    ///
+    /// Called once, after the handshake, by the pool that owns the buffer. The
+    /// default drops notifications, which is what a transport with no
+    /// out-of-band channel (a scripted fake, an answer-only stream) does.
+    fn set_notification_sink(&self, _sink: NotificationSink) {}
 
     /// Tear the connection down. Idempotent, never blocks on a stuck peer.
     async fn close(&self) {}

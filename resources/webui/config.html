@@ -603,6 +603,12 @@ function readControl(field, el) {
       return Number.isFinite(n) ? n : null;
     }
     case 'optional_string': return el.value === '' ? null : el.value;
+    // A JSON object is typed, not just echoed as text: the empty box is the
+    // field's "not set" (`null`), and a filled one becomes the parsed value.
+    case 'json': {
+      if (el.value.trim() === '') return null;
+      try { return JSON.parse(el.value); } catch (e) { return el.value; }
+    }
     case 'secret': return el.value.trim();
     default: return el.value;
   }
@@ -802,10 +808,16 @@ function buildControl(field, path) {
       break;
     }
     case 'json': {
+      // `null` is a real value for an optional object (`triggers[].args`), so
+      // it renders as an empty box rather than as an empty object. The
+      // control reports `null` back for that empty box, which is what the
+      // field already holds — an untouched control is not a change.
+      const pristine = field.value;
       const ta = document.createElement('textarea');
-      ta.value = field.value == null ? '{}' : JSON.stringify(field.value, null, 2);
+      ta.value = pristine;
+      ta.placeholder = field.value == null ? '(empty = not set)' : '';
       ta.dataset.path = path;
-      ta.addEventListener('input', () => setValue(path, ta.value, JSON.stringify(field.value, null, 2)));
+      ta.addEventListener('input', () => setValue(path, ta.value, pristine));
       wrap.appendChild(ta);
       break;
     }
@@ -891,20 +903,90 @@ function collectionNoun(secName) {
   if (secName === 'tools') return 'tool';
   if (secName === 'channels') return 'channel';
   if (secName === 'mcp.servers') return 'server';
+  if (secName === 'mcp.servers.triggers') return 'subscription';
   return 'backend';
+}
+
+// Nested collections (a server's trigger subscriptions). A child section is
+// named `<parent section>.<field>`, and that field has to be a `list` on the
+// parent's row: a populated collection's item paths then start with
+// `<parent>.<field>.`, while `tracing.backends` keeps its own section even
+// though `tracing[]` advertises it.
+function childCollectionOf(parentSec, sec) {
+  if (!parentSec || parentSec === sec) return null;
+  const prefix = parentSec.name + '.';
+  if (!sec.name.startsWith(prefix)) return null;
+  const field = sec.name.slice(prefix.length);
+  if (field === '' || field.includes('.')) return null;
+  const advertised = (parentSec.item_fields || []).find(f => f.name === field);
+  if (!advertised || (advertised.kind !== 'list' && advertised.kind !== 'json')) return null;
+  // A nested row path is `<parent>.<i>.<field>.<j>.<leaf>`; a collection's
+  // own rows are `<section>.<i>.<leaf>` and never step through a child field,
+  // so the field segment is what distinguishes the two. Only this section's
+  // items decide: the parent's own trigger *values* must not count.
+  const nestedSegment = '.' + field + '.';
+  const items = sec.items || [];
+  if (!items.length) return sec.name;
+  const nested = items.every(it => (it.fields || []).every(f => {
+    const path = String(f.path);
+    return path.startsWith(prefix) && path.includes(nestedSegment);
+  }));
+  return nested ? sec.name : null;
+}
+
+// The field whose value advertises a child collection (`mcp.servers[].triggers`).
+function childFieldName(parentName, childName) {
+  return childName.slice(parentName.length + 1).split('.')[0];
+}
+
+// The one collection a parent's rows carry (`mcp.servers[].triggers`).
+function findChildSection(parentSec) {
+  return (schema.sections || []).find(sec => sec !== parentSec
+    && childCollectionOf(parentSec, sec) != null) || null;
+}
+
+// Row ids address `<section>.<rowId>.<field>`. The row id is `row<N>`,
+// `new<N>` or the deepest `<child section>.<row>` prefix of such a row.
+const ROW_ID_RE = /^(row\d+|new\d+)$/;
+
+// `args` has two meanings in the MCP sections: the server's `Vec<String>`
+// launch arguments, and a subscription's optional JSON object. The editor
+// tells them apart by the control itself — `json` is the optional object's
+// kind — so no type name has to be repeated on this side.
+function isSubscriptionArgs(meta) {
+  return meta && meta.name === 'args' && meta.kind === 'json';
+}
+
+function isChildRowId(rowId, childName) {
+  return rowId === childName || (rowId.startsWith(childName + '.') && ROW_ID_RE.test(rowId.slice(childName.length + 1)));
 }
 
 function renderCollection(sec) {
   const cs = collectionRows[sec.name];
+  // A section whose rows nest inside another one's rows renders its items
+  // inline there, not as a section of its own.
+  const child = findChildSection(sec);
+  if (child) ensureCollectionRows(child);
+  // Set while this section's own rows are being rendered; child rows reuse
+  // `renderItem` through the same closure.
+  let renderingChildRow = false;
+  const childRow = (r) => child && !r.isNew && !renderingChildRow;
 
   function controlPath(row, fieldName) {
     return sec.name + '.' + row.id + '.' + fieldName;
   }
 
-  function renderItem(row) {
+  // A row rendered from a schema item keeps that item's absolute path
+  // (`mcp.servers.2.triggers.0.uri`); a row created in the editor gets its
+  // path from the section and the row id.
+  // Absolute path of a row of the nested collection: the parent's row index
+  // currently being rendered plus the child row's own index.
+  let parentRowIdx = null;
+
+  function renderItem(row, rowId, asChild) {
     const item = document.createElement('div');
     item.className = 'item';
-    item.dataset.rowId = row.id;
+    item.dataset.rowId = rowId;
 
     const head = document.createElement('div');
     head.className = 'item-head';
@@ -978,49 +1060,154 @@ function renderCollection(sec) {
       extraRow.appendChild(control);
       extraRow.appendChild(err);
       fieldsWrap.appendChild(extraRow);
-    } else if (row.fields) {
-      row.fields.forEach(f => fieldsWrap.appendChild(buildFieldRow(f, f.path)));
+    } else if (row.fields && !asChild) {
+      // An existing row keeps the schema's absolute field paths, so the rows
+      // of a nested collection must not be drawn from the parent's own.
+      row.fields.forEach(f => { fieldsWrap.appendChild(buildFieldRow(f, f.path)); });
+    } else if (asChild && child) {
+      // A row of the nested collection: the child section's template and
+      // absolute paths (`mcp.servers.<i>.triggers.<j>.<field>`).
+      // Values come from the child section's own item, not the template.
+      const item = (child.items || [])[row.origIdx] || { fields: [] };
+      const at = parentRowIdx != null ? parentRowIdx : row.origIdx;
+      const segment = sec.name + '.' + at + '.' + childFieldName(sec.name, child.name) + '.' + row.origIdx;
+      if (item.fields && item.fields.length) {
+        item.fields.forEach(f => {
+          const path = segment + '.' + f.name;
+          fieldsWrap.appendChild(buildFieldRow(Object.assign({}, f, { path }), path));
+        });
+      } else {
+        (child.item_fields || []).forEach(f => {
+          fieldsWrap.appendChild(buildFieldRow(f, segment + '.' + f.name));
+        });
+      }
     } else {
       // New provider / backend / tool: render from the element template.
-      (sec.item_fields || []).forEach(f => fieldsWrap.appendChild(buildFieldRow(f, controlPath(row, f.name))));
+      (sec.item_fields || []).forEach(f => {
+        fieldsWrap.appendChild(buildFieldRow(f, controlPath(row, f.name)));
+      });
     }
     item.appendChild(fieldsWrap);
     return item;
   }
 
-  function renderAll() {
+  // Child rows belonging to one parent row, rendered inline under it.
+  function renderChildRows(row, item) {
+    const childCs = child ? collectionRows[child.name] : null;
+    if (!childCs) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'subsection';
+    const hint = document.createElement('div');
+    hint.className = 'subsection-hint';
+    hint.textContent = collectionNoun(child.name) + 's';
+    wrap.appendChild(hint);
+
+    const visible = childCs.rows.filter(r => !r.removed && !r.isNew && isChildRowId(r.id, 'row' + row.origIdx));
+    if (visible.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-hint';
+      empty.textContent = 'No ' + collectionNoun(child.name) + 's declared for this ' + collectionNoun(sec.name) + '.';
+      wrap.appendChild(empty);
+    } else {
+      visible.forEach(r => {
+        renderingChildRow = true;
+        parentRowIdx = row.origIdx;
+        wrap.appendChild(renderItem(r, child.name + '.' + r.id, true));
+        parentRowIdx = null;
+        renderingChildRow = false;
+      });
+    }
+
+    // A new parent row has no index yet, so its subscriptions are added as
+    // part of the same `add` op rather than as separate rows.
+    if (!row.isNew) {
+      const add = document.createElement('button');
+      add.className = 'add-btn';
+      add.textContent = '+ Add ' + collectionNoun(child.name);
+      add.addEventListener('click', () => {
+        const sub = makeRow(child.name, null, null, true);
+        sub.parentRowId = row.id;
+        childCs.rows.push(sub);
+        // Re-render the whole parent collection: a child row is rendered as
+        // part of its parent row, and the parent row is what carries it.
+        const shell = item.parent;
+        if (shell) shell.replaceWith(renderAll(cs.rows));
+        refreshDirty();
+      });
+      wrap.appendChild(add);
+    }
+
+    const newOnes = childCs.rows.filter(r => r.isNew && r.parentRowId === row.id);
+    newOnes.forEach(r => {
+      renderingChildRow = true;
+      wrap.appendChild(renderItem(r, child.name + '.' + r.id, true));
+      renderingChildRow = false;
+    });
+
+    item.appendChild(wrap);
+  }
+
+  function renderAll(rows) {
     const shell = document.createElement('div');
     shell.className = 'collection';
-    const visible = cs.rows.filter(r => !r.removed);
+    const visible = rows.filter(r => !r.removed);
     if (visible.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'empty-hint';
       empty.textContent = 'No ' + collectionNoun(sec.name) + 's configured yet.';
       shell.appendChild(empty);
     } else {
-      visible.forEach(r => shell.appendChild(renderItem(r)));
+      visible.forEach(r => {
+        const item = renderItem(r, r.id);
+        if (childRow(r)) renderChildRows(r, item);
+        shell.appendChild(item);
+      });
     }
-    const add = document.createElement('button');
-    add.className = 'add-btn';
-    add.textContent = '+ Add ' + collectionNoun(sec.name);
-    add.addEventListener('click', () => {
-      const row = makeRow(sec.name, null, null, true);
-      if (sec.name === 'providers') row.key = 'new_provider_' + row.id;
-      else if (sec.name === 'channels') row.key = 'new_channel_' + row.id;
-      cs.rows.push(row);
-      shell.replaceWith(renderAll());
-      refreshDirty();
-    });
-    shell.appendChild(add);
+
+    // The add button belongs to the outermost collection: a child
+    // collection is grown through its parent row.
+    if (!child) {
+      const add = document.createElement('button');
+      add.className = 'add-btn';
+      add.textContent = '+ Add ' + collectionNoun(sec.name);
+      add.addEventListener('click', () => {
+        const row = makeRow(sec.name, null, null, true);
+        if (sec.name === 'providers') row.key = 'new_provider_' + row.id;
+        else if (sec.name === 'channels') row.key = 'new_channel_' + row.id;
+        cs.rows.push(row);
+        shell.replaceWith(renderAll(cs.rows));
+        refreshDirty();
+      });
+      shell.appendChild(add);
+    }
     return shell;
   }
 
-  return renderAll();
+  return renderAll(cs.rows);
 }
 
 /* ── Section rendering ── */
 
+// One editable row per configured item, created once per page load.
+function ensureCollectionRows(sec) {
+  if (sec.items == null || collectionRows[sec.name]) return;
+  collectionRows[sec.name] = { rows: [], nextId: 1 };
+  sec.items.forEach((item, idx) => {
+    collectionRows[sec.name].rows.push(makeRow(sec.name, item, idx, false));
+  });
+}
+
 function renderSection(sec) {
+  // A nested collection is rendered inline under its parent's rows; it must
+  // not get a section (and a second row list) of its own — but its rows have
+  // to be created here, or the parent has nothing to nest.
+  const parent = (schema.sections || []).find(p => childCollectionOf(p, sec) != null);
+  if (parent) {
+    ensureCollectionRows(sec);
+    return null;
+  }
+  ensureCollectionRows(sec);
+
   const section = document.createElement('section');
   section.className = 'section';
   section.id = 'sec-' + sec.name;
@@ -1034,10 +1221,6 @@ function renderSection(sec) {
   section.appendChild(h2);
 
   if (sec.items != null) {
-    if (!collectionRows[sec.name]) {
-      collectionRows[sec.name] = { rows: [], nextId: 1 };
-      sec.items.forEach((item, idx) => collectionRows[sec.name].rows.push(makeRow(sec.name, item, idx, false)));
-    }
     section.appendChild(renderCollection(sec));
   } else {
     const fields = document.createElement('div');
@@ -1058,6 +1241,16 @@ function currentValue(field) {
 function buildPatchOps() {
   const ops = [];
   const errors = [];
+  // A row inside a child collection carries the deepest section it lives in.
+  // A collection is patched together with its nested collections, outermost
+  // first: a parent's add op carries its new child rows, and a child row's
+  // index only exists once that op has landed.
+  const childrenOf = (sec) => (schema.sections || []).filter(s => childCollectionOf(sec, s) != null);
+  const sectionsOf = (sec) => {
+    const parents = (schema.sections || []).filter(p => childCollectionOf(p, sec) != null);
+    const chain = parents.length ? sectionsOf(parents[0]) : [];
+    return chain.concat([sec]).concat(childrenOf(sec));
+  };
 
   // ── Scalar sections ──
   schema.sections.forEach(sec => {
@@ -1080,146 +1273,238 @@ function buildPatchOps() {
   });
 
   // ── Collection sections ──
+  // Outermost first: a parent's add op carries its new child rows, and a
+  // child row's index only exists once that op has landed.
+  const patched = {};
   schema.sections.forEach(sec => {
     if (sec.items == null) return;
-    const cs = collectionRows[sec.name];
-    if (!cs) return;
-    const isMap = sec.name === 'providers' || sec.name === 'channels';
-
-    if (isMap) {
-      cs.rows.forEach(row => {
-        const key = (row.key || '').trim();
-        if (row.removed) {
-          if (row.origKey != null) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
-          return;
-        }
-        if (!key) {
-          errors.push({ path: sec.name, message: 'Every ' + collectionNoun(sec.name) + ' needs a non-empty name.' });
-          return;
-        }
-        const isRename = row.origKey != null && key !== row.origKey;
-        if (row.isNew || isRename) {
-          // Build the add object from the REAL controls. Existing rows are
-          // keyed by absolute schema paths (e.g. `providers.default.model`);
-          // new rows use `sec.name + row.id + field`. For a rename the add op
-          // carries `from` so the backend inherits masked fields (api_key).
-          // The add must be emitted BEFORE the remove so the source entry
-          // still exists when `from` resolves.
-          const obj = {};
-          if (sec.name === 'providers') {
-            (sec.item_fields || []).forEach(f => {
-              let el = qPath('providers.' + row.id + '.' + f.name);
-              if (!el && row.fields) {
-                const existing = row.fields.find(x => x.name === f.name);
-                el = existing ? qPath(existing.path) : null;
-              }
-              const val = el ? readControl(f, el) : f.value;
-              if (f.kind === 'secret' && (val === '' || val == null)) return; // empty secret → inherit via `from`
-              if (f.kind === 'optional_string') { obj[f.name] = val == null ? null : val; return; }
-              if (val !== null && val !== undefined) obj[f.name] = val;
-            });
-            const addOp = { op: 'add', path: sec.name + '.' + key, value: obj };
-            if (isRename) addOp.from = row.origKey;
-            ops.push(addOp);
-            if (isRename) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
-          } else if (sec.name === 'channels') {
-            const en = qPath('channels.' + row.id + '.enabled');
-            if (en) obj.enabled = en.checked;
-            const ta = qPath('channels.' + row.id + '.extra');
-            if (ta) {
-              try { obj.extra = JSON.parse(ta.value); } catch (e) { errors.push({ path: 'channels.' + key + '.extra', message: 'Invalid JSON: ' + e.message }); }
-            }
-            ops.push({ op: 'add', path: sec.name + '.' + key, value: obj });
-            if (isRename) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
-          }
-          return;
-        }
-        // Existing, same key: diff fields.
-        if (sec.name === 'providers') {
-          row.fields.forEach(f => {
-            const current = currentValue(f);
-            if (f.kind === 'secret') {
-              if (current === '' || current == null) return;
-              ops.push({ op: 'set', path: f.path, value: current });
-              return;
-            }
-            if (current === null) return;
-            if (f.kind === 'optional_string') {
-              if ((f.value == null ? null : f.value) !== current) ops.push({ op: 'set', path: f.path, value: current });
-              return;
-            }
-            if (!jsonEq(f.value, current)) ops.push({ op: 'set', path: f.path, value: current });
-          });
-        } else if (sec.name === 'channels') {
-          const en = qPath('channels.' + row.id + '.enabled');
-          const pristineEnabled = row.fields[0] ? row.fields[0].value : true;
-          if (en && en.checked !== pristineEnabled) {
-            ops.push({ op: 'set', path: 'channels.' + key + '.enabled', value: en.checked });
-          }
-          const ta = qPath('channels.' + row.id + '.extra');
-          if (ta) {
-            let parsed;
-            try { parsed = JSON.parse(ta.value); } catch (e) { errors.push({ path: 'channels.' + key + '.extra', message: 'Invalid JSON: ' + e.message }); }
-            if (parsed !== undefined && JSON.stringify(parsed) !== row.pristineExtra) {
-              ops.push({ op: 'set', path: 'channels.' + key + '.extra', value: parsed });
-            }
-          }
-        }
-      });
-    } else {
-      // Vec collections (tools / tracing.backends): removes (desc) first,
-      // then sets with final post-removal indices, then appends for new rows.
-      const removes = cs.rows
-        .filter(r => r.removed && r.origIdx != null)
-        .map(r => r.origIdx)
-        .sort((a, b) => b - a);
-      removes.forEach(idx => ops.push({ op: 'remove', path: sec.name + '.' + idx }));
-
-      const kept = cs.rows.filter(r => !r.removed);
-      kept.forEach((row, newIdx) => {
-        if (row.isNew) {
-          const obj = {};
-          (sec.item_fields || []).forEach(f => {
-            const controlPath = sec.name + '.' + row.id + '.' + f.name;
-            const el = qPath(controlPath);
-            const special = mcpSpecialValue(f, controlPath, el);
-            if (special) {
-              if (special.error) { errors.push(special.error); return; }
-              if (special.value !== null) obj[f.name] = special.value;
-              return;
-            }
-            const val = el ? readControl(f, el) : f.value;
-            // A blank secret means "keep the default / inherit", never "".
-            if (f.kind === 'secret' && (val === '' || val == null)) return;
-            if (val !== null && val !== undefined) obj[f.name] = val;
-          });
-          ops.push({ op: 'add', path: sec.name, value: obj });
-          return;
-        }
-        row.fields.forEach(f => {
-          const special = mcpSpecialValue(f, f.path, qPath(f.path));
-          if (special) {
-            if (special.error) { errors.push(special.error); return; }
-            if (special.value !== null && !jsonEq(f.value, special.value)) {
-              const fieldName = f.path.split('.').pop();
-              ops.push({ op: 'set', path: sec.name + '.' + newIdx + '.' + fieldName, value: special.value });
-            }
-            return;
-          }
-          const current = currentValue(f);
-          // Masked fields show no value; a blank control must not clear it.
-          if (f.kind === 'secret' && (current === '' || current == null)) return;
-          if (current === null) return;
-          if (!jsonEq(f.value, current)) {
-            const fieldName = f.path.split('.').pop();
-            ops.push({ op: 'set', path: sec.name + '.' + newIdx + '.' + fieldName, value: current });
-          }
-        });
-      });
+    const chain = sectionsOf(sec);
+    if (chain[0] !== sec) return;
+    const topRows = collectionRows[sec.name];
+    if (!topRows || patched[sec.name]) return;
+    patched[sec.name] = true;
+    patchCollection(sec, topRows, errors, ops, chain);
+    for (let i = 1; i < chain.length; i += 1) {
+      const parentCs = collectionRows[chain[i - 1].name];
+      const childCs = collectionRows[chain[i].name];
+      if (parentCs && childCs) {
+        patchNestedChild(chain[i - 1], parentCs, errors, ops, chain.slice(i));
+      }
     }
   });
 
   return { ops, errors };
+}
+
+// Escape a section's field name as it appears in a row path.
+function fieldOfPath(path, sectionName) {
+  return String(path).slice(sectionName.length + 1).split('.').pop();
+}
+
+// Set ops for the fields of an existing row of `sec`, addressed by its index
+// (`newIdx`) within that section.
+function diffRowFields(row, sec, errors, ops, newIdx) {
+  row.fields.forEach(f => {
+    const special = isSubscriptionArgs(f) ? null : mcpSpecialValue(f, f.path, qPath(f.path));
+    if (special) {
+      if (special.error) { errors.push(special.error); return; }
+      if (special.value !== null && !jsonEq(f.value, special.value)) {
+        ops.push({ op: 'set', path: sec.name + '.' + newIdx + '.' + fieldOfPath(f.path, sec.name), value: special.value });
+      }
+      return;
+    }
+    const current = currentValue(f);
+    // Masked fields show no value; a blank control must not clear it.
+    if (f.kind === 'secret' && (current === '' || current == null)) return;
+    if (current === null) return;
+    if (!jsonEq(f.value, current)) {
+      ops.push({ op: 'set', path: sec.name + '.' + newIdx + '.' + fieldOfPath(f.path, sec.name), value: current });
+    }
+  });
+}
+
+// Build one add object from a row's live controls (a new row of `sec`).
+function addValueOfRow(row, sec, errors) {
+  const obj = {};
+  (sec.item_fields || []).forEach(f => {
+    const controlPath = sec.name + '.' + row.id + '.' + f.name;
+    const el = qPath(controlPath);
+    const special = mcpSpecialValue(f, controlPath, el);
+    if (special) {
+      if (special.error) { errors.push(special.error); return; }
+      if (special.value !== null) obj[f.name] = special.value;
+      return;
+    }
+    const val = el ? readControl(f, el) : f.value;
+    // A blank secret means "keep the default / inherit", never "".
+    if (f.kind === 'secret' && (val === '' || val == null)) return;
+    if (val !== null && val !== undefined) obj[f.name] = val;
+  });
+  return obj;
+}
+
+function patchCollection(sec, cs, errors, ops, chain) {
+  const isMap = sec.name === 'providers' || sec.name === 'channels';
+
+  if (isMap) {
+    cs.rows.forEach(row => {
+      const key = (row.key || '').trim();
+      if (row.removed) {
+        if (row.origKey != null) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
+        return;
+      }
+      if (!key) {
+        errors.push({ path: sec.name, message: 'Every ' + collectionNoun(sec.name) + ' needs a non-empty name.' });
+        return;
+      }
+      const isRename = row.origKey != null && key !== row.origKey;
+      if (row.isNew || isRename) {
+        // Build the add object from the REAL controls. Existing rows are
+        // keyed by absolute schema paths (e.g. `providers.default.model`);
+        // new rows use `sec.name + row.id + field`. For a rename the add op
+        // carries `from` so the backend inherits masked fields (api_key).
+        // The add must be emitted BEFORE the remove so the source entry
+        // still exists when `from` resolves.
+        const obj = {};
+        if (sec.name === 'providers') {
+          (sec.item_fields || []).forEach(f => {
+            let el = qPath('providers.' + row.id + '.' + f.name);
+            if (!el && row.fields) {
+              const existing = row.fields.find(x => x.name === f.name);
+              el = existing ? qPath(existing.path) : null;
+            }
+            const val = el ? readControl(f, el) : f.value;
+            if (f.kind === 'secret' && (val === '' || val == null)) return; // empty secret → inherit via `from`
+            if (f.kind === 'optional_string') { obj[f.name] = val == null ? null : val; return; }
+            if (val !== null && val !== undefined) obj[f.name] = val;
+          });
+          const addOp = { op: 'add', path: sec.name + '.' + key, value: obj };
+          if (isRename) addOp.from = row.origKey;
+          ops.push(addOp);
+          if (isRename) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
+        } else if (sec.name === 'channels') {
+          const en = qPath('channels.' + row.id + '.enabled');
+          if (en) obj.enabled = en.checked;
+          const ta = qPath('channels.' + row.id + '.extra');
+          if (ta) {
+            try { obj.extra = JSON.parse(ta.value); } catch (e) { errors.push({ path: 'channels.' + key + '.extra', message: 'Invalid JSON: ' + e.message }); }
+          }
+          ops.push({ op: 'add', path: sec.name + '.' + key, value: obj });
+          if (isRename) ops.push({ op: 'remove', path: sec.name + '.' + row.origKey });
+        }
+        return;
+      }
+      // Existing, same key: diff fields.
+      if (sec.name === 'providers') {
+        row.fields.forEach(f => {
+          const current = currentValue(f);
+          if (f.kind === 'secret') {
+            if (current === '' || current == null) return;
+            ops.push({ op: 'set', path: f.path, value: current });
+            return;
+          }
+          if (current === null) return;
+          if (f.kind === 'optional_string') {
+            if ((f.value == null ? null : f.value) !== current) ops.push({ op: 'set', path: f.path, value: current });
+            return;
+          }
+          if (!jsonEq(f.value, current)) ops.push({ op: 'set', path: f.path, value: current });
+        });
+      } else if (sec.name === 'channels') {
+        const en = qPath('channels.' + row.id + '.enabled');
+        const pristineEnabled = row.fields[0] ? row.fields[0].value : true;
+        if (en && en.checked !== pristineEnabled) {
+          ops.push({ op: 'set', path: 'channels.' + key + '.enabled', value: en.checked });
+        }
+        const ta = qPath('channels.' + row.id + '.extra');
+        if (ta) {
+          let parsed;
+          try { parsed = JSON.parse(ta.value); } catch (e) { errors.push({ path: 'channels.' + key + '.extra', message: 'Invalid JSON: ' + e.message }); }
+          if (parsed !== undefined && JSON.stringify(parsed) !== row.pristineExtra) {
+            ops.push({ op: 'set', path: 'channels.' + key + '.extra', value: parsed });
+          }
+        }
+      }
+    });
+  } else {
+    // Vec collections (tools / tracing.backends): removes (desc) first,
+    // then sets with final post-removal indices, then appends for new rows.
+    const removes = cs.rows
+      .filter(r => r.removed && r.origIdx != null)
+      .map(r => r.origIdx)
+      .sort((a, b) => b - a);
+    removes.forEach(idx => ops.push({ op: 'remove', path: sec.name + '.' + idx }));
+
+    const kept = cs.rows.filter(r => !r.removed);
+    kept.forEach((row, newIdx) => {
+      if (row.isNew) {
+        const obj = addValueOfRow(row, sec, errors);
+        // A new row of a parent collection carries its child rows in the same
+        // `add` op: the child index does not exist before that op lands.
+        const nested = nestedValuesOfRow(row, sec, chain, errors);
+        if (nested) obj[childFieldName(sec.name, nested.name)] = nested.values;
+        ops.push({ op: 'add', path: sec.name, value: obj });
+        return;
+      }
+      diffRowFields(row, sec, errors, ops, newIdx);
+    });
+  }
+}
+
+// The index inside a child collection, from a row id shaped
+// `<child section>.row<N>` — the part the existing row controls are
+// addressed with.
+function childIdxOf(rowId) {
+  return Number(String(rowId).slice(String(rowId).lastIndexOf('.row') + 4));
+}
+
+// The child values of a new parent row. `undefined` when the section has no
+// child collection or the row declares none.
+function nestedValuesOfRow(row, sec, chain, errors) {
+  const idx = chain.indexOf(sec);
+  const child = chain[idx + 1];
+  if (!child) return undefined;
+  const childCs = collectionRows[child.name];
+  if (!childCs) return undefined;
+  const values = childCs.rows
+    .filter(r => !r.removed && r.isNew && r.parentRowId === row.id)
+    .map(r => addValueOfRow(r, child, errors));
+  return values.length ? { name: child.name, values: values } : undefined;
+}
+
+// Appends / removes of a child collection for one existing parent row.
+function patchNestedChild(parentSec, parentCs, errors, ops, rest) {
+  const child = rest[0];
+  // A child row is appended under the server it belongs to: the add route
+  // takes the parent index, not a child index.
+  const parentField = childFieldName(parentSec.name, child.name);
+  // The outer index a parent row had before this save: removes are declared
+  // by original index, so the survivors' original indices stay addressable no
+  // matter how many earlier siblings are being removed in the same patch.
+  const outerIdx = (row) => parentCs.rows
+    .filter(r => !r.removed && r.id.startsWith('row'))
+    .indexOf(row);
+  const childRows = (collectionRows[child.name] || { rows: [] }).rows;
+  for (const row of parentCs.rows) {
+    if (row.removed || row.isNew || !row.id.startsWith('row')) continue;
+    // Path of this row's child collection: `<parent>.<outer index>.<field>`.
+    const first = parentSec.name + '.' + outerIdx(row) + '.' + parentField;
+    const removed = childRows
+      .filter(r => r.removed && r.origIdx != null && isChildRowId(r.id, 'row' + row.origIdx))
+      .map(r => r.origIdx)
+      .sort((a, b) => b - a);
+    removed.forEach(j => ops.push({ op: 'remove', path: first + '.' + j }));
+    childRows
+      .filter(r => r.isNew && r.parentRowId === row.id)
+      .forEach(r => {
+        const placed = parentSec.name + '.' + outerIdx(row) + '.' + parentField;
+        ops.push({ op: 'add', path: placed, value: addValueOfRow(r, child, errors) });
+      });
+    // An existing child keeps its id (`row<j>`), so its edits are sets.
+    childRows
+      .filter(r => !r.removed && !r.isNew && isChildRowId(r.id, 'row' + row.origIdx))
+      .forEach(r => diffRowFields(r, child, errors, ops, childIdxOf(r.id)));
+  }
 }
 
 /* ── Status / errors ── */
@@ -1316,7 +1601,10 @@ async function boot() {
     schema = data.schema;
     const panel = $('config-panel');
     panel.innerHTML = '';
-    schema.sections.forEach(sec => panel.appendChild(renderSection(sec)));
+    schema.sections.forEach(sec => {
+      const el = renderSection(sec);
+      if (el) panel.appendChild(el);
+    });
   } catch (err) {
     $('config-panel').innerHTML = '<div class="state-msg">Failed to load config state: ' + esc(err.message) + '</div>';
   }

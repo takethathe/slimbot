@@ -16,6 +16,7 @@
 //! - **Secrets stay in one place.** Credentials are materialized into the
 //!   connect call and never stored on the cache, the status view, or a log line.
 
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,11 +27,12 @@ use parking_lot::RwLock;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
-use super::rpc::{McpClient, McpError, McpTool, McpTransport};
+use super::rpc::{McpClient, McpError, McpTool, McpTransport, NotificationSink};
 use super::transport::{HttpTransport, StdioTransport};
 use super::{js_safe_ident, server_prefix};
 use crate::approval::RiskLevel;
-use crate::config::{McpConfig, McpServerConfig, TransportKind};
+use crate::config::{McpConfig, McpServerConfig, McpTriggerSubscription, TransportKind};
+use crate::cron::now_ms;
 use crate::info;
 use crate::tool::ToolDefinition;
 use crate::warn_log;
@@ -167,6 +169,29 @@ fn callable_name(server: &str, tool: &str) -> String {
     format!("{}{}", server_prefix(server), js_safe_ident(tool))
 }
 
+/// What the pool holds for one declared notification subscription.
+///
+/// Nothing else: the entry carries no copy of the subscription's own identity,
+/// so the slot is the buffer's key (`(server, uri)`) and the source id is read
+/// off the configuration at snapshot time. Storing the id here instead would
+/// let two declarations of one id collapse into a single slot in the buffer.
+///
+/// Last-value: a later notification replaces the earlier one, so one
+/// subscription's slot never grows. `received_at` is local epoch milliseconds,
+/// the same clock the trigger layer stamps its own collections with.
+#[derive(Debug, Clone)]
+struct NotificationEntry {
+    params: Value,
+    received_at: i64,
+}
+
+/// One buffer slot: which server pushed, and which of its uris was named.
+///
+/// The pair is what a subscription declaration is, so two servers declaring
+/// the same uri, or one server declaring two uris, own two slots apiece — the
+/// loss mode a `source_id` key had.
+type NotificationSlot = (String, String);
+
 /// The tool set one server currently contributes.
 struct ServerState {
     status: ServerStatus,
@@ -198,6 +223,11 @@ pub(crate) struct Timing {
 pub struct McpService {
     specs: Vec<McpServerConfig>,
     states: Arc<RwLock<HashMap<String, ServerState>>>,
+    /// Last notification per declared `(server, uri)`, keyed by the pair the
+    /// subscription declares. Bounded by the number of subscriptions: the only
+    /// keys that can enter are the ones the configuration declares, and each
+    /// holds one value.
+    notifications: Arc<RwLock<HashMap<NotificationSlot, NotificationEntry>>>,
     connector: Arc<dyn Connector>,
     timing: Timing,
     call_timeout: Duration,
@@ -245,6 +275,7 @@ impl McpService {
         Self {
             specs,
             states: Arc::new(RwLock::new(HashMap::new())),
+            notifications: Arc::new(RwLock::new(HashMap::new())),
             connector,
             timing,
             call_timeout,
@@ -279,12 +310,13 @@ impl McpService {
     pub fn start(&self) {
         for spec in self.specs.iter().filter(|s| s.enabled) {
             let states = self.states.clone();
+            let notifications = self.notifications.clone();
             let connector = self.connector.clone();
             let shutdown = self.shutdown.clone();
             let spec = spec.clone();
             let timing = self.timing;
             let handle = tokio::spawn(async move {
-                supervise(spec, states, connector, shutdown, timing).await;
+                supervise(spec, states, notifications, connector, shutdown, timing).await;
             });
             self.tasks.write().push(handle);
         }
@@ -501,6 +533,57 @@ impl McpService {
     pub fn any_online(&self) -> bool {
         self.states.read().values().any(|s| s.status.is_online())
     }
+
+    /// The last notification held for each declared source, as
+    /// `source_id -> (params, received_at_ms)`.
+    ///
+    /// Read-only by construction: there is no way to write a slot except
+    /// through [`Self::ingest_notification`], and only configured uris reach
+    /// it. Connector output stays a snapshot (ADR 0009) — this accessor is how
+    /// the trigger layer reads it, and nothing writes it back to disk.
+    ///
+    /// The buffer is keyed by `(server, uri)`; the source id is read off the
+    /// declaration here, because that is the only key a condition script has
+    /// (`ctx.sources[id]`). A subscription may be renamed in config without
+    /// losing the push it already holds: the value outlives the id. Two
+    /// declarations sharing one source id would collide on this map, which is
+    /// why `Config::validate_mcp` refuses that configuration rather than
+    /// letting this accessor pick one.
+    pub fn notification_snapshot(&self) -> BTreeMap<String, (Value, i64)> {
+        let buffer = self.notifications.read();
+        let mut out = BTreeMap::new();
+        for spec in &self.specs {
+            for subscription in spec.notifications() {
+                let slot = (spec.name.clone(), subscription.uri.clone());
+                if let Some(entry) = buffer.get(&slot) {
+                    out.insert(
+                        subscription.source_id.trim().to_string(),
+                        (entry.params.clone(), entry.received_at),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Take one server-pushed notification. A `(server, method)` pair that no
+    /// configured subscription names is dropped silently: a server may push
+    /// anything, and only the owner's declarations decide what is kept.
+    pub fn ingest_notification(&self, server: &str, method: &str, params: Value) {
+        for subscription in self.declared_notifications(server) {
+            record_notification(server, &subscription, &self.notifications, method, &params);
+        }
+    }
+
+    /// The `notification` subscriptions one configured server declares. An
+    /// unknown server declares none, so its pushes go nowhere.
+    fn declared_notifications(&self, server: &str) -> Vec<McpTriggerSubscription> {
+        self.specs
+            .iter()
+            .filter(|spec| spec.name == server)
+            .flat_map(|spec| spec.notifications())
+            .collect()
+    }
 }
 
 /// Cache a server's tools under collision-free callable names.
@@ -535,6 +618,7 @@ fn cache_tools(server: &str, tools: Vec<McpTool>) -> Vec<CachedTool> {
 async fn supervise(
     spec: McpServerConfig,
     states: Arc<RwLock<HashMap<String, ServerState>>>,
+    notifications: Arc<RwLock<HashMap<NotificationSlot, NotificationEntry>>>,
     connector: Arc<dyn Connector>,
     shutdown: Arc<tokio::sync::Notify>,
     timing: Timing,
@@ -550,7 +634,7 @@ async fn supervise(
         }
         let outcome = tokio::time::timeout(
             timing.connect_timeout,
-            connect_and_cache(&spec, &connector, &states),
+            connect_and_cache(&spec, &connector, &states, &notifications),
         )
         .await
         .map_err(|_| McpError::Timeout(timing.connect_timeout.as_secs()))
@@ -626,6 +710,56 @@ async fn wait_until_dead(
     }
 }
 
+/// Take one server-pushed notification under one owner-declared subscription.
+///
+/// The match is exact on both halves: the push must come from the server the
+/// subscription belongs to, and the method must be the uri it names. An
+/// undeclared method, or a declared uri pushed by a different server, is
+/// dropped silently — a server may push anything, and only the owner's
+/// declarations decide what is kept.
+///
+/// The slot is that same pair, so the buffer holds one entry per declaration
+/// and never one per source id: a second declaration of an id cannot overwrite
+/// the first while it is in flight.
+fn record_notification(
+    server: &str,
+    subscription: &McpTriggerSubscription,
+    buffer: &RwLock<HashMap<NotificationSlot, NotificationEntry>>,
+    method: &str,
+    params: &Value,
+) {
+    if subscription.uri != method {
+        return;
+    }
+    // Last-value: a later notification replaces the earlier one, which is what
+    // keeps the buffer bounded by the number of subscriptions.
+    buffer.write().insert(
+        (server.to_string(), subscription.uri.clone()),
+        NotificationEntry {
+            params: params.clone(),
+            received_at: now_ms(),
+        },
+    );
+}
+
+/// The receiver one transport hands its server's pushes to. The buffer is keyed
+/// by `(server, uri)`; the server name is the one the transport was connected
+/// for, so a push can only ever land in that server's own slots.
+fn notification_sink(
+    server: String,
+    subscriptions: Vec<McpTriggerSubscription>,
+    buffer: Arc<RwLock<HashMap<NotificationSlot, NotificationEntry>>>,
+) -> NotificationSink {
+    // The declared subscriptions are fixed at construction, so this closure
+    // only walks them; each decides whether the push is addressed to it. It
+    // never blocks on the service: the buffer is the only thing it shares.
+    Arc::new(move |method: &str, params: Value| {
+        for subscription in &subscriptions {
+            record_notification(&server, subscription, &buffer, method, &params);
+        }
+    })
+}
+
 /// Connect, handshake, cache the tool set and mark the server online. Returns
 /// how many tools the server contributed, so the caller can log it without
 /// reading the shared state again.
@@ -633,9 +767,23 @@ async fn connect_and_cache(
     spec: &McpServerConfig,
     connector: &Arc<dyn Connector>,
     states: &Arc<RwLock<HashMap<String, ServerState>>>,
+    notifications: &Arc<RwLock<HashMap<NotificationSlot, NotificationEntry>>>,
 ) -> Result<usize, McpError> {
     let transport = connector.connect(spec).await?;
-    let client = McpClient::connect(transport).await?;
+    // The new transport is the only place a connection appears, so this is
+    // where its push channel is wired to the one buffer every subscriber reads.
+    // Installed after the handshake: `initialize` may itself make the server
+    // push `notifications/tools/list_changed`, and that frame has to reach the
+    // sink rather than fall into the gap before it was installed.
+    let client = McpClient::connect(transport.clone()).await?;
+    // One connection serves one server, so the sink carries this server's own
+    // name and subscriptions; the buffer is the one the whole pool reads.
+    let sink = notification_sink(
+        spec.name.clone(),
+        spec.notifications(),
+        notifications.clone(),
+    );
+    transport.set_notification_sink(sink);
     let tools = cache_tools(&spec.name, client.list_tools().await?);
     let count = tools.len();
     {
@@ -729,10 +877,33 @@ pub(crate) mod test_support {
 
     struct FakeTransport {
         peer: Arc<FakePeer>,
+        /// What the pool installed; the peer flips it to simulate a push.
+        sink: Arc<std::sync::Mutex<Option<NotificationSink>>>,
+    }
+
+    impl FakeTransport {
+        /// Push once, the way a transport does when the server sends a frame
+        /// with no id. Returns false when no sink was installed.
+        pub fn push(&self, method: &str, params: Value) -> bool {
+            let sink = self.sink.lock().ok().and_then(|guard| guard.clone());
+            match sink {
+                Some(sink) => {
+                    sink(method, params);
+                    true
+                }
+                None => false,
+            }
+        }
     }
 
     #[async_trait]
     impl McpTransport for FakeTransport {
+        fn set_notification_sink(&self, sink: NotificationSink) {
+            if let Ok(mut slot) = self.sink.lock() {
+                *slot = Some(sink);
+            }
+        }
+
         async fn request(&self, _id: u64, method: &str, _params: Value) -> Result<Value, McpError> {
             if !self.peer.online.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(McpError::Transport("peer is down".to_string()));
@@ -758,13 +929,28 @@ pub(crate) mod test_support {
 
     pub struct FakeConnector {
         peers: RwLock<HashMap<String, Arc<FakePeer>>>,
+        /// The current connection per server, so a test can push from the
+        /// server side after the pool installed its sink.
+        transports: RwLock<HashMap<String, Arc<FakeTransport>>>,
     }
 
     impl FakeConnector {
         pub fn new(peers: Vec<(String, Arc<FakePeer>)>) -> Arc<Self> {
             Arc::new(Self {
                 peers: RwLock::new(peers.into_iter().collect()),
+                transports: RwLock::new(HashMap::new()),
             })
+        }
+
+        /// Push one notification through the transport the pool is holding for
+        /// `server`, i.e. down the real sink path. Returns false when the
+        /// server has no live connection to push on.
+        pub fn push(&self, server: &str, method: &str, params: Value) -> bool {
+            let transport = self.transports.read().get(server).cloned();
+            match transport {
+                Some(transport) => transport.push(method, params),
+                None => false,
+            }
         }
     }
 
@@ -779,7 +965,14 @@ pub(crate) mod test_support {
                 .ok_or_else(|| McpError::Transport("no such configured peer".to_string()))?;
             peer.attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Arc::new(FakeTransport { peer }))
+            let transport = Arc::new(FakeTransport {
+                peer,
+                sink: Arc::new(std::sync::Mutex::new(None)),
+            });
+            self.transports
+                .write()
+                .insert(spec.name.clone(), transport.clone());
+            Ok(transport)
         }
     }
 
@@ -856,6 +1049,24 @@ mod tests {
             timing(),
             Duration::from_secs(2),
         ))
+    }
+
+    /// One configured server plus the fake peer it connects to.
+    fn spec_with_triggers(name: &str, triggers: Vec<McpTriggerSubscription>) -> McpServerConfig {
+        McpServerConfig {
+            triggers,
+            ..spec(name)
+        }
+    }
+
+    /// A `notification` subscription, spelled as the config would carry it.
+    fn notification(uri: &str, source_id: &str) -> McpTriggerSubscription {
+        McpTriggerSubscription {
+            r#type: "notification".to_string(),
+            uri: uri.to_string(),
+            source_id: source_id.to_string(),
+            ..Default::default()
+        }
     }
 
     async fn wait_until<T>(probe: impl Fn() -> Option<T>, timeout: Duration) -> Result<T, ()> {
@@ -1269,6 +1480,262 @@ mod tests {
         );
         let unique: HashSet<&str> = names.iter().copied().collect();
         assert_eq!(unique.len(), names.len(), "no two callables collide");
+    }
+
+    #[tokio::test]
+    async fn test_notification_declared_in_config_lands_in_the_snapshot() {
+        // The transport hands a server-pushed notification to the pool; the
+        // pool keeps it under the `source_id` its subscription declares, so a
+        // condition script can read it as `ctx.sources["builds"]`.
+        let peer = FakePeer::new(vec![json!({"name": "read"})]);
+        let connector = FakeConnector::new(vec![("ci".to_string(), peer)]);
+        let service = Arc::new(McpService::with_connector(
+            vec![spec_with_triggers(
+                "ci",
+                vec![notification("notifications/tools/list_changed", "builds")],
+            )],
+            connector.clone(),
+            timing(),
+            Duration::from_secs(2),
+        ));
+        assert!(
+            service.notification_snapshot().is_empty(),
+            "a fresh pool holds nothing"
+        );
+        service.start();
+        wait_until(
+            || service.any_online().then_some(()),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("server must come online");
+
+        // Push through the transport the pool connected: if the sink is not
+        // installed on the new transport, nothing arrives at all.
+        assert!(
+            connector.push(
+                "ci",
+                "notifications/tools/list_changed",
+                json!({"tools": ["deploy"]})
+            ),
+            "the pool must have installed a notification sink on connect"
+        );
+
+        let snapshot = service.notification_snapshot();
+        let (params, received_at) = snapshot.get("builds").expect("{snapshot:?}");
+        assert_eq!(*params, json!({"tools": ["deploy"]}));
+        assert!(*received_at > 0, "{received_at}");
+        service.shutdown().await;
+    }
+
+    #[test]
+    fn test_notification_for_an_undeclared_uri_is_ignored() {
+        // A server may push anything; only an owner's declaration decides what
+        // is kept. An undeclared uri, or a declared uri pushed by a *different*
+        // server, must leave the buffer exactly as it was.
+        let service = Arc::new(McpService::with_connector(
+            vec![
+                spec_with_triggers("ci", vec![notification("notifications/builds", "builds")]),
+                spec_with_triggers("mail", vec![notification("notifications/mail", "inbox")]),
+            ],
+            FakeConnector::new(vec![]),
+            timing(),
+            Duration::from_secs(2),
+        ));
+        service.ingest_notification("ci", "notifications/builds", json!({"n": 1}));
+        service.ingest_notification("ci", "notifications/message", json!({"n": 2}));
+        // Declared on `mail` only: `ci` pushing it is not a subscription.
+        service.ingest_notification("ci", "notifications/mail", json!({"n": 3}));
+        // A server that is not configured at all.
+        service.ingest_notification("ghost", "notifications/builds", json!({"n": 4}));
+
+        let snapshot = service.notification_snapshot();
+        let keys: Vec<&String> = snapshot.keys().collect();
+        assert_eq!(keys, vec!["builds"], "{snapshot:?}");
+        assert_eq!(
+            snapshot["builds"].0,
+            json!({"n": 1}),
+            "the declared notification must be the one kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notification_buffer_second_push_overwrites_the_first() {
+        // Last-value: a source reads as "what the server said last", never as a
+        // pile of every push since start-up. That is also the bound the ticket
+        // promises — the entry count tracks the subscription count, not the
+        // notification count.
+        let peer = FakePeer::new(vec![json!({"name": "read"})]);
+        let connector = FakeConnector::new(vec![("ci".to_string(), peer)]);
+        let service = Arc::new(McpService::with_connector(
+            vec![spec_with_triggers(
+                "ci",
+                vec![notification("notifications/tools/list_changed", "builds")],
+            )],
+            connector.clone(),
+            timing(),
+            Duration::from_secs(2),
+        ));
+        service.start();
+        wait_until(
+            || service.any_online().then_some(()),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("server must come online");
+
+        connector.push("ci", "notifications/tools/list_changed", json!({"n": 1}));
+        let first = service.notification_snapshot();
+        assert_eq!(first.len(), 1, "{first:?}");
+
+        for n in 2..=20 {
+            connector.push("ci", "notifications/tools/list_changed", json!({ "n": n }));
+        }
+        let after = service.notification_snapshot();
+        assert_eq!(
+            after.len(),
+            1,
+            "one subscription means one slot, however many pushes: {after:?}"
+        );
+        assert_eq!(
+            after["builds"].0,
+            json!({"n": 20}),
+            "the last notification must win"
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_notification_received_at_tracks_the_local_clock() {
+        // `observed_at` downstream is this stamp, so it has to be a real clock
+        // reading (the source layer decides staleness from it) and it must not
+        // move backwards between two pushes.
+        let peer = FakePeer::new(vec![json!({"name": "read"})]);
+        let connector = FakeConnector::new(vec![("ci".to_string(), peer)]);
+        let service = Arc::new(McpService::with_connector(
+            vec![spec_with_triggers(
+                "ci",
+                vec![
+                    notification("notifications/builds", "builds"),
+                    notification("notifications/deploys", "deploys"),
+                ],
+            )],
+            connector.clone(),
+            timing(),
+            Duration::from_secs(2),
+        ));
+        service.start();
+        wait_until(
+            || service.any_online().then_some(()),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("server must come online");
+
+        let before = crate::cron::now_ms();
+        connector.push("ci", "notifications/builds", json!({"n": 1}));
+        let first = service.notification_snapshot()["builds"].1;
+        // A real local-time stamp lands inside the window this test brackets,
+        // with slack only for the two clock reads, not for a fixed epoch.
+        let after = crate::cron::now_ms();
+        assert!(
+            (before..=after).contains(&first),
+            "received_at {first} must sit between {before} and {after}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        connector.push("ci", "notifications/deploys", json!({"n": 2}));
+        let second = service.notification_snapshot()["deploys"].1;
+        assert!(second >= first, "{second} must not precede {first}");
+        assert!(
+            second > first,
+            "a later push must be stamped later ({second} vs {first})"
+        );
+        service.shutdown().await;
+    }
+
+    #[test]
+    fn test_notification_two_servers_with_distinct_source_ids_do_not_interfere() {
+        // The buffer is keyed by `(server, uri)`, not by the source id: two
+        // servers each own their slot, so a push on one never lands on the
+        // other — and a push to the *same uri* from the other server is a
+        // separate slot rather than an overwrite.
+        let service = Arc::new(McpService::with_connector(
+            vec![
+                spec_with_triggers("ci", vec![notification("notifications/builds", "builds")]),
+                spec_with_triggers(
+                    "deploys",
+                    vec![notification("notifications/builds", "deploys")],
+                ),
+            ],
+            FakeConnector::new(vec![]),
+            timing(),
+            Duration::from_secs(2),
+        ));
+        service.ingest_notification("ci", "notifications/builds", json!({"n": 1}));
+        service.ingest_notification("deploys", "notifications/builds", json!({"n": 2}));
+
+        let snapshot = service.notification_snapshot();
+        assert_eq!(
+            snapshot.keys().collect::<Vec<_>>(),
+            vec!["builds", "deploys"],
+            "one entry per declaration: {snapshot:?}"
+        );
+        assert_eq!(snapshot["builds"].0, json!({"n": 1}));
+        assert_eq!(snapshot["deploys"].0, json!({"n": 2}));
+
+        // And a later push moves only its own server's slot.
+        service.ingest_notification("deploys", "notifications/builds", json!({"n": 3}));
+        let snapshot = service.notification_snapshot();
+        assert_eq!(snapshot["builds"].0, json!({"n": 1}), "{snapshot:?}");
+        assert_eq!(snapshot["deploys"].0, json!({"n": 3}), "{snapshot:?}");
+    }
+
+    #[tokio::test]
+    async fn test_notification_snapshot_without_subscriptions_is_empty() {
+        // The feature is opt-in per server: a connector that declares nothing
+        // contributes nothing, even while it pushes notifications, and its
+        // pushes must not fail or accumulate anywhere.
+        let peer = FakePeer::new(vec![json!({"name": "read"})]);
+        let connector = FakeConnector::new(vec![("ci".to_string(), peer)]);
+        let service = Arc::new(McpService::with_connector(
+            vec![spec("ci")],
+            connector.clone(),
+            timing(),
+            Duration::from_secs(2),
+        ));
+        service.start();
+        wait_until(
+            || service.any_online().then_some(()),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("server must come online");
+
+        connector.push("ci", "notifications/tools/list_changed", json!({}));
+        assert!(
+            service.notification_snapshot().is_empty(),
+            "{:?}",
+            service.notification_snapshot()
+        );
+
+        // A `tool` subscription is collected on demand, not pushed: it is not a
+        // notification slot either.
+        let mut tool_sub = notification("notifications/builds", "ignored");
+        tool_sub.r#type = "tool".to_string();
+        let service = Arc::new(McpService::with_connector(
+            vec![spec_with_triggers("ci", vec![tool_sub])],
+            connector.clone(),
+            timing(),
+            Duration::from_secs(2),
+        ));
+        connector.push("ci", "notifications/builds", json!({"n": 1}));
+        service.ingest_notification("ci", "notifications/builds", json!({"n": 1}));
+        assert!(
+            service.notification_snapshot().is_empty(),
+            "only `notification` subscriptions buffer: {:?}",
+            service.notification_snapshot()
+        );
     }
 
     #[test]

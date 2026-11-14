@@ -163,7 +163,7 @@ pub fn prune_expired(entries: &mut Vec<Entry>, ttl_ms: i64, now: i64) {
     entries.retain(|e| now.saturating_sub(e.at) <= ttl_ms);
 }
 
-fn fingerprint_of(item: &Value) -> String {
+pub(crate) fn fingerprint_of(item: &Value) -> String {
     if let Some(declared) = item.get("fingerprint").and_then(|v| v.as_str())
         && !declared.is_empty()
     {

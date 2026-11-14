@@ -30,7 +30,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::agent::SubagentRuntime;
-use crate::config::TriggersConfig;
+use crate::config::{McpServerConfig, TriggersConfig};
 use crate::debug;
 use crate::message_bus::MessageBus;
 use crate::trace::{SpanRecorder, SpanStatus, Tracer};
@@ -87,6 +87,7 @@ impl TriggerService {
             tracer,
             None,
             bus,
+            &[],
         )
         .service
     }
@@ -161,6 +162,11 @@ impl TriggerService {
         }
         self.sources.reload();
         self.rules.reload();
+        // Reference counting is settled here, after both reloads and before the
+        // collect: the enabled rules of *this* tick are what decides which
+        // collectors run, so a rule paused on disk stops its source at once.
+        self.sources
+            .set_referenced_sources(self.rules.referenced_sources());
         let index = self.sources.begin_tick();
         let due_sources = self.sources.due(index);
         let due_rules = self.rules.due(index);
@@ -285,7 +291,12 @@ pub fn assemble(
     tracer: Tracer,
     runtime: Option<Arc<SubagentRuntime>>,
     bus: Arc<MessageBus>,
+    mcp_servers: &[McpServerConfig],
 ) -> Wiring {
+    // The MCP section is what declares virtual sources, and it is not part of
+    // `TriggersConfig`, so the two layers are reconciled here — one place for
+    // every caller, instead of each wiring remembering to hand them over.
+    layers.sources.attach_mcp_servers(mcp_servers);
     let dispatch = Dispatcher::new(
         runtime,
         bus,
@@ -418,6 +429,37 @@ mod tests {
             service.secrets().get("token").map(String::as_str),
             Some("from-keychain")
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_tick_collects_only_the_sources_an_enabled_rule_reads() {
+        // The reference set is settled after the rules reload and before the
+        // collect, so one tick is enough: a source nobody reads is never run,
+        // and disabling the rule that read the other one stops it too.
+        let h = Harness::new();
+        h.source("src-0001");
+        h.source("src-0002");
+        let mut meta = TriggerMeta::new("trg-a", "reads one");
+        meta.sources = vec!["src-0001".to_string()];
+        h.rule(&meta, "function judge() { return {fire: false}; }");
+
+        let first = h.service.tick().await;
+        assert_eq!(first.sources.succeeded, vec!["src-0001".to_string()]);
+        assert!(first.sources.frame.view("src-0002").is_none());
+
+        // Pausing the rule writes its meta, so the next reload sees the pause.
+        let disabled = h.rules.set_enabled("trg-a", false).unwrap();
+        assert!(!disabled.enabled);
+        assert!(h.rules.get("trg-a").is_some_and(|meta| !meta.enabled));
+        let after = h.service.tick().await;
+        assert!(
+            after.sources.succeeded.is_empty(),
+            "a paused rule must stop its source: {:?}",
+            after.sources.succeeded
+        );
+        assert!(after.sources.due.is_empty(), "{:?}", after.sources.due);
+        // Both definitions are still there for the next `list`.
+        assert_eq!(h.sources.status().len(), 2);
     }
 
     #[tokio::test]

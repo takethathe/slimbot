@@ -98,6 +98,7 @@ cargo run -- -d /data/myapp setup
 | `executors` | object | 否 | `{"max_count": 20}` | 执行器数量软上限（`0` = 不设上限） |
 | `pressure` | object | 否 | 见下文 | 上下文压力占比（长度限制全部由 provider 窗口派生） |
 | `mcp` | object | 否 | 空池 | MCP 连接器（`mcp.servers[]`）与连接预算 |
+| `triggers` | object | 否 | 见 [触发器层](trigger.md) | 触发器 tick、队列与数据源上限 |
 
 ### `channels` — 通信通道
 
@@ -436,6 +437,26 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 
 这一节是顶层配置而不是 `triggers` 的子字段：`executors/` 是 workspace 根级目录，执行器不是触发器的附属（见 [executor.md](executor.md#目录布局)）。
 
+### `triggers` — 触发器层
+
+触发器的 tick 节奏、队列边界与数据源治理都在这一节；全套字段与语义见 [trigger.md](trigger.md#配置)。本节只登记有行为后果的那几个旋钮：
+
+```json
+{ "triggers": { "enabled": true, "tick_interval_s": 60, "max_active_sources": 8 } }
+```
+
+| 字段 | 类型 | 约束 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `enabled` | bool | — | `true` | 总开关；关掉则 tick 不跑、源不采集（定义与规则都留在磁盘上） |
+| `tick_interval_s` | u64 | range(1, 3600) | `60` | 固定 tick 间隔。`every_n_ticks` 因此有确定含义 |
+| `max_concurrent_collect` | usize | range(1, 16) | `4` | 单 tick 内并发采集的源数上限（磁盘采集器与 `type=tool` 虚拟源共享这个闸） |
+| `max_active_sources` | usize | range(0, 100) | `8` | 活跃数据源上限：被 enabled 规则读到的源达到这个数后，`trigger_source create` 被拒并返回现有源清单；`0` = 不设上限。默认 8 是**故意宽松**的，只挡失控增长，不是配额 |
+| `secrets` | array | — | `[]` | `{name, value}` 列表，脚本经 `ctx.secret(name)` 取，`value` 在配置编辑器里恒为掩码 |
+
+`max_active_sources` 与执行器的 `max_count` 是同一种约定（软上限 + 拒绝时带回可比对的清单 + `0` 关闭），区别是它按**被 enabled 规则引用的 source** 计数：有规则在读的源占额度，没有规则读的源不占；**首次 tick 推送引用集合之前所有 source 都计入**（那时无法区分谁被引用，保守地把全部算进上限）。拒绝响应的形状与「先查后试跑」的次序见 [trigger.md](trigger.md#活跃-source-上限)。
+
+虚拟源不在这一节，而在 `mcp.servers[].triggers[]`：它们是连接器的一部分，随 server 一起声明、一起消失（见下节）。
+
 ### `mcp` — MCP 连接器
 
 声明可从 codemode 脚本里调用的外部 MCP server。**这一节只描述连接，不是工具白名单**：连接器工具永不进入模型的 tool schema，只在脚本里经 `searchTools()` 发现、`tools.mcp__<server>__<tool>()` 调用（[ADR 0016](adr/0016-mcp-through-codemode-only.md)）。机制与隐私规则见 [mcp.md](mcp.md)。
@@ -478,6 +499,42 @@ SlimBot 只有一个 Agent。Agent 通过名称从 `providers` 映射中引用�
 | `enabled` | bool | `true` | 关掉保留配置但永不尝试连接（状态读作 `disabled`） |
 | `command` / `args` / `env` | string / array / map | — | stdio：要启动的可执行文件与参数；`env` 是子进程**唯一**能拿到的环境（其余由 gateway 继承而来的一律清掉，只放回 `PATH`、`HOME`） |
 | `url` / `headers` | string / map | — | http：streamable-HTTP 端点与静态请求头（通常就是一条 `Authorization`） |
+| `triggers` | array | `[]` | 触发器订阅：这个 server 喂给触发器层的数据源（见下） |
+
+#### `mcp.servers[].triggers[]` — 触发器订阅
+
+每条订阅同时是触发器层的一个**数据源**（虚拟源：没有目录、没有 `collect.js`），`source_id` 就是条件脚本里 `ctx.sources[...]` 的键。它是**源声明**，不是工具白名单——连接器工具照样不进模型 schema（ADR 0016）。语义与在 tick 里的位置见 [mcp.md](mcp.md#配置声明订阅与虚拟源注入) 与 [trigger.md](trigger.md#虚拟源mcp-订阅)。
+
+```json
+{
+  "name": "ci",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "some-ci-mcp"],
+  "triggers": [
+    { "type": "notification", "uri": "notifications/builds", "source_id": "ci-builds",
+      "description": "Latest build status pushed by the CI server" },
+    { "type": "tool", "tool": "list_runs", "args": { "limit": 5 }, "source_id": "ci-runs" }
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `type` | `notification` / `tool` | 白名单 | `"notification"` | `notification`：server 主动推，池保持 last-value；`tool`：宿主每个到期 tick 调一次这个连接器工具 |
+| `uri` | string | str_max(256) | `""` | `notification` 必填：要缓冲的 method，精确匹配（如 `notifications/tools/list_changed`） |
+| `tool` | string | str_max(128) | `""` | `tool` 必填：工具名，**不带** `mcp__<server>__` 前缀（host 补） |
+| `args` | any JSON | — | `null` | `tool`：每次采集传同一份固定参数（可省，缺省按 `{}` 下发） |
+| `description` | string | str_max(256) | `""` | 给人看的一行说明，`trigger_source list` 会显示；留空则自动生成 `mcp <server> <uri\|tool>` |
+| `source_id` | string | str_max(64) | `""` | **必填**：这个源在 `ctx.sources` 里的键（全配置内唯一；撞名由配置验证拒绝） |
+
+校验与冲突：
+
+- 每条订阅必须写 `source_id`；`type=notification` 必须写 `uri`，`type=tool` 必须写 `tool`，否则配置验证直接拒绝（`mcp.servers.<name>.triggers[<i>]: needs a source_id` 之类的报错）。disabled 的 server 跳过这条形状校验——它本来就不会被连接。
+- `source_id` 是条件脚本读帧的唯一键，一个 id 只能指一个源：**同一个 `source_id` 被两条订阅声明**（跨 server 或同一 server 内）时 `Config::validate_mcp()` 直接拒绝，报错点名撞名的 id 与涉及的 server、以及两处声明的位置。这条撞名校验**不看 `enabled`**——disabled 的订阅在被重新启用时会立刻和对方争同一个键。
+- `source_id` 与 `triggers/sources/<id>/` 撞名时**订阅赢**，磁盘目录被忽略并记一行 `warn`（这是磁盘侧与配置侧的重名，与上面两条订阅之间的撞名不是一回事）。
+- 改订阅不用重启 gateway，下一次 tick 的 `reload()` 就生效，删掉订阅即删掉那个源。
+- `type=notification` 的实时性取决于 transport：stdio 实时，HTTP 只能在某次工具调用等应答期间顺带收到（见 [mcp.md](mcp.md#服务端推送notification)）。
 
 `env` 与 `headers` 的值里可以写 `${secret:<key>}`：缺 `slimbot.` 前缀时按所属 server 展开为 `slimbot.mcp.<server>.<name>`，走与 `api_key` 同一条解析链（见下文）。占位符解不出来时**原样送去**，让握手失败理由带着它，而不是拿着空凭证启动。
 

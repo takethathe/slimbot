@@ -145,6 +145,7 @@ define_config! {
         max_queue: usize = 20, range(1, 200), desc: "Max pending fires in the dispatch queue (overflow is dropped)",
         max_merge: usize = 3, range(1, 20), desc: "Max notify messages merged into one inbound input per origin per tick",
         history_lines: usize = 5000, range(100, 100_000), desc: "Fire history lines kept before the file is rolled to one generation",
+        max_active_sources: usize = 8, range(0, 100), desc: "Cap on sources a trigger may actively reference: at the cap `trigger_source create` is refused and returns the current sources. 0 disables the cap (the default 8 is deliberately loose)",
         secrets: Vec<SecretEntry> = Vec::<SecretEntry>::new(), none, desc: "Secrets available to scripts via ctx.secret(name); values are masked",
     }
 }
@@ -206,6 +207,31 @@ define_config! {
         env: BTreeMap<String, String> = empty_map(), secret, desc: "stdio: environment for the child (the only environment it gets); values may hold ${secret:<key>}",
         url: String = "".to_string(), str_max(512), desc: "http: endpoint URL",
         headers: BTreeMap<String, String> = empty_map(), secret, desc: "http: static request headers, typically an Authorization value built from ${secret:<key>}",
+        // A subscription is a source declaration, not a credential, so it is
+        // stored in its declared shape: the editor addresses one entry as
+        // `mcp.servers.<i>.triggers.<j>.<field>` and the tick reads the struct
+        // directly. `mcp_value_map` blanks the whole `servers` array before
+        // serializing, so the `env`/`headers` secrets never ride along.
+        triggers: Vec<McpTriggerSubscription> = Vec::<McpTriggerSubscription>::new(), none, desc: "Trigger subscriptions: notifications to buffer and tools to collect as virtual sources",
+    }
+}
+
+// ── MCP trigger subscriptions (trigger source expansion) ──
+//
+// A server declares what it feeds the trigger layer: a notification it pushes
+// (passive) or one of its tools to call on every due tick (active). Either way
+// the entry names a `source_id`, which is the key a condition script reads the
+// collected snapshot under — so the subscription is a source declaration, not
+// a tool allow-list (ADR 0016 keeps connector tools out of the model schema).
+
+define_config! {
+    "mcp.servers.triggers" => McpTriggerSubscription {
+        r#type: String = "notification".to_string(), allowed(["notification", "tool"]), desc: "Subscription kind: notification (server pushes) or tool (host calls it each due tick)",
+        uri: String = "".to_string(), str_max(256), desc: "notification: the notification method URI to buffer (e.g. notifications/tools/list_changed)",
+        tool: String = "".to_string(), str_max(128), desc: "tool: the tool name without the mcp__<server>__ prefix",
+        args: Option<serde_json::Value> = None::<serde_json::Value>, none, desc: "tool: fixed JSON arguments passed on every collection call (optional)",
+        description: String = "".to_string(), str_max(256), desc: "Human-readable summary shown by `trigger_source list`",
+        source_id: String = "".to_string(), str_max(64), desc: "Source id this subscription appears under in the tick frame",
     }
 }
 
@@ -228,6 +254,20 @@ impl McpServerConfig {
             .iter()
             .filter(|(k, _)| !k.trim().is_empty())
             .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// The subscriptions of kind `notification`, in declared order: the pushes
+    /// this server is allowed to write into the trigger layer's snapshot.
+    ///
+    /// `clamp()` has already forced the kind into the whitelist, so the string
+    /// comparison is the whole test; the `tool` kind is collected on demand by
+    /// the trigger layer instead, and has nothing to subscribe to here.
+    pub fn notifications(&self) -> Vec<McpTriggerSubscription> {
+        self.triggers
+            .iter()
+            .filter(|sub| sub.r#type == "notification")
+            .cloned()
             .collect()
     }
 
@@ -319,4 +359,109 @@ pub fn approval_field_metas() -> &'static [crate::config_macro::FieldMeta] {
             secret: false,
         },
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_subscription(value: serde_json::Value) -> McpTriggerSubscription {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn test_mcp_trigger_subscription_parses_notification_type() {
+        let sub = parse_subscription(serde_json::json!({
+            "type": "notification",
+            "uri": "notifications/tools/list_changed",
+            "description": "Tool list changed",
+            "source_id": "tools-changed",
+        }));
+        assert_eq!(sub.r#type, "notification");
+        assert_eq!(sub.uri, "notifications/tools/list_changed");
+        assert_eq!(sub.description, "Tool list changed");
+        assert_eq!(sub.source_id, "tools-changed");
+        assert!(sub.tool.is_empty());
+        assert_eq!(sub.args, None);
+    }
+
+    #[test]
+    fn test_mcp_trigger_subscription_parses_tool_type_with_fixed_args() {
+        let sub = parse_subscription(serde_json::json!({
+            "type": "tool",
+            "tool": "list_builds",
+            "args": { "branch": "main", "limit": 5 },
+            "description": "Latest CI builds",
+            "source_id": "ci-builds",
+        }));
+        assert_eq!(sub.r#type, "tool");
+        assert_eq!(sub.tool, "list_builds");
+        assert_eq!(
+            sub.args,
+            Some(serde_json::json!({ "branch": "main", "limit": 5 }))
+        );
+        assert_eq!(sub.source_id, "ci-builds");
+        assert!(sub.uri.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_trigger_subscription_empty_array_is_the_default() {
+        let server = McpServerConfig::default();
+        assert!(server.triggers.is_empty());
+    }
+
+    #[test]
+    fn test_triggers_config_max_active_sources_defaults_to_eight() {
+        assert_eq!(TriggersConfig::default().max_active_sources, 8);
+    }
+
+    #[test]
+    fn test_triggers_config_max_active_sources_keeps_custom_value() {
+        let mut config = TriggersConfig {
+            max_active_sources: 25,
+            ..Default::default()
+        };
+        config.clamp();
+        assert_eq!(config.max_active_sources, 25);
+    }
+
+    #[test]
+    fn test_triggers_config_max_active_sources_clamps_to_declared_range() {
+        let mut low = TriggersConfig {
+            max_active_sources: 0,
+            ..Default::default()
+        };
+        low.clamp();
+        assert_eq!(
+            low.max_active_sources, 0,
+            "0 stays disabled, like `executors.max_count`"
+        );
+
+        let mut high = TriggersConfig {
+            max_active_sources: 500,
+            ..Default::default()
+        };
+        high.clamp();
+        assert_eq!(high.max_active_sources, 100);
+    }
+
+    #[test]
+    fn test_mcp_trigger_subscription_unknown_type_falls_back_to_notification() {
+        let mut sub = McpTriggerSubscription {
+            r#type: "webhook".to_string(),
+            ..Default::default()
+        };
+        sub.clamp();
+        assert_eq!(sub.r#type, "notification");
+    }
+
+    #[test]
+    fn test_mcp_trigger_subscription_keeps_tool_type() {
+        let mut sub = McpTriggerSubscription {
+            r#type: "tool".to_string(),
+            ..Default::default()
+        };
+        sub.clamp();
+        assert_eq!(sub.r#type, "tool");
+    }
 }

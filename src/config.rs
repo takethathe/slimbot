@@ -10,9 +10,9 @@ use crate::secrets::SecretStore;
 // Re-export for backward compatibility (other modules import these from crate::config)
 pub use crate::config_defs::{
     AgentConfig, CronConfig, DreamConfig, ExecutorsConfig, HeartbeatConfig, JsonRenderConfig,
-    McpConfig, McpServerConfig, MemoryConfig, OwnerConfig, PressureConfig, ProviderConfig,
-    SecretEntry, SubagentConfig, TraceBackendEntry, TraceConfig, TransportKind, TriggersConfig,
-    WebFetchConfig,
+    McpConfig, McpServerConfig, McpTriggerSubscription, MemoryConfig, OwnerConfig, PressureConfig,
+    ProviderConfig, SecretEntry, SubagentConfig, TraceBackendEntry, TraceConfig, TransportKind,
+    TriggersConfig, WebFetchConfig,
 };
 
 // ── Root Config ──
@@ -236,6 +236,81 @@ impl ChannelEntryCompat {
     }
 }
 
+/// Refuse a subscription that cannot name what to watch or where to put it.
+///
+/// `clamp()` has already forced the kind into the whitelist, so the match here
+/// only has to split the two kinds apart; the empty `uri` / `tool` halves the
+/// other kind leaves behind are not checked.
+fn validate_trigger_subscriptions(server: &McpServerConfig) -> Result<()> {
+    for (idx, subscription) in server.triggers.iter().enumerate() {
+        let at = format!("mcp.servers.{}.triggers[{}]", server.name, idx);
+        if subscription.source_id.trim().is_empty() {
+            anyhow::bail!("{at}: needs a source_id");
+        }
+        match subscription.r#type.as_str() {
+            "notification" if subscription.uri.trim().is_empty() => {
+                anyhow::bail!("{at}: a \"notification\" subscription needs a uri");
+            }
+            "tool" if subscription.tool.trim().is_empty() => {
+                anyhow::bail!("{at}: a \"tool\" subscription needs a tool name");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Refuse two subscriptions that claim one source id.
+///
+/// A `source_id` is the key a condition script reads the tick frame under
+/// (`ctx.sources[id]`), and the layer holds exactly one runtime per key — so two
+/// declarations of one id would leave the script one source where the config
+/// described two, with no way to tell which one answered. That is a
+/// configuration question, not a runtime one: refuse it at load, naming both
+/// declarations, rather than pick a winner.
+///
+/// This walks every server, not just the enabled ones: a disabled entry's
+/// subscription comes back on the tick it is re-enabled, and two declarations
+/// of one id would then collide at runtime.
+fn validate_subscription_source_ids(servers: &[McpServerConfig]) -> Result<()> {
+    /// Where one subscription of one server put a source id.
+    struct Claim {
+        server: String,
+        at: String,
+    }
+    let mut claims: HashMap<String, Claim> = HashMap::new();
+    for server in servers {
+        for (idx, subscription) in server.triggers.iter().enumerate() {
+            let id = subscription.source_id.trim();
+            // An empty id is the other validator's refusal; it must not turn
+            // into a collision report that hides the real cause.
+            if id.is_empty() {
+                continue;
+            }
+            let at = format!("mcp.servers.{}.triggers[{}]", server.name, idx);
+            match claims.get(id) {
+                Some(first) => anyhow::bail!(
+                    "mcp.servers: source_id `{id}` is declared twice ({} on server `{}`, {} on server `{}`); a source id is the key a condition reads, so it must name exactly one subscription",
+                    first.at,
+                    first.server,
+                    at,
+                    server.name
+                ),
+                None => {
+                    claims.insert(
+                        id.to_string(),
+                        Claim {
+                            server: server.name.clone(),
+                            at,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn clamp(&mut self) {
         self.agent.clamp();
@@ -263,6 +338,11 @@ impl Config {
         self.mcp.clamp();
         for server in self.mcp.servers.iter_mut() {
             server.clamp();
+            // A subscription is stored in its declared shape, so an
+            // over-long value is clamped once, on load, not on every use.
+            for subscription in server.triggers.iter_mut() {
+                subscription.clamp();
+            }
         }
         if let Some(wf) = &mut self.web_fetch {
             wf.clamp();
@@ -307,6 +387,9 @@ impl Config {
     /// configuration error, not a runtime one: better to refuse the gateway
     /// than to bring up a pool that can never answer a call.
     fn validate_mcp(&self) -> Result<()> {
+        // Two subscriptions that claim one source id are refused whether or not
+        // their servers are enabled: see `validate_subscription_source_ids`.
+        validate_subscription_source_ids(&self.mcp.servers)?;
         let mut seen: HashMap<String, String> = HashMap::new();
         for server in &self.mcp.servers {
             // A disabled entry is never connected to, so its transport shape
@@ -333,6 +416,9 @@ impl Config {
                         }
                     }
                 }
+                // A subscription is a source declaration: without it the tick
+                // has nothing to collect under and the entry is silently dead.
+                validate_trigger_subscriptions(server)?;
             }
             // Two names that sanitize to the same callable prefix would be
             // indistinguishable to a script (`gh-mcp` vs `gh_mcp`).
@@ -595,6 +681,82 @@ mod tests {
             config.validate().is_err(),
             "an enabled http connector with no url must be refused"
         );
+    }
+
+    #[test]
+    fn test_validate_mcp_duplicate_source_id_across_servers_is_refused() {
+        // One source id is one key in the tick frame, so two servers declaring
+        // it describe a source that cannot exist. The refusal has to name the
+        // id and both servers: the owner's fix is to rename one of them, and
+        // there is no other clue in the config.
+        let config: Config = serde_json::from_str(
+            r#"{
+            "agent": {"provider": "default"},
+            "providers": {"default": {"type": "openai", "api_key": "k", "model": "m"}},
+            "mcp": {"servers": [
+                {"name": "ci", "command": "a",
+                 "triggers": [{"type": "notification", "uri": "notifications/builds", "source_id": "builds"}]},
+                {"name": "deploys", "command": "b",
+                 "triggers": [{"type": "notification", "uri": "notifications/builds", "source_id": "builds"}]}
+            ]}
+        }"#,
+        )
+        .unwrap();
+        let err = config
+            .validate()
+            .expect_err("two servers may not declare one source id")
+            .to_string();
+        for expected in ["builds", "ci", "deploys"] {
+            assert!(
+                err.contains(expected),
+                "the error names `{expected}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_mcp_duplicate_source_id_within_one_server_is_refused() {
+        // The same collision inside one server: two subscriptions of one server
+        // pointing at one id would lose one of them silently in the layer.
+        let config: Config = serde_json::from_str(
+            r#"{
+            "agent": {"provider": "default"},
+            "providers": {"default": {"type": "openai", "api_key": "k", "model": "m"}},
+            "mcp": {"servers": [
+                {"name": "ci", "command": "a",
+                 "triggers": [
+                    {"type": "notification", "uri": "notifications/builds", "source_id": "ci-events"},
+                    {"type": "tool", "tool": "list_runs", "source_id": "ci-events"}
+                 ]}
+            ]}
+        }"#,
+        )
+        .unwrap();
+        let err = config
+            .validate()
+            .expect_err("one server may not declare one source id twice")
+            .to_string();
+        assert!(err.contains("ci-events"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_mcp_distinct_source_ids_across_servers_are_allowed() {
+        // The control for the two refusals above: distinct ids, even on the
+        // same uri, are the normal case and must load.
+        let config: Config = serde_json::from_str(
+            r#"{
+            "agent": {"provider": "default"},
+            "providers": {"default": {"type": "openai", "api_key": "k", "model": "m"}},
+            "mcp": {"servers": [
+                {"name": "ci", "command": "a",
+                 "triggers": [{"type": "notification", "uri": "notifications/builds", "source_id": "builds"}]},
+                {"name": "deploys", "command": "b",
+                 "triggers": [{"type": "notification", "uri": "notifications/builds", "source_id": "deploys"}]}
+            ]}
+        }"#,
+        )
+        .unwrap();
+        config.validate().expect("distinct ids are fine");
     }
 
     #[test]

@@ -52,7 +52,10 @@ pub use config::{
     ChannelConfig, Config, CronConfig, DreamConfig, GatewayConfig, HeartbeatConfig, OwnerConfig,
     ToolEntry, ToolsConfig, TraceBackendEntry, TraceConfig, WebFetchConfig,
 };
-pub use config_defs::{AgentConfig, PressureConfig, ProviderConfig, SecretEntry, TriggersConfig};
+pub use config_defs::{
+    AgentConfig, McpServerConfig, McpTriggerSubscription, PressureConfig, ProviderConfig,
+    SecretEntry, TriggersConfig,
+};
 pub use config_macro::FieldMeta;
 pub use consolidate::Consolidator;
 pub use context::{ContextBuilder, RunContext, build_runtime_context};

@@ -13,7 +13,7 @@ pub mod meta;
 pub mod state;
 pub mod tool;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -444,6 +444,22 @@ impl SubscriptionLayer {
         self.lock().get(id).map(|r| r.meta.clone())
     }
 
+    /// Every source at least one *enabled* rule reads.
+    ///
+    /// This is what keeps the source layer honest: a collector whose rule was
+    /// paused or deleted stops running, so a source costs nothing until
+    /// something actually looks at it. A disabled rule is excluded on purpose —
+    /// it is not asking for data, and including it would let a paused rule pin
+    /// a source forever.
+    pub fn referenced_sources(&self) -> HashSet<String> {
+        self.lock()
+            .values()
+            .filter(|runtime| runtime.meta.enabled)
+            .flat_map(|runtime| runtime.meta.sources.iter().cloned())
+            .filter(|id| !id.trim().is_empty())
+            .collect()
+    }
+
     pub fn script(&self, id: &str) -> Option<String> {
         self.lock().get(id).and_then(|r| r.script.clone())
     }
@@ -507,6 +523,11 @@ impl SubscriptionLayer {
             runtime.state.prev = false;
         }
         runtime.meta.updated_at = now_ms();
+        // The definition is on disk, and `reload` re-reads it every tick: a
+        // toggle that only touched memory would be undone on the next tick.
+        if let Err(e) = meta::save_meta(&self.root, &runtime.meta) {
+            warn_log!("[trigger] cannot persist enabled flag for {id}: {e}");
+        }
         self.persist_runtime(id, runtime);
         Some(runtime.meta.clone())
     }
@@ -907,6 +928,43 @@ mod tests {
                 .find(|s| s.meta.id == id)
                 .expect("rule must be listed")
         }
+    }
+
+    #[tokio::test]
+    async fn test_set_enabled_survives_the_next_reload() {
+        // `enabled` is the one field the tool edits in memory; a reload must not
+        // undo it, or pausing a rule would last exactly until the next tick.
+        let h = Harness::new();
+        h.rule(rule("trg-a", &["src-0001"]), None);
+
+        h.rules.set_enabled("trg-a", false).unwrap();
+        h.rules.reload();
+        assert!(
+            !h.rules.get("trg-a").expect("rule must exist").enabled,
+            "a paused rule must stay paused across a reload"
+        );
+        assert!(h.rules.referenced_sources().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_referenced_sources_are_the_union_of_enabled_rules_only() {
+        // A disabled rule is not asking for anything: it must not keep its
+        // exclusive source alive while it is paused.
+        let h = Harness::new();
+        h.rule(rule("trg-a", &["src-0001", "src-0002"]), None);
+        let mut paused = rule("trg-b", &["src-0003"]);
+        paused.enabled = false;
+        h.rule(paused, None);
+        h.rule(rule("trg-c", &["src-0002"]), None);
+
+        let referenced = h.rules.referenced_sources();
+        let mut ids: Vec<&str> = referenced.iter().map(String::as_str).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["src-0001", "src-0002"]);
+
+        // Re-enabling the rule puts its source back in the same reload.
+        h.rules.set_enabled("trg-b", true).unwrap();
+        assert!(h.rules.referenced_sources().contains("src-0003"));
     }
 
     #[tokio::test]

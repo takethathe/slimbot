@@ -207,11 +207,13 @@ pub async fn assemble_gateway(paths: &PathManager) -> Result<Gateway> {
     let rules_layer = trigger_layers.rules.clone();
     let trigger_secrets = trigger_layers.secrets.clone();
     let sources_for_catalog = source_layer.clone();
+    let max_active_sources = config.triggers.max_active_sources;
     catalog.register(
         "trigger_source",
         Arc::new(move || {
             Some(Box::new(crate::trigger::tool::TriggerSourceTool::new(
                 sources_for_catalog.clone(),
+                max_active_sources,
             )) as Box<dyn Tool>)
         }),
     );
@@ -621,6 +623,7 @@ pub async fn assemble_gateway(paths: &PathManager) -> Result<Gateway> {
             tracer,
             Some(agent_loop.subagent_runtime()),
             message_bus.clone(),
+            &config.mcp.servers,
         );
         let dispatch = wiring.dispatch;
         let trigger_service = wiring.service;

@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::approval::ControlLevel;
 use crate::config::{
     AgentConfig, ChannelConfig, Config, CronConfig, DreamConfig, ExecutorsConfig, HeartbeatConfig,
-    JsonRenderConfig, McpConfig, McpServerConfig, MemoryConfig, OwnerConfig, PressureConfig,
-    ProviderConfig, SecretEntry, SubagentConfig, ToolEntry, TraceBackendEntry, TraceConfig,
-    TriggersConfig, WebFetchConfig,
+    JsonRenderConfig, McpConfig, McpServerConfig, McpTriggerSubscription, MemoryConfig,
+    OwnerConfig, PressureConfig, ProviderConfig, SecretEntry, SubagentConfig, ToolEntry,
+    TraceBackendEntry, TraceConfig, TriggersConfig, WebFetchConfig,
 };
 use crate::config_macro::FieldMeta;
 
@@ -82,6 +82,11 @@ pub struct SchemaField {
     pub secret: bool,
     /// Current value; always `null` for secret fields (never plaintext).
     pub value: serde_json::Value,
+    /// The `define_config!` type the field was declared with. `kind` is a
+    /// rendering hint and two fields can share one (`args` is a string list on
+    /// a server and an optional JSON object on a subscription), so the
+    /// declared type travels with the field.
+    pub ty: String,
 }
 
 /// One element of a collection section (providers/channels entries, a tool
@@ -159,6 +164,7 @@ pub fn serialize_schema(config: &Config) -> SchemaTree {
         tracing_backends_section(config),
         trigger_secrets_section(config),
         mcp_servers_section(config),
+        mcp_trigger_subscriptions_section(config),
     ];
     SchemaTree { sections }
 }
@@ -176,6 +182,11 @@ fn kind_for(meta: &FieldMeta) -> &'static str {
         // field `json`; without this arm it rendered as a text input.
         "json" => "json",
         "Option<String>" => "optional_string",
+        // A free-form optional object (`mcp.servers[].triggers[].args`) is the
+        // second badly-described family: without this arm it rendered as a
+        // text input and the editor would have written a JSON string back.
+        // The macro records the type path as declared, hence the full spelling.
+        "Option<serde_json::Value>" => "json",
         t if t.starts_with("Vec<") => "list",
         _ if !meta.allowed.is_empty() => "select",
         _ => "string",
@@ -205,6 +216,7 @@ fn field_from_meta(meta: &FieldMeta, value: serde_json::Value, path: &str) -> Sc
         } else {
             value
         },
+        ty: meta.ty.to_string(),
     }
 }
 
@@ -375,6 +387,7 @@ fn tools_section(config: &Config) -> SchemaSection {
         allowed: BUILTIN_TOOLS.iter().map(|s| s.to_string()).collect(),
         secret: false,
         value: serde_json::json!("shell"),
+        ty: "String".to_string(),
     };
     let enabled_meta = SchemaField {
         name: "enabled".to_string(),
@@ -387,6 +400,7 @@ fn tools_section(config: &Config) -> SchemaSection {
         allowed: Vec::new(),
         secret: false,
         value: serde_json::json!(true),
+        ty: "bool".to_string(),
     };
 
     let items = config
@@ -433,6 +447,7 @@ fn channels_section(config: &Config) -> SchemaSection {
         allowed: Vec::new(),
         secret: false,
         value: serde_json::json!(true),
+        ty: "bool".to_string(),
     };
     let extra_meta = SchemaField {
         name: "extra".to_string(),
@@ -445,6 +460,7 @@ fn channels_section(config: &Config) -> SchemaSection {
         allowed: Vec::new(),
         secret: false,
         value: serde_json::json!({}),
+        ty: "json".to_string(),
     };
 
     let mut names: Vec<&String> = config.channels.keys().collect();
@@ -601,6 +617,45 @@ fn mcp_servers_section(config: &Config) -> SchemaSection {
     SchemaSection {
         name: "mcp.servers".to_string(),
         label: "MCP Servers".to_string(),
+        fields: Vec::new(),
+        item_fields: Some(item_fields),
+        items: Some(items),
+    }
+}
+
+/// `mcp.servers[].triggers`: a Vec of subscriptions, addressed by numeric
+/// index within the server that declares them.
+///
+/// One flat section covers every server: the entries are rendered in server
+/// order and the outer server index — not a nested row — is what the patch
+/// path carries (`mcp.servers.<i>.triggers.<j>.<field>`), which is exactly
+/// what the generic Vec collection writer emits.
+fn mcp_trigger_subscriptions_section(config: &Config) -> SchemaSection {
+    let metas = McpTriggerSubscription::fields();
+    let item_fields = metas
+        .iter()
+        .map(|m| field_from_meta(m, m.default.clone(), meta_name(m)))
+        .collect();
+
+    let mut items = Vec::new();
+    for (server_idx, server) in config.mcp.servers.iter().enumerate() {
+        for sub_idx in 0..server.triggers.len() {
+            let fields = fields_from_metas(
+                metas,
+                &to_value_map(&server.triggers[sub_idx]),
+                &format!("mcp.servers.{}.triggers.{}", server_idx, sub_idx),
+            );
+            items.push(SchemaItem {
+                key: None,
+                fields,
+                extra: None,
+            });
+        }
+    }
+
+    SchemaSection {
+        name: "mcp.servers.triggers".to_string(),
+        label: "MCP Trigger Subscriptions".to_string(),
         fields: Vec::new(),
         item_fields: Some(item_fields),
         items: Some(items),
@@ -765,6 +820,39 @@ fn set_path(config: &mut Config, segs: &[&str], value: &serde_json::Value) -> Re
                 .get_mut(i)
                 .ok_or_else(|| format!("{}: index out of range", section))?;
             crate::config_macro::set_scalar(entry, &section, field, value)
+        }
+        // The editor writes one flat collection: the rows of every server's
+        // `triggers` are addressed by index only, and the server is the one
+        // entry whose list actually has that index.
+        ["mcp", "servers", "triggers", sub_idx, field] => {
+            let j = parse_index(sub_idx)?;
+            let section = format!("mcp.servers.triggers.{}", sub_idx);
+            let owner = config
+                .mcp
+                .servers
+                .iter()
+                .position(|server| j < server.triggers.len())
+                .ok_or_else(|| format!("{}: index out of range", section))?;
+            // A subscription is a declared struct: its field is written
+            // exactly like any other scalar section's field.
+            let subscription = &mut config.mcp.servers[owner].triggers[j];
+            crate::config_macro::set_scalar(subscription, &section, field, value)
+        }
+        ["mcp", "servers", idx, "triggers", sub_idx, field] => {
+            let i = parse_index(idx)?;
+            let j = parse_index(sub_idx)?;
+            // A subscription is a declared struct, so the editor writes one
+            // field of it exactly like any other scalar section.
+            let section = format!("mcp.servers.{}.triggers.{}", idx, sub_idx);
+            let subscription = config
+                .mcp
+                .servers
+                .get_mut(i)
+                .ok_or_else(|| format!("mcp.servers.{}: index out of range", idx))?
+                .triggers
+                .get_mut(j)
+                .ok_or_else(|| format!("{}: index out of range", section))?;
+            crate::config_macro::set_scalar(subscription, &section, field, value)
         }
         ["mcp", "servers", idx, field] => {
             let i = parse_index(idx)?;
@@ -976,6 +1064,26 @@ fn add_path(config: &mut Config, op: &PatchOp, segs: &[&str]) -> Result<(), Stri
             config.mcp.servers.push(server);
             Ok(())
         }
+        ["mcp", "servers", idx, "triggers"] => {
+            let i = parse_index(idx)?;
+            // Parse and clamp before storing: the row keeps the declared
+            // shape, so an unknown or over-long value never lands in the file.
+            let mut subscription: McpTriggerSubscription = serde_json::from_value(op.value.clone())
+                .map_err(|e| {
+                    format!(
+                        "mcp.servers.{}.triggers: invalid subscription object: {}",
+                        idx, e
+                    )
+                })?;
+            subscription.clamp();
+            let server = config
+                .mcp
+                .servers
+                .get_mut(i)
+                .ok_or_else(|| format!("mcp.servers.{}: index out of range", idx))?;
+            server.triggers.push(subscription);
+            Ok(())
+        }
         _ => Err(format!("add not supported for path: {}", segs.join("."))),
     }
 }
@@ -1029,6 +1137,25 @@ fn remove_path(config: &mut Config, segs: &[&str]) -> Result<(), String> {
                 Err(format!("mcp.servers.{}: index out of range", idx))
             } else {
                 config.mcp.servers.remove(i);
+                Ok(())
+            }
+        }
+        ["mcp", "servers", idx, "triggers", sub_idx] => {
+            let i = parse_index(idx)?;
+            let j = parse_index(sub_idx)?;
+            let triggers = &mut config
+                .mcp
+                .servers
+                .get_mut(i)
+                .ok_or_else(|| format!("mcp.servers.{}: index out of range", idx))?
+                .triggers;
+            if j >= triggers.len() {
+                Err(format!(
+                    "mcp.servers.{}.triggers.{}: index out of range",
+                    idx, sub_idx
+                ))
+            } else {
+                triggers.remove(j);
                 Ok(())
             }
         }
@@ -1253,6 +1380,7 @@ mod tests {
                 "tracing.backends",
                 "triggers.secrets",
                 "mcp.servers",
+                "mcp.servers.triggers",
             ]
         );
     }
@@ -2477,6 +2605,9 @@ mod tests {
     fn test_patch_accepts_all_rendered_mcp_server_item_paths() {
         // Mirrors the global scalar-path lock but with a populated collection:
         // item fields are not skipped for `list` kind, so `args` must be settable.
+        // The one exception is `triggers`: a `Vec<_>` field is edited through
+        // its own section (`mcp.servers.<i>.triggers`), so a whole-array check
+        // reaches `set_scalar`, which refuses it by design.
         let mut config = config_with_mcp_server();
         config.clamp();
         config.normalize();
@@ -2485,7 +2616,7 @@ mod tests {
         let ops: Vec<PatchOp> = sec.items.as_ref().unwrap()[0]
             .fields
             .iter()
-            .filter(|f| f.kind != "secret")
+            .filter(|f| f.kind != "secret" && f.name != "triggers")
             .map(|f| op(PatchOpKind::Set, &f.path, f.value.clone()))
             .collect();
         let expected = serde_json::to_string(&config).unwrap();
@@ -2897,6 +3028,305 @@ mod tests {
             rejected,
             vec!["agent.provider".to_string()],
             "only the provider pointer is allowed to fail validation"
+        );
+    }
+
+    // ── MCP trigger subscriptions (trigger source expansion) ──
+
+    fn config_with_trigger_subscriptions() -> Config {
+        use serde_json::json;
+        let mut config = config_with_mcp_server();
+        config.mcp.servers[0].triggers = vec![
+            McpTriggerSubscription {
+                r#type: "notification".to_string(),
+                uri: "notifications/tools/list_changed".to_string(),
+                description: "Tool list changed".to_string(),
+                source_id: "gh-tools-changed".to_string(),
+                ..Default::default()
+            },
+            McpTriggerSubscription {
+                r#type: "tool".to_string(),
+                tool: "list_builds".to_string(),
+                args: Some(json!({ "branch": "main" })),
+                description: "Latest CI builds".to_string(),
+                source_id: "gh-builds".to_string(),
+                ..Default::default()
+            },
+        ];
+        config
+    }
+
+    #[test]
+    fn test_schema_mcp_server_advertises_triggers_as_its_own_section() {
+        let tree = serialize_schema(&config_with_trigger_subscriptions());
+
+        // The server row advertises the collection by name; the entries live in
+        // a section of their own, addressed by numeric index.
+        let servers = section(&tree, "mcp.servers");
+        let item = &servers.items.as_ref().unwrap()[0];
+        let triggers = item.fields.iter().find(|f| f.name == "triggers").unwrap();
+        assert_eq!(triggers.kind, "list");
+        assert_eq!(triggers.path, "mcp.servers.0.triggers");
+
+        let template = servers.item_fields.as_ref().unwrap();
+        let template_triggers = template.iter().find(|f| f.name == "triggers").unwrap();
+        assert_eq!(template_triggers.kind, "list");
+        assert_eq!(template_triggers.path, "triggers");
+
+        // The subscription fields are rendered with an absolute section path.
+        let subs = section(&tree, "mcp.servers.triggers");
+        let template = subs.item_fields.as_ref().unwrap();
+        let by_name = |name: &str| template.iter().find(|f| f.name == name).unwrap();
+        assert_eq!(by_name("type").kind, "select");
+        assert_eq!(
+            by_name("type").allowed,
+            vec!["notification".to_string(), "tool".to_string()]
+        );
+        assert_eq!(by_name("uri").path, "uri");
+        assert_eq!(by_name("uri").max, Some(json!(256)));
+        assert_eq!(by_name("tool").max, Some(json!(128)));
+        assert_eq!(by_name("args").kind, "json");
+        assert_eq!(by_name("description").max, Some(json!(256)));
+        assert_eq!(by_name("source_id").max, Some(json!(64)));
+
+        // String fields stay plain string inputs; only `args` is a JSON object
+        // (a `kind` of its own, not the `string` fallback a text box uses).
+        assert_eq!(by_name("description").kind, "string");
+        assert_eq!(by_name("args").default, json!(null));
+
+        let items = subs.items.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        let first = &items[0].fields;
+        let first_type = first.iter().find(|f| f.name == "type").unwrap();
+        assert_eq!(first_type.value, json!("notification"));
+        assert_eq!(first_type.path, "mcp.servers.0.triggers.0.type");
+        let uri = first.iter().find(|f| f.name == "uri").unwrap();
+        assert_eq!(uri.value, json!("notifications/tools/list_changed"));
+        let args = items[1].fields.iter().find(|f| f.name == "args").unwrap();
+        assert_eq!(args.value, json!({ "branch": "main" }));
+        let tool = items[1].fields.iter().find(|f| f.name == "tool").unwrap();
+        assert_eq!(tool.value, json!("list_builds"));
+
+        // Credentials stay out of the whole tree, subscriptions included.
+        let rendered = serde_json::to_string(&tree).unwrap();
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(!rendered.contains("env-super-secret"));
+    }
+
+    #[test]
+    fn test_patch_accepts_the_subscription_ops_the_editor_emits() {
+        // What the WebUI editor sends for its three subscription gestures:
+        // edit an existing row, append a row under a server, drop a row.
+        let mut config = config_with_trigger_subscriptions();
+        let before = config.mcp.servers[0].clone();
+        let ops = vec![
+            op(
+                PatchOpKind::Set,
+                "mcp.servers.0.triggers.0.type",
+                json!("tool"),
+            ),
+            op(
+                PatchOpKind::Set,
+                "mcp.servers.0.triggers.0.args",
+                json!({ "branch": "main" }),
+            ),
+            op(
+                PatchOpKind::Add,
+                "mcp.servers.0.triggers",
+                json!({
+                    "type": "notification",
+                    "uri": "notifications/progress",
+                    "source_id": "gh-progress"
+                }),
+            ),
+            op(PatchOpKind::Remove, "mcp.servers.0.triggers.0", json!(null)),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        let server = &config.mcp.servers[0];
+        let subs = &server.triggers;
+        assert_eq!(subs.len(), 2, "one edited row and one appended row");
+        assert_eq!(subs[0].r#type, "tool");
+        assert_eq!(subs[0].args, Some(json!({ "branch": "main" })));
+        assert_eq!(subs[1].uri, "notifications/progress");
+        assert_eq!(
+            server.name, before.name,
+            "the server row itself is untouched"
+        );
+        assert_eq!(server.command, before.command);
+    }
+
+    #[test]
+    fn test_patch_add_subscription_to_a_new_server_carries_its_entries() {
+        // A new server may arrive with its subscriptions in the same add op;
+        // `mcp.servers.<i>.triggers` is then the per-server append route.
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Add,
+                "mcp.servers",
+                json!({
+                    "name": "ci",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "triggers": [{
+                        "type": "notification",
+                        "uri": "notifications/x",
+                        "source_id": "ci-x"
+                    }]
+                }),
+            )],
+        )
+        .unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.mcp.servers[0].triggers.len(), 1);
+
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Add,
+                "mcp.servers.0.triggers",
+                json!({ "type": "tool", "tool": "list_builds", "source_id": "ci-builds" }),
+            )],
+        )
+        .unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.mcp.servers[0].triggers.len(), 2);
+    }
+
+    #[test]
+    fn test_patch_add_subscription_out_of_range_server_is_refused() {
+        let mut config = make_config();
+        let err = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Add,
+                "mcp.servers.3.triggers",
+                json!({ "type": "tool", "tool": "x", "source_id": "x" }),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("index out of range"), "{err}");
+    }
+
+    #[test]
+    fn test_schema_whole_server_list_is_still_rejected_as_a_scalar() {
+        // Every Vec-typed field is a collection with its own section: a plain
+        // `set` on the array is refused rather than written as unknown JSON.
+        let mut config = config_with_trigger_subscriptions();
+        let ops = vec![op(
+            PatchOpKind::Set,
+            "mcp.servers.0.triggers",
+            json!([{ "type": "tool", "tool": "x", "source_id": "x" }]),
+        )];
+        let err = apply_config_patch(&mut config, &ops).unwrap_err();
+        assert!(err.contains("edited as its own collection"), "{err}");
+    }
+
+    #[test]
+    fn test_patch_add_set_remove_mcp_trigger_subscription() {
+        let mut config = config_with_mcp_server();
+        let ops = vec![
+            op(
+                PatchOpKind::Add,
+                "mcp.servers.0.triggers",
+                json!({
+                    "type": "notification",
+                    "uri": "notifications/progress",
+                    "description": "Progress",
+                    "source_id": "gh-progress"
+                }),
+            ),
+            op(
+                PatchOpKind::Set,
+                "mcp.servers.0.triggers.0.uri",
+                json!("notifications/x"),
+            ),
+            op(
+                PatchOpKind::Set,
+                "mcp.servers.0.triggers.0.type",
+                json!("tool"),
+            ),
+            op(
+                PatchOpKind::Set,
+                "mcp.servers.0.triggers.0.tool",
+                json!("list_builds"),
+            ),
+            op(
+                PatchOpKind::Set,
+                "mcp.servers.0.triggers.0.args",
+                json!({ "branch": "main" }),
+            ),
+        ];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        let sub = &config.mcp.servers[0].triggers[0];
+        assert_eq!(sub.r#type, "tool");
+        assert_eq!(sub.tool, "list_builds");
+        assert_eq!(sub.args, Some(json!({ "branch": "main" })));
+        assert_eq!(
+            sub.uri, "notifications/x",
+            "the unused half of the other kind is kept, not cleared"
+        );
+
+        let ops = vec![op(
+            PatchOpKind::Remove,
+            "mcp.servers.0.triggers.0",
+            json!(null),
+        )];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert!(errors.is_empty());
+        assert!(config.mcp.servers[0].triggers.is_empty());
+    }
+
+    #[test]
+    fn test_schema_triggers_section_describes_the_active_source_cap() {
+        let config = make_config();
+        let tree = serialize_schema(&config);
+        let triggers = section(&tree, "triggers");
+        let cap = field(triggers, "max_active_sources");
+        assert_eq!(cap.kind, "int");
+        assert_eq!(cap.value, json!(8));
+        // 0 is a legal value: it switches the cap off.
+        assert_eq!(cap.min, Some(json!(0)));
+        assert_eq!(cap.max, Some(json!(100)));
+        assert!(!cap.desc.is_empty());
+    }
+
+    #[test]
+    fn test_patch_set_max_active_sources_clamps_to_range() {
+        let mut config = make_config();
+        let errors = apply_config_patch(
+            &mut config,
+            &[op(
+                PatchOpKind::Set,
+                "triggers.max_active_sources",
+                json!(250),
+            )],
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(config.triggers.max_active_sources, 100);
+    }
+
+    #[test]
+    fn test_patch_subscription_validation_error_lands_on_the_mcp_section() {
+        // The message names the server (`mcp.servers.gh: ...`), so it is
+        // highlighted as an MCP error; the editor addresses the offending
+        // sub-row once the field mapping learns it.
+        let mut config = config_with_mcp_server();
+        let ops = vec![op(
+            PatchOpKind::Add,
+            "mcp.servers.0.triggers",
+            json!({ "type": "tool", "tool": "", "source_id": "gh-builds" }),
+        )];
+        let errors = apply_config_patch(&mut config, &ops).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "mcp.servers");
+        assert!(
+            errors[0].message.contains("needs a tool name"),
+            "{errors:?}"
         );
     }
 

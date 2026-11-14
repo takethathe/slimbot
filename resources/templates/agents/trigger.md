@@ -1,7 +1,7 @@
 ---
 name: trigger
 description: Create, edit, test, or stop triggers and their data sources — standing rules like "remind me every day at nine", "tell me when the news mentions X", "keep an eye on this file".
-tools: trigger_source, trigger
+tools: trigger_source, trigger, web_fetch
 deliver: true
 timeout_secs: 300
 ---
@@ -43,6 +43,9 @@ That list decides your route:
 
 - **A source already watches the thing** — reuse its `src-…` id and skip to
   step 4: read its shape before judging on it.
+- **A `notification` or `tool` source already carries it** — these are declared
+  in the MCP config (`origin` in the list says which), so there is nothing to
+  edit here: read the shape and go to step 5.
 - **Nothing watches it yet** — build the source (step 3).
 - **A pure time-only reminder** ("every day at nine") needs no source at all —
   go straight to step 5.
@@ -69,6 +72,13 @@ connector for, or when you are unsure whether a plain read is enough. That file
 is the single home of the connector discovery and call rules; this one only says
 what the source must do.
 
+**When the channel is an API you have not used**, call `web_fetch` first: read
+the endpoint's documentation or an example response, and only then write the
+collector against the fields it really returns. `web_fetch` is a one-off look
+taken here, in this run — it is not part of the source and never runs on a tick.
+A collector must fetch on its own with `ctx.http`, and a page you confirmed by
+hand is the only evidence that its field names are real.
+
 What a collector can use besides connectors — no shell, no `sleep`, and no
 writing:
 
@@ -86,8 +96,24 @@ async function collect(ctx) {
 For paths outside the workspace, the source needs `allow_paths` — a script that
 reaches outside and is not allowed to will fail every tick.
 
-**Done when** `create` returns a `src-…` id. A directory created without a
-script is fine — add one with `action: "update"` before moving on.
+`create` runs the script once before it writes anything, under the same
+environment and timeout the tick uses, and answers with `test: {ok, items,
+elapsed_ms}` — counts and timings only, never the collected values. When it
+fails, `test.error` names the cause (a 404, a missing field, a syntax error, a
+timeout) and **nothing is written**: fix the script and call again. A source
+created without a script at all is a half-built one you finish with
+`action: "update"`.
+
+`create` is also refused once as many sources are active as
+`triggers.max_active_sources` allows (8 by default, 0 disables the cap). The
+count is the sources your enabled rules read; before the first tick has
+reported which sources are read, every source counts. The refusal carries a
+`sources` list — each entry with `id`, `name`, `description`, `origin` and
+`referenced` (whether a rule reads it) — so you can delete the one that
+duplicates your source or no longer runs, or reuse it, then call `create`
+again.
+
+**Done when** `create` returns a `src-…` id with `test.ok: true`.
 
 ## 4. Look at the shape, not the data
 
@@ -95,12 +121,22 @@ Call `trigger_source` with `action: "list"`. Each source reports `status`,
 `items_count`, and a `shape` of field names and types — shapes only, never real
 values, deliberately: write the condition against the shape.
 
+- `origin` says where the source comes from: `disk` is a collector you can
+  edit, `notification` is what an MCP server pushed, `tool` is one connector
+  tool the host calls each tick. The last two are declared in the MCP config —
+  read them, never try to rewrite them with this tool: `update` and `delete`
+  refuse a virtual source and point you at the config.
 - `status: pending` means the source has not collected yet. Wait one tick
   rather than debugging a script that is fine.
 - `status: degraded` means the last collection failed; `last_error` says why.
   Fix the script, then wait for the next tick — no restart is needed.
 - `items_count: 0` on a `ready` source is a real answer: there is nothing to
-  watch right now.
+  watch right now. On a `notification` source that has never been pushed to,
+  the view is empty without ever being observed, so a rule naming it stays
+  unready instead of judging an empty world.
+- A source that no enabled rule names is not collected at all. Its `id` is
+  still listed, and it starts collecting on the tick after a rule that names it
+  is enabled.
 
 **Done when** the fields you intend to judge on appear in `shape` with the types
 you expected.
@@ -179,6 +215,10 @@ condition to test — skip this step once `list` shows the rule `ready`.
 
 Iterate with `action: "update"` until the result matches what the user described.
 A rule that has never been tested is a rule that will fail silently at 3am.
+
+The same holds one level down: `trigger_source` `update` re-runs the collector
+before it overwrites anything, so a script edit (or a tighter `timeout_s`) that
+cannot run is refused and the source keeps its previous version.
 
 **Done when** `test` returns the result you predicted.
 

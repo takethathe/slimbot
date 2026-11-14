@@ -4,7 +4,7 @@
 
 ## 概述
 
-模型写的代码要能无人值守地跑，而且不能给这台机器一个 shell。四种脚本共用一个求值器：数据源的 `collect(ctx)`、触发器条件的 `judge(ctx)`、模型/子代理提交的 agent 程序 `main(ctx)`（票 25），与执行器的动作脚本 `act(ctx)`（票 12）。选型与实测数据见 [ADR 0008](adr/0008-codemode-runtime-choice.md)（引擎 = `rquickjs`，中断 203ms 生效，8MB 上限 2ms 报错，二进制净增 772KB）。
+模型写的代码要能无人值守地跑，而且不能给这台机器一个 shell。四种脚本共用一个求值器：数据源的 `collect(ctx)`、触发器条件的 `judge(ctx)`、模型/子代理提交的 agent 程序 `main(ctx)`（票 25），与执行器的动作脚本 `act(ctx)`（票 12）。**入口数不随数据源种类增长**：`mcp.servers[].triggers[]` 声明的 `type=tool` 虚拟源仍走同一个 `collect` 入口（`ENTRY_COLLECT`），只是脚本不是模型写的那段——宿主用连接器桥调一次 `mcp__<server>__<tool>`，把结果整段包成一条 item 后交给同一套 `normalize`（见 [trigger.md](trigger.md#虚拟源mcp-订阅)）。`type=notification` 的虚拟源根本不进求值器：它的数据在 `McpService` 的缓冲里，`freeze()` 直接读。选型与实测数据见 [ADR 0008](adr/0008-codemode-runtime-choice.md)（引擎 = `rquickjs`，中断 203ms 生效，8MB 上限 2ms 报错，二进制净增 772KB）。
 
 每次执行得到：
 
@@ -33,7 +33,7 @@
 | 装给谁 | 脚本可见的函数 |
 |--------|----------------|
 | collect | `ctx.http.get/post(url, opts?)`、`ctx.fs.stat/read/list(path)`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()`；**进程有连接器池时**再加只读连接器面 `ctx.tools.mcp__*(args?)` 与 `await ctx.searchTools(query, limit?)`（见[连接器面](#连接器面一座桥四张过滤表)） |
-| judge | `ctx.store.get/set/keys`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()` |
+| judge | `ctx.store.get/set/keys`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()`（**没有** http / fs / secret / tools / subagent：判定只读已经采好的世界） |
 | agent（`main`） | `ctx.tools.<name>(args?)`、`await ctx.searchTools(query, limit?)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()` |
 | act（执行器） | `ctx.http.get/post(url, opts?)`、`ctx.secret(name)`、`ctx.log(msg)`、`ctx.now()`、`ctx.boot_at()`、`ctx.uptime_s()`；**池存在时**再加连接器面 `ctx.tools.mcp__*(args?)` 与 `await ctx.searchTools(query, limit?)`（读全开、写按 `allow_connectors`）—— **没有** fs / shell / store / 任何内置工具名 |
 | 测试基线 | `NoHost`（一个函数都不装） |
